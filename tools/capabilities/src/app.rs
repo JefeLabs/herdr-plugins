@@ -122,6 +122,9 @@ pub enum InputAction {
     AddQuestion,
     /// Append `- kind: target` under Artifacts (input is "kind: target").
     AddArtifact,
+    /// Replace the capability's affected areas (comma-separated group paths;
+    /// empty clears them).
+    EditAreas,
 }
 
 #[allow(clippy::large_enum_variant)] // Chat carries the live turn; boxing buys nothing here
@@ -977,6 +980,17 @@ impl App {
         self.refresh_found();
     }
 
+    /// `+`: edit the selected capability's affected areas.
+    fn open_areas_input(&mut self) {
+        if let Some(it) = self.selected_intent() {
+            self.screen = Screen::Input {
+                label: "affected areas (group paths, comma-separated; empty clears)".into(),
+                text: it.fm.areas.join(", "),
+                action: InputAction::EditAreas,
+            };
+        }
+    }
+
     fn key_list(&mut self, k: KeyEvent) -> Flow {
         let last = self.list.len().saturating_sub(1);
         match k.code {
@@ -1010,6 +1024,7 @@ impl App {
             KeyCode::Char('r') => self.rescan(),
             KeyCode::Char('s') => self.start_send(),
             KeyCode::Char('g') => self.go_to_agent(),
+            KeyCode::Char('+') => self.open_areas_input(),
             _ => {}
         }
         Flow::Continue
@@ -1397,6 +1412,7 @@ impl App {
                 }
             }
             KeyCode::Char('s') => self.start_send(),
+            KeyCode::Char('+') => self.open_areas_input(),
             KeyCode::Char('t') => {
                 if let Some(it) = self.selected_intent() {
                     self.screen = Screen::Input {
@@ -2429,7 +2445,8 @@ impl App {
             KeyCode::Enter => {
                 self.screen = Screen::Browse;
                 let value = text.trim().to_string();
-                if value.is_empty() {
+                // an empty areas list is a real answer: it clears them
+                if value.is_empty() && !matches!(action, InputAction::EditAreas) {
                     return Flow::Continue;
                 }
                 self.run_input_action(action, &value);
@@ -2504,6 +2521,18 @@ impl App {
             InputAction::Rename => {
                 let v = value.to_string();
                 self.update_selected_fields(|fm| fm.title = v);
+            }
+            InputAction::EditAreas => {
+                let areas: Vec<String> = value
+                    .split(',')
+                    .map(|a| a.trim().trim_matches('/').to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect();
+                if let Some(bad) = areas.iter().find(|a| !self.store.root().join(a).is_dir()) {
+                    self.message = Some(format!("no group `{bad}`: areas unchanged"));
+                } else {
+                    self.update_selected_fields(|fm| fm.areas = areas);
+                }
             }
             InputAction::AddItem { heading, pane } => {
                 self.edit_selected_body(|body| {
@@ -3875,6 +3904,89 @@ mod tests {
         let text = format!("{:?}", t.backend().buffer());
         assert!(text.contains("Inbox (1 +1)"), "{text}");
         assert!(text.contains("↳ Alpha"), "{text}");
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            key(app, KeyCode::Char(c));
+        }
+    }
+    fn clear_input(app: &mut App) {
+        for _ in 0..80 {
+            key(app, KeyCode::Backspace);
+        }
+    }
+
+    #[test]
+    fn plus_edits_the_areas_and_refuses_unknown_groups() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        key(&mut fx.app, KeyCode::Char('+'));
+        assert_eq!(fx.app.view().screen, "input");
+        assert_eq!(fx.app.view().input_text, "");
+        type_text(&mut fx.app, "Inbox");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(Store::load(&path).unwrap().fm.areas, vec!["Inbox"]);
+        assert!(
+            fx.app
+                .view()
+                .rows
+                .iter()
+                .any(|r| r.reference && r.label == "Alpha")
+        );
+        // the input opens on the current areas (the selection stayed on Alpha)
+        assert_eq!(fx.app.selected_intent().unwrap().path, path);
+        key(&mut fx.app, KeyCode::Char('+'));
+        assert_eq!(fx.app.view().input_text, "Inbox");
+        clear_input(&mut fx.app);
+        type_text(&mut fx.app, "Inbox, nowhere");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("no group `nowhere`"),
+            "{:?}",
+            fx.app.view().message
+        );
+        assert_eq!(
+            Store::load(&path).unwrap().fm.areas,
+            vec!["Inbox"],
+            "unchanged"
+        );
+        // an empty input clears them
+        key(&mut fx.app, KeyCode::Char('+'));
+        clear_input(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(Store::load(&path).unwrap().fm.areas.is_empty());
+    }
+
+    #[test]
+    fn plus_works_in_the_list_too() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('+'));
+        type_text(&mut fx.app, "Inbox");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().layout, "list");
+        let beta = fx
+            .app
+            .store
+            .scan()
+            .unwrap()
+            .groups
+            .iter()
+            .flat_map(|g| g.intents.iter())
+            .find(|i| i.fm.title == "Beta")
+            .unwrap()
+            .fm
+            .areas
+            .clone();
+        assert_eq!(beta, vec!["Inbox"]);
     }
 
     #[test]
