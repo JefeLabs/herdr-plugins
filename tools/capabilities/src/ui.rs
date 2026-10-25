@@ -996,6 +996,9 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
 ///
 ///  description, up to two wrapped lines
 /// ```
+///
+/// Returns where each drawn card landed, `(row index, first line, end line)`,
+/// so a mouse click can be mapped back to a card.
 pub fn render_capability_list(
     rows: &[ListRow],
     selected: usize,
@@ -1003,9 +1006,10 @@ pub fn render_capability_list(
     empty: &str,
     area: Rect,
     buf: &mut Buffer,
-) {
+) -> Vec<(usize, u16, u16)> {
+    let mut hits = Vec::new();
     if area.height < 3 || area.width < 20 {
-        return;
+        return hits;
     }
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -1036,7 +1040,7 @@ pub fn render_capability_list(
             ..body
         };
         Paragraph::new(Span::styled(empty.to_string(), dim)).render(body, buf);
-        return;
+        return hits;
     }
     let inner_w = w.saturating_sub(2);
     let descs: Vec<Vec<String>> = rows
@@ -1071,6 +1075,7 @@ pub fn render_capability_list(
             }
             *y += 1;
         };
+        let rule_y = y;
         put(Line::styled("─".repeat(w), dim), &mut y);
         let card_top = y;
         // the title, and its path in the tree under it
@@ -1138,6 +1143,7 @@ pub fn render_capability_list(
                 &mut y,
             );
         }
+        hits.push((i, rule_y, y.min(bottom)));
         if i == selected {
             let h = y.min(bottom).saturating_sub(card_top);
             buf.set_style(
@@ -1150,4 +1156,5 @@ pub fn render_capability_list(
             );
         }
     }
+    hits
 }

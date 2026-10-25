@@ -389,6 +389,10 @@ pub struct App {
     poll_ticks: u32,
     /// Tests pin the clock here; `None` means the real time.
     fixed_now: Option<chrono::DateTime<chrono::Local>>,
+    /// The area last drawn, so mouse clicks can be mapped to what is there.
+    last_area: std::cell::Cell<Rect>,
+    /// Where each list card was last drawn: `(list index, first line, end line)`.
+    card_hits: std::cell::RefCell<Vec<(usize, u16, u16)>>,
 }
 
 impl App {
@@ -434,6 +438,8 @@ impl App {
             poller: None,
             poll_ticks: 0,
             fixed_now: None,
+            last_area: std::cell::Cell::new(Rect::default()),
+            card_hits: std::cell::RefCell::new(Vec::new()),
         };
         let last = crate::config::last_used(&app.dirs, &app.cfg);
         if let Some(l) = last.layout.as_deref().and_then(Layout::parse) {
@@ -792,6 +798,68 @@ impl App {
                 .stderr(std::process::Stdio::null())
                 .status();
         });
+    }
+
+    /// Mouse in the browser: a click selects a tree row or a list card; a
+    /// click on the selected group opens or closes it, on the selected card
+    /// opens it in the tree; the wheel moves the selection.
+    pub fn mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind as K};
+        if !matches!(self.screen, Screen::Browse) {
+            return;
+        }
+        let step = |app: &mut App, c: char| {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        };
+        let area = self.last_area.get();
+        match (self.layout, ev.kind) {
+            (Layout::List, K::Down(MouseButton::Left)) => {
+                let hit = self
+                    .card_hits
+                    .borrow()
+                    .iter()
+                    .find(|(_, top, end)| ev.row >= *top && ev.row < *end)
+                    .map(|(i, _, _)| *i);
+                match hit {
+                    Some(i) if i == self.list_selected => self.set_layout(Layout::Tree),
+                    Some(i) => self.list_selected = i,
+                    None => {}
+                }
+            }
+            (Layout::Tree, K::Down(MouseButton::Left)) => {
+                let (left, _, _) = ui::split(area);
+                if ev.column >= left.x + left.width || ev.row < left.y {
+                    return;
+                }
+                // the same scroll the tree was drawn with
+                let visible = left.height as usize;
+                let scroll = if visible > 0 && self.selected >= visible {
+                    self.selected + 1 - visible
+                } else {
+                    0
+                };
+                let i = scroll + usize::from(ev.row - left.y);
+                if i >= self.rows.len() {
+                    return;
+                }
+                self.focus = Pane::Tree;
+                if i == self.selected
+                    && let Some(Row::Group { path, .. }) = self.rows.get(i)
+                {
+                    let path = path.clone();
+                    if !self.collapsed.remove(&path) {
+                        self.collapsed.insert(path);
+                    }
+                    self.rebuild_rows();
+                } else {
+                    self.selected = i;
+                }
+            }
+            (_, K::ScrollDown) => step(self, 'j'),
+            (_, K::ScrollUp) => step(self, 'k'),
+            _ => {}
+        }
+        self.refresh_found();
     }
 
     fn key_list(&mut self, k: KeyEvent) -> Flow {
@@ -2760,7 +2828,9 @@ impl App {
         } else {
             "nothing matches this filter: f changes it"
         };
-        ui::render_capability_list(&rows, self.list_selected, &header, empty, list_area, buf);
+        let hits =
+            ui::render_capability_list(&rows, self.list_selected, &header, empty, list_area, buf);
+        *self.card_hits.borrow_mut() = hits;
         let text = self.message.clone().unwrap_or_else(|| {
             "j/k move  Enter open in tree  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
                 .to_string()
@@ -2769,6 +2839,7 @@ impl App {
     }
 
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
+        self.last_area.set(area);
         if matches!(self.screen, Screen::Browse) && self.layout == Layout::List {
             self.draw_list(area, buf);
             return;
@@ -3050,11 +3121,16 @@ fn install_signal_handlers() {
 }
 
 fn restore_terminal() {
-    use crossterm::{cursor::Show, event::DisableBracketedPaste, terminal::LeaveAlternateScreen};
+    use crossterm::{
+        cursor::Show,
+        event::{DisableBracketedPaste, DisableMouseCapture},
+        terminal::LeaveAlternateScreen,
+    };
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         Show
     );
@@ -3062,7 +3138,11 @@ fn restore_terminal() {
 
 fn init_terminal() -> ratatui::DefaultTerminal {
     let t = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
     t
 }
 
@@ -3148,6 +3228,7 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
                 Flow::Continue => {}
             },
             Ok(Event::Paste(text)) => app.paste(&text),
+            Ok(Event::Mouse(m)) => app.mouse(m),
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -3517,6 +3598,84 @@ mod tests {
             v.rows
         );
         assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Deep one");
+    }
+
+    fn mouse(
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    fn left_click(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+        )
+    }
+
+    /// Draw once at `w`×`h` so the app knows where everything is.
+    fn draw_at(app: &App, w: u16, h: u16) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+    }
+
+    #[test]
+    fn clicking_a_tree_row_selects_it_and_a_selected_group_toggles() {
+        let mut fx = setup("agy.jsonl");
+        draw_at(&fx.app, 100, 24);
+        // rows: Inbox, In the inbox, skoolscout, Alpha, Beta
+        fx.app.mouse(left_click(3, 4));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Beta");
+        fx.app.mouse(left_click(3, 2));
+        assert_eq!(
+            fx.app.view().rows[fx.app.view().selected].label,
+            "skoolscout"
+        );
+        let before = fx.app.view().rows.len();
+        fx.app.mouse(left_click(3, 2)); // the selected group: collapse it
+        assert_eq!(
+            fx.app.view().rows.len(),
+            before - 2,
+            "{:?}",
+            fx.app.view().rows
+        );
+        fx.app.mouse(left_click(3, 2)); // and open it again
+        assert_eq!(fx.app.view().rows.len(), before);
+        // the wheel moves the selection
+        fx.app
+            .mouse(mouse(crossterm::event::MouseEventKind::ScrollDown, 3, 2));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Alpha");
+        // a click below the last row changes nothing
+        fx.app.mouse(left_click(3, 20));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Alpha");
+    }
+
+    #[test]
+    fn clicking_a_card_selects_it_and_clicking_it_again_opens_it() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 100, 60);
+        let y = shown
+            .lines()
+            .position(|l| l.starts_with(" Org admins"))
+            .unwrap() as u16;
+        draw_at(&fx.app, 100, 60);
+        fx.app.mouse(left_click(5, y));
+        assert!(list_title(&fx.app).starts_with("Org admins"));
+        assert_eq!(fx.app.view().layout, "list");
+        fx.app.mouse(left_click(5, y + 2)); // anywhere on the selected card
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree", "a second click opens it");
+        assert!(v.rows[v.selected].label.starts_with("Org admins"));
     }
 
     #[test]
