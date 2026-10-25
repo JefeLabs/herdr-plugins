@@ -655,6 +655,85 @@ pub fn toggle_checklist(body: &str, heading: &str, index: usize) -> Option<Strin
     Some(text)
 }
 
+pub const QUESTIONS_HEADING: &str = "## Open questions";
+
+/// Section order used when a missing section has to be created.
+const SECTION_ORDER: &[&str] = &[
+    "## Description",
+    "## Preconditions",
+    "## Acceptance criteria",
+    "## Open questions",
+];
+
+/// Append `line` at the end of the `heading` section, creating the section
+/// (in canonical order) when it is missing.
+fn append_to_section(body: &str, heading: &str, line: &str) -> String {
+    let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
+    let heading_idx = lines
+        .iter()
+        .position(|l| l.trim().eq_ignore_ascii_case(heading));
+    let insert_at = match heading_idx {
+        Some(h) => {
+            // end of this section: just before the next heading, trimming trailing blanks
+            let mut end = lines.len();
+            for (i, l) in lines.iter().enumerate().skip(h + 1) {
+                if l.starts_with("## ") {
+                    end = i;
+                    break;
+                }
+            }
+            let mut at = end;
+            while at > h + 1 && lines[at - 1].trim().is_empty() {
+                at -= 1;
+            }
+            at
+        }
+        None => {
+            // create the section before the first later section in canonical order
+            let my_pos = SECTION_ORDER
+                .iter()
+                .position(|h| h.eq_ignore_ascii_case(heading))
+                .unwrap_or(SECTION_ORDER.len());
+            let later = lines.iter().position(|l| {
+                l.starts_with("## ")
+                    && SECTION_ORDER
+                        .iter()
+                        .position(|h| h.eq_ignore_ascii_case(l.trim()))
+                        .map(|p| p > my_pos)
+                        .unwrap_or(false)
+            });
+            let at = later.unwrap_or(lines.len());
+            let mut block = vec![heading.to_string()];
+            block.push(line.to_string());
+            if at < lines.len() {
+                block.push(String::new());
+            }
+            // keep a blank line before the new heading
+            if at > 0 && !lines[at - 1].trim().is_empty() {
+                block.insert(0, String::new());
+            }
+            lines.splice(at..at, block);
+            let mut out = lines.join("\n");
+            out.push('\n');
+            return out;
+        }
+    };
+    lines.insert(insert_at, line.to_string());
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Add an unchecked item to a checklist section.
+pub fn add_checklist_item(body: &str, heading: &str, text: &str) -> String {
+    append_to_section(body, heading, &format!("- [ ] {}", text.trim()))
+}
+
+/// Add an open question.
+pub fn add_question(body: &str, text: &str) -> String {
+    append_to_section(body, QUESTIONS_HEADING, &format!("- {}", text.trim()))
+}
+
 pub const CRITERIA_HEADING: &str = "## Acceptance criteria";
 pub const PRECONDITIONS_HEADING: &str = "## Preconditions";
 

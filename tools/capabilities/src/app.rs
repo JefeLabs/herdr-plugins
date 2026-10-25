@@ -108,6 +108,13 @@ pub enum InputAction {
     },
     /// Set the capability's title (the file name is kept).
     Rename,
+    /// Append a `- [ ]` item under `heading`, then return focus to that pane.
+    AddItem {
+        heading: &'static str,
+        pane: Pane,
+    },
+    /// Append an open question.
+    AddQuestion,
 }
 
 #[allow(clippy::large_enum_variant)] // Chat carries the live turn; boxing buys nothing here
@@ -624,6 +631,32 @@ impl App {
             self.focus = Pane::Tree;
             return Flow::Continue;
         };
+        if k.code == KeyCode::Char('a') {
+            let (label, action) = match self.focus {
+                Pane::Preconditions => (
+                    "new precondition (what must already be true)",
+                    InputAction::AddItem {
+                        heading: crate::store::PRECONDITIONS_HEADING,
+                        pane: Pane::Preconditions,
+                    },
+                ),
+                Pane::Criteria => (
+                    "new acceptance criterion (a check a reviewer could verify)",
+                    InputAction::AddItem {
+                        heading: crate::store::CRITERIA_HEADING,
+                        pane: Pane::Criteria,
+                    },
+                ),
+                Pane::Questions => ("new open question", InputAction::AddQuestion),
+                _ => return Flow::Continue,
+            };
+            self.screen = Screen::Input {
+                label: label.into(),
+                text: String::new(),
+                action,
+            };
+            return Flow::Continue;
+        }
         match self.focus {
             Pane::Description => match k.code {
                 KeyCode::Esc => self.focus = Pane::Tree,
@@ -705,6 +738,23 @@ impl App {
             Pane::Tree => {}
         }
         Flow::Continue
+    }
+
+    /// Reload the selected capability, transform its body, save (conflict-checked), rescan.
+    fn edit_selected_body(&mut self, f: impl FnOnce(&str) -> String) {
+        let Some(path) = self.selected_intent().map(|i| i.path.clone()) else {
+            return;
+        };
+        match Store::load(&path) {
+            Ok(mut it) => {
+                it.body = f(&it.body);
+                if let Err(e) = Store::save(&mut it) {
+                    self.message = Some(format!("save failed: {e}"));
+                }
+                self.rescan();
+            }
+            Err(e) => self.message = Some(format!("{e:#}")),
+        }
     }
 
     fn toggle_selected_checklist(&mut self, heading: &str, index: usize) {
@@ -1509,6 +1559,30 @@ impl App {
                 let v = value.to_string();
                 self.update_selected_fields(|fm| fm.title = v);
             }
+            InputAction::AddItem { heading, pane } => {
+                self.edit_selected_body(|body| {
+                    crate::store::add_checklist_item(body, heading, value)
+                });
+                self.focus = pane;
+                let n = self
+                    .selected_intent()
+                    .map(|it| crate::store::checklist(&it.body, heading).len())
+                    .unwrap_or(1);
+                if pane == Pane::Preconditions {
+                    self.preconditions_selected = n.saturating_sub(1);
+                } else {
+                    self.criteria_selected = n.saturating_sub(1);
+                }
+            }
+            InputAction::AddQuestion => {
+                self.edit_selected_body(|body| crate::store::add_question(body, value));
+                self.focus = Pane::Questions;
+                self.question_selected = self
+                    .selected_intent()
+                    .map(|it| crate::store::questions(&it.body).len())
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+            }
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
                 match self.store.move_group(&rel, Path::new(value)) {
@@ -1898,9 +1972,9 @@ impl App {
                 (Some(m), _) => m.clone(),
                 (None, Pane::Tree) => "Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Questions) => "Questions: j/k choose · Enter answer · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
             },
         };
         ui::render_status(&status_text, status, buf);
@@ -3235,5 +3309,46 @@ mod tests {
             "{}",
             fx.app.editor.text()
         );
+    }
+
+    #[test]
+    fn a_in_a_pane_adds_an_item_to_that_pane() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('C')); // preconditions
+        key(&mut fx.app, KeyCode::Char('a'));
+        assert_eq!(fx.app.view().screen, "input");
+        assert!(fx.app.view().hint.unwrap().contains("precondition"));
+        type_str(&mut fx.app, "Report cards are optional here");
+        key(&mut fx.app, KeyCode::Enter);
+        let body = Store::load(&path).unwrap().body;
+        assert!(
+            body.contains("## Preconditions\n- [ ] Report cards are optional here"),
+            "{body}"
+        );
+        assert_eq!(fx.app.view().focus, "preconditions", "stays in the pane");
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "Skipped folders read Skipped");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(
+            Store::load(&path)
+                .unwrap()
+                .body
+                .contains("## Acceptance criteria\n- [ ] Skipped folders read Skipped")
+        );
+        key(&mut fx.app, KeyCode::Char('Q'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "Which org?");
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&path).unwrap();
+        assert!(
+            it.body.contains("## Open questions\n- Which org?"),
+            "{}",
+            it.body
+        );
+        assert_eq!(it.open_questions(), 1);
     }
 }

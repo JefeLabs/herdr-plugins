@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use herdr_capabilities::store::{
-    SaveError, State, Store, answer_question, criteria, open_questions, preconditions, questions,
-    slugify, toggle_criterion, toggle_precondition,
+    SaveError, State, Store, add_checklist_item, add_question, answer_question, criteria,
+    open_questions, preconditions, questions, slugify, toggle_criterion, toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -407,4 +407,27 @@ fn preconditions_are_their_own_checklist() {
         body.contains("- [ ] Skipped folders read Skipped"),
         "criteria untouched: {body}"
     );
+}
+
+#[test]
+fn add_checklist_item_appends_under_the_heading_creating_it_if_missing() {
+    let body = "## Description\nx\n\n## Preconditions\n- [ ] one\n\n## Open questions\n- q?\n";
+    let out = add_checklist_item(body, "## Preconditions", "two");
+    assert!(
+        out.contains("## Preconditions\n- [ ] one\n- [ ] two\n"),
+        "{out}"
+    );
+    let out = add_checklist_item(&out, "## Acceptance criteria", "a check");
+    assert!(
+        out.contains("## Acceptance criteria\n- [ ] a check\n"),
+        "created before Open questions: {out}"
+    );
+    assert!(
+        out.find("## Acceptance criteria").unwrap() < out.find("## Open questions").unwrap(),
+        "{out}"
+    );
+    let out = add_question(&out, "new q?");
+    assert!(out.contains("- q?\n- new q?\n"), "{out}");
+    let out = add_question("## Description\nonly\n", "first?");
+    assert!(out.ends_with("## Open questions\n- first?\n"), "{out}");
 }
