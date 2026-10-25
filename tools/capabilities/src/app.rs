@@ -1199,15 +1199,22 @@ impl App {
             Ok(()) => {
                 self.message = Some("proposal applied".into());
                 self.rescan();
-                self.screen = match self.parked_chat.take() {
-                    Some(mut st) => {
-                        st.latest = None;
-                        st.hint = Some("applied".into());
-                        st.opened_stamp = it.loaded_updated;
-                        Screen::Chat(st)
-                    }
-                    None => Screen::Browse,
-                };
+                // Apply ends the refinement for now: back to the view, or to the
+                // editor with the new body if polish started there. The
+                // conversation id is stored, so `p` resumes it later.
+                let from_editor = self
+                    .parked_chat
+                    .take()
+                    .map(|st| st.from_editor)
+                    .unwrap_or(false);
+                if from_editor && self.editing.is_some() {
+                    self.editor = TextArea::from_text(&it.body);
+                    self.editing = Some(it);
+                    self.screen = Screen::Edit;
+                } else {
+                    self.focus = Pane::Tree;
+                    self.screen = Screen::Browse;
+                }
             }
             Err(e) => {
                 self.message = Some(format!("apply failed: {e:#}"));
@@ -3185,5 +3192,48 @@ mod tests {
         assert_eq!(fx.app.view().focus, "criteria");
         key(&mut fx.app, KeyCode::Enter);
         assert!(Store::load(&path).unwrap().body.contains("- [x] crit one"));
+    }
+
+    #[test]
+    fn apply_returns_to_the_view_and_the_chat_can_resume_later() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        polish(&mut fx.app);
+        wait_until(&mut fx.app, "turn", |a| {
+            !a.view().turn_running && a.view().can_apply
+        });
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.screen, "browse", "apply lands back in the view: {v:?}");
+        assert_eq!(v.focus, "tree");
+        assert!(v.message.as_deref().unwrap_or("").contains("applied"));
+        // the conversation id survived, so the next polish resumes
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert!(it.fm.conversations.contains_key("fake"));
+    }
+
+    #[test]
+    fn apply_from_the_editor_returns_to_the_editor_with_the_new_body() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Enter);
+        ctrl(&mut fx.app, 'p');
+        key(&mut fx.app, KeyCode::Enter);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_until(&mut fx.app, "turn", |a| {
+            !a.view().turn_running && a.view().can_apply
+        });
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "edit");
+        assert!(
+            fx.app
+                .editor
+                .text()
+                .starts_with("## Observed\nParents who skip"),
+            "{}",
+            fx.app.editor.text()
+        );
     }
 }
