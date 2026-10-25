@@ -25,12 +25,78 @@ pub enum PrState {
 /// Tasks of one linked plan. `readable: false` when the file could not be
 /// read; `counted: false` when no ledger says how many are done (the plan
 /// executor deletes its ledger once a plan finishes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlanTasks {
     pub done: usize,
     pub total: usize,
     pub readable: bool,
     pub counted: bool,
+    /// Distinct files the plan names in its `- Create/Modify/Test:` lines.
+    pub files: usize,
+    /// The state of the pull request found by this plan's file name, if any
+    /// (`Open` when any is open, else `Merged` when any is merged).
+    pub pr: Option<PrState>,
+}
+
+impl PlanTasks {
+    pub fn size(&self) -> Option<Size> {
+        plan_size(self.total, self.files)
+    }
+}
+
+/// A plan's size, from its tasks and the files it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Size {
+    S,
+    M,
+    L,
+    XL,
+}
+
+impl Size {
+    /// Cells in the bar, and the plan's weight in the building share.
+    pub fn cells(self) -> usize {
+        match self {
+            Size::S => 1,
+            Size::M => 2,
+            Size::L => 3,
+            Size::XL => 4,
+        }
+    }
+}
+
+/// S up to 3 tasks or 8 files, M up to 6 or 20, L up to 10 or 40, XL beyond;
+/// the larger of the two scales wins. A plan with neither has no size.
+pub fn plan_size(tasks: usize, files: usize) -> Option<Size> {
+    if tasks == 0 && files == 0 {
+        return None;
+    }
+    let by_tasks = match tasks {
+        0..=3 => Size::S,
+        4..=6 => Size::M,
+        7..=10 => Size::L,
+        _ => Size::XL,
+    };
+    let by_files = match files {
+        0..=8 => Size::S,
+        9..=20 => Size::M,
+        21..=40 => Size::L,
+        _ => Size::XL,
+    };
+    Some(by_tasks.max(by_files))
+}
+
+/// Pull requests found per spec or plan file name.
+pub type FoundByName = Vec<(String, Vec<(u64, PrState)>)>;
+
+/// One plan's block in the building section of the bar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanBlock {
+    pub cells: usize,
+    /// 0.0 ..= 1.0 done.
+    pub fill: f32,
+    /// Its pull request is open: built, waiting for review.
+    pub in_review: bool,
 }
 
 /// What was gathered outside the capability file.
@@ -51,20 +117,35 @@ pub struct Progress {
     /// How full each stage is, 0.0 ..= 1.0: sent, specced, planned,
     /// building, PR open, merged, verified.
     pub segments: [f32; 7],
+    /// The building stage as one block per sized plan; empty when no linked
+    /// plan has a size, and the building segment is drawn as three cells.
+    pub plans: Vec<PlanBlock>,
 }
 
 /// Cells per stage in the bar, in `Progress::segments` order.
 const STAGE_CELLS: [usize; 7] = [1, 1, 1, 3, 1, 1, 2];
 
 /// The bar as one block per stage, separated by spaces, so the filled part
-/// reads as "these stages are done" rather than as a percentage.
-pub fn stage_bar(segments: &[f32; 7]) -> String {
-    segments
-        .iter()
-        .zip(STAGE_CELLS)
-        .map(|(f, cells)| bar(f.clamp(0.0, 1.0) * 10.0, cells))
-        .collect::<Vec<_>>()
-        .join(" ")
+/// reads as "these stages are done" rather than as a percentage. The building
+/// stage is one block per sized plan (`▒` while its pull request is in review).
+pub fn stage_bar(p: &Progress) -> String {
+    let seg = |i: usize| bar(p.segments[i].clamp(0.0, 1.0) * 10.0, STAGE_CELLS[i]);
+    let building = if p.plans.is_empty() {
+        seg(3)
+    } else {
+        p.plans
+            .iter()
+            .map(|b| {
+                if b.in_review {
+                    "▒".repeat(b.cells)
+                } else {
+                    bar(b.fill.clamp(0.0, 1.0) * 10.0, b.cells)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    [seg(0), seg(1), seg(2), building, seg(4), seg(5), seg(6)].join(" ")
 }
 
 /// Stage weights, summing to 10.
@@ -156,6 +237,36 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         (SENT, label)
     };
 
+    // one block per sized plan, each filled by its own evidence
+    let plans: Vec<PlanBlock> = ev
+        .plans
+        .iter()
+        .filter(|p| p.readable)
+        .filter_map(|p| {
+            let size = p.size()?;
+            let fill = if base >= MERGED || p.pr == Some(PrState::Merged) {
+                1.0
+            } else if p.counted && p.total > 0 {
+                p.done.min(p.total) as f32 / p.total as f32
+            } else {
+                0.0
+            };
+            Some(PlanBlock {
+                cells: size.cells(),
+                fill,
+                in_review: fill < 1.0 && p.pr == Some(PrState::Open),
+            })
+        })
+        .collect();
+    if !plans.is_empty() && base < PR_OPEN {
+        // weigh the building share by plan size; a plan in review is built
+        let weight: usize = plans.iter().map(|b| b.cells).sum();
+        let built: f32 = plans
+            .iter()
+            .map(|b| b.cells as f32 * if b.in_review { 1.0 } else { b.fill })
+            .sum();
+        building_share = built / weight as f32;
+    }
     let reached = |stage: f32| if base >= stage { 1.0 } else { 0.0 };
     let segments = [
         1.0,
@@ -171,6 +282,7 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         },
     ];
     Some(Progress {
+        plans,
         segments,
         fill: (base + verified).min(10.0),
         label: if complete {
@@ -192,12 +304,15 @@ pub fn plan_tasks(plan: &str, ledger: Option<&str>) -> PlanTasks {
         .filter_map(|l| l.strip_prefix("### Task "))
         .filter_map(leading_number)
         .collect();
+    let files = plan_files(plan);
     let Some(ledger) = ledger.filter(|_| !headings.is_empty()) else {
         return PlanTasks {
             done: 0,
             total: headings.len(),
             readable: true,
             counted: false,
+            files,
+            pr: None,
         };
     };
     let done: BTreeSet<u64> = ledger
@@ -215,7 +330,34 @@ pub fn plan_tasks(plan: &str, ledger: Option<&str>) -> PlanTasks {
         total: headings.len(),
         readable: true,
         counted: true,
+        files,
+        pr: None,
     }
+}
+
+/// Distinct paths in a plan's `- Create:`, `- Modify:` and `- Test:` lines
+/// (the backticked path, without a `:line-range` suffix).
+fn plan_files(plan: &str) -> usize {
+    let mut seen = BTreeSet::new();
+    for line in plan.lines().map(str::trim_start) {
+        let Some(rest) = ["- Create:", "- Modify:", "- Test:"]
+            .iter()
+            .find_map(|p| line.strip_prefix(p))
+        else {
+            continue;
+        };
+        let Some((_, after)) = rest.split_once('`') else {
+            continue;
+        };
+        let Some((path, _)) = after.split_once('`') else {
+            continue;
+        };
+        let path = path.split(':').next().unwrap_or(path).trim();
+        if !path.is_empty() {
+            seen.insert(path.to_string());
+        }
+    }
+    seen.len()
 }
 
 fn leading_number(s: &str) -> Option<u64> {
@@ -281,12 +423,7 @@ pub fn plan_evidence(repo: Option<&Path>, it: &Intent) -> Vec<PlanTasks> {
         .into_iter()
         .filter(|a| a.kind.eq_ignore_ascii_case("plan"))
         .map(|a| {
-            let unreadable = PlanTasks {
-                done: 0,
-                total: 0,
-                readable: false,
-                counted: false,
-            };
+            let unreadable = PlanTasks::default();
             let path = match repo {
                 Some(r) => crate::send::resolve_in_repo(r, &a.target),
                 None => {
@@ -546,10 +683,11 @@ pub enum Update {
         path: PathBuf,
         plans: Vec<PlanTasks>,
     },
-    /// Pull requests found mentioning the capability's spec or plan files.
+    /// Pull requests found mentioning each of the capability's spec or plan
+    /// file names, per name.
     FoundPrs {
         path: PathBuf,
-        prs: Vec<(u64, PrState)>,
+        by_name: FoundByName,
     },
 }
 
@@ -638,17 +776,14 @@ impl Poller {
         let env = self.env.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let mut prs: Vec<(u64, PrState)> = Vec::new();
-            if let Some(gh) = tool_bin(&env, "GH_BIN_PATH", Some("gh")) {
-                for q in &queries {
-                    for (n, st) in prs_mentioning(&gh, &repo, q, &env) {
-                        if !prs.iter().any(|(m, _)| *m == n) {
-                            prs.push((n, st));
-                        }
-                    }
-                }
-            }
-            let _ = tx.send((key, Update::FoundPrs { path, prs }));
+            let by_name: FoundByName = match tool_bin(&env, "GH_BIN_PATH", Some("gh")) {
+                Some(gh) => queries
+                    .iter()
+                    .map(|q| (q.clone(), prs_mentioning(&gh, &repo, q, &env)))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let _ = tx.send((key, Update::FoundPrs { path, by_name }));
         });
     }
 

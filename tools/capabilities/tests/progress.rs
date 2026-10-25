@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use herdr_capabilities::progress::{
-    Evidence, PlanTasks, Poller, PrState, Update, agent_statuses, ago, bar, plan_evidence,
-    plan_tasks, pr_number, pr_state, progress, prs_mentioning, stage_bar,
+    Evidence, PlanTasks, Poller, PrState, Size, Update, agent_statuses, ago, bar, plan_evidence,
+    plan_size, plan_tasks, pr_number, pr_state, progress, prs_mentioning, stage_bar,
 };
 use herdr_capabilities::store::{Intent, State, Store};
 
@@ -35,6 +35,7 @@ fn tasks(done: usize, total: usize) -> PlanTasks {
         total,
         readable: true,
         counted: true,
+        ..Default::default()
     }
 }
 
@@ -102,6 +103,7 @@ fn an_unreadable_plan_shows_a_question_mark() {
                 total: 0,
                 readable: false,
                 counted: false,
+                ..Default::default()
             },
             tasks(1, 2),
         ],
@@ -229,7 +231,8 @@ fn ledger_counts_distinct_completed_tasks() {
             done: 0,
             total: 3,
             readable: true,
-            counted: false
+            counted: false,
+            ..Default::default()
         },
         "no ledger: the tasks are known, how many are done is not (steps are not tasks)"
     );
@@ -383,6 +386,7 @@ fn plan_evidence_without_repo_marks_unreadable() {
             total: 0,
             readable: false,
             counted: false,
+            ..Default::default()
         }]
     );
 }
@@ -482,6 +486,7 @@ fn without_a_ledger_building_shows_no_count_and_no_share() {
         total: 5,
         readable: true,
         counted: false,
+        ..Default::default()
     };
     let ev = Evidence {
         plans: vec![tasks(2, 8), uncounted],
@@ -490,7 +495,11 @@ fn without_a_ledger_building_shows_no_count_and_no_share() {
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- plan: a.md\n- plan: b.md\n");
     let pr = progress(&it, &ev).unwrap();
     assert_eq!(pr.label, "building", "no guessed count");
-    assert_eq!(pr.segments[3], 0.0, "and no building share");
+    // each plan shows its own evidence: the ledgered L plan a quarter done,
+    // the unledgered M plan empty
+    assert_eq!(pr.plans.len(), 2);
+    assert_eq!((pr.plans[0].cells, pr.plans[0].fill), (3, 0.25));
+    assert_eq!((pr.plans[1].cells, pr.plans[1].fill), (2, 0.0));
 }
 
 #[test]
@@ -505,11 +514,11 @@ fn segments_follow_the_stages_reached() {
     );
     let pr = progress(&it, &ev).unwrap();
     assert_eq!(pr.segments, [1.0, 1.0, 1.0, 1.0 / 3.0, 0.0, 0.0, 0.5]);
-    assert_eq!(stage_bar(&pr.segments), "█ █ █ █░░ ░ ░ █░");
+    assert_eq!(stage_bar(&pr), "█ █ █ ▍ ░ ░ █░", "one S plan, a third done");
     // ticks alone light only the verified block
     let (_tmp, it) = intent(State::Sent, "## Acceptance criteria\n- [x] a\n- [ ] b\n");
     let pr = progress(&it, &Evidence::default()).unwrap();
-    assert_eq!(stage_bar(&pr.segments), "█ ░ ░ ░░░ ░ ░ █░");
+    assert_eq!(stage_bar(&pr), "█ ░ ░ ░░░ ░ ░ █░");
     // a merged PR fills every stage up to merged
     let ev = Evidence {
         plans: vec![],
@@ -517,7 +526,7 @@ fn segments_follow_the_stages_reached() {
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
     let pr = progress(&it, &ev).unwrap();
-    assert_eq!(stage_bar(&pr.segments), "█ █ █ ███ █ █ ░░");
+    assert_eq!(stage_bar(&pr), "█ █ █ ███ █ █ ░░");
 }
 
 #[test]
@@ -546,5 +555,80 @@ fn prs_are_found_by_the_file_names_they_mention() {
     assert!(
         calls.contains("pr list --state all --search \"p.md\""),
         "{calls}"
+    );
+}
+
+#[test]
+fn plan_size_comes_from_tasks_and_files() {
+    assert_eq!(plan_size(0, 0), None);
+    assert_eq!(plan_size(3, 8), Some(Size::S));
+    assert_eq!(plan_size(0, 3), Some(Size::S));
+    assert_eq!(plan_size(5, 15), Some(Size::M));
+    assert_eq!(plan_size(8, 32), Some(Size::L));
+    assert_eq!(plan_size(7, 28), Some(Size::L));
+    assert_eq!(plan_size(12, 10), Some(Size::XL));
+    assert_eq!(plan_size(2, 45), Some(Size::XL), "the larger scale wins");
+}
+
+#[test]
+fn plan_files_are_the_distinct_paths_it_names() {
+    let plan = "### Task 1: a\n**Files:**\n- Create: `src/a.rs`\n- Modify: `src/b.rs:12-20`\n- Test: `tests/t.rs`\n### Task 2: b\n- Modify: `src/a.rs`\n";
+    let t = plan_tasks(plan, None);
+    assert_eq!((t.total, t.files), (2, 3));
+}
+
+#[test]
+fn building_holds_one_block_per_sized_plan() {
+    let plan = |total, files, pr| PlanTasks {
+        done: 0,
+        total,
+        readable: true,
+        counted: false,
+        files,
+        pr,
+    };
+    // contract (no size), backend L merged, org L merged, family M in review
+    let ev = Evidence {
+        plans: vec![
+            plan(0, 0, None),
+            plan(8, 32, Some(PrState::Merged)),
+            plan(7, 28, Some(PrState::Merged)),
+            plan(5, 15, Some(PrState::Open)),
+        ],
+        prs: vec![
+            (5828, PrState::Merged),
+            (5831, PrState::Merged),
+            (5832, PrState::Open),
+        ],
+    };
+    let (_tmp, it) = intent(
+        State::Sent,
+        "## Artifacts\n- spec: s.md\n- plan: c.md\n- plan: b.md\n- plan: o.md\n- plan: f.md\n",
+    );
+    let pr = progress(&it, &ev).unwrap();
+    assert_eq!(stage_bar(&pr), "█ █ █ ███ ███ ▒▒ █ ░ ░░");
+    // a counted plan fills by its ledger share: M is two cells, a quarter done
+    let ev = Evidence {
+        plans: vec![PlanTasks {
+            done: 1,
+            total: 4,
+            readable: true,
+            counted: true,
+            files: 0,
+            pr: None,
+        }],
+        prs: vec![],
+    };
+    let (_tmp, it) = intent(State::Sent, "## Artifacts\n- plan: p.md\n");
+    assert_eq!(
+        stage_bar(&progress(&it, &ev).unwrap()),
+        "█ █ █ ▌░ ░ ░ ░░",
+        "a linked plan implies the spec stage"
+    );
+    // no sized plan: the building block keeps its three cells
+    let (_tmp, it) = intent(State::Sent, "x\n");
+    assert_eq!(
+        stage_bar(&progress(&it, &Evidence::default()).unwrap()),
+        "█ ░ ░ ░░░ ░ ░ ░░"
     );
 }

@@ -374,7 +374,7 @@ pub struct App {
     /// Plan tasks per capability path, as last reported by the poller.
     plan_evidence: HashMap<PathBuf, Vec<crate::progress::PlanTasks>>,
     /// Pull requests found mentioning each capability's spec or plan files.
-    found_prs: HashMap<PathBuf, Vec<(u64, crate::progress::PrState)>>,
+    found_prs: HashMap<PathBuf, crate::progress::FoundByName>,
     /// Pull request states per `(repo, pr: target as linked)`, as last
     /// reported by `gh`.
     pr_states: HashMap<(PathBuf, String), crate::progress::PrState>,
@@ -667,19 +667,47 @@ impl App {
             .collect();
         // add pull requests found by spec/plan name that no pr: line names
         let mut prs: Vec<(u64, PrState)> = prs;
-        for (n, st) in self.found_prs.get(&it.path).into_iter().flatten() {
+        let found = self.found_prs.get(&it.path);
+        for (n, st) in found.into_iter().flatten().flat_map(|(_, prs)| prs) {
             if !prs.iter().any(|(m, _)| m == n) {
                 prs.push((*n, *st));
             }
         }
-        crate::progress::Evidence {
-            plans: self
-                .plan_evidence
-                .get(&it.path)
-                .cloned()
-                .unwrap_or_default(),
-            prs,
+        // each plan learns the state of the pull requests found by its name
+        let mut plans = self
+            .plan_evidence
+            .get(&it.path)
+            .cloned()
+            .unwrap_or_default();
+        let plan_names: Vec<String> = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| a.kind.eq_ignore_ascii_case("plan"))
+            .map(|a| {
+                Path::new(a.target.trim())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (plan, name) in plans.iter_mut().zip(&plan_names) {
+            let mine: Vec<PrState> = found
+                .into_iter()
+                .flatten()
+                .filter(|(q, _)| q == name)
+                .flat_map(|(_, prs)| prs.iter().map(|(_, st)| *st))
+                .collect();
+            plan.pr = if mine
+                .iter()
+                .any(|s| matches!(s, PrState::Open | PrState::Unknown))
+            {
+                Some(PrState::Open)
+            } else if mine.contains(&PrState::Merged) {
+                Some(PrState::Merged)
+            } else {
+                None
+            };
         }
+        crate::progress::Evidence { plans, prs }
     }
 
     fn poller(&mut self) -> &mut crate::progress::Poller {
@@ -776,8 +804,8 @@ impl App {
                 crate::progress::Update::Plans { path, plans } => {
                     self.plan_evidence.insert(path, plans);
                 }
-                crate::progress::Update::FoundPrs { path, prs } => {
-                    self.found_prs.insert(path, prs);
+                crate::progress::Update::FoundPrs { path, by_name } => {
+                    self.found_prs.insert(path, by_name);
                 }
             }
         }
@@ -2840,8 +2868,7 @@ impl App {
                 };
                 ui::ListRow {
                     status: crate::store::readiness(i).label(),
-                    progress: crate::progress::progress(i, &self.evidence_for(i))
-                        .map(|p| (p.segments, p.label, p.complete)),
+                    progress: crate::progress::progress(i, &self.evidence_for(i)),
                     agent: o.agent.clone(),
                     running: o.running.clone(),
                     title: &i.fm.title,
@@ -4268,8 +4295,8 @@ mod tests {
             .to_string();
         assert!(line.contains("PR #77 open"), "{line}");
         assert!(
-            line.contains("█ █ █ ███ █ ░ ░░"),
-            "stage blocks up to PR open: {line}"
+            line.contains("█ █ █ ▒ █ ░ ░░"),
+            "the plan's own block shows it in review: {line}"
         );
     }
 

@@ -1,6 +1,6 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 4013
+assertion_line: 4040
 expression: narrow
 ---
 Capabilities · 7 · sorted by Updated
@@ -33,7 +33,7 @@ Capabilities · 7 · sorted by Updated
 ────────────────────────────────────────────────────────────────────────────────
  Counselors can reassign a student between orgs
  skoolscout/org
- Oct 22 16:15 │ sent   │ working     │ 3h ago  │ █ █ █ █░░ ░ ░ ░░ building 1/3
+ Oct 22 16:15 │ sent   │ working     │ 3h ago  │ █ █ █ ▍ ░ ░ ░░ building 1/3
 
  Reassignment needs a support ticket today.
 ────────────────────────────────────────────────────────────────────────────────

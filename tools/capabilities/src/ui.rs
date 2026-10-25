@@ -919,8 +919,8 @@ pub fn description_text(body: &str) -> String {
 pub struct ListRow<'a> {
     /// `raw`, `?2`, `ready`, `sent`.
     pub status: String,
-    /// `(stage segments, label, complete)` once sent.
-    pub progress: Option<([f32; 7], String, bool)>,
+    /// Delivery progress once sent.
+    pub progress: Option<crate::progress::Progress>,
     /// The sent agent's live state (`working`, `idle`, `needs you`, `done`,
     /// `closed`); `None` before sending.
     pub agent: Option<String>,
@@ -1116,10 +1116,10 @@ pub fn render_capability_list(
         }
         fields.push(sep());
         match &r.progress {
-            Some((_, _, true)) => fields.push(Span::raw("✓ complete")),
-            Some((segments, label, false)) => {
-                fields.push(Span::raw(crate::progress::stage_bar(segments)));
-                fields.push(Span::raw(format!(" {}", fit(label, 24))));
+            Some(p) if p.complete => fields.push(Span::raw("✓ complete")),
+            Some(p) => {
+                fields.push(Span::raw(crate::progress::stage_bar(p)));
+                fields.push(Span::raw(format!(" {}", fit(&p.label, 24))));
             }
             None => fields.push(Span::styled("—", dim)),
         }
