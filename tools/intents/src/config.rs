@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const PLUGIN_ID: &str = "jefelabs.intents";
 pub const KINDS: &[&str] = &["issue", "enhancement", "idea"];
@@ -138,6 +138,46 @@ pub struct ProviderSpec {
     /// set to tune a built-in provider.
     #[serde(default)]
     pub extra: Vec<String>,
+    /// Models the picker offers for this provider; empty skips the model step.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Flag that selects a model, e.g. `--model`.
+    #[serde(default = "default_model_flag")]
+    pub model_flag: String,
+}
+
+fn default_model_flag() -> String {
+    "--model".to_string()
+}
+
+/// The provider and model used last time; preselected in the picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastUsed {
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+fn last_used_path(dirs: &Dirs) -> PathBuf {
+    dirs.config.join("last-used.toml")
+}
+
+/// Last choice if recorded, else the config's polish provider with no model.
+pub fn last_used(dirs: &Dirs, cfg: &Config) -> LastUsed {
+    std::fs::read_to_string(last_used_path(dirs))
+        .ok()
+        .and_then(|t| toml::from_str::<LastUsed>(&t).ok())
+        .filter(|l| cfg.providers.contains_key(&l.provider))
+        .unwrap_or(LastUsed {
+            provider: cfg.polish_provider.clone(),
+            model: None,
+        })
+}
+
+pub fn save_last_used(dirs: &Dirs, last: &LastUsed) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&dirs.config)?;
+    std::fs::write(last_used_path(dirs), toml::to_string(last)?)?;
+    Ok(())
 }
 
 /// A `[providers.<name>]` table that only tunes a built-in: any field absent
@@ -153,6 +193,8 @@ struct ProviderOverride {
     extra: Vec<String>,
     /// Shorthand for `extra = ["--model", "<model>"]`.
     model: Option<String>,
+    models: Option<Vec<String>>,
+    model_flag: Option<String>,
 }
 
 fn default_send_kind() -> String {
@@ -264,6 +306,12 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
                 if let Some(k) = o.send_kind {
                     spec.send_kind = k;
                 }
+                if let Some(m) = o.models {
+                    spec.models = m;
+                }
+                if let Some(f) = o.model_flag {
+                    spec.model_flag = f;
+                }
                 spec.extra = extra;
             }
             None => {
@@ -279,6 +327,8 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
                         output: o.output.unwrap_or(Output::Text),
                         send_kind: o.send_kind.unwrap_or_else(default_send_kind),
                         extra,
+                        models: o.models.unwrap_or_default(),
+                        model_flag: o.model_flag.unwrap_or_else(default_model_flag),
                     },
                 );
             }
@@ -394,6 +444,16 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
             ),
             send_kind: "agy".into(),
             extra: Vec::new(),
+            models: argv(&[
+                "gemini-4-argon-high",
+                "gemini-4-argon-medium",
+                "gemini-4-argon-low",
+                "claude-opus-5-5-high",
+                "claude-opus-5-5-medium",
+                "claude-sonnet-5-5-medium",
+                "gemini-3.8-flash-high",
+            ]),
+            model_flag: "--model".into(),
         },
     );
     m.insert(
@@ -440,6 +500,8 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
             ),
             send_kind: "claude".into(),
             extra: Vec::new(),
+            models: argv(&["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]),
+            model_flag: "--model".into(),
         },
     );
     m.insert(
@@ -476,6 +538,8 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
             ),
             send_kind: "codex".into(),
             extra: Vec::new(),
+            models: argv(&[]),
+            model_flag: "--model".into(),
         },
     );
     m.insert(
@@ -512,6 +576,8 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
             ),
             send_kind: "copilot".into(),
             extra: Vec::new(),
+            models: argv(&[]),
+            model_flag: "--model".into(),
         },
     );
     m
@@ -789,5 +855,51 @@ mod tests {
             agy.polish
         );
         assert!(agy.resume.iter().any(|a| a == "--conversation"));
+    }
+
+    #[test]
+    fn builtin_providers_list_models_and_a_model_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        let agy = &cfg.providers["agy"];
+        assert_eq!(agy.models[0], "gemini-4-argon-high");
+        assert!(agy.models.iter().any(|m| m == "gemini-4-argon-medium"));
+        assert_eq!(agy.model_flag, "--model");
+        assert!(!cfg.providers["claude"].models.is_empty());
+    }
+
+    #[test]
+    fn last_used_round_trips_and_defaults_to_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        let first = last_used(&dirs, &cfg);
+        assert_eq!(
+            first,
+            LastUsed {
+                provider: "agy".into(),
+                model: None
+            },
+            "no file yet: the config's polish provider"
+        );
+        save_last_used(
+            &dirs,
+            &LastUsed {
+                provider: "agy".into(),
+                model: Some("gemini-4-argon-high".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            last_used(&dirs, &cfg).model.as_deref(),
+            Some("gemini-4-argon-high")
+        );
     }
 }

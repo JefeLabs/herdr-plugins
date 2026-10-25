@@ -17,7 +17,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::config::{Config, Dirs, Handoff, KINDS, polish_cwd, template};
+use crate::config::{
+    Config, Dirs, Handoff, KINDS, LastUsed, last_used, polish_cwd, save_last_used, template,
+};
 use crate::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
 use crate::editor::TextArea;
 use crate::provider::Reply;
@@ -69,6 +71,21 @@ pub struct ChatState {
     pub from_editor: bool,
     /// Wrapped lines scrolled back from the tail of the transcript.
     pub scroll: u16,
+    /// Model chosen in the picker, if the provider offers any.
+    pub model: Option<String>,
+}
+
+/// What the agent picker is choosing right now.
+pub enum PickStep {
+    Provider,
+    Model { provider: String },
+}
+
+/// The intent and context a chat will open on once the picker is done.
+pub struct PendingChat {
+    pub intent: Intent,
+    pub selection: Option<String>,
+    pub from_editor: bool,
 }
 
 pub enum Pending {
@@ -89,6 +106,13 @@ pub enum InputAction {
 pub enum Screen {
     Browse,
     Edit,
+    /// Choose provider, then model (if any), before a chat opens.
+    AgentPick {
+        step: PickStep,
+        items: Vec<String>,
+        selected: usize,
+        pending: PendingChat,
+    },
     Chat(ChatState),
     Diff {
         proposal: String,
@@ -141,6 +165,8 @@ pub struct View {
     pub diff_scroll: u16,
     pub input_text: String,
     pub send_prompt: Option<String>,
+    pub pick_items: Vec<String>,
+    pub pick_selected: usize,
 }
 
 pub struct App {
@@ -325,6 +351,12 @@ impl App {
                 self.screen = Screen::Edit;
                 self.key_edit(k)
             }
+            Screen::AgentPick {
+                step,
+                items,
+                selected,
+                pending,
+            } => self.key_agent_pick(step, items, selected, pending, k),
             Screen::Chat(st) => self.key_chat(st, k),
             Screen::Diff {
                 proposal,
@@ -456,7 +488,11 @@ impl App {
             KeyCode::Char('U') => self.update_selected_fields(|fm| fm.state = State::Refining),
             KeyCode::Char('p') => {
                 if let Some(it) = self.selected_intent().cloned() {
-                    self.open_chat(&it, None, false);
+                    self.open_agent_pick(PendingChat {
+                        intent: it,
+                        selection: None,
+                        from_editor: false,
+                    });
                 }
             }
             KeyCode::Char('s') => {
@@ -492,7 +528,11 @@ impl App {
                 let sel = self.editor.selection();
                 if let Some(mut it) = self.editing.clone() {
                     it.body = self.editor.text();
-                    self.open_chat(&it, sel.as_deref(), true);
+                    self.open_agent_pick(PendingChat {
+                        intent: it,
+                        selection: sel,
+                        from_editor: true,
+                    });
                 }
             }
             (KeyCode::Char('e'), true) => {
@@ -553,18 +593,125 @@ impl App {
 
     // ---- chat -------------------------------------------------------------
 
-    fn open_chat(&mut self, intent: &Intent, selection: Option<&str>, from_editor: bool) {
-        let provider = self.cfg.polish_provider.clone();
-        let conv_id = intent.fm.conversations.get(&provider).cloned();
+    /// Step one of the picker: providers, with the last used one preselected.
+    fn open_agent_pick(&mut self, pending: PendingChat) {
+        let items: Vec<String> = self.cfg.providers.keys().cloned().collect();
+        let last = last_used(&self.dirs, &self.cfg);
+        let selected = items.iter().position(|p| *p == last.provider).unwrap_or(0);
+        self.screen = Screen::AgentPick {
+            step: PickStep::Provider,
+            items,
+            selected,
+            pending,
+        };
+    }
+
+    fn key_agent_pick(
+        &mut self,
+        step: PickStep,
+        items: Vec<String>,
+        mut selected: usize,
+        pending: PendingChat,
+        k: KeyEvent,
+    ) -> Flow {
+        match k.code {
+            KeyCode::Esc => {
+                self.screen = if pending.from_editor && self.editing.is_some() {
+                    Screen::Edit
+                } else {
+                    Screen::Browse
+                };
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                selected = (selected + 1).min(items.len().saturating_sub(1));
+                self.screen = Screen::AgentPick {
+                    step,
+                    items,
+                    selected,
+                    pending,
+                };
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+                self.screen = Screen::AgentPick {
+                    step,
+                    items,
+                    selected,
+                    pending,
+                };
+            }
+            KeyCode::Enter => {
+                let Some(choice) = items.get(selected).cloned() else {
+                    self.screen = Screen::Browse;
+                    return Flow::Continue;
+                };
+                match step {
+                    PickStep::Provider => {
+                        let models = self
+                            .cfg
+                            .providers
+                            .get(&choice)
+                            .map(|p| p.models.clone())
+                            .unwrap_or_default();
+                        if models.is_empty() {
+                            self.open_chat(pending, &choice, None);
+                        } else {
+                            let last = last_used(&self.dirs, &self.cfg);
+                            let msel = if last.provider == choice {
+                                last.model
+                                    .and_then(|m| models.iter().position(|x| *x == m))
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            self.screen = Screen::AgentPick {
+                                step: PickStep::Model { provider: choice },
+                                items: models,
+                                selected: msel,
+                                pending,
+                            };
+                        }
+                    }
+                    PickStep::Model { provider } => {
+                        self.open_chat(pending, &provider, Some(choice))
+                    }
+                }
+            }
+            _ => {
+                self.screen = Screen::AgentPick {
+                    step,
+                    items,
+                    selected,
+                    pending,
+                }
+            }
+        }
+        Flow::Continue
+    }
+
+    fn open_chat(&mut self, pending: PendingChat, provider: &str, model: Option<String>) {
+        let PendingChat {
+            intent,
+            selection,
+            from_editor,
+        } = pending;
+        let _ = save_last_used(
+            &self.dirs,
+            &LastUsed {
+                provider: provider.to_string(),
+                model: model.clone(),
+            },
+        );
+        let conv_id = intent.fm.conversations.get(provider).cloned();
         let tpl = template(&self.dirs, &intent.fm.kind, true)
             .unwrap_or_else(|_| "Refine this intent.".to_string());
-        let seed = seed_prompt(&tpl, &intent.body, selection, &intent.fm.kind);
+        let seed = seed_prompt(&tpl, &intent.body, selection.as_deref(), &intent.fm.kind);
         let mut st = ChatState {
             turn: None,
             transcript: Vec::new(),
             latest: None,
             input: String::new(),
-            provider,
+            provider: provider.to_string(),
             conv_id,
             hint: None,
             intent_path: intent.path.clone(),
@@ -572,9 +719,10 @@ impl App {
             seed: seed.clone(),
             from_editor,
             scroll: 0,
+            model,
         };
         self.select_path(&intent.path);
-        let shown = match selection {
+        let shown = match selection.as_deref() {
             Some(s) => format!(
                 "polish (focus: {})",
                 s.lines()
@@ -586,15 +734,18 @@ impl App {
             ),
             None => "polish".to_string(),
         };
-        self.start_turn(&mut st, intent, &seed, &shown);
+        self.start_turn(&mut st, &intent, &seed, &shown);
         self.screen = Screen::Chat(st);
     }
 
     fn start_turn(&mut self, st: &mut ChatState, intent: &Intent, prompt: &str, shown: &str) {
-        let Some(spec) = self.cfg.providers.get(&st.provider).cloned() else {
+        let Some(mut spec) = self.cfg.providers.get(&st.provider).cloned() else {
             st.hint = Some(format!("unknown provider `{}`", st.provider));
             return;
         };
+        if let Some(m) = &st.model {
+            spec.extra.extend([spec.model_flag.clone(), m.clone()]);
+        }
         // neutral per-intent directory: no repository in the provider's reach
         let cwd = polish_cwd(self.store.root(), &intent.stem());
         if let Err(e) = std::fs::create_dir_all(&cwd) {
@@ -1226,10 +1377,19 @@ impl App {
             diff_scroll: 0,
             input_text: String::new(),
             send_prompt: None,
+            pick_items: Vec::new(),
+            pick_selected: 0,
         };
         match &self.screen {
             Screen::Browse => {}
             Screen::Edit => v.screen = "edit",
+            Screen::AgentPick {
+                items, selected, ..
+            } => {
+                v.screen = "agent-pick";
+                v.pick_items = items.clone();
+                v.pick_selected = *selected;
+            }
             Screen::Chat(st) => {
                 v.screen = "chat";
                 v.can_apply = st
@@ -1322,6 +1482,18 @@ impl App {
         let chat_intent = |st: &ChatState| Store::load(&st.intent_path).ok();
         match &self.screen {
             Screen::Edit => self.editor.render(right, buf, true),
+            Screen::AgentPick {
+                step,
+                items,
+                selected,
+                ..
+            } => {
+                let title = match step {
+                    PickStep::Provider => "refine with which agent?".to_string(),
+                    PickStep::Model { provider } => format!("{provider}: which model?"),
+                };
+                ui::render_list(&title, items, *selected, right, buf);
+            }
             Screen::Chat(st) => {
                 let (top, bottom) = ui::split_chat(right);
                 if let Some(it) = chat_intent(st) {
@@ -1403,7 +1575,7 @@ impl App {
             Screen::Edit => "Ctrl-s save · Ctrl-p polish · Ctrl-e $EDITOR · Esc back".to_string(),
             Screen::Chat(_) => "Enter send · Ctrl-a apply · Ctrl-d dismiss · PgUp/PgDn scroll · Esc cancel/back".to_string(),
             Screen::Diff { .. } => "Enter apply · Esc back · PgUp/PgDn scroll".to_string(),
-            Screen::SendPick { .. } => "j/k choose · Enter next · Esc cancel".to_string(),
+            Screen::SendPick { .. } | Screen::AgentPick { .. } => "j/k choose · Enter next · Esc cancel".to_string(),
             Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
             Screen::Browse => match &self.message {
                 Some(m) => m.clone(),
@@ -1732,6 +1904,8 @@ mod tests {
             },
             send_kind: "claude".into(),
             extra: Vec::new(),
+            models: vec!["model-a".into(), "model-b".into()],
+            model_flag: "--model".into(),
         }
     }
 
@@ -1807,6 +1981,15 @@ mod tests {
 
     fn key(app: &mut App, code: KeyCode) -> Flow {
         app.key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    /// `p` opens the agent picker; accept the preselected provider and model.
+    fn polish(app: &mut App) {
+        key(app, KeyCode::Char('p'));
+        assert_eq!(app.view().screen, "agent-pick", "{:?}", app.view());
+        key(app, KeyCode::Enter);
+        if app.view().screen == "agent-pick" {
+            key(app, KeyCode::Enter);
+        }
     }
     fn ctrl(app: &mut App, c: char) -> Flow {
         app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
@@ -1919,7 +2102,7 @@ mod tests {
     fn chat_turn_streams_into_transcript_and_enables_apply_only_with_proposal() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         assert_eq!(fx.app.view().screen, "chat");
         wait_until(&mut fx.app, "turn finished", |a| {
             !a.view().turn_running && a.view().transcript_len >= 2
@@ -1946,7 +2129,7 @@ mod tests {
 "#).unwrap();
         fx2.app.provider_env[0].1 = noblock.display().to_string();
         select(&mut fx2.app, "Alpha");
-        key(&mut fx2.app, KeyCode::Char('p'));
+        polish(&mut fx2.app);
         wait_until(&mut fx2.app, "turn finished", |a| {
             !a.view().turn_running && a.view().transcript_len >= 2
         });
@@ -1964,7 +2147,7 @@ mod tests {
     fn apply_replaces_whole_body_after_diff_and_records_questions_and_polished_at() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         wait_until(&mut fx.app, "turn finished", |a| {
             !a.view().turn_running && a.view().can_apply
         });
@@ -1995,7 +2178,7 @@ mod tests {
     fn conversation_id_persists_and_resume_argv_is_used_on_second_turn() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         wait_until(&mut fx.app, "first turn", |a| {
             !a.view().turn_running && a.view().transcript_len >= 2
         });
@@ -2031,7 +2214,7 @@ mod tests {
             .provider_env
             .push(("FAKE_MODE".into(), "hang".into()));
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         wait_until(&mut fx.app, "deltas", |a| {
             a.view()
                 .transcript
@@ -2226,7 +2409,7 @@ mod tests {
     fn chat_letters_are_typed_and_apply_is_ctrl_a() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         wait_until(&mut fx.app, "turn", |a| {
             !a.view().turn_running && a.view().can_apply
         });
@@ -2269,7 +2452,7 @@ mod tests {
             it.body, "other toolbar wrote this\n",
             "R must not overwrite the body"
         );
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
         let it = Store::load(&path).unwrap();
         assert_eq!(
@@ -2283,7 +2466,7 @@ mod tests {
     fn apply_prompts_when_the_file_changed_during_the_chat() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         wait_until(&mut fx.app, "turn", |a| {
             !a.view().turn_running && a.view().can_apply
         });
@@ -2343,6 +2526,9 @@ mod tests {
         key(&mut fx.app, KeyCode::End);
         type_str(&mut fx.app, " unsaved");
         ctrl(&mut fx.app, 'p');
+        assert_eq!(fx.app.view().screen, "agent-pick");
+        key(&mut fx.app, KeyCode::Enter);
+        key(&mut fx.app, KeyCode::Enter);
         wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
         key(&mut fx.app, KeyCode::Esc);
         assert_eq!(fx.app.view().screen, "edit");
@@ -2354,7 +2540,7 @@ mod tests {
     fn chat_and_diff_scroll_with_page_keys() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        polish(&mut fx.app);
         wait_until(&mut fx.app, "turn", |a| {
             !a.view().turn_running && a.view().can_apply
         });
@@ -2443,5 +2629,50 @@ mod tests {
             "{:?}",
             v.rows
         );
+    }
+
+    #[test]
+    fn agent_picker_offers_provider_then_model_and_remembers_the_choice() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('p'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "agent-pick");
+        assert_eq!(
+            v.pick_items[v.pick_selected], "fake",
+            "config's polish provider preselected"
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.screen, "agent-pick");
+        assert_eq!(v.pick_items, ["model-a", "model-b"]);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "chat");
+        wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(
+            log.contains("--model model-b"),
+            "model reaches the provider argv: {log}"
+        );
+        key(&mut fx.app, KeyCode::Esc);
+        // next time, the last choice is preselected
+        key(&mut fx.app, KeyCode::Char('p'));
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.pick_items[v.pick_selected], "model-b");
+        key(&mut fx.app, KeyCode::Esc);
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().screen, "browse");
+    }
+
+    #[test]
+    fn provider_without_models_skips_the_model_step() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.cfg.providers.get_mut("fake").unwrap().models.clear();
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('p'));
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "chat");
     }
 }

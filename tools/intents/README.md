@@ -48,6 +48,8 @@ Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapse
 
 Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` refine (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 
+`p` (or `Ctrl-p` in the editor) first asks which agent: a provider list, then that provider's models if it has any, with your last choice preselected, so `Enter` `Enter` repeats it. The choice is saved in `last-used.toml` in the config dir.
+
 Refine (chat): type and `Enter` to send the next message, `Esc` cancels a running turn or leaves, `Ctrl-a` shows a diff of the latest proposal, `Ctrl-d` dismisses it, `PgUp`/`PgDn` scroll the transcript. Plain letters are always typed, so a message may start with "a" or "d". In the diff, only `Enter` applies; `Esc` goes back; `PgUp`/`PgDn` scroll.
 
 Send: pick a handoff, then on the confirm screen `Tab` cycles the provider, `j`/`k` scroll the prompt, `Enter` sends, `Esc` cancels.
@@ -62,15 +64,20 @@ The conversation id is stored per provider in the intent's front matter and resu
 
 | Provider | Polish | Resume | Status |
 |---|---|---|---|
-| `agy` (default) | `agy -p=… --output-format stream-json` | `--conversation <id>` | verified |
+| `agy` (default) | `agy -p=… --output-format stream-json --sandbox` | `--conversation <id>` | verified; models include `gemini-4-argon-high/medium/low` |
 | `claude` | `claude -p … --output-format stream-json --include-partial-messages --session-id <uuid>` | `--resume <id>` | verified |
 | `codex` | `codex exec --json …` | `codex exec resume <id> …` | unverified (account returned 402) |
 | `copilot` | `copilot -p … --output-format json` | `--session-id <id>` | unverified (policy denied) |
 
-Any other CLI goes in `intents.toml` as a custom provider. Polish runs with no tools and no repository in reach: the built-in argv use `--permission-mode plan --tools "" --strict-mcp-config` (claude), `--mode plan` (agy), `--sandbox read-only` (codex) and `--deny-tool '*'` (copilot), and every turn runs in a neutral directory under the root (`<root>/.polish/<intent>`), never in your checkout. The tool never passes `--allow-all*` or `--dangerously-skip-permissions`.
+Any other CLI goes in `intents.toml` as a custom provider. Polish runs with no tools and no repository in reach: the built-in argv use `--permission-mode plan --tools "" --strict-mcp-config` (claude), `--sandbox` (agy; its `--mode plan` is ignored while slash expansion is off), `--sandbox read-only` (codex) and `--deny-tool '*'` (copilot), and every turn runs in a neutral directory under the root (`<root>/.polish/<intent>`), never in your checkout. The tool never passes `--allow-all*` or `--dangerously-skip-permissions`.
 
 ```toml
 polish_provider = "agy"
+
+# tune a built-in without restating it
+[providers.agy]
+model  = "gemini-4-argon-high"          # or extra = ["--model", "…"]; the picker still lets you change it
+models = ["gemini-4-argon-high", "gemini-4-argon-medium", "claude-opus-5-5-high"]   # what the picker offers
 
 [providers.mine]
 polish = ["my-cli", "--prompt", "{prompt}"]

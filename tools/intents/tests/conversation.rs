@@ -37,6 +37,8 @@ fn spec() -> ProviderSpec {
         },
         send_kind: "claude".into(),
         extra: Vec::new(),
+        models: Vec::new(),
+        model_flag: "--model".into(),
     }
 }
 
