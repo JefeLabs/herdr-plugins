@@ -17,6 +17,7 @@ serde_json = "1"
 anyhow = "1"
 shellexpand = "3"
 nix = { version = "0.31", features = ["signal"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 insta = "1"
