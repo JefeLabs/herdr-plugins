@@ -1,9 +1,11 @@
-## Story
+## Description
 
 As a <who>, I want <what>, so that <why>.
 
-## Acceptance
+## Acceptance criteria
 
+- [ ] 
 
-## Notes
+## Open questions
 
+- 

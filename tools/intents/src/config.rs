@@ -902,4 +902,29 @@ mod tests {
             Some("gemini-4-argon-high")
         );
     }
+
+    #[test]
+    fn every_kind_template_has_description_criteria_and_questions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        load_or_init(&dirs).unwrap();
+        for k in KINDS {
+            let body = template(&dirs, k, false).unwrap();
+            for h in [
+                "## Description",
+                "## Acceptance criteria",
+                "## Open questions",
+            ] {
+                assert!(body.contains(h), "{k}.md lacks {h}:\n{body}");
+            }
+            let polish = template(&dirs, k, true).unwrap();
+            assert!(
+                polish.contains("Acceptance criteria") && polish.contains("→"),
+                "{k}.polish.md must describe the structure and the answer marker"
+            );
+        }
+    }
 }

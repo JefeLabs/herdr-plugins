@@ -502,20 +502,157 @@ pub fn slugify(title: &str) -> String {
     }
 }
 
-/// Number of `- ` items under `## Open questions`.
-pub fn open_questions(body: &str) -> usize {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub text: String,
+    /// The line indented under the question starting with `→`.
+    pub answer: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Criterion {
+    pub text: String,
+    pub done: bool,
+}
+
+pub const ANSWER_MARK: &str = "→";
+
+fn section_lines<'a>(body: &'a str, heading: &str) -> Vec<(usize, &'a str)> {
+    let mut out = Vec::new();
     let mut in_section = false;
-    let mut n = 0;
-    for line in body.lines() {
+    for (i, line) in body.lines().enumerate() {
         if line.starts_with("## ") {
-            in_section = line.trim().eq_ignore_ascii_case("## open questions");
+            in_section = line.trim().eq_ignore_ascii_case(heading);
             continue;
         }
-        if in_section && line.trim_start().starts_with("- ") {
-            n += 1;
+        if in_section {
+            out.push((i, line));
         }
     }
-    n
+    out
+}
+
+/// Questions under `## Open questions`: `- text`, optionally followed by an
+/// indented `→ answer` line.
+pub fn questions(body: &str) -> Vec<Question> {
+    let mut out: Vec<Question> = Vec::new();
+    for (_, line) in section_lines(body, "## Open questions") {
+        let trimmed = line.trim_start();
+        if let Some(q) = trimmed.strip_prefix("- ") {
+            out.push(Question {
+                text: q.trim().to_string(),
+                answer: None,
+            });
+        } else if let Some(a) = trimmed.strip_prefix(ANSWER_MARK)
+            && line.starts_with(' ')
+            && let Some(last) = out.last_mut()
+        {
+            let a = a.trim();
+            if !a.is_empty() {
+                last.answer = Some(a.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Unanswered questions.
+pub fn open_questions(body: &str) -> usize {
+    questions(body)
+        .iter()
+        .filter(|q| q.answer.is_none())
+        .count()
+}
+
+/// Write (or replace) the answer under question `index`. `None` if out of range.
+pub fn answer_question(body: &str, index: usize, answer: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut seen = 0usize;
+    let mut q_line: Option<usize> = None;
+    for (i, line) in section_lines(body, "## Open questions") {
+        if line.trim_start().starts_with("- ") {
+            if seen == index {
+                q_line = Some(i);
+                break;
+            }
+            seen += 1;
+        }
+    }
+    let qi = q_line?;
+    let mut out: Vec<String> = lines[..=qi].iter().map(|l| l.to_string()).collect();
+    out.push(format!("  {ANSWER_MARK} {}", answer.trim()));
+    let mut rest = qi + 1;
+    // drop an existing answer line right under the question
+    if rest < lines.len()
+        && lines[rest].starts_with(' ')
+        && lines[rest].trim_start().starts_with(ANSWER_MARK)
+    {
+        rest += 1;
+    }
+    out.extend(lines[rest..].iter().map(|l| l.to_string()));
+    let mut text = out.join("\n");
+    if body.ends_with('\n') {
+        text.push('\n');
+    }
+    Some(text)
+}
+
+/// Checklist items under `## Acceptance criteria`.
+pub fn criteria(body: &str) -> Vec<Criterion> {
+    section_lines(body, "## Acceptance criteria")
+        .into_iter()
+        .filter_map(|(_, line)| {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("- [ ] ") {
+                Some(Criterion {
+                    text: rest.trim().to_string(),
+                    done: false,
+                })
+            } else {
+                t.strip_prefix("- [x] ")
+                    .or_else(|| t.strip_prefix("- [X] "))
+                    .map(|rest| Criterion {
+                        text: rest.trim().to_string(),
+                        done: true,
+                    })
+            }
+        })
+        .collect()
+}
+
+/// Flip the checkbox of criterion `index`. `None` if out of range.
+pub fn toggle_criterion(body: &str, index: usize) -> Option<String> {
+    let mut seen = 0usize;
+    let mut target: Option<usize> = None;
+    for (i, line) in section_lines(body, "## Acceptance criteria") {
+        let t = line.trim_start();
+        if t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ") {
+            if seen == index {
+                target = Some(i);
+                break;
+            }
+            seen += 1;
+        }
+    }
+    let ti = target?;
+    let mut lines: Vec<String> = body.lines().map(|l| l.to_string()).collect();
+    let l = &lines[ti];
+    let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+    let t = l.trim_start();
+    lines[ti] = if let Some(rest) = t.strip_prefix("- [ ] ") {
+        format!("{indent}- [x] {rest}")
+    } else {
+        let rest = t
+            .strip_prefix("- [x] ")
+            .or_else(|| t.strip_prefix("- [X] "))
+            .unwrap_or("");
+        format!("{indent}- [ ] {rest}")
+    };
+    let mut text = lines.join("\n");
+    if body.ends_with('\n') {
+        text.push('\n');
+    }
+    Some(text)
 }
 
 /// Convenience for callers that want the raw mapping (e.g. tests).

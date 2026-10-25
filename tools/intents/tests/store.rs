@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use herdr_intents::store::{SaveError, State, Store, open_questions, slugify};
+use herdr_intents::store::{
+    SaveError, State, Store, answer_question, criteria, open_questions, questions, slugify,
+    toggle_criterion,
+};
 
 fn store() -> (tempfile::TempDir, Store) {
     let tmp = tempfile::tempdir().unwrap();
@@ -328,4 +331,65 @@ fn save_meta_does_not_bump_updated() {
         "meta writes keep `updated`"
     );
     assert_eq!(after.fm.conversations["agy"], "c1");
+}
+
+const STRUCTURED: &str = "## Description\nParents who skip see Pending.\n\n## Acceptance criteria\n- [ ] Skipped folders read Skipped\n- [x] Nothing changes for uploaded folders\n\n## Open questions\n- Which org saw this?\n  → IYM, on Oct 20\n- Since when?\n";
+
+#[test]
+fn questions_parse_with_optional_answers() {
+    let qs = questions(STRUCTURED);
+    assert_eq!(qs.len(), 2);
+    assert_eq!(qs[0].text, "Which org saw this?");
+    assert_eq!(qs[0].answer.as_deref(), Some("IYM, on Oct 20"));
+    assert_eq!(qs[1].text, "Since when?");
+    assert!(qs[1].answer.is_none());
+    assert_eq!(
+        open_questions(STRUCTURED),
+        1,
+        "only unanswered questions are open"
+    );
+}
+
+#[test]
+fn answer_question_writes_the_answer_under_the_question() {
+    let body = answer_question(STRUCTURED, 1, "Since the 10-20 release").unwrap();
+    assert!(
+        body.contains("- Since when?\n  → Since the 10-20 release\n"),
+        "{body}"
+    );
+    assert_eq!(open_questions(&body), 0);
+    // answering again replaces the old answer
+    let body = answer_question(&body, 1, "actually 10-21").unwrap();
+    assert!(
+        body.contains("- Since when?\n  → actually 10-21\n") && !body.contains("10-20 release"),
+        "{body}"
+    );
+    assert!(
+        answer_question(STRUCTURED, 9, "x").is_none(),
+        "out of range"
+    );
+}
+
+#[test]
+fn criteria_parse_and_toggle() {
+    let cs = criteria(STRUCTURED);
+    assert_eq!(cs.len(), 2);
+    assert_eq!(
+        (cs[0].text.as_str(), cs[0].done),
+        ("Skipped folders read Skipped", false)
+    );
+    assert_eq!(
+        (cs[1].text.as_str(), cs[1].done),
+        ("Nothing changes for uploaded folders", true)
+    );
+    let body = toggle_criterion(STRUCTURED, 0).unwrap();
+    assert!(
+        body.contains("- [x] Skipped folders read Skipped"),
+        "{body}"
+    );
+    let body = toggle_criterion(&body, 1).unwrap();
+    assert!(
+        body.contains("- [ ] Nothing changes for uploaded folders"),
+        "{body}"
+    );
 }

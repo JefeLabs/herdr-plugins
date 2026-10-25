@@ -42,9 +42,29 @@ type = "plugin_action"
 command = "jefelabs.intents.add"
 ```
 
+## Shape of an intent
+
+Every intent body has three sections, seeded by the kind's template and kept by the agent's proposals:
+
+```markdown
+## Description
+What this is, in the author's words (for an issue: observed, expected, steps).
+
+## Acceptance criteria
+- [ ] a check a reviewer could verify
+- [x] one already met
+
+## Open questions
+- Which org saw this?
+  → IYM, on Oct 20
+- Since when?
+```
+
+Questions can be answered one at a time: `Q` lists them, `Enter` on one opens an input, and the answer is written as an indented `→` line under the question. Answered questions no longer count as open (the `?N` mark in the tree counts only unanswered ones), and the agent is told to keep them with their answers rather than re-ask. `C` lists the acceptance criteria and `Enter` toggles the checkbox; the list stays open until `Esc` so several can be ticked.
+
 ## Keys
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group, `n` new group, `m` move the selected intent or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group, `n` new group, `m` move the selected intent or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `Q` answer a question, `C` tick acceptance criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
 
 Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` refine (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 
