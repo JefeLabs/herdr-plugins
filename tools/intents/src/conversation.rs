@@ -29,6 +29,8 @@ pub struct Turn {
     tx: Sender<TurnMsg>,
     pid: u32,
     cancelled: bool,
+    /// Set by `cancel` so the reader thread can tell a user cancel from a crash.
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Turn {
@@ -75,10 +77,12 @@ impl Turn {
         }
 
         let child = Arc::new(Mutex::new(child));
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let tx = tx.clone();
             let spec = spec.clone();
             let child = Arc::clone(&child);
+            let cancel_flag = Arc::clone(&cancel_flag);
             std::thread::spawn(move || {
                 let mut text = String::new();
                 let mut sent_id: Option<String> = None;
@@ -103,11 +107,20 @@ impl Turn {
                 }
                 // stdout closed: the process is finishing. Reap it.
                 let status = child.lock().ok().and_then(|mut c| c.wait().ok());
-                let killed = status
-                    .map(|s| !s.success() && s.code().is_none())
-                    .unwrap_or(false);
-                if killed {
-                    let _ = tx.send(TurnMsg::Failed("cancelled".to_string()));
+                let signal = status.and_then(|s| {
+                    if s.code().is_none() {
+                        std::os::unix::process::ExitStatusExt::signal(&s)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(sig) = signal {
+                    let msg = if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        "cancelled".to_string()
+                    } else {
+                        format!("provider exited by signal {sig} before replying")
+                    };
+                    let _ = tx.send(TurnMsg::Failed(msg));
                 } else if text.trim().is_empty() {
                     let _ = tx.send(TurnMsg::Failed(
                         error.unwrap_or_else(|| "provider produced no reply".to_string()),
@@ -124,6 +137,7 @@ impl Turn {
             tx,
             pid,
             cancelled: false,
+            cancel_flag,
         })
     }
 
@@ -141,6 +155,8 @@ impl Turn {
             return;
         }
         self.cancelled = true;
+        self.cancel_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let pgid = nix::unistd::Pid::from_raw(self.pid as i32);
         let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
         let deadline = Instant::now() + Duration::from_millis(500);

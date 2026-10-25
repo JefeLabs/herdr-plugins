@@ -133,6 +133,26 @@ pub struct ProviderSpec {
     pub output: Output,
     #[serde(default = "default_send_kind")]
     pub send_kind: String,
+    /// Options inserted right after the program on every call, e.g.
+    /// `["--model", "gemini-4-argon-medium"]`. The only field a user needs to
+    /// set to tune a built-in provider.
+    #[serde(default)]
+    pub extra: Vec<String>,
+}
+
+/// A `[providers.<name>]` table that only tunes a built-in: any field absent
+/// keeps the built-in value.
+#[derive(Debug, Default, Deserialize)]
+struct ProviderOverride {
+    polish: Option<Vec<String>>,
+    resume: Option<Vec<String>>,
+    #[serde(flatten)]
+    output: Option<Output>,
+    send_kind: Option<String>,
+    #[serde(default)]
+    extra: Vec<String>,
+    /// Shorthand for `extra = ["--model", "<model>"]`.
+    model: Option<String>,
 }
 
 fn default_send_kind() -> String {
@@ -173,7 +193,7 @@ struct RawConfig {
     polish_provider: Option<String>,
     workbrokr: Option<bool>,
     #[serde(default)]
-    providers: BTreeMap<String, ProviderSpec>,
+    providers: BTreeMap<String, ProviderOverride>,
     #[serde(default)]
     handoff: Vec<Handoff>,
 }
@@ -225,9 +245,44 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
     };
 
     let mut providers = builtin_providers();
-    for (name, mut spec) in raw.providers {
-        spec.name = name.clone();
-        providers.insert(name, spec);
+    for (name, o) in raw.providers {
+        let mut extra = o.extra.clone();
+        if let Some(m) = &o.model {
+            extra.extend(["--model".to_string(), m.clone()]);
+        }
+        match providers.get_mut(&name) {
+            Some(spec) => {
+                if let Some(p) = o.polish {
+                    spec.polish = p;
+                }
+                if let Some(r) = o.resume {
+                    spec.resume = r;
+                }
+                if let Some(out) = o.output {
+                    spec.output = out;
+                }
+                if let Some(k) = o.send_kind {
+                    spec.send_kind = k;
+                }
+                spec.extra = extra;
+            }
+            None => {
+                let Some(polish) = o.polish else {
+                    anyhow::bail!("provider `{name}`: a custom provider needs `polish = [...]`");
+                };
+                providers.insert(
+                    name.clone(),
+                    ProviderSpec {
+                        name: name.clone(),
+                        polish,
+                        resume: o.resume.unwrap_or_default(),
+                        output: o.output.unwrap_or(Output::Text),
+                        send_kind: o.send_kind.unwrap_or_else(default_send_kind),
+                        extra,
+                    },
+                );
+            }
+        }
     }
     let mut handoffs = builtin_handoffs();
     for h in raw.handoff {
@@ -315,8 +370,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--print-timeout",
                 "90s",
                 "--disable-slash-commands",
-                "--mode",
-                "plan",
+                "--sandbox",
             ]),
             resume: argv(&[
                 "agy",
@@ -328,8 +382,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--print-timeout",
                 "90s",
                 "--disable-slash-commands",
-                "--mode",
-                "plan",
+                "--sandbox",
             ]),
             output: jsonl(
                 "event",
@@ -340,6 +393,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "result",
             ),
             send_kind: "agy".into(),
+            extra: Vec::new(),
         },
     );
     m.insert(
@@ -385,6 +439,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "result",
             ),
             send_kind: "claude".into(),
+            extra: Vec::new(),
         },
     );
     m.insert(
@@ -420,6 +475,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "turn.completed",
             ),
             send_kind: "codex".into(),
+            extra: Vec::new(),
         },
     );
     m.insert(
@@ -455,6 +511,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "session.idle",
             ),
             send_kind: "copilot".into(),
+            extra: Vec::new(),
         },
     );
     m
@@ -680,8 +737,8 @@ mod tests {
         let i = claude.polish.iter().position(|a| a == "--tools").unwrap();
         assert_eq!(claude.polish[i + 1], "", "claude gets an empty tool list");
         assert!(
-            has(&cfg.providers["agy"], "--mode")
-                && cfg.providers["agy"].polish.iter().any(|a| a == "plan")
+            has(&cfg.providers["agy"], "--sandbox")
+                && !cfg.providers["agy"].polish.iter().any(|a| a == "--mode")
         );
         assert!(
             has(&cfg.providers["codex"], "--sandbox")
@@ -708,5 +765,29 @@ mod tests {
     fn polish_cwd_is_a_neutral_dir_under_the_root() {
         let p = polish_cwd(Path::new("/r"), "2026-10-24-slug");
         assert_eq!(p, Path::new("/r/.polish/2026-10-24-slug"));
+    }
+
+    #[test]
+    fn a_model_override_tunes_a_builtin_without_restating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        load_or_init(&dirs).unwrap();
+        fs::write(
+            dirs.config.join("intents.toml"),
+            "[providers.agy]\nmodel = \"gemini-4-argon-medium\"\n",
+        )
+        .unwrap();
+        let cfg = load_or_init(&dirs).unwrap();
+        let agy = &cfg.providers["agy"];
+        assert_eq!(agy.extra, ["--model", "gemini-4-argon-medium"]);
+        assert!(
+            agy.polish.iter().any(|a| a == "--sandbox"),
+            "built-in argv kept: {:?}",
+            agy.polish
+        );
+        assert!(agy.resume.iter().any(|a| a == "--conversation"));
     }
 }

@@ -16,4 +16,7 @@ fi
 if [ "${FAKE_MODE:-}" = hang ]; then
   sleep 600
 fi
+if [ "${FAKE_MODE:-}" = selfkill ]; then
+  kill -TERM $$
+fi
 exit 0

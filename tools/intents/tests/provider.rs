@@ -186,3 +186,16 @@ fn hostile_conversation_id_falls_back_to_a_fresh_conversation() {
     let good = render_argv(spec, "p", Some("019a0c1e-aaaa-7000-8000-000000000001"), out);
     assert!(good.iter().any(|a| a == "resume"));
 }
+
+#[test]
+fn extra_options_are_inserted_after_the_program() {
+    let mut spec = builtin_providers()["codex"].clone();
+    spec.extra = vec!["--model".into(), "m".into()];
+    let argv = render_argv(&spec, "p", None, Path::new("/tmp/o"));
+    assert_eq!(&argv[..3], ["codex", "--model", "m"]);
+    let dd = argv.iter().position(|a| a == "--").unwrap();
+    assert!(
+        dd > 2 && argv[dd + 1] == "p",
+        "prompt stays after `--`: {argv:?}"
+    );
+}

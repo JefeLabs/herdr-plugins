@@ -36,6 +36,7 @@ fn spec() -> ProviderSpec {
             done_type: Some("result".into()),
         },
         send_kind: "claude".into(),
+        extra: Vec::new(),
     }
 }
 
@@ -258,4 +259,16 @@ fn follow_up_prompt_without_id_carries_seed_and_transcript() {
         p, "shorter please",
         "with a resumable conversation only the new message is sent"
     );
+}
+
+// a provider that dies by signal on its own is not "cancelled"
+#[test]
+fn provider_killed_by_signal_is_reported_as_such_not_as_cancelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let turn = Turn::start(&spec(), "x", None, tmp.path(), &env(None, Some("selfkill"))).unwrap();
+    let msgs = collect(&turn, Duration::from_secs(5));
+    match msgs.last() {
+        Some(TurnMsg::Failed(m)) => assert!(m.contains("signal") && !m.contains("cancel"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }

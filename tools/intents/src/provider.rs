@@ -43,14 +43,21 @@ pub fn render_argv(
         }
         _ => (&spec.polish, uuid::Uuid::new_v4().to_string()),
     };
-    template
+    let mut argv: Vec<String> = template
         .iter()
         .map(|a| {
             a.replace("{prompt}", prompt)
                 .replace("{conv}", &conv_value)
                 .replace("{outfile}", &outfile.display().to_string())
         })
-        .collect()
+        .collect();
+    // user tuning (`extra`, e.g. a model) goes right after the program, never after a `--`
+    if !spec.extra.is_empty() && !argv.is_empty() {
+        let tail = argv.split_off(1);
+        argv.extend(spec.extra.iter().cloned());
+        argv.extend(tail);
+    }
+    argv
 }
 
 /// Classify one line of stdout. Non-JSON lines are shown as text, never an error.

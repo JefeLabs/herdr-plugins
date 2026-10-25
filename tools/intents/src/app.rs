@@ -1731,6 +1731,7 @@ mod tests {
                 done_type: Some("result".into()),
             },
             send_kind: "claude".into(),
+            extra: Vec::new(),
         }
     }
 
