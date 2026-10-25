@@ -4294,10 +4294,58 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(line.contains("PR #77 open"), "{line}");
+        assert!(line.contains("▉▉▉▉▉▉██"), "{line}");
+        let it = fx
+            .app
+            .list
+            .iter()
+            .find(|i| i.fm.title.starts_with("Counselors"))
+            .unwrap()
+            .clone();
+        let pr = crate::progress::progress(&it, &fx.app.evidence_for(&it)).unwrap();
+        let kinds: String = crate::progress::stage_cells(&pr)
+            .iter()
+            .map(|c| match c.kind {
+                crate::progress::CellKind::Done => 'D',
+                crate::progress::CellKind::Todo => 'T',
+                crate::progress::CellKind::Review => 'R',
+            })
+            .collect();
+        assert_eq!(kinds, "DDDRDTTT", "the plan's own block shows it in review");
+    }
+
+    #[test]
+    fn bar_cells_are_styled_by_kind_with_no_gap_cells() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let (w, h) = (120u16, 60u16);
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let row = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        // the Notify card: PR open, merged and verified still to do
+        let y = (0..h)
+            .find(|&y| row(y).contains("PR #42 open"))
+            .expect("Notify's metadata row");
+        let text = row(y);
+        assert!(text.contains("▉▉▉██▉▉▉██ PR #42 open"), "{text}");
         assert!(
-            line.contains("▉▉▉▒▕▉░▕░░"),
-            "the plan's own block shows it in review: {line}"
+            !text.contains('▕') && !text.contains('░'),
+            "no gap or shade cells: {text}"
         );
+        let start = text.find("▉▉▉██▉▉▉██").unwrap();
+        let x0 = text[..start].chars().count() as u16;
+        let dim = |x: u16| {
+            buf[(x, y)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        };
+        assert!(!dim(x0), "a done cell is plain");
+        assert!(dim(x0 + 7), "the merged cell, still to do, is dim");
+        assert!(dim(x0 + 9), "the verified cells are dim");
     }
 
     #[test]

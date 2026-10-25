@@ -125,40 +125,92 @@ pub struct Progress {
 /// Cells per stage in the bar, in `Progress::segments` order.
 const STAGE_CELLS: [usize; 7] = [1, 1, 1, 3, 1, 1, 2];
 
-/// The bar as one block per stage with no gaps, so the filled part reads as
-/// "these stages are done" rather than as a percentage. The building stage is
-/// one block per sized plan (`▒` while its pull request is in review). Where
-/// blocks meet, a filled block ends in a seven-eighths cell (`▉`) whose thin
-/// right sliver is the border; any other block is followed by a thin `▕`.
-pub fn stage_bar(p: &Progress) -> String {
-    let seg = |i: usize| bar(p.segments[i].clamp(0.0, 1.0) * 10.0, STAGE_CELLS[i]);
+/// What a bar cell stands for; the renderer styles it (done plain, to do
+/// dim, in review highlighted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellKind {
+    Done,
+    Todo,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarCell {
+    pub ch: char,
+    pub kind: CellKind,
+}
+
+/// The bar as cells, one block per stage, with no gap cells: the building
+/// stage is one block per sized plan. Every cell is a solid block, told apart
+/// by kind; every block but the last ends in a seven-eighths cell (`▉`) whose
+/// thin sliver is the border where it meets the next block.
+pub fn stage_cells(p: &Progress) -> Vec<BarCell> {
+    const EIGHTHS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    // a block `cells` wide, `fill` done: full cells, one partial, then to-do cells
+    let block = |fill: f32, cells: usize, review: bool| -> Vec<BarCell> {
+        if review {
+            return vec![
+                BarCell {
+                    ch: '█',
+                    kind: CellKind::Review,
+                };
+                cells
+            ];
+        }
+        let scaled = fill.clamp(0.0, 1.0) * cells as f32;
+        let mut full = scaled.floor() as usize;
+        let mut eighths = ((scaled - full as f32) * 8.0).round() as usize;
+        if eighths == 8 {
+            full += 1;
+            eighths = 0;
+        }
+        let full = full.min(cells);
+        let mut out = vec![
+            BarCell {
+                ch: '█',
+                kind: CellKind::Done,
+            };
+            full
+        ];
+        if eighths > 0 && out.len() < cells {
+            out.push(BarCell {
+                ch: EIGHTHS[eighths - 1],
+                kind: CellKind::Done,
+            });
+        }
+        while out.len() < cells {
+            out.push(BarCell {
+                ch: '█',
+                kind: CellKind::Todo,
+            });
+        }
+        out
+    };
+    let seg = |i: usize| block(p.segments[i], STAGE_CELLS[i], false);
     let mut blocks = vec![seg(0), seg(1), seg(2)];
     if p.plans.is_empty() {
         blocks.push(seg(3));
     } else {
-        blocks.extend(p.plans.iter().map(|b| {
-            if b.in_review {
-                "▒".repeat(b.cells)
-            } else {
-                bar(b.fill.clamp(0.0, 1.0) * 10.0, b.cells)
-            }
-        }));
+        blocks.extend(p.plans.iter().map(|b| block(b.fill, b.cells, b.in_review)));
     }
     blocks.extend([seg(4), seg(5), seg(6)]);
     let last = blocks.len() - 1;
-    let mut out = String::new();
-    for (i, block) in blocks.into_iter().enumerate() {
-        if i == last {
-            out.push_str(&block);
-        } else if let Some(body) = block.strip_suffix('█') {
-            out.push_str(body);
-            out.push('▉');
-        } else {
-            out.push_str(&block);
-            out.push('▕');
+    let mut out = Vec::new();
+    for (i, mut cells) in blocks.into_iter().enumerate() {
+        if i < last
+            && let Some(end) = cells.last_mut()
+            && end.ch == '█'
+        {
+            end.ch = '▉';
         }
+        out.extend(cells);
     }
     out
+}
+
+/// The bar's glyphs alone (kinds dropped).
+pub fn stage_bar(p: &Progress) -> String {
+    stage_cells(p).iter().map(|c| c.ch).collect()
 }
 
 /// Stage weights, summing to 10.

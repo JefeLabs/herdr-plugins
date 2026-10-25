@@ -1118,7 +1118,7 @@ pub fn render_capability_list(
         match &r.progress {
             Some(p) if p.complete => fields.push(Span::raw("✓ complete")),
             Some(p) => {
-                fields.push(Span::raw(crate::progress::stage_bar(p)));
+                fields.extend(bar_spans(p));
                 fields.push(Span::raw(format!(" {}", fit(&p.label, 24))));
             }
             None => fields.push(Span::styled("—", dim)),
@@ -1156,4 +1156,29 @@ pub fn render_capability_list(
         }
     }
     hits
+}
+
+/// The progress bar as styled runs: done cells plain, to-do cells dim, cells
+/// in review yellow.
+fn bar_spans(p: &crate::progress::Progress) -> Vec<Span<'static>> {
+    use crate::progress::CellKind;
+    let style = |k: CellKind| match k {
+        CellKind::Done => Style::default(),
+        CellKind::Todo => Style::default().add_modifier(Modifier::DIM),
+        CellKind::Review => Style::default().fg(ratatui::style::Color::Yellow),
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut kind: Option<CellKind> = None;
+    for c in crate::progress::stage_cells(p) {
+        if kind.is_some_and(|k| k != c.kind) {
+            spans.push(Span::styled(std::mem::take(&mut run), style(kind.unwrap())));
+        }
+        kind = Some(c.kind);
+        run.push(c.ch);
+    }
+    if let Some(k) = kind {
+        spans.push(Span::styled(run, style(k)));
+    }
+    spans
 }

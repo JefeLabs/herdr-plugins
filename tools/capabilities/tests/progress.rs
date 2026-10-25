@@ -3,9 +3,30 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use herdr_capabilities::progress::{
-    Evidence, PlanTasks, Poller, PrState, Size, Update, agent_statuses, ago, bar, plan_evidence,
-    plan_size, plan_tasks, pr_number, pr_state, progress, prs_mentioning, stage_bar,
+    CellKind, Evidence, PlanTasks, Poller, PrState, Progress, Size, Update, agent_statuses, ago,
+    bar, plan_evidence, plan_size, plan_tasks, pr_number, pr_state, progress, prs_mentioning,
+    stage_cells,
 };
+
+/// The bar as `(glyphs, kinds)`: D done, T to do (drawn dim), R in review.
+fn bar_of(p: &Progress) -> (String, String) {
+    let cells = stage_cells(p);
+    (
+        cells.iter().map(|c| c.ch).collect(),
+        cells
+            .iter()
+            .map(|c| match c.kind {
+                CellKind::Done => 'D',
+                CellKind::Todo => 'T',
+                CellKind::Review => 'R',
+            })
+            .collect(),
+    )
+}
+
+fn pair(g: &str, k: &str) -> (String, String) {
+    (g.to_string(), k.to_string())
+}
 use herdr_capabilities::store::{Intent, State, Store};
 
 fn intent(state: State, body: &str) -> (tempfile::TempDir, Intent) {
@@ -514,11 +535,15 @@ fn segments_follow_the_stages_reached() {
     );
     let pr = progress(&it, &ev).unwrap();
     assert_eq!(pr.segments, [1.0, 1.0, 1.0, 1.0 / 3.0, 0.0, 0.0, 0.5]);
-    assert_eq!(stage_bar(&pr), "▉▉▉▍▕░▕░▕█░", "one S plan, a third done");
+    assert_eq!(
+        bar_of(&pr),
+        pair("▉▉▉▍▉▉██", "DDDDTTDT"),
+        "one S plan, a third done"
+    );
     // ticks alone light only the verified block
     let (_tmp, it) = intent(State::Sent, "## Acceptance criteria\n- [x] a\n- [ ] b\n");
     let pr = progress(&it, &Evidence::default()).unwrap();
-    assert_eq!(stage_bar(&pr), "▉░▕░▕░░░▕░▕░▕█░");
+    assert_eq!(bar_of(&pr), pair("▉▉▉██▉▉▉██", "DTTTTTTTDT"));
     // a merged PR fills every stage up to merged
     let ev = Evidence {
         plans: vec![],
@@ -526,7 +551,7 @@ fn segments_follow_the_stages_reached() {
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
     let pr = progress(&it, &ev).unwrap();
-    assert_eq!(stage_bar(&pr), "▉▉▉██▉▉▉░░");
+    assert_eq!(bar_of(&pr), pair("▉▉▉██▉▉▉██", "DDDDDDDDTT"));
 }
 
 #[test]
@@ -606,7 +631,7 @@ fn building_holds_one_block_per_sized_plan() {
         "## Artifacts\n- spec: s.md\n- plan: c.md\n- plan: b.md\n- plan: o.md\n- plan: f.md\n",
     );
     let pr = progress(&it, &ev).unwrap();
-    assert_eq!(stage_bar(&pr), "▉▉▉██▉██▉▒▒▕▉░▕░░");
+    assert_eq!(bar_of(&pr), pair("▉▉▉██▉██▉█▉▉▉██", "DDDDDDDDDRRDTTT"));
     // a counted plan fills by its ledger share: M is two cells, a quarter done
     let ev = Evidence {
         plans: vec![PlanTasks {
@@ -621,27 +646,33 @@ fn building_holds_one_block_per_sized_plan() {
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- plan: p.md\n");
     assert_eq!(
-        stage_bar(&progress(&it, &ev).unwrap()),
-        "▉▉▉▌░▕░▕░▕░░",
+        bar_of(&progress(&it, &ev).unwrap()),
+        pair("▉▉▉▌▉▉▉██", "DDDDTTTTT"),
         "a linked plan implies the spec stage"
     );
     // no sized plan: the building block keeps its three cells
     let (_tmp, it) = intent(State::Sent, "x\n");
     assert_eq!(
-        stage_bar(&progress(&it, &Evidence::default()).unwrap()),
-        "▉░▕░▕░░░▕░▕░▕░░"
+        bar_of(&progress(&it, &Evidence::default()).unwrap()),
+        pair("▉▉▉██▉▉▉██", "DTTTTTTTTT")
     );
 }
 
 #[test]
 fn blocks_touch_and_borders_show_where_they_meet() {
-    // a filled block ends in a seven-eighths cell; anything else gets a thin border
+    // every block ends in a seven-eighths cell: the sliver is the border, no extra cells
     let ev = Evidence {
         plans: vec![],
         prs: vec![(1, PrState::Open)],
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
-    let bar = stage_bar(&progress(&it, &ev).unwrap());
-    assert!(!bar.contains(' '), "no gaps: {bar}");
-    assert_eq!(bar, "▉▉▉██▉▉░▕░░");
+    let (glyphs, kinds) = bar_of(&progress(&it, &ev).unwrap());
+    assert!(
+        !glyphs.contains(' ') && !glyphs.contains('▕'),
+        "no gap cells at all: {glyphs}"
+    );
+    assert_eq!(
+        (glyphs.as_str(), kinds.as_str()),
+        ("▉▉▉██▉▉▉██", "DDDDDDDTTT")
+    );
 }
