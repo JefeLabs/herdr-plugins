@@ -6,7 +6,6 @@
 //! messages and control-socket commands.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
@@ -384,92 +383,138 @@ impl App {
     }
 }
 
-/// Run the TUI until quit, SIGTERM/SIGHUP, or the controlling terminal goes away.
+/// Run the TUI until quit, SIGTERM/SIGHUP/SIGINT, or the terminal goes away.
 /// `control` is polled every loop for commands from the `select` mode.
+///
+/// Terminal events are read on their own thread: crossterm's reader spins
+/// forever once the pty is gone, so the main loop must never block on it.
+/// When the stop flag is set (a signal, a dead reader, a failed draw) the
+/// tools are killed, the terminal restored, and the process exits outright so
+/// no thread can keep it alive.
 pub fn run(
     paths: ConfigPaths,
     env: SpawnEnv,
     mut control: Option<Box<dyn FnMut() -> Vec<ControlCmd>>>,
 ) -> anyhow::Result<()> {
-    let stop = Arc::new(AtomicBool::new(false));
-    for sig in [
-        nix::sys::signal::Signal::SIGTERM,
-        nix::sys::signal::Signal::SIGHUP,
-        nix::sys::signal::Signal::SIGINT,
-    ] {
-        let flag = Arc::clone(&stop);
-        // SAFETY: the handler only stores into an AtomicBool.
-        unsafe {
-            let _ = nix::sys::signal::sigaction(
-                sig,
-                &nix::sys::signal::SigAction::new(
-                    nix::sys::signal::SigHandler::Handler(on_signal),
-                    nix::sys::signal::SaFlags::empty(),
-                    nix::sys::signal::SigSet::empty(),
-                ),
-            );
-        }
-        STOP_FLAGS.lock().unwrap().push(flag);
-    }
+    install_signal_handlers();
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
+        restore_terminal();
         default_hook(info);
     }));
 
     let mut terminal = ratatui::init();
-    let area = terminal.size()?;
-    let mut app = App::new(
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let area = terminal.size().unwrap_or(ratatui::layout::Size {
+        width: 80,
+        height: 24,
+    });
+    let mut app = match App::new(
         paths,
         env,
         Size {
             rows: area.height,
             cols: area.width,
         },
-    )?;
-
-    let result = (|| -> anyhow::Result<()> {
-        loop {
-            terminal.draw(|f| app.draw(f.area(), f.buffer_mut()))?;
-            if stop.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            if let Some(c) = control.as_mut() {
-                for cmd in c() {
-                    app.apply_control(cmd);
-                }
-            }
-            if crossterm::event::poll(Duration::from_millis(16))? {
-                match crossterm::event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => {
-                        if app.apply_key(k) == Flow::Quit {
-                            return Ok(());
-                        }
-                    }
-                    Event::Resize(cols, rows) => app.resize(Size { rows, cols }),
-                    Event::Paste(text) => app.paste(&text),
-                    _ => {}
-                }
-            }
-            // Drain pty wakes so one redraw covers a burst of output.
-            while app.wake_rx.try_recv().is_ok() {}
+    ) {
+        Ok(app) => app,
+        Err(e) => {
+            restore_terminal();
+            return Err(e);
         }
+    };
+
+    let (events_tx, events_rx) = channel::<Event>();
+    std::thread::spawn(move || {
+        while let Ok(ev) = crossterm::event::read() {
+            if events_tx.send(ev).is_err() {
+                break;
+            }
+        }
+        STOP.store(true, Ordering::Relaxed);
+    });
+
+    let outcome: anyhow::Result<()> = (|| loop {
+        if terminal
+            .draw(|f| app.draw(f.area(), f.buffer_mut()))
+            .is_err()
+        {
+            return Ok(()); // the terminal is gone
+        }
+        if STOP.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if let Some(c) = control.as_mut() {
+            for cmd in c() {
+                app.apply_control(cmd);
+            }
+        }
+        match events_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                if app.apply_key(k) == Flow::Quit {
+                    return Ok(());
+                }
+            }
+            Ok(Event::Resize(cols, rows)) => app.resize(Size { rows, cols }),
+            Ok(Event::Paste(text)) => app.paste(&text),
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        // Drain pty wakes so one redraw covers a burst of output.
+        while app.wake_rx.try_recv().is_ok() {}
     })();
 
     app.shutdown();
-    ratatui::restore();
-    result
-}
-
-static STOP_FLAGS: std::sync::Mutex<Vec<Arc<AtomicBool>>> = std::sync::Mutex::new(Vec::new());
-
-extern "C" fn on_signal(_: i32) {
-    if let Ok(flags) = STOP_FLAGS.try_lock() {
-        for f in flags.iter() {
-            f.store(true, Ordering::Relaxed);
+    restore_terminal();
+    // The event-reader thread may be spinning on a dead pty; do not wait for it.
+    match outcome {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "herdr-toolbar: {e:#}");
+            std::process::exit(1)
         }
     }
+}
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: i32) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn install_signal_handlers() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    for sig in [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGINT] {
+        // SAFETY: the handler only stores into a static AtomicBool.
+        unsafe {
+            let _ = sigaction(
+                sig,
+                &SigAction::new(
+                    SigHandler::Handler(on_signal),
+                    SaFlags::SA_RESTART,
+                    SigSet::empty(),
+                ),
+            );
+        }
+    }
+}
+
+/// Undo what `ratatui::init` did, ignoring every error: the terminal may be
+/// gone (hang-up), and `ratatui::restore` reports failures with `eprintln!`,
+/// which itself panics when stderr is dead and would abort the process from
+/// inside the panic hook.
+fn restore_terminal() {
+    use crossterm::{cursor::Show, event::DisableBracketedPaste, terminal::LeaveAlternateScreen};
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 #[cfg(test)]

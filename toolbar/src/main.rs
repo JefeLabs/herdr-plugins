@@ -55,7 +55,9 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("herdr-toolbar: {e:#}");
+            use std::io::Write;
+            // never `eprintln!`: it panics when stderr is a dead pty
+            let _ = writeln!(std::io::stderr(), "herdr-toolbar: {e:#}");
             ExitCode::FAILURE
         }
     }

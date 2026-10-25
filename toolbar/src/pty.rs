@@ -228,14 +228,17 @@ impl ToolProcess {
             return;
         }
         let Some(pid) = self.pid else { return };
+        // The child leads its own session (portable-pty calls setsid), so its
+        // process group id is its pid: signal the whole group, so a `sh -c`
+        // wrapper's children go with it.
         let pid = nix::unistd::Pid::from_raw(pid as i32);
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP);
+        let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGHUP);
         let deadline = Instant::now() + Duration::from_millis(500);
         while self.state() == ToolState::Running && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         if self.state() == ToolState::Running {
-            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
             let _ = self.child.lock().unwrap().wait();
             *self.exit.lock().unwrap() = Some(None);
         }
