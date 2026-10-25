@@ -373,6 +373,8 @@ pub struct App {
     list_selected: usize,
     /// Plan tasks per capability path, as last reported by the poller.
     plan_evidence: HashMap<PathBuf, Vec<crate::progress::PlanTasks>>,
+    /// Pull requests found mentioning each capability's spec or plan files.
+    found_prs: HashMap<PathBuf, Vec<(u64, crate::progress::PrState)>>,
     /// Pull request states per `(repo, pr: target as linked)`, as last
     /// reported by `gh`.
     pr_states: HashMap<(PathBuf, String), crate::progress::PrState>,
@@ -433,6 +435,7 @@ impl App {
             list_selected: 0,
             plan_evidence: HashMap::new(),
             pr_states: HashMap::new(),
+            found_prs: HashMap::new(),
             agents: None,
             agents_unavailable: false,
             poller: None,
@@ -662,6 +665,13 @@ impl App {
                 Some((n, state))
             })
             .collect();
+        // add pull requests found by spec/plan name that no pr: line names
+        let mut prs: Vec<(u64, PrState)> = prs;
+        for (n, st) in self.found_prs.get(&it.path).into_iter().flatten() {
+            if !prs.iter().any(|(m, _)| m == n) {
+                prs.push((*n, *st));
+            }
+        }
         crate::progress::Evidence {
             plans: self
                 .plan_evidence
@@ -712,6 +722,35 @@ impl App {
         }
     }
 
+    /// Search GitHub for pull requests mentioning each sent capability's spec
+    /// and plan file names (search is rate-limited, so this runs on entry, on
+    /// `r` and about every ten minutes).
+    fn request_found_prs(&mut self) {
+        let sent: Vec<(PathBuf, PathBuf, Vec<String>)> = self
+            .list
+            .iter()
+            .filter(|i| i.fm.state == State::Sent)
+            .filter_map(|i| {
+                let repo = i.fm.repo.clone()?;
+                let names: Vec<String> = crate::store::artifacts(&i.body)
+                    .into_iter()
+                    .filter(|a| {
+                        a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
+                    })
+                    .filter_map(|a| {
+                        Path::new(a.target.trim())
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                    })
+                    .collect();
+                (!names.is_empty()).then(|| (i.path.clone(), repo, names))
+            })
+            .collect();
+        for (path, repo, names) in sent {
+            self.poller().request_found_prs(path, repo, names);
+        }
+    }
+
     /// Fold finished background requests into the list's evidence.
     fn drain_polls(&mut self) {
         let Some(p) = self.poller.as_mut() else {
@@ -736,6 +775,9 @@ impl App {
                 }
                 crate::progress::Update::Plans { path, plans } => {
                     self.plan_evidence.insert(path, plans);
+                }
+                crate::progress::Update::FoundPrs { path, prs } => {
+                    self.found_prs.insert(path, prs);
                 }
             }
         }
@@ -2494,6 +2536,9 @@ impl App {
         // every ~60 s; all on background threads
         self.drain_polls();
         if self.layout == Layout::List {
+            if self.poll_ticks.is_multiple_of(18000) {
+                self.request_found_prs();
+            }
             if self.poll_ticks.is_multiple_of(1800) {
                 // pick up lines agents appended to capability files
                 if self.poll_ticks > 0 {
@@ -2737,11 +2782,9 @@ impl App {
                     }),
                     _ => None,
                 };
-                // the sent agent's session time, while Herdr still lists it
-                let running = match (&i.fm.sent_to, &self.agents, i.fm.state) {
-                    (Some(sent), Some(agents), State::Sent) if agents.contains_key(&sent.agent) => {
-                        Some(crate::progress::running_for(sent.at, now))
-                    }
+                // time since the capability was sent
+                let running = match (&i.fm.sent_to, i.fm.state) {
+                    (Some(sent), State::Sent) => Some(crate::progress::ago(sent.at, now)),
                     _ => None,
                 };
                 let group = i
@@ -2798,7 +2841,7 @@ impl App {
                 ui::ListRow {
                     status: crate::store::readiness(i).label(),
                     progress: crate::progress::progress(i, &self.evidence_for(i))
-                        .map(|p| (p.fill, p.label, p.complete)),
+                        .map(|p| (p.segments, p.label, p.complete)),
                     agent: o.agent.clone(),
                     running: o.running.clone(),
                     title: &i.fm.title,
@@ -4107,11 +4150,11 @@ mod tests {
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
         let shown = render(&fx.app, 120, 60);
-        assert!(shown.contains("! needs you │ 2h 14m"), "{shown}");
-        assert!(shown.contains("working     │ 3h 24m"), "{shown}");
+        assert!(shown.contains("! needs you │ 2h ago"), "{shown}");
+        assert!(shown.contains("working     │ 3h ago"), "{shown}");
         assert!(
-            shown.contains("closed      │ —"),
-            "no clock once the pane is gone: {shown}"
+            shown.contains("closed      │ 4h ago"),
+            "time since sent, whether or not the pane is still there: {shown}"
         );
         assert!(
             shown.contains("│ raw    │ —           │ —"),
@@ -4203,6 +4246,31 @@ mod tests {
         filter_by(&mut fx.app, "Completed");
         let shown = render(&fx.app, 100, 12);
         assert!(shown.contains("nothing matches this filter"), "{shown}");
+    }
+
+    #[test]
+    fn prs_found_by_plan_name_move_the_card() {
+        let mut fx = list_fixture(true);
+        // the Counselors capability links plans/reassign.md but no pr: line
+        fs::write(
+            fx.tmp.path().join("prs/search-reassign.md.json"),
+            r#"[{"number":77,"state":"OPEN"}]"#,
+        )
+        .unwrap();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 70);
+        let line = shown
+            .lines()
+            .skip_while(|l| !l.starts_with(" Counselors"))
+            .nth(2)
+            .unwrap_or_default()
+            .to_string();
+        assert!(line.contains("PR #77 open"), "{line}");
+        assert!(
+            line.contains("█ █ █ ███ █ ░ ░░"),
+            "stage blocks up to PR open: {line}"
+        );
     }
 
     #[test]

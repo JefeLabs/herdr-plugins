@@ -919,12 +919,12 @@ pub fn description_text(body: &str) -> String {
 pub struct ListRow<'a> {
     /// `raw`, `?2`, `ready`, `sent`.
     pub status: String,
-    /// `(fill 0..=10, label, complete)` once sent.
-    pub progress: Option<(f32, String, bool)>,
+    /// `(stage segments, label, complete)` once sent.
+    pub progress: Option<([f32; 7], String, bool)>,
     /// The sent agent's live state (`working`, `idle`, `needs you`, `done`,
     /// `closed`); `None` before sending.
     pub agent: Option<String>,
-    /// How long the sent agent's session has been running, while it exists.
+    /// Time since the capability was sent, e.g. `15h ago`.
     pub running: Option<String>,
     pub title: &'a str,
     /// The group path in the tree, e.g. `skoolscout/org`.
@@ -960,7 +960,6 @@ pub fn fit(text: &str, max: usize) -> String {
 
 const LIST_HINTS: &str = "v tree · S sort · f filter · s send · g agent";
 const STATUS_W: usize = 6;
-const BAR_W: usize = 10;
 const WHEN_W: usize = 12;
 const AGENT_W: usize = 11;
 const RUNNING_W: usize = 7;
@@ -991,7 +990,7 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
 /// ────────────────────────────────────────
 ///  Title
 ///  group path
-///  TIMESTAMP │ STATUS │ AGENT │ RUNNING │ PROGRESS
+///  TIMESTAMP │ STATUS │ AGENT │ SENT AGO │ STAGES label
 ///  worktree path │ slot N          (once the agent is in a worktree)
 ///
 ///  description, up to two wrapped lines
@@ -1118,8 +1117,8 @@ pub fn render_capability_list(
         fields.push(sep());
         match &r.progress {
             Some((_, _, true)) => fields.push(Span::raw("✓ complete")),
-            Some((fill, label, false)) => {
-                fields.push(Span::raw(crate::progress::bar(*fill, BAR_W)));
+            Some((segments, label, false)) => {
+                fields.push(Span::raw(crate::progress::stage_bar(segments)));
                 fields.push(Span::raw(format!(" {}", fit(label, 24))));
             }
             None => fields.push(Span::styled("—", dim)),

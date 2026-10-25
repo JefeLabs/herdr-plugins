@@ -2,6 +2,16 @@
 # Stand-in for `gh` in progress tests. Logs every call; `pr view <n>` answers
 # with the state stored in $FAKE_GH_DIR/<n>, and fails when there is none.
 printf '%s\n' "$*" >> "${FAKE_GH_LOG:-/dev/null}"
+if [ "$1 $2" = "pr list" ]; then
+  q=""
+  while [ $# -gt 0 ]; do
+    [ "$1" = "--search" ] && { q="$2"; break; }
+    shift
+  done
+  q=$(printf '%s' "$q" | tr -d '"')
+  if [ -f "$FAKE_GH_DIR/search-$q.json" ]; then cat "$FAKE_GH_DIR/search-$q.json"; else echo '[]'; fi
+  exit 0
+fi
 n="$3"
 case "$n" in
   */pull/*) n="${n##*/pull/}"; n="${n%%/*}" ;;

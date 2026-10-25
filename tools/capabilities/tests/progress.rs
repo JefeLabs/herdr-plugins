@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use herdr_capabilities::progress::{
-    Evidence, PlanTasks, Poller, PrState, Update, agent_statuses, bar, plan_evidence, plan_tasks,
-    pr_number, pr_state, progress, running_for,
+    Evidence, PlanTasks, Poller, PrState, Update, agent_statuses, ago, bar, plan_evidence,
+    plan_tasks, pr_number, pr_state, progress, prs_mentioning, stage_bar,
 };
 use herdr_capabilities::store::{Intent, State, Store};
 
@@ -34,6 +34,7 @@ fn tasks(done: usize, total: usize) -> PlanTasks {
         done,
         total,
         readable: true,
+        counted: true,
     }
 }
 
@@ -100,6 +101,7 @@ fn an_unreadable_plan_shows_a_question_mark() {
                 done: 0,
                 total: 0,
                 readable: false,
+                counted: false,
             },
             tasks(1, 2),
         ],
@@ -221,8 +223,16 @@ fn ledger_counts_distinct_completed_tasks() {
     let plan = "### Task 1: a\n- [ ] x\n### Task 2: b\n- [x] y\n### Task 3: c\n";
     let ledger = "# SDD ledger — plan: docs/p.md\nTask 1: complete (commits a..b)\nTask 1: complete (again)\nTask 3: complete\nTask 2: Ruling: something\n";
     assert_eq!(plan_tasks(plan, Some(ledger)), tasks(2, 3));
-    assert_eq!(plan_tasks(plan, None), tasks(1, 2), "checkbox fallback");
-    assert_eq!(plan_tasks("# no tasks\n", None), tasks(0, 0));
+    assert_eq!(
+        plan_tasks(plan, None),
+        PlanTasks {
+            done: 0,
+            total: 3,
+            readable: true,
+            counted: false
+        },
+        "no ledger: the tasks are known, how many are done is not (steps are not tasks)"
+    );
 }
 
 #[test]
@@ -371,7 +381,8 @@ fn plan_evidence_without_repo_marks_unreadable() {
         vec![PlanTasks {
             done: 0,
             total: 0,
-            readable: false
+            readable: false,
+            counted: false,
         }]
     );
 }
@@ -454,16 +465,86 @@ fn agent_worktree_and_slot_come_from_its_working_directory() {
 }
 
 #[test]
-fn running_time_reads_compactly() {
+fn time_since_sent_reads_compactly() {
     let t0 = chrono::Local::now();
     let at = |secs: i64| t0 + chrono::Duration::seconds(secs);
-    assert_eq!(running_for(t0, at(30)), "<1m");
-    assert_eq!(running_for(t0, at(45 * 60)), "45m");
-    assert_eq!(running_for(t0, at(2 * 3600 + 14 * 60)), "2h 14m");
-    assert_eq!(running_for(t0, at(3 * 86400 + 4 * 3600 + 59)), "3d 4h");
+    assert_eq!(ago(t0, at(30)), "<1m ago");
+    assert_eq!(ago(t0, at(45 * 60)), "45m ago");
+    assert_eq!(ago(t0, at(15 * 3600 + 35 * 60)), "15h ago");
+    assert_eq!(ago(t0, at(3 * 86400 + 4 * 3600)), "3d ago");
+    assert_eq!(ago(t0, at(-90)), "<1m ago");
+}
+
+#[test]
+fn without_a_ledger_building_shows_no_count_and_no_share() {
+    let uncounted = PlanTasks {
+        done: 0,
+        total: 5,
+        readable: true,
+        counted: false,
+    };
+    let ev = Evidence {
+        plans: vec![tasks(2, 8), uncounted],
+        prs: vec![],
+    };
+    let (_tmp, it) = intent(State::Sent, "## Artifacts\n- plan: a.md\n- plan: b.md\n");
+    let pr = progress(&it, &ev).unwrap();
+    assert_eq!(pr.label, "building", "no guessed count");
+    assert_eq!(pr.segments[3], 0.0, "and no building share");
+}
+
+#[test]
+fn segments_follow_the_stages_reached() {
+    let ev = Evidence {
+        plans: vec![tasks(1, 3)],
+        prs: vec![],
+    };
+    let (_tmp, it) = intent(
+        State::Sent,
+        "## Acceptance criteria\n- [x] a\n- [ ] b\n\n## Artifacts\n- spec: s.md\n- plan: p.md\n",
+    );
+    let pr = progress(&it, &ev).unwrap();
+    assert_eq!(pr.segments, [1.0, 1.0, 1.0, 1.0 / 3.0, 0.0, 0.0, 0.5]);
+    assert_eq!(stage_bar(&pr.segments), "█ █ █ █░░ ░ ░ █░");
+    // ticks alone light only the verified block
+    let (_tmp, it) = intent(State::Sent, "## Acceptance criteria\n- [x] a\n- [ ] b\n");
+    let pr = progress(&it, &Evidence::default()).unwrap();
+    assert_eq!(stage_bar(&pr.segments), "█ ░ ░ ░░░ ░ ░ █░");
+    // a merged PR fills every stage up to merged
+    let ev = Evidence {
+        plans: vec![],
+        prs: vec![(1, PrState::Merged)],
+    };
+    let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
+    let pr = progress(&it, &ev).unwrap();
+    assert_eq!(stage_bar(&pr.segments), "█ █ █ ███ █ █ ░░");
+}
+
+#[test]
+fn prs_are_found_by_the_file_names_they_mention() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("prs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("search-p.md.json"),
+        r#"[{"number":5828,"state":"MERGED"},{"number":5832,"state":"OPEN"}]"#,
+    )
+    .unwrap();
+    let log = tmp.path().join("gh.log");
+    let env = vec![
+        ("FAKE_GH_DIR".to_string(), dir.display().to_string()),
+        ("FAKE_GH_LOG".to_string(), log.display().to_string()),
+    ];
+    let gh = fixtures().join("fake-gh.sh");
     assert_eq!(
-        running_for(t0, at(-90)),
-        "<1m",
-        "a clock behind the send time"
+        prs_mentioning(&gh, tmp.path(), "p.md", &env),
+        vec![(5828, PrState::Merged), (5832, PrState::Open)]
+    );
+    assert!(prs_mentioning(&gh, tmp.path(), "other.md", &env).is_empty());
+    assert!(prs_mentioning(&tmp.path().join("no-gh"), tmp.path(), "p.md", &env).is_empty());
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains("pr list --state all --search \"p.md\""),
+        "{calls}"
     );
 }

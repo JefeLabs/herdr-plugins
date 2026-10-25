@@ -22,12 +22,15 @@ pub enum PrState {
     Unknown,
 }
 
-/// Tasks of one linked plan. `readable: false` when the file could not be read.
+/// Tasks of one linked plan. `readable: false` when the file could not be
+/// read; `counted: false` when no ledger says how many are done (the plan
+/// executor deletes its ledger once a plan finishes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanTasks {
     pub done: usize,
     pub total: usize,
     pub readable: bool,
+    pub counted: bool,
 }
 
 /// What was gathered outside the capability file.
@@ -41,10 +44,27 @@ pub struct Evidence {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Progress {
-    /// 0.0 ..= 10.0, one unit per bar cell.
+    /// 0.0 ..= 10.0, one unit per bar cell (used for sorting).
     pub fill: f32,
     pub label: String,
     pub complete: bool,
+    /// How full each stage is, 0.0 ..= 1.0: sent, specced, planned,
+    /// building, PR open, merged, verified.
+    pub segments: [f32; 7],
+}
+
+/// Cells per stage in the bar, in `Progress::segments` order.
+const STAGE_CELLS: [usize; 7] = [1, 1, 1, 3, 1, 1, 2];
+
+/// The bar as one block per stage, separated by spaces, so the filled part
+/// reads as "these stages are done" rather than as a percentage.
+pub fn stage_bar(segments: &[f32; 7]) -> String {
+    segments
+        .iter()
+        .zip(STAGE_CELLS)
+        .map(|(f, cells)| bar(f.clamp(0.0, 1.0) * 10.0, cells))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Stage weights, summing to 10.
@@ -84,6 +104,7 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         .collect();
     let merged = prs.iter().filter(|(_, s)| *s == PrState::Merged).count();
 
+    let mut building_share = 0.0f32;
     let (base, label) = if !prs.is_empty() && merged == prs.len() {
         let label = if crit.is_empty() {
             "no criteria".to_string()
@@ -103,21 +124,23 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         (PR_OPEN, label)
     } else if count("plan") > 0 {
         let readable: Vec<&PlanTasks> = ev.plans.iter().filter(|p| p.readable).collect();
+        // a plan without a ledger has an unknown done count: guess nothing
+        let uncounted = readable.iter().any(|p| !p.counted && p.total > 0);
         let total: usize = readable.iter().map(|p| p.total).sum();
         let done: usize = readable.iter().map(|p| p.done.min(p.total)).sum();
-        let share = if total == 0 {
+        building_share = if total == 0 || uncounted {
             0.0
         } else {
-            BUILDING * done as f32 / total as f32
+            done as f32 / total as f32
         };
         let label = if readable.len() < ev.plans.len() {
             "building ?".to_string()
-        } else if total == 0 {
+        } else if total == 0 || uncounted {
             "building".to_string()
         } else {
             format!("building {done}/{total}")
         };
-        (PLANNED + share, label)
+        (PLANNED + BUILDING * building_share, label)
     } else if count("spec") > 0 || count("issue") > 0 {
         (SPECCED, "planning".to_string())
     } else {
@@ -133,7 +156,22 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         (SENT, label)
     };
 
+    let reached = |stage: f32| if base >= stage { 1.0 } else { 0.0 };
+    let segments = [
+        1.0,
+        reached(SPECCED),
+        reached(PLANNED),
+        if base >= PR_OPEN { 1.0 } else { building_share },
+        reached(PR_OPEN),
+        reached(MERGED),
+        if crit.is_empty() {
+            0.0
+        } else {
+            ticked as f32 / crit.len() as f32
+        },
+    ];
     Some(Progress {
+        segments,
         fill: (base + verified).min(10.0),
         label: if complete {
             "✓ complete".to_string()
@@ -144,48 +182,39 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
     })
 }
 
-/// Tasks in a superpowers plan. With a ledger: `### Task <n>` headings against
-/// distinct `Task <n>: complete` lines. Without one: ticked checkboxes against
-/// all checkboxes in the plan.
+/// Tasks in a superpowers plan: `### Task <n>` headings, done counted from
+/// distinct `Task <n>: complete` lines in its ledger. Without a ledger the
+/// done count is unknown (`counted: false`); checkbox steps are not tasks and
+/// agents do not tick them, so they are not used.
 pub fn plan_tasks(plan: &str, ledger: Option<&str>) -> PlanTasks {
     let headings: BTreeSet<u64> = plan
         .lines()
         .filter_map(|l| l.strip_prefix("### Task "))
         .filter_map(leading_number)
         .collect();
-    if let Some(ledger) = ledger
-        && !headings.is_empty()
-    {
-        let done: BTreeSet<u64> = ledger
-            .lines()
-            .filter_map(|l| l.strip_prefix("Task "))
-            .filter_map(|rest| {
-                let n = leading_number(rest)?;
-                let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-                after.starts_with(": complete").then_some(n)
-            })
-            .filter(|n| headings.contains(n))
-            .collect();
+    let Some(ledger) = ledger.filter(|_| !headings.is_empty()) else {
         return PlanTasks {
-            done: done.len(),
+            done: 0,
             total: headings.len(),
             readable: true,
+            counted: false,
         };
-    }
-    let mut total = 0;
-    let mut done = 0;
-    for l in plan.lines().map(str::trim_start) {
-        if l.starts_with("- [ ]") {
-            total += 1;
-        } else if l.starts_with("- [x]") || l.starts_with("- [X]") {
-            total += 1;
-            done += 1;
-        }
-    }
+    };
+    let done: BTreeSet<u64> = ledger
+        .lines()
+        .filter_map(|l| l.strip_prefix("Task "))
+        .filter_map(|rest| {
+            let n = leading_number(rest)?;
+            let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            after.starts_with(": complete").then_some(n)
+        })
+        .filter(|n| headings.contains(n))
+        .collect();
     PlanTasks {
-        done,
-        total,
+        done: done.len(),
+        total: headings.len(),
         readable: true,
+        counted: true,
     }
 }
 
@@ -194,20 +223,14 @@ fn leading_number(s: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// How long since `since`, compactly: `<1m`, `45m`, `2h 14m`, `3d 4h`.
-pub fn running_for(
-    since: chrono::DateTime<chrono::Local>,
-    now: chrono::DateTime<chrono::Local>,
-) -> String {
+/// Time since `since`, compactly: `<1m ago`, `45m ago`, `15h ago`, `3d ago`.
+pub fn ago(since: chrono::DateTime<chrono::Local>, now: chrono::DateTime<chrono::Local>) -> String {
     let mins = (now - since).num_minutes();
-    if mins < 1 {
-        return "<1m".to_string();
-    }
-    let (d, h, m) = (mins / 1440, (mins % 1440) / 60, mins % 60);
-    match (d, h) {
-        (0, 0) => format!("{m}m"),
-        (0, _) => format!("{h}h {m}m"),
-        _ => format!("{d}d {h}h"),
+    match mins {
+        m if m < 1 => "<1m ago".to_string(),
+        m if m < 60 => format!("{m}m ago"),
+        m if m < 1440 => format!("{}h ago", m / 60),
+        m => format!("{}d ago", m / 1440),
     }
 }
 
@@ -262,6 +285,7 @@ pub fn plan_evidence(repo: Option<&Path>, it: &Intent) -> Vec<PlanTasks> {
                 done: 0,
                 total: 0,
                 readable: false,
+                counted: false,
             };
             let path = match repo {
                 Some(r) => crate::send::resolve_in_repo(r, &a.target),
@@ -397,6 +421,60 @@ pub fn worktree_of(cwd: &Path) -> (Option<String>, Option<u32>, Option<PathBuf>)
     (None, None, None)
 }
 
+/// Pull requests in `repo` whose title or description mentions `query` (a
+/// spec or plan file name): `gh pr list --state all --search "<query>"`.
+/// Empty when gh cannot answer.
+pub fn prs_mentioning(
+    gh: &Path,
+    repo: &Path,
+    query: &str,
+    env: &[(String, String)],
+) -> Vec<(u64, PrState)> {
+    let out = Command::new(gh)
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--search",
+            &format!("\"{query}\""),
+            "--json",
+            "number,state",
+            "--limit",
+            "30",
+        ])
+        .current_dir(repo)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return Vec::new();
+    };
+    v.as_array()
+        .map(|prs| {
+            prs.iter()
+                .filter_map(|p| {
+                    let n = p.get("number")?.as_u64()?;
+                    let state = match p.get("state")?.as_str()? {
+                        "OPEN" => PrState::Open,
+                        "MERGED" => PrState::Merged,
+                        "CLOSED" => PrState::Closed,
+                        _ => PrState::Unknown,
+                    };
+                    Some((n, state))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `herdr agent list` as `name → AgentInfo`. Agents without a name (not
 /// started by this tool) are skipped. `None` when herdr cannot answer.
 pub fn agent_statuses(
@@ -467,6 +545,11 @@ pub enum Update {
     Plans {
         path: PathBuf,
         plans: Vec<PlanTasks>,
+    },
+    /// Pull requests found mentioning the capability's spec or plan files.
+    FoundPrs {
+        path: PathBuf,
+        prs: Vec<(u64, PrState)>,
     },
 }
 
@@ -543,6 +626,29 @@ impl Poller {
                     plans,
                 },
             ));
+        });
+    }
+
+    /// Search for pull requests mentioning each of `queries` (file names).
+    pub fn request_found_prs(&mut self, path: PathBuf, repo: PathBuf, queries: Vec<String>) {
+        let key = format!("found:{}", path.display());
+        if !self.in_flight.insert(key.clone()) {
+            return;
+        }
+        let env = self.env.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut prs: Vec<(u64, PrState)> = Vec::new();
+            if let Some(gh) = tool_bin(&env, "GH_BIN_PATH", Some("gh")) {
+                for q in &queries {
+                    for (n, st) in prs_mentioning(&gh, &repo, q, &env) {
+                        if !prs.iter().any(|(m, _)| *m == n) {
+                            prs.push((n, st));
+                        }
+                    }
+                }
+            }
+            let _ = tx.send((key, Update::FoundPrs { path, prs }));
         });
     }
 

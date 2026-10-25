@@ -138,7 +138,7 @@ Capabilities · 7 · sorted by Updated
 ────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
  skoolscout/org
- Oct 25 08:10 │ sent   │ ! needs you │ 2h 14m  │ ███████░░░ PR #42 open
+ Oct 25 08:10 │ sent   │ ! needs you │ 2h ago  │ █ █ █ ███ █ ░ ░░ PR #42 open
  .claude/worktrees/org/notify │ slot 3
 
  The primary contact gets no prompt to book the intro meeting.
@@ -151,16 +151,16 @@ Capabilities · 7 · sorted by Updated
  shows up labelled Pending.…
 ```
 
-Each capability is a card that opens with a horizontal rule: the title in bold, with its path in the tree under it; then the timestamp, the capability's status, the agent's status, how long the agent's session has been running (counted from the send, shown while Herdr still lists the agent) and the implementation progress; then, once the agent is working in a worktree, that worktree's path (relative to the repo) and its workbrokr slot, read from the nearest `.slot` file above the agent's working directory; then, after a blank line, up to two wrapped lines of the description.
+Each capability is a card that opens with a horizontal rule: the title in bold, with its path in the tree under it; then the timestamp, the capability's status, the agent's status, how long ago it was sent and the implementation progress; then, once the agent is working in a worktree, that worktree's path (relative to the repo) and its workbrokr slot, read from the nearest `.slot` file above the agent's working directory; then, after a blank line, up to two wrapped lines of the description.
 
-Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a ten-cell bar shows how far the feature has got, from evidence that already exists:
+Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a bar with one block per stage (sent, specced, planned, building, PR open, merged, verified) shows how far the feature has got, from evidence that already exists. A filled block means that stage is done; the building block fills by its share of tasks and the verified block by its share of ticked criteria. The label names the stage you are in:
 
 | Stage | Label | Evidence |
 |---|---|---|
 | Sent | `speccing` or `charting · N decisions` | `state: sent` |
 | Specced | `planning` | a `spec:` or `issue:` line under Artifacts |
-| Planned / Building | `building k/N` | `plan:` lines; tasks counted against each plan's superpowers ledger (`.superpowers/sdd/*/progress.md`), in the main checkout or any worktree, summed over plans |
-| PR open | `PR #n open`, `PRs m/t merged` | `pr:` lines, state from `gh pr view` |
+| Planned / Building | `building k/N`, or `building` | `plan:` lines; `### Task` headings counted against each plan's superpowers ledger (`.superpowers/sdd/*/progress.md`), in the main checkout or any worktree, summed over plans. The plan executor deletes its ledger when a plan finishes, so without a ledger the label shows no count rather than a guess |
+| PR open | `PR #n open`, `PRs m/t merged` | `pr:` lines, plus pull requests whose title or description mentions the capability's spec or plan file names (`gh pr list --search`, on entry, on `r` and about every ten minutes); state from `gh` |
 | Merged | `verifying j/M` | every remaining PR merged (closed ones are ignored) |
 | Complete | `✓ complete` | every acceptance criterion ticked, by you |
 
