@@ -446,8 +446,10 @@ fn agent_worktree_and_slot_come_from_its_working_directory() {
     env.push(("FAKE_AGENT_LIST".to_string(), list.display().to_string()));
     let map = agent_statuses(&fixtures().join("fake-herdr.sh"), &env).unwrap();
     assert_eq!(map["a"].worktree.as_deref(), Some("org/team"));
+    assert_eq!(map["a"].worktree_path.as_deref(), Some(area.as_path()));
     assert_eq!(map["a"].slot, Some(2));
     assert_eq!(map["b"].worktree, None, "no .slot above it");
+    assert_eq!(map["b"].worktree_path, None);
     assert_eq!(map["b"].slot, None);
 }
 

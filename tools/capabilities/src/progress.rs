@@ -368,13 +368,15 @@ pub struct AgentInfo {
     /// The worktree it is in: the area under `.claude/worktrees/` (e.g.
     /// `org/team`), else the worktree folder's name.
     pub worktree: Option<String>,
+    /// That worktree's folder (the one holding `.slot`).
+    pub worktree_path: Option<PathBuf>,
     /// The workbrokr slot from that worktree's `.slot` file.
     pub slot: Option<u32>,
 }
 
-/// The nearest folder at or above `cwd` holding a `.slot` file: its area name
-/// and slot number. `(None, None)` when there is none.
-pub fn worktree_of(cwd: &Path) -> (Option<String>, Option<u32>) {
+/// The nearest folder at or above `cwd` holding a `.slot` file: its area name,
+/// slot number and path. All `None` when there is none.
+pub fn worktree_of(cwd: &Path) -> (Option<String>, Option<u32>, Option<PathBuf>) {
     for dir in cwd.ancestors().take(16) {
         let Ok(text) = std::fs::read_to_string(dir.join(".slot")) else {
             continue;
@@ -390,9 +392,9 @@ pub fn worktree_of(cwd: &Path) -> (Option<String>, Option<u32>) {
             .map(|i| parts[i + 2..].join("/"))
             .filter(|a| !a.is_empty())
             .or_else(|| dir.file_name().map(|n| n.to_string_lossy().to_string()));
-        return (area, slot);
+        return (area, slot, Some(dir.to_path_buf()));
     }
-    (None, None)
+    (None, None, None)
 }
 
 /// `herdr agent list` as `name → AgentInfo`. Agents without a name (not
@@ -423,12 +425,14 @@ pub fn agent_statuses(
                     .get("foreground_cwd")
                     .or_else(|| a.get("cwd"))
                     .and_then(|c| c.as_str());
-                let (worktree, slot) = cwd.map(|c| worktree_of(Path::new(c))).unwrap_or_default();
+                let (worktree, slot, worktree_path) =
+                    cwd.map(|c| worktree_of(Path::new(c))).unwrap_or_default();
                 Some((
                     name.to_string(),
                     AgentInfo {
                         status: status.to_string(),
                         worktree,
+                        worktree_path,
                         slot,
                     },
                 ))

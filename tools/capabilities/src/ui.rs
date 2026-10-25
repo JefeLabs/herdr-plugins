@@ -927,8 +927,10 @@ pub struct ListRow<'a> {
     /// How long the sent agent's session has been running, while it exists.
     pub running: Option<String>,
     pub title: &'a str,
-    /// Where it lives: group path, then the sent agent's workbrokr slot.
-    pub location: String,
+    /// The group path in the tree, e.g. `skoolscout/org`.
+    pub group: String,
+    /// The sent agent's worktree path and slot, once it is in one.
+    pub worktree: Option<String>,
     pub when: String,
     pub description: &'a str,
 }
@@ -988,8 +990,9 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
 /// ```text
 /// ────────────────────────────────────────
 ///  Title
+///  group path
 ///  TIMESTAMP │ STATUS │ AGENT │ RUNNING │ PROGRESS
-///  group │ slot N
+///  worktree path │ slot N          (once the agent is in a worktree)
 ///
 ///  description, up to two wrapped lines
 /// ```
@@ -1040,8 +1043,8 @@ pub fn render_capability_list(
         .iter()
         .map(|r| card_description(r.description, inner_w))
         .collect();
-    // rule + title + fields + location + blank + description
-    let height = |i: usize| 1 + 3 + 1 + descs[i].len();
+    // rule + title + group + fields + [worktree] + blank + description
+    let height = |i: usize| 1 + 3 + usize::from(rows[i].worktree.is_some()) + 1 + descs[i].len();
     // first card shown: the selected card must fit completely
     let room = body.height as usize;
     let mut first = 0;
@@ -1070,7 +1073,7 @@ pub fn render_capability_list(
         };
         put(Line::styled("─".repeat(w), dim), &mut y);
         let card_top = y;
-        // row one: the title alone
+        // the title, and its path in the tree under it
         put(
             Line::from(vec![
                 Span::raw(" "),
@@ -1078,8 +1081,15 @@ pub fn render_capability_list(
             ]),
             &mut y,
         );
+        put(
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(fit(&r.group, inner_w), dim),
+            ]),
+            &mut y,
+        );
 
-        // row two: timestamp │ status │ agent │ progress
+        // metadata: timestamp │ status │ agent │ running │ progress
         let mut fields = vec![
             Span::raw(" "),
             Span::styled(format!("{:<WHEN_W$}", fit(&r.when, WHEN_W)), dim),
@@ -1111,14 +1121,14 @@ pub fn render_capability_list(
         }
         put(Line::from(fields), &mut y);
 
-        // row three: where it lives; then a blank line before the description
-        put(
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(fit(&r.location, inner_w), dim),
-            ]),
-            &mut y,
-        );
+        // the agent's worktree path under the metadata, once it is in one;
+        // then a blank line before the description
+        if let Some(w) = &r.worktree {
+            put(
+                Line::from(vec![Span::raw(" "), Span::styled(fit(w, inner_w), dim)]),
+                &mut y,
+            );
+        }
         put(Line::raw(""), &mut y);
 
         // description

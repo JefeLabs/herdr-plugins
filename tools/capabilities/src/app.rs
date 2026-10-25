@@ -2638,7 +2638,8 @@ impl App {
             description: String,
             agent: Option<String>,
             running: Option<String>,
-            location: String,
+            group: String,
+            worktree: Option<String>,
         }
         let now = self.fixed_now.unwrap_or_else(chrono::Local::now);
         let owned: Vec<Owned> = self
@@ -2672,26 +2673,45 @@ impl App {
                     }
                     _ => None,
                 };
-                // group path, then the sent agent's slot
-                let mut location = vec![
-                    i.path
-                        .parent()
-                        .and_then(|d| d.strip_prefix(self.store.root()).ok())
-                        .map(|d| d.display().to_string())
-                        .unwrap_or_default(),
-                ];
-                if i.fm.state == State::Sent
-                    && let (Some(sent), Some(agents)) = (&i.fm.sent_to, &self.agents)
-                    && let Some(info) = agents.get(&sent.agent)
-                    && let Some(n) = info.slot
-                {
-                    location.push(format!("slot {n}"));
-                }
+                let group = i
+                    .path
+                    .parent()
+                    .and_then(|d| d.strip_prefix(self.store.root()).ok())
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default();
+                // the sent agent's worktree, relative to the repo when inside it
+                let worktree = match (&i.fm.sent_to, &self.agents, i.fm.state) {
+                    (Some(sent), Some(agents), State::Sent) => {
+                        agents.get(&sent.agent).and_then(|info| {
+                            let path = info.worktree_path.as_ref()?;
+                            let shown = match i
+                                .fm
+                                .repo
+                                .as_deref()
+                                .and_then(|r| path.strip_prefix(r).ok())
+                            {
+                                Some(rel) => rel.display().to_string(),
+                                None => match dirs_home().and_then(|h| {
+                                    path.strip_prefix(h).ok().map(|p| p.to_path_buf())
+                                }) {
+                                    Some(rel) => format!("~/{}", rel.display()),
+                                    None => path.display().to_string(),
+                                },
+                            };
+                            Some(match info.slot {
+                                Some(n) => format!("{shown} │ slot {n}"),
+                                None => shown,
+                            })
+                        })
+                    }
+                    _ => None,
+                };
                 Owned {
                     description,
                     agent,
                     running,
-                    location: location.join(" │ "),
+                    group,
+                    worktree,
                 }
             })
             .collect();
@@ -2711,7 +2731,8 @@ impl App {
                     agent: o.agent.clone(),
                     running: o.running.clone(),
                     title: &i.fm.title,
-                    location: o.location.clone(),
+                    group: o.group.clone(),
+                    worktree: o.worktree.clone(),
                     when: when.format("%b %d %H:%M").to_string(),
                     description: &o.description,
                 }
@@ -3220,6 +3241,11 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
     )?;
     println!("{}", it.path.display());
     Ok(())
+}
+
+/// The user's home folder, for shortening paths to `~/…`.
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -3844,27 +3870,39 @@ mod tests {
         let mut fx = list_fixture(true);
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
-        let shown = render(&fx.app, 120, 60);
-        assert!(
-            shown.contains(" skoolscout/org │ slot 3"),
-            "group, then the sent agent's slot: {shown}"
-        );
-        assert!(
-            !shown.contains("worktree"),
-            "no worktree name on cards: {shown}"
-        );
-        assert!(
-            shown.lines().any(|l| l == " Inbox"),
-            "an unsent card shows its group alone: {shown}"
-        );
+        let shown = render(&fx.app, 120, 70);
         let lines: Vec<&str> = shown.lines().collect();
-        let at = lines.iter().position(|l| l.contains("│ slot 3")).unwrap();
-        assert_eq!(lines[at + 1], "", "a blank line before the description");
+        let row = |prefix: &str| {
+            lines
+                .iter()
+                .position(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no line starting {prefix:?}: {shown}"))
+        };
+        // sent card: title, tree path, metadata, worktree path and slot, blank, description
+        let t = row(" Notify primary contact");
+        assert_eq!(lines[t + 1], " skoolscout/org", "tree path under the title");
         assert!(
-            lines[at + 2].starts_with(" The primary contact"),
+            lines[t + 2].starts_with(" Oct 25 08:10 │ sent"),
             "{}",
-            lines[at + 2]
+            lines[t + 2]
         );
+        assert_eq!(
+            lines[t + 3],
+            " .claude/worktrees/org/notify │ slot 3",
+            "worktree path under the metadata row"
+        );
+        assert_eq!(lines[t + 4], "", "a blank line before the description");
+        assert!(
+            lines[t + 5].starts_with(" The primary contact"),
+            "{}",
+            lines[t + 5]
+        );
+        // unsent card: no worktree row
+        let a = lines.iter().position(|l| *l == " a").unwrap();
+        assert_eq!(lines[a + 1], " Inbox");
+        assert!(lines[a + 2].starts_with(" Oct 25 07:30 │ raw"));
+        assert_eq!(lines[a + 3], "");
+        assert_eq!(lines[a + 4], " (no description yet)");
     }
 
     #[test]
