@@ -68,7 +68,7 @@ The right-hand side shows the three parts as separate panes under a header. The 
 
 ## Keys
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an capability in the selected group, `n` new group, `m` move the selected capability or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `Tab` move between panes, `t` rename (the title is meant to be a capability phrase: who can do what), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an capability in the selected group, `n` new group, `m` move the selected capability or group (type the target group path), `K` cycle kind, `R` ready (refused while any question is unanswered), `U` back to refining, `p` refine with the agent, `Tab` move between panes, `t` rename (the title is meant to be a capability phrase: who can do what), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
 
 Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` refine (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 

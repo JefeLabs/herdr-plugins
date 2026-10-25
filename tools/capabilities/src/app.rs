@@ -592,7 +592,22 @@ impl App {
                 let i = KINDS.iter().position(|k| *k == fm.kind).unwrap_or(0);
                 fm.kind = KINDS[(i + 1) % KINDS.len()].to_string();
             }),
-            KeyCode::Char('R') => self.update_selected_fields(|fm| fm.state = State::Ready),
+            KeyCode::Char('R') => {
+                // ready means nothing is left unanswered
+                let open = self
+                    .selected_intent()
+                    .map(|it| it.open_questions())
+                    .unwrap_or(0);
+                if open > 0 {
+                    self.message = Some(format!(
+                        "{open} open question{} still unanswered: answer or remove {} first (Q)",
+                        if open == 1 { "" } else { "s" },
+                        if open == 1 { "it" } else { "them" }
+                    ));
+                } else {
+                    self.update_selected_fields(|fm| fm.state = State::Ready);
+                }
+            }
             KeyCode::Char('U') => self.update_selected_fields(|fm| fm.state = State::Refining),
             KeyCode::Char('p') => {
                 if let Some(it) = self.selected_intent().cloned() {
@@ -3409,5 +3424,28 @@ mod tests {
                 .contains("newer build"),
             "the notice survives key presses"
         );
+    }
+
+    #[test]
+    fn ready_requires_every_open_question_to_be_answered() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox"); // two unanswered questions
+        key(&mut fx.app, KeyCode::Char('R'));
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        assert_eq!(
+            Store::load(&path).unwrap().fm.state,
+            State::Raw,
+            "not marked ready"
+        );
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("2 open question"), "{m}");
+        // answer both, then R works
+        let mut it = Store::load(&path).unwrap();
+        it.body = crate::store::answer_question(&it.body, 0, "yes").unwrap();
+        it.body = crate::store::answer_question(&it.body, 1, "no").unwrap();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('R'));
+        assert_eq!(Store::load(&path).unwrap().fm.state, State::Ready);
     }
 }
