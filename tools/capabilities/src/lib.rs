@@ -5,6 +5,7 @@ pub mod config;
 pub mod conversation;
 pub mod editor;
 pub mod markdown;
+pub mod progress;
 pub mod provider;
 pub mod send;
 pub mod store;
