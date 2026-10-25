@@ -14,6 +14,7 @@ struct Fx {
     _tmp: tempfile::TempDir,
     cmd: CommandBuilder,
     pid_file: std::path::PathBuf,
+    socket: std::path::PathBuf,
 }
 
 fn fx() -> Fx {
@@ -48,6 +49,7 @@ fn fx() -> Fx {
         _tmp: tmp,
         cmd,
         pid_file,
+        socket: state.join("wtest.sock"),
     }
 }
 
@@ -162,5 +164,10 @@ fn hang_up_of_the_terminal_ends_the_toolbar_and_its_tools_within_a_second() {
         &format!("tool {tool} gone"),
         Duration::from_millis(1500),
         || !alive(tool),
+    );
+    assert!(
+        !fx.socket.exists(),
+        "control socket must be removed on exit: {}",
+        fx.socket.display()
     );
 }

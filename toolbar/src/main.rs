@@ -85,12 +85,18 @@ fn run_tui() -> anyhow::Result<()> {
         inherit: ctx.inherit.clone(),
         tool_id: String::new(),
     };
-    let result = app::run(paths, env, Some(Box::new(move || control.poll())));
-    // `control` was moved into the closure and dropped inside run; make sure
-    // nothing is left even if Herdr tore the pane down abruptly.
-    let _ = std::fs::remove_file(herdr::pane_file(&ctx));
-    let _ = std::fs::remove_file(herdr::socket_path(&ctx));
-    result
+    let pane_file = herdr::pane_file(&ctx);
+    let socket = herdr::socket_path(&ctx);
+    // `run` exits the process itself, so cleanup goes through `on_exit`.
+    app::run(
+        paths,
+        env,
+        Some(Box::new(move || control.poll())),
+        Some(Box::new(move || {
+            let _ = std::fs::remove_file(pane_file);
+            let _ = std::fs::remove_file(socket);
+        })),
+    )
 }
 
 fn run_toggle() -> anyhow::Result<()> {

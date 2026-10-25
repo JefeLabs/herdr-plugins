@@ -395,6 +395,7 @@ pub fn run(
     paths: ConfigPaths,
     env: SpawnEnv,
     mut control: Option<Box<dyn FnMut() -> Vec<ControlCmd>>>,
+    on_exit: Option<Box<dyn FnOnce()>>,
 ) -> anyhow::Result<()> {
     install_signal_handlers();
 
@@ -468,6 +469,12 @@ pub fn run(
 
     app.shutdown();
     restore_terminal();
+    // Drop the control poller (its socket unlinks on drop), then the caller's
+    // cleanup: `run` exits the process below, so nothing after it would run.
+    drop(control);
+    if let Some(f) = on_exit {
+        f();
+    }
     // The event-reader thread may be spinning on a dead pty; do not wait for it.
     match outcome {
         Ok(()) => std::process::exit(0),
