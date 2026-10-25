@@ -824,6 +824,11 @@ mod tests {
         app.select(0);
         app.resize(Size { rows: 9, cols: 50 });
         // content = 50 - 3 bar columns = 47 wide, footer not showing
+        assert!(
+            app.slots[0].proc.is_some(),
+            "slot 0 did not start: {:?}",
+            app.slots[0].last_error
+        );
         assert_eq!(app.slots[0].proc.as_ref().unwrap().screen().size(), (9, 47));
         assert_eq!(app.slots[1].proc.as_ref().unwrap().screen().size(), (9, 47));
         app.shutdown();
