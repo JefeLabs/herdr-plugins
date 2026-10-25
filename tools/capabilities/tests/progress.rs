@@ -125,14 +125,21 @@ fn an_open_pr_skips_missing_plan_stages() {
 }
 
 #[test]
-fn an_unknown_pr_state_counts_as_open() {
+fn an_unknown_pr_state_shows_no_state_word() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(7, PrState::Unknown)],
     };
     let (fill, label, _) = p("## Artifacts\n- pr: #7\n", &ev);
+    assert!(close(fill, 7.0), "still past planning: {fill}");
+    assert_eq!(label, "PR #7");
+    let ev = Evidence {
+        plans: vec![],
+        prs: vec![(1, PrState::Merged), (2, PrState::Unknown)],
+    };
+    let (fill, label, _) = p("## Artifacts\n- pr: #1\n- pr: #2\n", &ev);
     assert!(close(fill, 7.0));
-    assert_eq!(label, "PR #7 open");
+    assert_eq!(label, "2 PRs", "no merged count while one is unknown");
 }
 
 #[test]
@@ -299,11 +306,11 @@ fn pr_state_reads_gh_and_degrades() {
     fs::write(dir.join("9"), "OPEN").unwrap();
     let env = vec![("FAKE_GH_DIR".to_string(), dir.display().to_string())];
     let gh = fixtures().join("fake-gh.sh");
-    assert_eq!(pr_state(&gh, tmp.path(), 7, &env), PrState::Merged);
-    assert_eq!(pr_state(&gh, tmp.path(), 9, &env), PrState::Open);
-    assert_eq!(pr_state(&gh, tmp.path(), 8, &env), PrState::Unknown);
+    assert_eq!(pr_state(&gh, tmp.path(), "#7", &env), PrState::Merged);
+    assert_eq!(pr_state(&gh, tmp.path(), "#9", &env), PrState::Open);
+    assert_eq!(pr_state(&gh, tmp.path(), "#8", &env), PrState::Unknown);
     assert_eq!(
-        pr_state(&tmp.path().join("no-gh"), tmp.path(), 7, &env),
+        pr_state(&tmp.path().join("no-gh"), tmp.path(), "#7", &env),
         PrState::Unknown
     );
 }
@@ -387,4 +394,32 @@ fn poller_reports_on_a_channel_without_duplicates() {
     assert!(matches!(&updates[0], Update::Agents(Some(m)) if m.len() == 1));
     let calls = fs::read_to_string(tmp.path().join("herdr.log")).unwrap();
     assert_eq!(calls.matches("agent list").count(), 1);
+}
+
+#[test]
+fn pr_state_asks_gh_about_the_pr_as_linked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("prs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("1850"), "MERGED").unwrap();
+    fs::write(dir.join("9"), "OPEN").unwrap();
+    let log = tmp.path().join("gh.log");
+    let env = vec![
+        ("FAKE_GH_DIR".to_string(), dir.display().to_string()),
+        ("FAKE_GH_LOG".to_string(), log.display().to_string()),
+    ];
+    let gh = fixtures().join("fake-gh.sh");
+    let url = "https://github.com/skoolscout/jefelabs-com/pull/1850";
+    assert_eq!(pr_state(&gh, tmp.path(), url, &env), PrState::Merged);
+    assert_eq!(pr_state(&gh, tmp.path(), "o/other#9", &env), PrState::Open);
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.contains(&format!("pr view {url}")),
+        "the URL itself, not its number: {calls}"
+    );
+    assert!(
+        calls.contains("-R o/other"),
+        "owner/repo#n names its repo: {calls}"
+    );
+    assert_eq!(pr_number("o/other#9"), Some(9));
 }

@@ -321,11 +321,15 @@ pub struct App {
     list_selected: usize,
     /// Plan tasks per capability path, as last reported by the poller.
     plan_evidence: HashMap<PathBuf, Vec<crate::progress::PlanTasks>>,
-    /// Pull request states per `(repo, number)`, as last reported by `gh`.
-    pr_states: HashMap<(PathBuf, u64), crate::progress::PrState>,
+    /// Pull request states per `(repo, pr: target as linked)`, as last
+    /// reported by `gh`.
+    pr_states: HashMap<(PathBuf, String), crate::progress::PrState>,
     /// Latest `herdr agent list` (`name → agent_status`); `None` until known
     /// or when herdr cannot answer.
     agents: Option<HashMap<String, String>>,
+    /// herdr was asked and could not answer: the agent field stays blank
+    /// rather than looking like it is still loading.
+    agents_unavailable: bool,
     /// Background runner for herdr, gh and plan reads; made on first use so
     /// it picks up `herdr_env`.
     poller: Option<crate::progress::Poller>,
@@ -370,6 +374,7 @@ impl App {
             plan_evidence: HashMap::new(),
             pr_states: HashMap::new(),
             agents: None,
+            agents_unavailable: false,
             poller: None,
             poll_ticks: 0,
         };
@@ -545,16 +550,19 @@ impl App {
         let prs = crate::store::artifacts(&it.body)
             .into_iter()
             .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
-            .filter_map(|a| pr_number(&a.target))
-            .map(|n| {
+            .filter_map(|a| {
+                let n = pr_number(&a.target)?;
                 let state = it
                     .fm
                     .repo
                     .as_ref()
-                    .and_then(|r| self.pr_states.get(&(r.clone(), n)))
+                    .and_then(|r| {
+                        self.pr_states
+                            .get(&(r.clone(), a.target.trim().to_string()))
+                    })
                     .copied()
                     .unwrap_or(PrState::Unknown);
-                (n, state)
+                Some((n, state))
             })
             .collect();
         crate::progress::Evidence {
@@ -592,14 +600,15 @@ impl App {
             .cloned()
             .collect();
         for it in sent {
-            let prs: Vec<u64> = crate::store::artifacts(&it.body)
+            let prs: Vec<String> = crate::store::artifacts(&it.body)
                 .into_iter()
                 .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
-                .filter_map(|a| crate::progress::pr_number(&a.target))
+                .filter(|a| crate::progress::pr_number(&a.target).is_some())
+                .map(|a| a.target.trim().to_string())
                 .collect();
             if let Some(repo) = it.fm.repo.clone() {
-                for n in prs {
-                    self.poller().request_pr(repo.clone(), n);
+                for target in prs {
+                    self.poller().request_pr(repo.clone(), target);
                 }
             }
             self.poller().request_plans(it);
@@ -617,9 +626,16 @@ impl App {
         }
         for u in updates {
             match u {
-                crate::progress::Update::Agents(a) => self.agents = a,
-                crate::progress::Update::Pr { repo, n, state } => {
-                    self.pr_states.insert((repo, n), state);
+                crate::progress::Update::Agents(a) => {
+                    self.agents_unavailable = a.is_none();
+                    self.agents = a;
+                }
+                crate::progress::Update::Pr {
+                    repo,
+                    target,
+                    state,
+                } => {
+                    self.pr_states.insert((repo, target), state);
                 }
                 crate::progress::Update::Plans { path, plans } => {
                     self.plan_evidence.insert(path, plans);
@@ -633,6 +649,12 @@ impl App {
 
     /// `s`: refuse with the reason, or open the hand-off picker.
     fn start_send(&mut self) {
+        // the picker is drawn beside the tree: point the tree at this capability
+        if self.layout == Layout::List
+            && let Some(p) = self.selected_intent().map(|i| i.path.clone())
+        {
+            self.reveal(&p);
+        }
         if let Some(refusal) = self.selected_intent().and_then(crate::store::send_refusal) {
             self.message = Some(refusal);
         } else if let Some(it) = self.selected_intent() {
@@ -711,6 +733,15 @@ impl App {
 
     pub fn rescan(&mut self) {
         self.found_cache = None;
+        self.reload_tree();
+        self.refresh_found();
+        if self.layout == Layout::List {
+            self.poll_ticks = 0;
+        }
+    }
+
+    /// Re-read every capability from disk, keeping both selections.
+    fn reload_tree(&mut self) {
         let keep = match self.layout {
             Layout::Tree => self.selected_path(),
             Layout::List => self.list.get(self.list_selected).map(|i| i.path.clone()),
@@ -725,10 +756,6 @@ impl App {
             if let Some(i) = self.list.iter().position(|i| i.path == p) {
                 self.list_selected = i;
             }
-        }
-        self.refresh_found();
-        if self.layout == Layout::List {
-            self.poll_ticks = 0;
         }
     }
 
@@ -2298,6 +2325,10 @@ impl App {
         self.drain_polls();
         if self.layout == Layout::List {
             if self.poll_ticks.is_multiple_of(1800) {
+                // pick up lines agents appended to capability files
+                if self.poll_ticks > 0 {
+                    self.reload_tree();
+                }
                 self.request_polls(true);
             } else if self.poll_ticks.is_multiple_of(90) {
                 self.request_polls(false);
@@ -2526,6 +2557,7 @@ impl App {
                             Some(st) => st.to_string(),
                             None => "closed".to_string(),
                         },
+                        None if self.agents_unavailable => "—".to_string(),
                         None => "…".to_string(),
                     }),
                     _ => None,
@@ -3585,6 +3617,63 @@ mod tests {
             row(title_y - 1).starts_with("────"),
             "the card opens with a rule: {:?}",
             row(title_y - 1)
+        );
+    }
+
+    fn list_goto(app: &mut App, title: &str) {
+        for _ in 0..10 {
+            key(app, KeyCode::Char('k'));
+        }
+        for _ in 0..10 {
+            if list_title(app).starts_with(title) {
+                return;
+            }
+            key(app, KeyCode::Char('j'));
+        }
+        panic!("no list row {title}");
+    }
+
+    #[test]
+    fn send_from_the_list_shows_that_capability_in_the_tree() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        list_goto(&mut fx.app, "Org admins");
+        key(&mut fx.app, KeyCode::Char('s'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "send-pick");
+        assert!(
+            v.rows[v.selected].label.contains("Org admins"),
+            "the tree beside the picker points at the capability being sent: {:?}",
+            v.rows.get(v.selected)
+        );
+    }
+
+    #[test]
+    fn the_list_timer_picks_up_lines_appended_on_disk() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/43"), "OPEN").unwrap();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/building.md");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("- pr: #43\n");
+        fs::write(&path, text).unwrap();
+        fx.app.poll_ticks = 1800; // the minute timer is due
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 40);
+        assert!(shown.contains("PR #43 open"), "{shown}");
+    }
+
+    #[test]
+    fn the_agent_field_is_blank_when_herdr_cannot_answer() {
+        let mut fx = list_fixture(true);
+        fx.app.herdr_env.retain(|(k, _)| k != "FAKE_AGENT_LIST"); // fake herdr now fails
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 40);
+        assert!(
+            shown.contains("Oct 25 08:10 │ sent   │ —"),
+            "no endless loading mark: {shown}"
         );
     }
 

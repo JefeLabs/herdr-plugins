@@ -92,10 +92,13 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         };
         (MERGED, label)
     } else if !prs.is_empty() {
-        let label = if prs.len() == 1 {
-            format!("PR #{} open", prs[0].0)
-        } else {
-            format!("PRs {merged}/{} merged", prs.len())
+        // a state gh could not give is not shown as one
+        let unknown = prs.iter().any(|(_, s)| *s == PrState::Unknown);
+        let label = match (prs.len(), unknown) {
+            (1, true) => format!("PR #{}", prs[0].0),
+            (1, false) => format!("PR #{} open", prs[0].0),
+            (n, true) => format!("{n} PRs"),
+            (n, false) => format!("PRs {merged}/{n} merged"),
         };
         (PR_OPEN, label)
     } else if count("plan") > 0 {
@@ -191,14 +194,18 @@ fn leading_number(s: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// `#5830`, or a GitHub pull request URL.
+/// `#5830`, `owner/repo#12`, or a GitHub pull request URL.
 pub fn pr_number(target: &str) -> Option<u64> {
     let t = target.trim();
     if let Some(n) = t.strip_prefix('#') {
         return n.trim().parse().ok();
     }
-    let (_, after) = t.split_once("/pull/")?;
-    leading_number(after)
+    if let Some((_, after)) = t.split_once("/pull/") {
+        return leading_number(after);
+    }
+    // owner/repo#12
+    let (_, n) = t.split_once('#')?;
+    n.trim().parse().ok()
 }
 
 /// `fill` (0..=10) drawn over `cells` cells: full blocks, one eighth-block
@@ -292,11 +299,28 @@ fn ledgers_for(roots: &[PathBuf], plan: &str) -> Vec<String> {
     out
 }
 
-/// `gh pr view <n> --json state`, run in `repo`. Anything but a clear answer
-/// is `Unknown`.
-pub fn pr_state(gh: &Path, repo: &Path, n: u64, env: &[(String, String)]) -> PrState {
+/// `gh pr view … --json state`, run in `repo`, for a `pr:` target as linked:
+/// `#n` asks about this repo's PR, a URL is passed as is (it names its own
+/// repo), and `owner/repo#n` adds `-R owner/repo`. Anything but a clear
+/// answer is `Unknown`.
+pub fn pr_state(gh: &Path, repo: &Path, target: &str, env: &[(String, String)]) -> PrState {
+    let t = target.trim();
+    let args: Vec<String> = if let Some(n) = t.strip_prefix('#') {
+        vec![n.trim().to_string()]
+    } else if t.contains("/pull/") {
+        vec![t.to_string()]
+    } else if let Some((slug, n)) = t.split_once('#') {
+        vec![n.trim().to_string(), "-R".into(), slug.trim().to_string()]
+    } else {
+        return PrState::Unknown;
+    };
+    let view = ["pr".to_string(), "view".to_string(), args[0].clone()];
+    let rest: Vec<String> = ["--json".to_string(), "state".to_string()]
+        .into_iter()
+        .chain(args[1..].iter().cloned())
+        .collect();
     let out = Command::new(gh)
-        .args(["pr", "view", &n.to_string(), "--json", "state"])
+        .args(view.iter().chain(rest.iter()))
         .current_dir(repo)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
@@ -364,7 +388,8 @@ pub enum Update {
     Agents(Option<HashMap<String, String>>),
     Pr {
         repo: PathBuf,
-        n: u64,
+        /// The `pr:` target as linked.
+        target: String,
         state: PrState,
     },
     /// Plan tasks for the capability at `path` (reading plans runs git).
@@ -409,8 +434,8 @@ impl Poller {
         });
     }
 
-    pub fn request_pr(&mut self, repo: PathBuf, n: u64) {
-        let key = format!("pr:{}:{n}", repo.display());
+    pub fn request_pr(&mut self, repo: PathBuf, target: String) {
+        let key = format!("pr:{}:{target}", repo.display());
         if !self.in_flight.insert(key.clone()) {
             return;
         }
@@ -418,9 +443,16 @@ impl Poller {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let state = tool_bin(&env, "GH_BIN_PATH", Some("gh"))
-                .map(|gh| pr_state(&gh, &repo, n, &env))
+                .map(|gh| pr_state(&gh, &repo, &target, &env))
                 .unwrap_or(PrState::Unknown);
-            let _ = tx.send((key, Update::Pr { repo, n, state }));
+            let _ = tx.send((
+                key,
+                Update::Pr {
+                    repo,
+                    target,
+                    state,
+                },
+            ));
         });
     }
 
