@@ -3,8 +3,8 @@ use std::path::Path;
 
 use herdr_capabilities::store::{
     SaveError, State, Store, add_artifact, add_checklist_item, add_question, answer_question,
-    artifacts, criteria, open_questions, preconditions, questions, slugify, toggle_criterion,
-    toggle_precondition,
+    artifacts, criteria, discover_artifacts, open_questions, preconditions, questions, slugify,
+    toggle_criterion, toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -457,4 +457,74 @@ fn artifacts_parse_kind_and_target_and_can_be_added() {
         out.contains("- spec: docs/x.md\n- plan: docs/y.md\n"),
         "{out}"
     );
+}
+
+#[test]
+fn discover_artifacts_finds_specs_plans_and_adrs_that_match_the_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    for d in [
+        "docs/superpowers/specs",
+        "docs/superpowers/plans",
+        "docs/adr",
+        "docs/other",
+    ] {
+        fs::create_dir_all(repo.join(d)).unwrap();
+    }
+    fs::write(
+        repo.join("docs/superpowers/specs/2026-10-24-skipped-folder-label-design.md"),
+        "# Skipped folder label\n\nFamilies who skip a folder see Pending.\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("docs/superpowers/plans/2026-10-25-skipped-folder-label.md"),
+        "# Skipped folder label Implementation Plan\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("docs/adr/0007-pending-vs-skipped.md"),
+        "# ADR 7: Pending vs Skipped folder state\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("docs/adr/0008-unrelated.md"),
+        "# ADR 8: Caching\n",
+    )
+    .unwrap();
+    fs::write(repo.join("docs/other/skipped-folder-notes.md"), "# notes\n").unwrap();
+    let found = discover_artifacts(
+        repo,
+        "Families can skip a folder without seeing Pending",
+        &["docs/superpowers/specs/2026-10-24-skipped-folder-label-design.md".to_string()],
+    );
+    let targets: Vec<(&str, &str)> = found
+        .iter()
+        .map(|a| (a.kind.as_str(), a.target.as_str()))
+        .collect();
+    assert!(
+        targets.contains(&(
+            "plan",
+            "docs/superpowers/plans/2026-10-25-skipped-folder-label.md"
+        )),
+        "{targets:?}"
+    );
+    assert!(
+        targets.contains(&("adr", "docs/adr/0007-pending-vs-skipped.md")),
+        "{targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|(_, t)| t.contains("0008")),
+        "unrelated ADR excluded: {targets:?}"
+    );
+    assert!(
+        !targets
+            .iter()
+            .any(|(_, t)| t.contains("2026-10-24-skipped-folder-label-design")),
+        "already linked ones are not repeated: {targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|(_, t)| t.contains("docs/other")),
+        "only the known folders are scanned: {targets:?}"
+    );
+    assert!(discover_artifacts(Path::new("/nonexistent"), "x", &[]).is_empty());
 }

@@ -782,6 +782,94 @@ pub fn add_artifact(body: &str, kind: &str, target: &str) -> String {
     )
 }
 
+/// Where generated artifacts live in a repo, and the kind each folder implies.
+const ARTIFACT_DIRS: &[(&str, &str)] = &[
+    ("docs/superpowers/specs", "spec"),
+    ("docs/superpowers/plans", "plan"),
+    ("docs/adr", "adr"),
+];
+
+fn significant_words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| {
+            w.len() > 3
+                && !matches!(
+                    *w,
+                    "with"
+                        | "without"
+                        | "from"
+                        | "that"
+                        | "this"
+                        | "into"
+                        | "when"
+                        | "then"
+                        | "them"
+                        | "they"
+                        | "have"
+                        | "design"
+                        | "plan"
+                        | "implementation"
+                )
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn word_matches(a: &str, b: &str) -> bool {
+    a == b || (a.len() >= 4 && b.starts_with(a)) || (b.len() >= 4 && a.starts_with(b))
+}
+
+/// Files under the known artifact folders of `repo` whose name or first
+/// heading shares at least two significant words with `title`, minus the
+/// targets already linked. Paths are relative to the repo.
+pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<Artifact> {
+    let wanted = significant_words(title);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    // two shared words for a normal title; a one-word title matches on that word
+    let needed = wanted.len().min(2);
+    let mut out = Vec::new();
+    for (dir, kind) in ARTIFACT_DIRS {
+        let Ok(rd) = std::fs::read_dir(repo.join(dir)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                continue;
+            }
+            let rel = format!("{dir}/{}", e.file_name().to_string_lossy());
+            if already.iter().any(|a| a.trim() == rel) {
+                continue;
+            }
+            let heading = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .find(|l| l.starts_with("# "))
+                        .map(|l| l.trim_start_matches('#').trim().to_string())
+                })
+                .unwrap_or_default();
+            let haystack: Vec<String> =
+                significant_words(&format!("{} {heading}", e.file_name().to_string_lossy()));
+            let hits = wanted
+                .iter()
+                .filter(|w| haystack.iter().any(|h| word_matches(w, h)))
+                .count();
+            if hits >= needed {
+                out.push(Artifact {
+                    kind: kind.to_string(),
+                    target: rel,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.target.cmp(&b.target));
+    out
+}
+
 pub const CRITERIA_HEADING: &str = "## Acceptance criteria";
 pub const PRECONDITIONS_HEADING: &str = "## Preconditions";
 

@@ -62,9 +62,15 @@ What this is, in the author's words (for an issue: observed, expected, steps).
 - Which org saw this?
   → IYM, on Oct 20
 - Since when?
+
+## Artifacts
+- spec: docs/superpowers/specs/2026-10-25-skipped-folder-design.md
+- issue: #5499
 ```
 
 The right-hand side shows the three parts as separate panes under a header. The Description pane and the agent's replies in the chat render Markdown: headings bold, bullets as dots, bold, italic and code spans styled, code blocks dimmed; the editor shows the raw text. `Tab` and `Shift-Tab` move focus between the tree, Description, Preconditions, Acceptance criteria and Open questions; `Esc` returns to the tree. In Description, `j`/`k` scroll and `Enter` edits. In Acceptance criteria, `j`/`k` choose and `Enter` or space toggles the checkbox, staying in the pane so several can be ticked. In Open questions, `j`/`k` choose and `Enter` opens an answer box right under the question; type (or paste), `Enter` saves, `Esc` cancels. Answers are stored as an indented `→` line under the question, answered questions no longer count as open (the `?N` mark counts only unanswered ones), and the agent is told to keep them with their answers rather than re-ask. `Q` jumps to the questions; `C` jumps to the criteria and, pressed again, to the preconditions. In any of the three list panes `a` adds an item there by hand; a polish drafts all three lists for you. Preconditions are assumptions, not checks: when a capability is sent, the receiving agent is told to verify each one against the code before building anything and to ask about those it cannot settle.
+
+The Artifacts pane (`V`) lists what the agents produced for the capability: specs, plans, ADRs, decision records and tickets, one `- kind: target` line each under `## Artifacts`. Every handoff prompt asks the receiving agent to append such a line for each file or issue it creates. `Enter` reads a Markdown file right here (`o` opens it outside, as do tickets and URLs), `a` adds a line by hand. The pane also scans the capability's repo (`docs/superpowers/specs`, `docs/superpowers/plans`, `docs/adr`) for files whose name or first heading shares words with the capability's title and lists them dimmed as *found*, with a `?` after the kind; `Enter` reads them the same way and `L` links one for good. The scan runs once per selected capability and again after `r`.
 
 ## Keys
 

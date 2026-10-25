@@ -419,6 +419,7 @@ mod tests {
             criteria_selected: 0,
             question_selected: 0,
             artifacts_selected: 0,
+            found: &[],
             answering: None,
         };
         let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
@@ -522,6 +523,8 @@ pub struct DetailView<'a> {
     pub criteria_selected: usize,
     pub question_selected: usize,
     pub artifacts_selected: usize,
+    /// Artifacts found by scanning the repo but not yet linked; listed after the linked ones.
+    pub found: &'a [crate::store::Artifact],
     /// `(question index, text so far)` while an answer is being typed.
     pub answering: Option<(usize, &'a str)>,
 }
@@ -575,7 +578,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
             Constraint::Length((p_rows + 1).clamp(2, third.min(8))),
             Constraint::Length((c_rows + 1).clamp(2, third.min(8))),
             Constraint::Length((q_rows + 1).clamp(2, third + 2)),
-            Constraint::Length((arts.len() as u16 + 1).clamp(2, 6)),
+            Constraint::Length(((arts.len() + v.found.len()) as u16 + 1).clamp(2, 8)),
         ])
         .split(area);
 
@@ -761,14 +764,21 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         line.render(rect, buf);
     }
 
-    // artifacts
-    let block = pane_block(
-        &format!("Artifacts ({})", arts.len()),
-        v.focus == Pane::Artifacts,
-    );
+    // artifacts: linked first, then those found in the repo (dim, "found")
+    let title = if v.found.is_empty() {
+        format!("Artifacts ({})", arts.len())
+    } else {
+        format!("Artifacts ({} linked, {} found)", arts.len(), v.found.len())
+    };
+    let block = pane_block(&title, v.focus == Pane::Artifacts);
     let inner = block.inner(layout[5]);
     block.render(layout[5], buf);
-    if arts.is_empty() {
+    let all: Vec<(&crate::store::Artifact, bool)> = arts
+        .iter()
+        .map(|a| (a, false))
+        .chain(v.found.iter().map(|a| (a, true)))
+        .collect();
+    if all.is_empty() {
         Paragraph::new(Span::styled("none yet — specs, plans, ADRs and tickets the agents produce land here (a adds one by hand)", Style::default().add_modifier(Modifier::DIM))).wrap(Wrap { trim: false }).render(inner, buf);
     }
     let skip = if v.artifacts_selected >= inner.height as usize {
@@ -776,7 +786,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     } else {
         0
     };
-    for (k, (i, a)) in arts.iter().enumerate().skip(skip).enumerate() {
+    for (k, (i, (a, is_found))) in all.iter().enumerate().skip(skip).enumerate() {
         let y = inner.y + k as u16;
         if y >= inner.y + inner.height {
             break;
@@ -789,12 +799,19 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         if v.focus == Pane::Artifacts && i == v.artifacts_selected {
             buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
         }
-        Line::from(vec![
-            Span::styled(
-                format!("{:<9}", sanitize(&a.kind)),
+        let (tag, target_style, hint) = if *is_found {
+            (
+                format!("{:<9}", format!("{}?", sanitize(&a.kind))),
                 Style::default().add_modifier(Modifier::DIM),
-            ),
-            Span::raw(sanitize(&a.target)),
+                "   (found · L links)",
+            )
+        } else {
+            (format!("{:<9}", sanitize(&a.kind)), Style::default(), "")
+        };
+        Line::from(vec![
+            Span::styled(tag, Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(sanitize(&a.target), target_style),
+            Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
         ])
         .render(rect, buf);
     }

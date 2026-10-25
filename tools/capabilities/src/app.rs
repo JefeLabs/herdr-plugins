@@ -202,6 +202,8 @@ pub struct View {
     pub criteria_selected: usize,
     pub answer_text: String,
     pub artifact_count: usize,
+    /// Artifacts found in the repo but not yet linked.
+    pub found_count: usize,
     pub reader_title: String,
 }
 
@@ -238,6 +240,8 @@ pub struct App {
     criteria_selected: usize,
     question_selected: usize,
     artifacts_selected: usize,
+    /// Artifacts found in the selected capability's repo, cached per path.
+    found_cache: Option<(PathBuf, Vec<crate::store::Artifact>)>,
 }
 
 impl App {
@@ -269,6 +273,7 @@ impl App {
             criteria_selected: 0,
             question_selected: 0,
             artifacts_selected: 0,
+            found_cache: None,
         };
         app.rebuild_rows();
         Ok(app)
@@ -331,6 +336,7 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
+        self.found_cache = None;
         let keep = self.selected_path();
         match self.store.scan() {
             Ok(t) => self.tree = t,
@@ -340,6 +346,7 @@ impl App {
         if let Some(p) = keep {
             self.select_path(&p);
         }
+        self.refresh_found();
     }
 
     fn selected_path(&self) -> Option<PathBuf> {
@@ -390,6 +397,38 @@ impl App {
         }
     }
 
+    /// Fill the found-artifacts cache for the selected capability (scans its
+    /// repo's `docs/superpowers/{specs,plans}` and `docs/adr`). Cached per path,
+    /// dropped on rescan, so a key press costs nothing once computed.
+    fn refresh_found(&mut self) {
+        let Some(it) = self.selected_intent().cloned() else {
+            self.found_cache = None;
+            return;
+        };
+        if matches!(&self.found_cache, Some((p, _)) if *p == it.path) {
+            return;
+        }
+        let found = match &it.fm.repo {
+            Some(repo) if repo.is_dir() => {
+                let already: Vec<String> = crate::store::artifacts(&it.body)
+                    .into_iter()
+                    .map(|a| a.target)
+                    .collect();
+                crate::store::discover_artifacts(repo, &it.fm.title, &already)
+            }
+            _ => Vec::new(),
+        };
+        self.found_cache = Some((it.path, found));
+    }
+
+    /// The cached found artifacts for the selected capability.
+    fn found_artifacts(&self) -> &[crate::store::Artifact] {
+        match (&self.found_cache, self.selected_intent()) {
+            (Some((p, found)), Some(it)) if *p == it.path => found,
+            _ => &[],
+        }
+    }
+
     /// A field-only change: reload from disk, change, save, rescan. Never
     /// writes the cached row's body (C2).
     fn update_selected_fields(&mut self, f: impl FnOnce(&mut crate::store::FrontMatter)) {
@@ -405,6 +444,12 @@ impl App {
     // ---- keys -------------------------------------------------------------
 
     pub fn key(&mut self, k: KeyEvent) -> Flow {
+        let flow = self.key_inner(k);
+        self.refresh_found();
+        flow
+    }
+
+    fn key_inner(&mut self, k: KeyEvent) -> Flow {
         if k.kind == KeyEventKind::Release {
             return Flow::Continue;
         }
@@ -794,21 +839,45 @@ impl App {
                 }
             }
             Pane::Artifacts => {
-                let arts = crate::store::artifacts(&it.body);
+                let linked = crate::store::artifacts(&it.body);
+                let found = self.found_artifacts().to_vec();
+                let total = linked.len() + found.len();
+                // (artifact, is_found) at a row of the combined list
+                let pick = |i: usize| {
+                    if i < linked.len() {
+                        linked.get(i).cloned().map(|a| (a, false))
+                    } else {
+                        found.get(i - linked.len()).cloned().map(|a| (a, true))
+                    }
+                };
                 match k.code {
                     KeyCode::Esc => self.focus = Pane::Tree,
                     KeyCode::Char('j') | KeyCode::Down => {
                         self.artifacts_selected =
-                            (self.artifacts_selected + 1).min(arts.len().saturating_sub(1))
+                            (self.artifacts_selected + 1).min(total.saturating_sub(1))
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.artifacts_selected = self.artifacts_selected.saturating_sub(1)
                     }
                     KeyCode::Enter | KeyCode::Char('o') => {
-                        if let Some(a) = arts.get(self.artifacts_selected).cloned() {
+                        if let Some((a, _)) = pick(self.artifacts_selected) {
                             self.open_artifact(&it, &a, k.code == KeyCode::Char('o'));
                         }
                     }
+                    KeyCode::Char('L') => match pick(self.artifacts_selected) {
+                        Some((a, true)) => {
+                            self.edit_selected_body(|body| {
+                                crate::store::add_artifact(body, &a.kind, &a.target)
+                            });
+                            self.found_cache = None;
+                            self.artifacts_selected = linked.len();
+                            self.message = Some(format!("linked {}", a.target));
+                        }
+                        Some((_, false)) => {
+                            self.message = Some("already linked".into());
+                        }
+                        None => {}
+                    },
                     _ => {}
                 }
             }
@@ -1963,6 +2032,7 @@ impl App {
                 .selected_intent()
                 .map(|i| crate::store::artifacts(&i.body).len())
                 .unwrap_or(0),
+            found_count: self.found_artifacts().len(),
             reader_title: String::new(),
         };
         match &self.screen {
@@ -2171,6 +2241,7 @@ impl App {
                             criteria_selected: self.criteria_selected,
                             question_selected: self.question_selected,
                             artifacts_selected: self.artifacts_selected,
+                            found: self.found_artifacts(),
                             answering,
                         },
                         right,
@@ -2207,7 +2278,7 @@ impl App {
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read here · o open outside · a add · Esc tree".to_string(),
+                (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
             },
         };
         ui::render_status(&status_text, status, buf);
@@ -3708,6 +3779,47 @@ mod tests {
                 .message
                 .unwrap_or_default()
                 .contains("nope.md")
+        );
+    }
+
+    #[test]
+    fn found_artifacts_show_in_the_pane_and_l_links_one() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx._tmp.path().join("repo");
+        fs::create_dir_all(repo.join("docs/superpowers/specs")).unwrap();
+        fs::write(
+            repo.join("docs/superpowers/specs/2026-10-25-alpha-design.md"),
+            "# Alpha design\n\nbody\n",
+        )
+        .unwrap();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(repo.clone());
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('V'));
+        let v = fx.app.view();
+        assert_eq!(v.artifact_count, 0, "nothing linked yet");
+        assert_eq!(v.found_count, 1, "but one found by scanning the repo");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(
+            fx.app.view().screen,
+            "reader",
+            "a found file reads like a linked one"
+        );
+        key(&mut fx.app, KeyCode::Esc);
+        key(&mut fx.app, KeyCode::Char('L'));
+        let body = Store::load(&path).unwrap().body;
+        assert!(
+            body.contains("- spec: docs/superpowers/specs/2026-10-25-alpha-design.md"),
+            "{body}"
+        );
+        let v = fx.app.view();
+        assert_eq!(
+            (v.artifact_count, v.found_count),
+            (1, 0),
+            "linked, so no longer merely found"
         );
     }
 }
