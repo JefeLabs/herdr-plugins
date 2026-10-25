@@ -1,5 +1,6 @@
 ---
 source: tools/capabilities/src/app.rs
+assertion_line: 3752
 expression: t.backend()
 ---
 "▾ Inbox (1)               │a add capability · n new group · ? help                        "
@@ -17,4 +18,4 @@ expression: t.backend()
 "                          │                                                               "
 "                          │                                                               "
 "                          │                                                               "
-"Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R "
+"v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s "

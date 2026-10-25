@@ -367,6 +367,11 @@ pub enum Update {
         n: u64,
         state: PrState,
     },
+    /// Plan tasks for the capability at `path` (reading plans runs git).
+    Plans {
+        path: PathBuf,
+        plans: Vec<PlanTasks>,
+    },
 }
 
 /// Runs `herdr` and `gh` on spawned threads and hands results back over a
@@ -417,6 +422,30 @@ impl Poller {
                 .unwrap_or(PrState::Unknown);
             let _ = tx.send((key, Update::Pr { repo, n, state }));
         });
+    }
+
+    /// Read the plans of `intent` (git and file reads) off the UI thread.
+    pub fn request_plans(&mut self, intent: Intent) {
+        let key = format!("plans:{}", intent.path.display());
+        if !self.in_flight.insert(key.clone()) {
+            return;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let plans = plan_evidence(intent.fm.repo.as_deref(), &intent);
+            let _ = tx.send((
+                key,
+                Update::Plans {
+                    path: intent.path,
+                    plans,
+                },
+            ));
+        });
+    }
+
+    /// Requests started and not yet drained.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
     }
 
     /// Every result that has arrived since the last call.

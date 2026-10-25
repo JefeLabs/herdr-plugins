@@ -319,8 +319,18 @@ pub struct App {
     /// Every capability in the tree, in list order (all groups, collapsed or not).
     list: Vec<Intent>,
     list_selected: usize,
-    /// Plan and PR evidence per capability path, for progress.
-    evidence: HashMap<PathBuf, crate::progress::Evidence>,
+    /// Plan tasks per capability path, as last reported by the poller.
+    plan_evidence: HashMap<PathBuf, Vec<crate::progress::PlanTasks>>,
+    /// Pull request states per `(repo, number)`, as last reported by `gh`.
+    pr_states: HashMap<(PathBuf, u64), crate::progress::PrState>,
+    /// Latest `herdr agent list` (`name → agent_status`); `None` until known
+    /// or when herdr cannot answer.
+    agents: Option<HashMap<String, String>>,
+    /// Background runner for herdr, gh and plan reads; made on first use so
+    /// it picks up `herdr_env`.
+    poller: Option<crate::progress::Poller>,
+    /// Ticks since the list started polling; 0 means "poll everything now".
+    poll_ticks: u32,
 }
 
 impl App {
@@ -357,7 +367,11 @@ impl App {
             sort: SortOrder::Updated,
             list: Vec::new(),
             list_selected: 0,
-            evidence: HashMap::new(),
+            plan_evidence: HashMap::new(),
+            pr_states: HashMap::new(),
+            agents: None,
+            poller: None,
+            poll_ticks: 0,
         };
         let last = crate::config::last_used(&app.dirs, &app.cfg);
         if let Some(l) = last.layout.as_deref().and_then(Layout::parse) {
@@ -441,7 +455,6 @@ impl App {
         }
         let mut list = Vec::new();
         collect(&self.tree, &mut list);
-        let empty = crate::progress::Evidence::default();
         match self.sort {
             SortOrder::Updated => list.sort_by_key(|i| std::cmp::Reverse(crate::store::stamp(i))),
             SortOrder::Captured => list.sort_by_key(|i| std::cmp::Reverse(i.fm.created)),
@@ -449,8 +462,7 @@ impl App {
             SortOrder::Progress => {
                 let key = |i: &Intent| {
                     use crate::store::Readiness;
-                    let ev = self.evidence.get(&i.path).unwrap_or(&empty);
-                    let prog = crate::progress::progress(i, ev);
+                    let prog = crate::progress::progress(i, &self.evidence_for(i));
                     let (rank, open, fill) = match crate::store::readiness(i) {
                         Readiness::Raw => (0, 0, 0.0),
                         Readiness::Open(n) => (1, n, 0.0),
@@ -496,6 +508,7 @@ impl App {
                     _ => None,
                 };
                 self.layout = Layout::List;
+                self.poll_ticks = 0;
                 if let Some(i) = target.and_then(|p| self.list.iter().position(|i| i.path == p)) {
                     self.list_selected = i;
                 }
@@ -525,6 +538,149 @@ impl App {
         self.select_path(path);
     }
 
+    /// Plans and PR states gathered so far for `it`; a PR not yet answered by
+    /// `gh` reads as `Unknown` (open).
+    fn evidence_for(&self, it: &Intent) -> crate::progress::Evidence {
+        use crate::progress::{PrState, pr_number};
+        let prs = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+            .filter_map(|a| pr_number(&a.target))
+            .map(|n| {
+                let state = it
+                    .fm
+                    .repo
+                    .as_ref()
+                    .and_then(|r| self.pr_states.get(&(r.clone(), n)))
+                    .copied()
+                    .unwrap_or(PrState::Unknown);
+                (n, state)
+            })
+            .collect();
+        crate::progress::Evidence {
+            plans: self
+                .plan_evidence
+                .get(&it.path)
+                .cloned()
+                .unwrap_or_default(),
+            prs,
+        }
+    }
+
+    fn poller(&mut self) -> &mut crate::progress::Poller {
+        let env = self.herdr_env.clone();
+        self.poller
+            .get_or_insert_with(|| crate::progress::Poller::new(env))
+    }
+
+    /// Background requests started and not yet reported.
+    pub fn polls_in_flight(&self) -> usize {
+        self.poller.as_ref().map_or(0, |p| p.in_flight())
+    }
+
+    /// Ask for agent states and, when `all`, every sent capability's plans and
+    /// PR states.
+    fn request_polls(&mut self, all: bool) {
+        self.poller().request_agents();
+        if !all {
+            return;
+        }
+        let sent: Vec<Intent> = self
+            .list
+            .iter()
+            .filter(|i| i.fm.state == State::Sent)
+            .cloned()
+            .collect();
+        for it in sent {
+            let prs: Vec<u64> = crate::store::artifacts(&it.body)
+                .into_iter()
+                .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+                .filter_map(|a| crate::progress::pr_number(&a.target))
+                .collect();
+            if let Some(repo) = it.fm.repo.clone() {
+                for n in prs {
+                    self.poller().request_pr(repo.clone(), n);
+                }
+            }
+            self.poller().request_plans(it);
+        }
+    }
+
+    /// Fold finished background requests into the list's evidence.
+    fn drain_polls(&mut self) {
+        let Some(p) = self.poller.as_mut() else {
+            return;
+        };
+        let updates = p.drain();
+        if updates.is_empty() {
+            return;
+        }
+        for u in updates {
+            match u {
+                crate::progress::Update::Agents(a) => self.agents = a,
+                crate::progress::Update::Pr { repo, n, state } => {
+                    self.pr_states.insert((repo, n), state);
+                }
+                crate::progress::Update::Plans { path, plans } => {
+                    self.plan_evidence.insert(path, plans);
+                }
+            }
+        }
+        if self.sort == SortOrder::Progress {
+            self.rebuild_list();
+        }
+    }
+
+    /// `s`: refuse with the reason, or open the hand-off picker.
+    fn start_send(&mut self) {
+        if let Some(refusal) = self.selected_intent().and_then(crate::store::send_refusal) {
+            self.message = Some(refusal);
+        } else if let Some(it) = self.selected_intent() {
+            let handoffs: Vec<Handoff> = self
+                .cfg
+                .handoffs
+                .iter()
+                .filter(|h| h.applies_to(&it.fm.kind))
+                .cloned()
+                .collect();
+            if handoffs.is_empty() {
+                self.message = Some(format!("no handoff for kind `{}`", it.fm.kind));
+            } else {
+                self.screen = Screen::SendPick {
+                    handoffs,
+                    selected: 0,
+                };
+            }
+        }
+    }
+
+    /// `g`: focus the agent the selected capability was sent to.
+    fn go_to_agent(&mut self) {
+        let Some(agent) = self
+            .selected_intent()
+            .and_then(|i| i.fm.sent_to.as_ref())
+            .map(|s| s.agent.clone())
+        else {
+            self.message = Some("not sent yet".into());
+            return;
+        };
+        let env = self.herdr_env.clone();
+        let Some(bin) = crate::progress::tool_bin(&env, "HERDR_BIN_PATH", None) else {
+            self.message = Some("Herdr is required: HERDR_BIN_PATH is not set".into());
+            return;
+        };
+        self.message = Some(format!("focusing {agent}"));
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new(bin)
+                .args(["agent", "focus", &agent])
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
+
     fn key_list(&mut self, k: KeyEvent) -> Flow {
         let last = self.list.len().saturating_sub(1);
         match k.code {
@@ -546,6 +702,8 @@ impl App {
                     crate::config::save_view(&self.dirs, self.layout.label(), self.sort.label());
             }
             KeyCode::Char('r') => self.rescan(),
+            KeyCode::Char('s') => self.start_send(),
+            KeyCode::Char('g') => self.go_to_agent(),
             _ => {}
         }
         Flow::Continue
@@ -569,6 +727,9 @@ impl App {
             }
         }
         self.refresh_found();
+        if self.layout == Layout::List {
+            self.poll_ticks = 0;
+        }
     }
 
     fn selected_path(&self) -> Option<PathBuf> {
@@ -924,27 +1085,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('s') => {
-                if let Some(refusal) = self.selected_intent().and_then(crate::store::send_refusal) {
-                    self.message = Some(refusal);
-                } else if let Some(it) = self.selected_intent() {
-                    let handoffs: Vec<Handoff> = self
-                        .cfg
-                        .handoffs
-                        .iter()
-                        .filter(|h| h.applies_to(&it.fm.kind))
-                        .cloned()
-                        .collect();
-                    if handoffs.is_empty() {
-                        self.message = Some(format!("no handoff for kind `{}`", it.fm.kind));
-                    } else {
-                        self.screen = Screen::SendPick {
-                            handoffs,
-                            selected: 0,
-                        };
-                    }
-                }
-            }
+            KeyCode::Char('s') => self.start_send(),
             KeyCode::Char('t') => {
                 if let Some(it) = self.selected_intent() {
                     self.screen = Screen::Input {
@@ -2152,6 +2293,17 @@ impl App {
             // about every 5 s at the loop's 33 ms cadence
             self.check_for_newer_build(binary_mtime());
         }
+        // list evidence: agents every ~3 s, plans and PRs on entry, on r and
+        // every ~60 s; all on background threads
+        self.drain_polls();
+        if self.layout == Layout::List {
+            if self.poll_ticks.is_multiple_of(1800) {
+                self.request_polls(true);
+            } else if self.poll_ticks.is_multiple_of(90) {
+                self.request_polls(false);
+            }
+            self.poll_ticks = self.poll_ticks.wrapping_add(1);
+        }
         let Screen::Chat(st) = &mut self.screen else {
             return;
         };
@@ -2340,7 +2492,92 @@ impl App {
         v
     }
 
+    /// The list layout over the whole area, status line at the bottom.
+    fn draw_list(&self, area: Rect, buf: &mut Buffer) {
+        let list_area = Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        let status = Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        struct Owned {
+            group: String,
+            description: String,
+            flag: Option<&'static str>,
+        }
+        let owned: Vec<Owned> = self
+            .list
+            .iter()
+            .map(|i| {
+                let group = i
+                    .path
+                    .parent()
+                    .and_then(|d| d.strip_prefix(self.store.root()).ok())
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default();
+                let description = ui::description_text(&i.body)
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty() && !l.starts_with('#'))
+                    .unwrap_or("")
+                    .to_string();
+                let flag = match (&i.fm.sent_to, &self.agents, i.fm.state) {
+                    (Some(sent), Some(agents), State::Sent) => match agents.get(&sent.agent) {
+                        Some(st) if st == "blocked" => Some("! needs you"),
+                        Some(_) => None,
+                        None => Some("closed"),
+                    },
+                    _ => None,
+                };
+                Owned {
+                    group,
+                    description,
+                    flag,
+                }
+            })
+            .collect();
+        let rows: Vec<ui::ListRow> = self
+            .list
+            .iter()
+            .zip(&owned)
+            .map(|(i, o)| {
+                let when = match self.sort {
+                    SortOrder::Captured => i.fm.created,
+                    _ => crate::store::stamp(i),
+                };
+                ui::ListRow {
+                    status: crate::store::readiness(i).label(),
+                    progress: crate::progress::progress(i, &self.evidence_for(i))
+                        .map(|p| (p.fill, p.label, p.complete)),
+                    flag: o.flag,
+                    title: &i.fm.title,
+                    group: &o.group,
+                    when: when.format("%b %d %H:%M").to_string(),
+                    description: &o.description,
+                }
+            })
+            .collect();
+        let header = format!(
+            "Capabilities · {} · sorted by {}",
+            self.list.len(),
+            self.sort.label()
+        );
+        ui::render_capability_list(&rows, self.list_selected, &header, list_area, buf);
+        let text = self.message.clone().unwrap_or_else(|| {
+            "j/k move  Enter open in tree  v tree  S sort  s send  g agent  r rescan  q quit"
+                .to_string()
+        });
+        ui::render_status(&text, status, buf);
+    }
+
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
+        if matches!(self.screen, Screen::Browse) && self.layout == Layout::List {
+            self.draw_list(area, buf);
+            return;
+        }
         let (left, right, status) = ui::split(area);
         let tree_rows: Vec<ui::TreeRow> = self
             .rows
@@ -2523,7 +2760,7 @@ impl App {
             Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
             Screen::Browse => match (&self.message, self.focus) {
                 (Some(m), _) => m.clone(),
-                (None, Pane::Tree) => "Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
+                (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · a add · Tab next pane · Esc tree".to_string(),
@@ -3139,6 +3376,293 @@ mod tests {
         assert_eq!(last.model.as_deref(), Some("opus"));
         assert_eq!(last.layout.as_deref(), Some("list"));
         assert_eq!(last.sort.as_deref(), Some("Title"));
+    }
+
+    struct ListFx {
+        tmp: tempfile::TempDir,
+        app: App,
+    }
+
+    /// A capability file written by hand so its timestamps are fixed.
+    fn write_cap(root: &Path, dir: &str, stem: &str, front: &str, body: &str) {
+        let d = root.join(dir);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join(format!("{stem}.md")),
+            format!("---\n{front}---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    /// Six capabilities covering every row kind, a repo with a plan and its
+    /// ledger, a fake gh that knows PR #42 is open, and a fake herdr whose
+    /// agent for the PR capability is blocked.
+    fn list_fixture(repo_for_sent: bool) -> ListFx {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("docs/superpowers/plans")).unwrap();
+        fs::write(
+            repo.join("docs/superpowers/plans/reassign.md"),
+            "### Task 1: a\n### Task 2: b\n### Task 3: c\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join(".superpowers/sdd/reassign")).unwrap();
+        fs::write(
+            repo.join(".superpowers/sdd/reassign/progress.md"),
+            "# SDD ledger — plan: docs/superpowers/plans/reassign.md\nTask 1: complete\n",
+        )
+        .unwrap();
+        let repo_line = if repo_for_sent {
+            format!("repo: {}\n", repo.display())
+        } else {
+            String::new()
+        };
+        let sent = |agent: &str| {
+            format!(
+                "state: sent\n{repo_line}sent_to:\n  handoff: grill\n  workspace_id: w9\n  agent: {agent}\n  at: 2026-10-25T08:10:00-04:00\n"
+            )
+        };
+        let root = &dirs.root;
+        write_cap(
+            root,
+            "Inbox",
+            "raw",
+            "title: a\nkind: idea\nstate: raw\ncreated: 2026-10-25 07:30:00\nupdated: 2026-10-25 07:30:00\n",
+            "## Description\n\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "open",
+            "title: Families can skip a folder without seeing Pending\nkind: issue\nstate: refining\ncreated: 2026-10-24 09:00:00\nupdated: 2026-10-24 18:02:00\n",
+            "## Description\nWhen a parent uses Skip for now on the report-card folder, the folder still shows up labelled Pending.\n\n## Open questions\n- Which org saw this?\n- Since when?\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "ready",
+            "title: Org admins can export candidate lists as CSV\nkind: enhancement\nstate: refining\ncreated: 2026-10-22 09:00:00\nupdated: 2026-10-23 09:41:00\n",
+            "## Description\nAdmins need a one-click export of the filtered candidates table.\n\n## Open questions\n- Which columns?\n  → the visible ones\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "pr",
+            &format!(
+                "title: Notify primary contact to schedule a meeting\nkind: idea\ncreated: 2026-10-25 00:34:00\nupdated: 2026-10-25 08:10:00\n{}",
+                sent("intent-notify-547e")
+            ),
+            "## Description\nThe primary contact gets no prompt to book the intro meeting.\n\n## Acceptance criteria\n- [ ] gets an email\n\n## Artifacts\n- spec: docs/superpowers/specs/notify.md\n- pr: #42\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "building",
+            &format!(
+                "title: Counselors can reassign a student between orgs\nkind: idea\ncreated: 2026-10-21 09:00:00\nupdated: 2026-10-22 16:15:00\n{}",
+                sent("intent-reassign-0001")
+            ),
+            "## Description\nReassignment needs a support ticket today.\n\n## Acceptance criteria\n- [ ] moves\n- [ ] keeps history\n\n## Artifacts\n- plan: docs/superpowers/plans/reassign.md\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "done",
+            &format!(
+                "title: Invitees skip the join request\nkind: idea\ncreated: 2026-10-19 09:00:00\nupdated: 2026-10-20 10:30:00\n{}",
+                sent("intent-invitees-0002")
+            ),
+            "## Description\nInvited parents no longer file a join request.\n\n## Acceptance criteria\n- [x] no request\n",
+        );
+        write_cap(
+            root,
+            "Inbox",
+            "long",
+            "title: \"A very long title that keeps going \\a well past any reasonable width so that it must be cut off cleanly at the edge\"\nkind: idea\nstate: raw\ncreated: 2026-10-18 09:00:00\nupdated: 2026-10-18 09:00:00\n",
+            "## Description\nshort\n",
+        );
+
+        let agents = tmp.path().join("agents.json");
+        fs::write(&agents, r#"{"result":{"agents":[{"agent":"claude","agent_status":"blocked","name":"intent-notify-547e"},{"agent":"claude","agent_status":"working","name":"intent-reassign-0001"}]}}"#).unwrap();
+        let prs = tmp.path().join("prs");
+        fs::create_dir_all(&prs).unwrap();
+        fs::write(prs.join("42"), "OPEN").unwrap();
+        let mut app = App::new(cfg, dirs).unwrap();
+        app.herdr_env = vec![
+            (
+                "HERDR_BIN_PATH".into(),
+                fixtures().join("fake-herdr.sh").display().to_string(),
+            ),
+            (
+                "FAKE_HERDR_LOG".into(),
+                tmp.path().join("herdr.log").display().to_string(),
+            ),
+            ("FAKE_AGENT_LIST".into(), agents.display().to_string()),
+            (
+                "GH_BIN_PATH".into(),
+                fixtures().join("fake-gh.sh").display().to_string(),
+            ),
+            ("FAKE_GH_DIR".into(), prs.display().to_string()),
+        ];
+        ListFx { tmp, app }
+    }
+
+    /// Tick until every background request has reported (5 s cap).
+    fn settle(app: &mut App) {
+        let start = Instant::now();
+        app.tick();
+        while app.polls_in_flight() > 0 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+            app.tick();
+        }
+        assert_eq!(app.polls_in_flight(), 0, "background polls never finished");
+    }
+
+    fn render(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn list_snapshot_at_80_and_120_columns() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let wide = render(&fx.app, 120, 18);
+        assert!(wide.contains("! needs you"), "{wide}");
+        assert!(wide.contains("PR #42 open"), "{wide}");
+        assert!(wide.contains("building 1/3"), "{wide}");
+        assert!(wide.contains("✓ complete"), "{wide}");
+        assert!(wide.contains("?2"), "{wide}");
+        assert!(
+            wide.contains("skoolscout/org"),
+            "group label when wide: {wide}"
+        );
+        insta::assert_snapshot!("list_120", wide);
+        let narrow = render(&fx.app, 80, 18);
+        assert!(
+            !narrow.contains("skoolscout/org"),
+            "no group label below 100: {narrow}"
+        );
+        assert!(
+            narrow.contains('…'),
+            "long titles cut with an ellipsis: {narrow}"
+        );
+        assert!(!narrow.contains('\u{7}'));
+        assert!(wide.contains("A very long title"), "the long row exists: {wide}");
+        insta::assert_snapshot!("list_80", narrow);
+    }
+
+    #[test]
+    fn s_in_the_list_is_gated_and_sends_when_ready() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        let goto = |app: &mut App, title: &str| {
+            for _ in 0..10 {
+                key(app, KeyCode::Char('k'));
+            }
+            for _ in 0..10 {
+                if list_title(app).starts_with(title) {
+                    return;
+                }
+                key(app, KeyCode::Char('j'));
+            }
+            panic!("no list row {title}");
+        };
+        goto(&mut fx.app, "Families");
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("2 open questions")
+        );
+        goto(&mut fx.app, "Org admins");
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "send-pick");
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(
+            fx.app.view().layout,
+            "list",
+            "back in the list after the picker"
+        );
+    }
+
+    #[test]
+    fn g_focuses_the_sent_agent() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        for _ in 0..10 {
+            if list_title(&fx.app).starts_with("Notify") {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        key(&mut fx.app, KeyCode::Char('g'));
+        let log = fx.tmp.path().join("herdr.log");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("agent focus intent-notify-547e")
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no focus call: {:?}", fs::read_to_string(&log));
+    }
+
+    #[test]
+    fn a_sent_capability_without_repo_still_renders() {
+        let mut fx = list_fixture(false);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let text = render(&fx.app, 120, 18);
+        assert!(text.contains("✓ complete"), "{text}");
+        assert!(
+            text.contains("building ?"),
+            "plan unreadable without a repo: {text}"
+        );
+    }
+
+    #[test]
+    fn pollers_only_run_while_the_list_shows() {
+        let mut fx = list_fixture(true);
+        for _ in 0..200 {
+            fx.app.tick();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let log = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(
+            !log.contains("agent list"),
+            "tree layout polls nothing: {log}"
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let log = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(log.contains("agent list"), "the list polls on entry: {log}");
     }
 
     /// Give the selected intent a repo so `send` has somewhere to go.

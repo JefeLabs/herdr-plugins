@@ -118,7 +118,7 @@ send_kind = "claude"
 
 ## Sending
 
-`s` lists the handoffs that apply to the capability's kind. Built in, all starting a Claude Code agent because they invoke Claude Code skills:
+`s` refuses while the capability is still `raw` or has an unanswered open question, for every handoff: open questions are the happy-path details an agent needs, and the refinement conversation is told to ask only those. Edge cases are the receiving agent's to find; every hand-off prompt says so. Otherwise `s` lists the handoffs that apply to the capability's kind. Built in, all starting a Claude Code agent because they invoke Claude Code skills:
 
 | Handoff | Kinds | What the agent does |
 |---|---|---|
@@ -128,6 +128,35 @@ send_kind = "claude"
 | `wayfinder` | any | `/wayfinder` with the capability as the destination |
 
 Send runs `herdr workspace create` on the capability's repo (always the main checkout, never a worktree), `herdr agent start` with the handoff's provider, and `herdr agent prompt` with the rendered prompt. In repos that use workbrokr (`helmsmith.config.ts` present) the building handoffs get a `work start` instruction prefixed; planning handoffs do not. If a step fails the capability is left as it was and the message names the step.
+
+## List view
+
+`v` flips the browser between the group tree and one full-screen list of every capability, across all groups (collapsed or not). The selection carries across both ways, and the layout and sort order are remembered.
+
+```
+Capabilities · 7 · sorted by Updated                       v tree · S sort · s send · g agent
+──────────────────────────────────────────────────────────────────────────────────────────────
+sent   ███████░░░ PR #42 open      ! needs you Notify primary contact to sched…   Oct 25 08:10
+       The primary contact gets no prompt to book the intro meeting.
+?2                                             Families can skip a folder wit…   Oct 24 18:02
+       When a parent uses Skip for now on the report-card folder, the folder…
+sent   ✓ complete                  closed      Invitees skip the join request    Oct 20 10:30
+```
+
+Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a ten-cell bar shows how far the feature has got, from evidence that already exists:
+
+| Stage | Label | Evidence |
+|---|---|---|
+| Sent | `speccing` or `charting · N decisions` | `state: sent` |
+| Specced | `planning` | a `spec:` or `issue:` line under Artifacts |
+| Planned / Building | `building k/N` | `plan:` lines; tasks counted against each plan's superpowers ledger (`.superpowers/sdd/*/progress.md`), in the main checkout or any worktree, summed over plans |
+| PR open | `PR #n open`, `PRs m/t merged` | `pr:` lines, state from `gh pr view` |
+| Merged | `verifying j/M` | every remaining PR merged (closed ones are ignored) |
+| Complete | `✓ complete` | every acceptance criterion ticked, by you |
+
+Ticked criteria fill only their own share of the bar; they never stand in for building or merging. Beside the bar, `! needs you` means the agent the capability was sent to is waiting on you in Herdr, and `closed` means its pane is gone.
+
+Keys in the list: `j`/`k` (and `PgUp`/`PgDn`) move, `Enter` opens the capability in the tree, `v` back to the tree, `S` cycles the sort order (Updated, Progress with the least advanced first, Captured, Title), `s` send (same gate), `g` focus the sent agent, `r` rescan, `q` quit. Agent states refresh every few seconds while the list shows; plans and PR states on entry, on `r` and about once a minute. `herdr`, `gh` and git run on background threads, and any of them failing only blanks its column. `gh` is found through `GH_BIN_PATH`, else on `PATH`.
 
 ## Files
 

@@ -914,3 +914,198 @@ pub fn description_text(body: &str) -> String {
     }
     out.trim().to_string()
 }
+
+/// One row of the full-screen capability list.
+pub struct ListRow<'a> {
+    /// `raw`, `?2`, `ready`, `sent`.
+    pub status: String,
+    /// `(fill 0..=10, label, complete)` once sent.
+    pub progress: Option<(f32, String, bool)>,
+    /// `! needs you` or `closed`.
+    pub flag: Option<&'a str>,
+    pub title: &'a str,
+    /// Group path relative to the root, e.g. `skoolscout/org`.
+    pub group: &'a str,
+    pub when: String,
+    pub description: &'a str,
+}
+
+/// `text` cut to `max` display columns, ending in `…` when cut.
+pub fn fit(text: &str, max: usize) -> String {
+    let text = sanitize(text).replace(['\n', '\t'], " ");
+    if Span::raw(text.as_str()).width() <= max {
+        return text;
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = Span::raw(c.to_string()).width();
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+const LIST_HINTS: &str = "v tree · S sort · s send · g agent";
+const STATUS_W: usize = 6;
+const BAR_W: usize = 10;
+const LABEL_W: usize = 16;
+const FLAG_W: usize = 11;
+const WHEN_W: usize = 12;
+
+/// The list layout: a header, then two lines per capability (status,
+/// progress, title, time; then the description's first line).
+pub fn render_capability_list(
+    rows: &[ListRow],
+    selected: usize,
+    header: &str,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    if area.height < 3 || area.width < 20 {
+        return;
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let w = area.width as usize;
+    let hints_w = Span::raw(LIST_HINTS).width();
+    let head = fit(header, w.saturating_sub(hints_w + 2));
+    let gap = w.saturating_sub(Span::raw(head.as_str()).width() + hints_w);
+    Line::from(vec![
+        Span::styled(head, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(if gap > 0 { LIST_HINTS } else { "" }, dim),
+    ])
+    .render(Rect { height: 1, ..area }, buf);
+    Line::styled("─".repeat(w), dim).render(
+        Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        },
+        buf,
+    );
+    let body = Rect {
+        y: area.y + 2,
+        height: area.height - 2,
+        ..area
+    };
+    if rows.is_empty() {
+        Paragraph::new(Span::styled(
+            "no capabilities yet: v back to the tree, then a adds one",
+            dim,
+        ))
+        .render(body, buf);
+        return;
+    }
+    let show_progress = rows.iter().any(|r| r.progress.is_some());
+    let progress_w = if show_progress {
+        BAR_W + 1 + LABEL_W + 1 + FLAG_W + 1
+    } else {
+        0
+    };
+    let show_group = w >= 100;
+    let title_w = w.saturating_sub(STATUS_W + 1 + progress_w + 1 + WHEN_W);
+    let per_page = (body.height as usize / 2).max(1);
+    let scroll = if selected >= per_page {
+        selected + 1 - per_page
+    } else {
+        0
+    };
+    for (k, (i, r)) in rows.iter().enumerate().skip(scroll).enumerate() {
+        let y = body.y + (k * 2) as u16;
+        if y >= body.y + body.height {
+            break;
+        }
+        let mut spans = vec![Span::raw(format!(
+            "{:<width$} ",
+            fit(&r.status, STATUS_W),
+            width = STATUS_W
+        ))];
+        if show_progress {
+            match &r.progress {
+                Some((_, _, true)) => spans.push(Span::raw(format!(
+                    "{:<width$}",
+                    "✓ complete",
+                    width = BAR_W + 1 + LABEL_W + 1
+                ))),
+                Some((fill, label, false)) => {
+                    spans.push(Span::raw(crate::progress::bar(*fill, BAR_W)));
+                    spans.push(Span::raw(format!(" {:<LABEL_W$} ", fit(label, LABEL_W))));
+                }
+                None => spans.push(Span::raw(" ".repeat(BAR_W + 1 + LABEL_W + 1))),
+            }
+            let flag = r.flag.unwrap_or("");
+            let flag_style = if flag.starts_with('!') {
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(ratatui::style::Color::Yellow)
+            } else {
+                dim
+            };
+            spans.push(Span::styled(format!("{flag:<FLAG_W$} "), flag_style));
+        }
+        let group = if show_group && !r.group.is_empty() {
+            fit(r.group, 24)
+        } else {
+            String::new()
+        };
+        let group_w = if group.is_empty() {
+            0
+        } else {
+            Span::raw(group.as_str()).width() + 2
+        };
+        let title = fit(r.title, title_w.saturating_sub(group_w));
+        let pad = title_w.saturating_sub(Span::raw(title.as_str()).width() + group_w);
+        spans.push(Span::raw(title));
+        spans.push(Span::raw(" ".repeat(pad)));
+        if !group.is_empty() {
+            spans.push(Span::styled(format!(" {group} "), dim));
+        }
+        spans.push(Span::raw(format!(" {:>WHEN_W$}", fit(&r.when, WHEN_W))));
+        Line::from(spans).render(
+            Rect {
+                y,
+                height: 1,
+                ..body
+            },
+            buf,
+        );
+        let has_second = y + 1 < body.y + body.height;
+        if has_second {
+            let desc = if r.description.trim().is_empty() {
+                "(no description yet)".to_string()
+            } else {
+                fit(r.description, w.saturating_sub(STATUS_W + 2))
+            };
+            Line::from(vec![
+                Span::raw(" ".repeat(STATUS_W + 1)),
+                Span::styled(desc, dim),
+            ])
+            .render(
+                Rect {
+                    y: y + 1,
+                    height: 1,
+                    ..body
+                },
+                buf,
+            );
+        }
+        if i == selected {
+            buf.set_style(
+                Rect {
+                    y,
+                    height: if has_second { 2 } else { 1 },
+                    ..body
+                },
+                Style::default().add_modifier(Modifier::REVERSED),
+            );
+        }
+    }
+}
