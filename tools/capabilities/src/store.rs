@@ -449,7 +449,8 @@ impl Store {
 
 /// The change stamp used for conflict detection: `updated` when present, else
 /// the file's mtime (hand-written files often lack `updated`).
-fn stamp(intent: &Intent) -> DateTime<Local> {
+/// When the capability last changed: its `updated`, else the file's mtime.
+pub fn stamp(intent: &Intent) -> DateTime<Local> {
     if let Some(u) = intent.fm.updated {
         return u;
     }
@@ -539,6 +540,10 @@ pub fn questions(body: &str) -> Vec<Question> {
     for (_, line) in section_lines(body, "## Open questions") {
         let trimmed = line.trim_start();
         if let Some(q) = trimmed.strip_prefix("- ") {
+            // a bare `- ` is the template's placeholder, not a question
+            if q.trim().is_empty() {
+                continue;
+            }
             out.push(Question {
                 text: q.trim().to_string(),
                 answer: None,
@@ -570,7 +575,11 @@ pub fn answer_question(body: &str, index: usize, answer: &str) -> Option<String>
     let mut seen = 0usize;
     let mut q_line: Option<usize> = None;
     for (i, line) in section_lines(body, "## Open questions") {
-        if line.trim_start().starts_with("- ") {
+        if line
+            .trim_start()
+            .strip_prefix("- ")
+            .is_some_and(|q| !q.trim().is_empty())
+        {
             if seen == index {
                 q_line = Some(i);
                 break;
@@ -597,12 +606,23 @@ pub fn answer_question(body: &str, index: usize, answer: &str) -> Option<String>
     Some(text)
 }
 
+/// The text after a `- [ ] ` / `- [x] ` marker, if `t` is a checklist line.
+fn checkbox_text(t: &str) -> Option<&str> {
+    t.strip_prefix("- [ ] ")
+        .or_else(|| t.strip_prefix("- [x] "))
+        .or_else(|| t.strip_prefix("- [X] "))
+}
+
 /// Checklist items (`- [ ]` / `- [x]`) under a `## Heading`.
 pub fn checklist(body: &str, heading: &str) -> Vec<Criterion> {
     section_lines(body, heading)
         .into_iter()
         .filter_map(|(_, line)| {
             let t = line.trim_start();
+            if checkbox_text(t).is_some_and(|r| r.trim().is_empty()) {
+                // `- [ ] ` with nothing after it is the template's placeholder
+                return None;
+            }
             if let Some(rest) = t.strip_prefix("- [ ] ") {
                 Some(Criterion {
                     text: rest.trim().to_string(),
@@ -626,7 +646,7 @@ pub fn toggle_checklist(body: &str, heading: &str, index: usize) -> Option<Strin
     let mut target: Option<usize> = None;
     for (i, line) in section_lines(body, heading) {
         let t = line.trim_start();
-        if t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ") {
+        if checkbox_text(t).is_some_and(|r| !r.trim().is_empty()) {
             if seen == index {
                 target = Some(i);
                 break;
@@ -656,6 +676,55 @@ pub fn toggle_checklist(body: &str, heading: &str, index: usize) -> Option<Strin
 }
 
 pub const QUESTIONS_HEADING: &str = "## Open questions";
+
+/// Where a capability stands before it is handed off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    Raw,
+    /// Refining with this many unanswered questions.
+    Open(usize),
+    Ready,
+    Sent,
+}
+
+impl Readiness {
+    pub fn label(self) -> String {
+        match self {
+            Readiness::Raw => "raw".into(),
+            Readiness::Open(n) => format!("?{n}"),
+            Readiness::Ready => "ready".into(),
+            Readiness::Sent => "sent".into(),
+        }
+    }
+}
+
+/// Derived from the stored state and the unanswered questions.
+pub fn readiness(it: &Intent) -> Readiness {
+    match it.fm.state {
+        State::Sent => Readiness::Sent,
+        State::Raw => Readiness::Raw,
+        State::Refining | State::Ready => match it.open_questions() {
+            0 => Readiness::Ready,
+            n => Readiness::Open(n),
+        },
+    }
+}
+
+/// Why `s` may not send this capability, or `None` when it may: it must be
+/// past `raw` and every open question must have an answer.
+pub fn send_refusal(it: &Intent) -> Option<String> {
+    if it.fm.state == State::Raw {
+        return Some("still raw: refine it (p) or mark it ready (R) before sending".into());
+    }
+    match it.open_questions() {
+        0 => None,
+        n => Some(format!(
+            "{n} open question{} still unanswered: answer {} before sending (Q)",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        )),
+    }
+}
 
 /// Section order used when a missing section has to be created.
 const SECTION_ORDER: &[&str] = &[

@@ -691,7 +691,9 @@ impl App {
                 }
             }
             KeyCode::Char('s') => {
-                if let Some(it) = self.selected_intent() {
+                if let Some(refusal) = self.selected_intent().and_then(crate::store::send_refusal) {
+                    self.message = Some(refusal);
+                } else if let Some(it) = self.selected_intent() {
                     let handoffs: Vec<Handoff> = self
                         .cfg
                         .handoffs
@@ -2677,6 +2679,33 @@ mod tests {
         }
     }
 
+    /// Move the selected capability out of `raw` so the send gate lets it through.
+    fn make_refining(app: &mut App) {
+        let path = app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&path, |fm| fm.state = State::Refining).unwrap();
+        app.rescan();
+    }
+
+    #[test]
+    fn s_refuses_a_raw_capability_and_one_with_open_questions() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox"); // two open questions
+        make_refining(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("2 open questions")
+        );
+        select(&mut fx.app, "Alpha"); // raw
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(fx.app.view().message.unwrap_or_default().contains("raw"));
+    }
+
     /// Give the selected intent a repo so `send` has somewhere to go.
     fn set_repo(app: &mut App, repo: &Path) {
         let path = app.selected_intent().unwrap().path.clone();
@@ -2991,6 +3020,7 @@ mod tests {
         select(&mut fx.app, "Alpha");
         let repo = fx._tmp.path().to_path_buf();
         set_repo(&mut fx.app, &repo);
+        make_refining(&mut fx.app);
         key(&mut fx.app, KeyCode::Char('s'));
         assert_eq!(fx.app.view().screen, "send-pick");
         key(&mut fx.app, KeyCode::Enter); // first applicable handoff for an idea: grill
@@ -3040,11 +3070,16 @@ mod tests {
         select(&mut fx.app, "Alpha");
         let repo = fx._tmp.path().to_path_buf();
         set_repo(&mut fx.app, &repo);
+        make_refining(&mut fx.app);
         key(&mut fx.app, KeyCode::Char('s'));
         key(&mut fx.app, KeyCode::Enter);
         key(&mut fx.app, KeyCode::Enter);
         let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
-        assert_eq!(it.fm.state, State::Raw);
+        assert_eq!(
+            it.fm.state,
+            State::Refining,
+            "unchanged when herdr is missing"
+        );
         assert!(
             fx.app
                 .view()
@@ -3207,6 +3242,7 @@ mod tests {
             ),
         ];
         select(&mut fx.app, "Alpha");
+        make_refining(&mut fx.app);
         let path = fx.app.selected_intent().unwrap().path.clone();
         let mut other = Store::load(&path).unwrap();
         other.body = "fresh body from disk\n".into();
@@ -3292,6 +3328,7 @@ mod tests {
             ),
         ];
         select(&mut fx.app, "Alpha"); // created with repo None
+        make_refining(&mut fx.app);
         key(&mut fx.app, KeyCode::Char('s'));
         key(&mut fx.app, KeyCode::Enter);
         assert_ne!(fx.app.view().screen, "send-confirm");

@@ -2,9 +2,9 @@ use std::fs;
 use std::path::Path;
 
 use herdr_capabilities::store::{
-    SaveError, State, Store, add_artifact, add_checklist_item, add_question, answer_question,
-    artifacts, criteria, discover_artifacts, open_questions, preconditions, questions, slugify,
-    toggle_criterion, toggle_precondition,
+    Readiness, SaveError, State, Store, add_artifact, add_checklist_item, add_question,
+    answer_question, artifacts, criteria, discover_artifacts, open_questions, preconditions,
+    questions, readiness, send_refusal, slugify, toggle_criterion, toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -527,4 +527,54 @@ fn discover_artifacts_finds_specs_plans_and_adrs_that_match_the_title() {
         "only the known folders are scanned: {targets:?}"
     );
     assert!(discover_artifacts(Path::new("/nonexistent"), "x", &[]).is_empty());
+}
+
+#[test]
+fn blank_template_placeholders_are_not_items() {
+    let body = "## Acceptance criteria\n\n- [ ] \n- [ ] real\n\n## Open questions\n\n- \n- who?\n";
+    assert_eq!(questions(body).len(), 1);
+    assert_eq!(open_questions(body), 1);
+    assert_eq!(criteria(body).len(), 1);
+    // index 0 is the first real item, not the placeholder
+    let answered = answer_question(body, 0, "owners").unwrap();
+    assert!(answered.contains("- who?\n  → owners"), "{answered}");
+    let ticked = toggle_criterion(body, 0).unwrap();
+    assert!(ticked.contains("- [x] real"), "{ticked}");
+    assert!(
+        ticked.contains("- [ ] \n"),
+        "placeholder untouched: {ticked}"
+    );
+}
+
+#[test]
+fn readiness_follows_state_and_open_questions() {
+    let (_tmp, s) = store();
+    let mk = |title: &str, state: State, body: &str| {
+        let it = s
+            .create(Path::new("Inbox"), title, "idea", body, None)
+            .unwrap();
+        Store::update_fields(&it.path, |fm| fm.state = state).unwrap()
+    };
+    let two_open = "## Open questions\n- a?\n- b?\n";
+    let answered = "## Open questions\n- a?\n  → yes\n";
+    let raw = mk("raw one", State::Raw, "x\n");
+    let refining_two_open = mk("refining open", State::Refining, two_open);
+    let refining_answered = mk("refining answered", State::Refining, answered);
+    let ready = mk("ready one", State::Ready, answered);
+    let sent_with_open = mk("sent one", State::Sent, two_open);
+    assert_eq!(readiness(&raw), Readiness::Raw);
+    assert_eq!(readiness(&refining_two_open), Readiness::Open(2));
+    assert_eq!(readiness(&refining_answered), Readiness::Ready);
+    assert_eq!(readiness(&ready), Readiness::Ready);
+    assert_eq!(readiness(&sent_with_open), Readiness::Sent);
+    assert_eq!(Readiness::Open(2).label(), "?2");
+    assert_eq!(Readiness::Raw.label(), "raw");
+    assert!(send_refusal(&raw).unwrap().contains("raw"));
+    assert!(
+        send_refusal(&refining_two_open)
+            .unwrap()
+            .contains("2 open questions")
+    );
+    assert_eq!(send_refusal(&refining_answered), None);
+    assert_eq!(send_refusal(&ready), None);
 }
