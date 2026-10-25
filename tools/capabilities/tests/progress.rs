@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use herdr_capabilities::progress::{
-    CellKind, Evidence, PlanTasks, Poller, PrState, Progress, Size, Update, agent_statuses, ago,
-    bar, plan_evidence, plan_size, plan_tasks, pr_number, pr_state, progress, prs_mentioning,
-    stage_cells,
+    CellKind, Evidence, FoundPr, PlanTasks, Poller, PrState, Progress, Size, Update,
+    agent_statuses, ago, bar, branch_area, plan_evidence, plan_size, plan_tasks, pr_number,
+    pr_state, progress, prs_mentioning, stage_cells,
 };
 
 /// The bar as `(glyphs, kinds)`: D done (`█`), T to do (`░`), R in review (`▓`).
@@ -561,7 +561,7 @@ fn prs_are_found_by_the_file_names_they_mention() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("search-p.md.json"),
-        r#"[{"number":5828,"state":"MERGED"},{"number":5832,"state":"OPEN"}]"#,
+        r#"[{"number":5828,"state":"MERGED","headRefName":"feature/org/office-hours--meeting-request-backend"},{"number":5832,"state":"OPEN"}]"#,
     )
     .unwrap();
     let log = tmp.path().join("gh.log");
@@ -572,7 +572,18 @@ fn prs_are_found_by_the_file_names_they_mention() {
     let gh = fixtures().join("fake-gh.sh");
     assert_eq!(
         prs_mentioning(&gh, tmp.path(), "p.md", &env),
-        vec![(5828, PrState::Merged), (5832, PrState::Open)]
+        vec![
+            FoundPr {
+                number: 5828,
+                state: PrState::Merged,
+                branch: "feature/org/office-hours--meeting-request-backend".into()
+            },
+            FoundPr {
+                number: 5832,
+                state: PrState::Open,
+                branch: String::new()
+            }
+        ]
     );
     assert!(prs_mentioning(&gh, tmp.path(), "other.md", &env).is_empty());
     assert!(prs_mentioning(&tmp.path().join("no-gh"), tmp.path(), "p.md", &env).is_empty());
@@ -675,4 +686,19 @@ fn blocks_touch_and_borders_show_where_they_meet() {
         (glyphs.as_str(), kinds.as_str()),
         ("▉▉▉██▉▉░░░", "DDDDDDDTTT")
     );
+}
+
+#[test]
+fn a_workbrokr_branch_names_its_area() {
+    assert_eq!(
+        branch_area("feature/org/candidates--meeting-request-org").as_deref(),
+        Some("org/candidates")
+    );
+    assert_eq!(
+        branch_area("fix/family/schedule-meeting--meeting-request-family").as_deref(),
+        Some("family/schedule-meeting")
+    );
+    assert_eq!(branch_area("main"), None);
+    assert_eq!(branch_area("feature/no-area-marker"), None);
+    assert_eq!(branch_area("changeset-release/develop"), None);
 }

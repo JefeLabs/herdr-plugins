@@ -129,6 +129,20 @@ send_kind = "claude"
 
 Send runs `herdr workspace create` on the capability's repo (always the main checkout, never a worktree), `herdr agent start` with the handoff's provider, and `herdr agent prompt` with the rendered prompt. In repos that use workbrokr (`helmsmith.config.ts` present) the building handoffs get a `work start` instruction prefixed; planning handoffs do not. If a step fails the capability is left as it was and the message names the step.
 
+## Affected areas
+
+A capability lives in one group but may affect others. List them in its front matter, or press `+` (in the tree or the list) and type group paths separated by commas; an unknown group is refused, an empty list clears them:
+
+```yaml
+areas:
+  - skoolscout/discover-schools/org/candidates
+  - skoolscout/discover-schools/family/schedule-meeting
+```
+
+The tree then shows the capability as a dim `↳` row under each affected group; that row acts on the real capability, and a group's count reads `own +affecting` (e.g. `(3 +2)`). In the list, the path row under the title reads home · other areas, and a hand-off tells the agent the other areas, since a change that spans them may need one work area each.
+
+Areas are also suggested from the work itself: a pull request found for the capability whose branch follows workbrokr's `<type>/<area>--<task>` shape names an area (`feature/org/candidates--…` gives `org/candidates`), and when exactly one group's path ends with it, the card shows `suggested: …`. `+` opens with suggestions already added, so Enter confirms them; nothing is added without that.
+
 ## List view
 
 `v` flips the browser between the group tree and one full-screen list of every capability, across all groups (collapsed or not). The selection carries across both ways, and the layout, sort order and filter are remembered.

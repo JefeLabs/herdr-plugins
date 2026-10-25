@@ -716,9 +716,9 @@ impl App {
         // add pull requests found by spec/plan name that no pr: line names
         let mut prs: Vec<(u64, PrState)> = prs;
         let found = self.found_prs.get(&it.path);
-        for (n, st) in found.into_iter().flatten().flat_map(|(_, prs)| prs) {
-            if !prs.iter().any(|(m, _)| m == n) {
-                prs.push((*n, *st));
+        for f in found.into_iter().flatten().flat_map(|(_, prs)| prs) {
+            if !prs.iter().any(|(m, _)| *m == f.number) {
+                prs.push((f.number, f.state));
             }
         }
         // each plan learns the state of the pull requests found by its name
@@ -742,7 +742,7 @@ impl App {
                 .into_iter()
                 .flatten()
                 .filter(|(q, _)| q == name)
-                .flat_map(|(_, prs)| prs.iter().map(|(_, st)| *st))
+                .flat_map(|(_, prs)| prs.iter().map(|f| f.state))
                 .collect();
             plan.pr = if mine
                 .iter()
@@ -980,12 +980,68 @@ impl App {
         self.refresh_found();
     }
 
-    /// `+`: edit the selected capability's affected areas.
+    /// Every group's path under the root, e.g. `skoolscout/org/candidates`.
+    fn group_paths(&self) -> Vec<String> {
+        fn walk(g: &Group, root: &Path, out: &mut Vec<String>) {
+            for sub in &g.groups {
+                if let Ok(rel) = sub.path.strip_prefix(root) {
+                    out.push(rel.display().to_string());
+                }
+                walk(sub, root, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.tree, self.store.root(), &mut out);
+        out
+    }
+
+    /// Areas the capability's pull requests were built in (workbrokr branch
+    /// names) that it does not list yet: a branch area maps to the one group
+    /// whose path ends with it; ambiguous or unknown areas are skipped.
+    fn suggested_areas(&self, it: &Intent) -> Vec<String> {
+        let Some(found) = self.found_prs.get(&it.path) else {
+            return Vec::new();
+        };
+        let home = it
+            .path
+            .parent()
+            .and_then(|d| d.strip_prefix(self.store.root()).ok())
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let groups = self.group_paths();
+        let mut out: Vec<String> = Vec::new();
+        for f in found.iter().flat_map(|(_, prs)| prs) {
+            let Some(area) = crate::progress::branch_area(&f.branch) else {
+                continue;
+            };
+            let matches: Vec<&String> = groups
+                .iter()
+                .filter(|g| **g == area || g.ends_with(&format!("/{area}")))
+                .collect();
+            if let [only] = matches.as_slice()
+                && **only != home
+                && !it
+                    .fm
+                    .areas
+                    .iter()
+                    .any(|a| a.trim().trim_matches('/') == only.as_str())
+                && !out.contains(only)
+            {
+                out.push((*only).clone());
+            }
+        }
+        out
+    }
+
+    /// `+`: edit the selected capability's affected areas; suggestions from
+    /// its pull requests are already added, so Enter confirms them.
     fn open_areas_input(&mut self) {
-        if let Some(it) = self.selected_intent() {
+        if let Some(it) = self.selected_intent().cloned() {
+            let mut areas = it.fm.areas.clone();
+            areas.extend(self.suggested_areas(&it));
             self.screen = Screen::Input {
                 label: "affected areas (group paths, comma-separated; empty clears)".into(),
-                text: it.fm.areas.join(", "),
+                text: areas.join(", "),
                 action: InputAction::EditAreas,
             };
         }
@@ -2912,6 +2968,12 @@ impl App {
                     )
                     .collect::<Vec<_>>()
                     .join(" · ");
+                let suggested = self.suggested_areas(i);
+                let group = if suggested.is_empty() {
+                    group
+                } else {
+                    format!("{group}   suggested: {} (+ adds)", suggested.join(", "))
+                };
                 // the sent agent's worktree, relative to the repo when inside it
                 let worktree = match (&i.fm.sent_to, &self.agents, i.fm.state) {
                     (Some(sent), Some(agents), State::Sent) => {
@@ -4588,6 +4650,45 @@ mod tests {
                 "cell {x} is unstyled: {st:?}"
             );
         }
+    }
+
+    #[test]
+    fn pr_branches_suggest_areas_that_plus_confirms() {
+        let mut fx = list_fixture(true);
+        fs::create_dir_all(fx.app.store.root().join("skoolscout/family")).unwrap();
+        // the Counselors plan's PR was built in the family work area
+        fs::write(
+            fx.tmp.path().join("prs/search-reassign.md.json"),
+            r#"[{"number":78,"state":"OPEN","headRefName":"feature/family--reassign-family"}]"#,
+        )
+        .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 70);
+        let t = shown
+            .lines()
+            .position(|l| l.starts_with(" Counselors"))
+            .unwrap();
+        let path_row = shown.lines().nth(t + 1).unwrap().to_string();
+        assert!(
+            path_row.contains("suggested: skoolscout/family"),
+            "{path_row}"
+        );
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Counselors");
+        key(&mut fx.app, KeyCode::Char('+'));
+        assert_eq!(
+            fx.app.view().input_text,
+            "skoolscout/family",
+            "suggestions prefilled"
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert_eq!(
+            Store::load(&it.path).unwrap().fm.areas,
+            vec!["skoolscout/family"]
+        );
     }
 
     #[test]

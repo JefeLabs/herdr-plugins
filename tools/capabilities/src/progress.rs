@@ -86,8 +86,26 @@ pub fn plan_size(tasks: usize, files: usize) -> Option<Size> {
     Some(by_tasks.max(by_files))
 }
 
+/// A pull request found by searching for a file name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundPr {
+    pub number: u64,
+    pub state: PrState,
+    /// Its head branch, e.g. `feature/org/candidates--meeting-request-org`.
+    pub branch: String,
+}
+
 /// Pull requests found per spec or plan file name.
-pub type FoundByName = Vec<(String, Vec<(u64, PrState)>)>;
+pub type FoundByName = Vec<(String, Vec<FoundPr>)>;
+
+/// The work area a workbrokr branch names: `<type>/<area>--<task>` gives
+/// `<area>` (e.g. `org/candidates`). `None` for any other branch shape.
+pub fn branch_area(branch: &str) -> Option<String> {
+    let (_, rest) = branch.split_once('/')?;
+    let (area, _) = rest.split_once("--")?;
+    let area = area.trim_matches('/');
+    (!area.is_empty()).then(|| area.to_string())
+}
 
 /// One plan's block in the building section of the bar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -632,7 +650,7 @@ pub fn prs_mentioning(
     repo: &Path,
     query: &str,
     env: &[(String, String)],
-) -> Vec<(u64, PrState)> {
+) -> Vec<FoundPr> {
     let out = Command::new(gh)
         .args([
             "pr",
@@ -642,7 +660,7 @@ pub fn prs_mentioning(
             "--search",
             &format!("\"{query}\""),
             "--json",
-            "number,state",
+            "number,state,headRefName",
             "--limit",
             "30",
         ])
@@ -664,14 +682,23 @@ pub fn prs_mentioning(
         .map(|prs| {
             prs.iter()
                 .filter_map(|p| {
-                    let n = p.get("number")?.as_u64()?;
+                    let number = p.get("number")?.as_u64()?;
                     let state = match p.get("state")?.as_str()? {
                         "OPEN" => PrState::Open,
                         "MERGED" => PrState::Merged,
                         "CLOSED" => PrState::Closed,
                         _ => PrState::Unknown,
                     };
-                    Some((n, state))
+                    let branch = p
+                        .get("headRefName")
+                        .and_then(|b| b.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    Some(FoundPr {
+                        number,
+                        state,
+                        branch,
+                    })
                 })
                 .collect()
         })
