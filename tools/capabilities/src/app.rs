@@ -4294,7 +4294,7 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(line.contains("PR #77 open"), "{line}");
-        assert!(line.contains("▉▉▉▉▉▉██"), "{line}");
+        assert!(line.contains("▉▉▉▓▉░░░"), "{line}");
         let it = fx
             .app
             .list
@@ -4315,7 +4315,7 @@ mod tests {
     }
 
     #[test]
-    fn bar_cells_are_styled_by_kind_with_no_gap_cells() {
+    fn bar_cells_are_shades_with_no_styling_and_no_gap_cells() {
         let mut fx = list_fixture(true);
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
@@ -4330,22 +4330,19 @@ mod tests {
             .find(|&y| row(y).contains("PR #42 open"))
             .expect("Notify's metadata row");
         let text = row(y);
-        assert!(text.contains("▉▉▉██▉▉▉██ PR #42 open"), "{text}");
-        assert!(
-            !text.contains('▕') && !text.contains('░'),
-            "no gap or shade cells: {text}"
-        );
-        let start = text.find("▉▉▉██▉▉▉██").unwrap();
+        assert!(text.contains("▉▉▉██▉▉░░░ PR #42 open"), "{text}");
+        assert!(!text.contains('▕'), "no gap cells: {text}");
+        // Herdr drops colour and dim on block glyphs, so the bar carries none
+        let start = text.find("▉▉▉██▉▉░░░").unwrap();
         let x0 = text[..start].chars().count() as u16;
-        let dim = |x: u16| {
-            buf[(x, y)]
-                .style()
-                .add_modifier
-                .contains(ratatui::style::Modifier::DIM)
-        };
-        assert!(!dim(x0), "a done cell is plain");
-        assert!(dim(x0 + 7), "the merged cell, still to do, is dim");
-        assert!(dim(x0 + 9), "the verified cells are dim");
+        for x in x0..x0 + 10 {
+            let st = buf[(x, y)].style();
+            assert!(
+                st.add_modifier.is_empty()
+                    && st.fg.is_none_or(|c| c == ratatui::style::Color::Reset),
+                "cell {x} is unstyled: {st:?}"
+            );
+        }
     }
 
     #[test]

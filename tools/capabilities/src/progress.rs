@@ -125,8 +125,9 @@ pub struct Progress {
 /// Cells per stage in the bar, in `Progress::segments` order.
 const STAGE_CELLS: [usize; 7] = [1, 1, 1, 3, 1, 1, 2];
 
-/// What a bar cell stands for; the renderer styles it (done plain, to do
-/// dim, in review highlighted).
+/// What a bar cell stands for. Each kind has its own glyph (done `█`, in
+/// review `▓`, to do `░`) because Herdr draws block glyphs in the default
+/// colour, dropping colour and dim; the shades are what reliably shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellKind {
     Done,
@@ -141,9 +142,9 @@ pub struct BarCell {
 }
 
 /// The bar as cells, one block per stage, with no gap cells: the building
-/// stage is one block per sized plan. Every cell is a solid block, told apart
-/// by kind; every block but the last ends in a seven-eighths cell (`▉`) whose
-/// thin sliver is the border where it meets the next block.
+/// stage is one block per sized plan. A done block (but the last) ends in a
+/// seven-eighths cell (`▉`) whose thin sliver is the border where it meets
+/// the next block; elsewhere the change of shade divides blocks.
 pub fn stage_cells(p: &Progress) -> Vec<BarCell> {
     const EIGHTHS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
     // a block `cells` wide, `fill` done: full cells, one partial, then to-do cells
@@ -151,7 +152,7 @@ pub fn stage_cells(p: &Progress) -> Vec<BarCell> {
         if review {
             return vec![
                 BarCell {
-                    ch: '█',
+                    ch: '▓',
                     kind: CellKind::Review,
                 };
                 cells
@@ -180,7 +181,7 @@ pub fn stage_cells(p: &Progress) -> Vec<BarCell> {
         }
         while out.len() < cells {
             out.push(BarCell {
-                ch: '█',
+                ch: '░',
                 kind: CellKind::Todo,
             });
         }

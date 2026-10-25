@@ -7,7 +7,7 @@ Capabilities · 7 · sorted by Updated                                       v t
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
  skoolscout/org
- Oct 25 08:10 │ sent   │ ! needs you │ 2h ago  │ ▉▉▉██▉▉▉██ PR #42 open
+ Oct 25 08:10 │ sent   │ ! needs you │ 2h ago  │ ▉▉▉██▉▉░░░ PR #42 open
  .claude/worktrees/org/notify │ slot 3
 
  The primary contact gets no prompt to book the intro meeting.
@@ -33,7 +33,7 @@ Capabilities · 7 · sorted by Updated                                       v t
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Counselors can reassign a student between orgs
  skoolscout/org
- Oct 22 16:15 │ sent   │ working     │ 3h ago  │ ▉▉▉▍▉▉██ building 1/3
+ Oct 22 16:15 │ sent   │ working     │ 3h ago  │ ▉▉▉▍░░░░ building 1/3
 
  Reassignment needs a support ticket today.
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
