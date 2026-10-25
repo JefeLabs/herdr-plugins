@@ -43,7 +43,7 @@ impl Turn {
         cwd: &Path,
         extra_env: &[(String, String)],
     ) -> anyhow::Result<Turn> {
-        let outfile = cwd.join(".intents-last-message.txt");
+        let outfile = cwd.join(".capabilities-last-message.txt");
         let argv = render_argv(spec, prompt, conv, &outfile);
         let (program, args) = argv.split_first().context("provider argv is empty")?;
         let mut cmd = Command::new(program);

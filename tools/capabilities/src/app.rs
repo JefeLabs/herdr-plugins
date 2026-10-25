@@ -1798,7 +1798,7 @@ impl App {
                 )
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .render(right, buf),
-                _ => ratatui::widgets::Paragraph::new("a add intent · n new group · ? help")
+                _ => ratatui::widgets::Paragraph::new("a add capability · n new group · ? help")
                     .render(right, buf),
             },
         }
@@ -2014,7 +2014,7 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "herdr-intents: {e:#}");
+            let _ = writeln!(std::io::stderr(), "herdr-capabilities: {e:#}");
             std::process::exit(1)
         }
     }
@@ -2032,7 +2032,7 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
             terminal.draw(|f| {
                 let area = f.area();
                 let p = ratatui::widgets::Paragraph::new(format!(
-                    "New intent (Inbox)\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
+                    "New capability (Inbox)\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
                 ));
                 p.render(area, f.buffer_mut());
             })?;
@@ -2065,7 +2065,7 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if title.is_none() && stdin_is_tty {
         anyhow::bail!(
-            "usage: herdr-intents add <title>   (or pipe a title line and body on stdin)"
+            "usage: herdr-capabilities add <title>   (or pipe a title line and body on stdin)"
         );
     }
     if !stdin_is_tty {

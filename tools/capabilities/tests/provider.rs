@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use herdr_intents::config::builtin_providers;
-use herdr_intents::provider::{Event, parse_line, parse_reply, render_argv};
+use herdr_capabilities::config::builtin_providers;
+use herdr_capabilities::provider::{Event, parse_line, parse_reply, render_argv};
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(

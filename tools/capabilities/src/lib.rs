@@ -1,4 +1,4 @@
-//! herdr-intents: capture intents, refine them with an agent, send them to agents.
+//! herdr-capabilities: capture intents, refine them with an agent, send them to agents.
 
 pub mod app;
 pub mod config;

@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use herdr_intents::config::{Dirs, load_or_init};
-use herdr_intents::send::{agent_name, main_checkout, render_prompt, send, uses_workbrokr};
-use herdr_intents::store::Store;
+use herdr_capabilities::config::{Dirs, load_or_init};
+use herdr_capabilities::send::{agent_name, main_checkout, render_prompt, send, uses_workbrokr};
+use herdr_capabilities::store::Store;
 
 fn fake_herdr() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-herdr.sh")

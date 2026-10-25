@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use herdr_intents::config::{Output, ProviderSpec, When};
-use herdr_intents::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
+use herdr_capabilities::config::{Output, ProviderSpec, When};
+use herdr_capabilities::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

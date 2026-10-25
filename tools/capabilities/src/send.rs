@@ -96,7 +96,7 @@ pub fn prepare(
     attachments: &[(String, u64)],
 ) -> Result<(PathBuf, String), String> {
     let repo = it.fm.repo.clone().ok_or_else(|| {
-        "intent has no repo: set `repo:` in its front matter to the main checkout to send it"
+        "capability has no repo: set `repo:` in its front matter to the main checkout to send it"
             .to_string()
     })?;
     if !repo.is_dir() {

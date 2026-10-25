@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-pub const PLUGIN_ID: &str = "jefelabs.intents";
+pub const PLUGIN_ID: &str = "jefelabs.capabilities";
 pub const KINDS: &[&str] = &["issue", "enhancement", "idea"];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16,13 +16,13 @@ pub enum Mode {
     Usage(String),
 }
 
-const USAGE: &str = "usage: herdr-intents [add [--popup] [title] | --version]";
+const USAGE: &str = "usage: herdr-capabilities [add [--popup] [title] | --version]";
 
 pub fn parse_mode(args: &[String]) -> Mode {
     match args.first().map(String::as_str) {
         None => Mode::Tui,
         Some("--version") | Some("-V") => {
-            Mode::Usage(format!("herdr-intents {}", env!("CARGO_PKG_VERSION")))
+            Mode::Usage(format!("herdr-capabilities {}", env!("CARGO_PKG_VERSION")))
         }
         Some("add") => {
             let mut popup = false;
@@ -53,14 +53,14 @@ pub struct Dirs {
     pub root: PathBuf,
 }
 
-/// Config dir: `INTENTS_CONFIG_DIR`, else this plugin's `HERDR_PLUGIN_CONFIG_DIR`,
-/// else `~/.config/herdr/plugins/config/jefelabs.intents`. Root from config or `~/intents`.
+/// Config dir: `CAPABILITIES_CONFIG_DIR`, else this plugin's `HERDR_PLUGIN_CONFIG_DIR`,
+/// else `~/.config/herdr/plugins/config/jefelabs.capabilities`. Root from config or `~/capabilities`.
 pub fn resolve_dirs(
     get: impl Fn(&str) -> Option<String>,
     home: &Path,
     cfg_root: Option<&str>,
 ) -> Dirs {
-    let config = if let Some(c) = get("INTENTS_CONFIG_DIR") {
+    let config = if let Some(c) = get("CAPABILITIES_CONFIG_DIR") {
         PathBuf::from(c)
     } else if get("HERDR_PLUGIN_ID").as_deref() == Some(PLUGIN_ID)
         && get("HERDR_PLUGIN_CONFIG_DIR").is_some()
@@ -69,10 +69,10 @@ pub fn resolve_dirs(
     } else {
         home.join(".config/herdr/plugins/config").join(PLUGIN_ID)
     };
-    let root = match (get("INTENTS_ROOT"), cfg_root) {
+    let root = match (get("CAPABILITIES_ROOT"), cfg_root) {
         (Some(env_root), _) => PathBuf::from(expand_home(&env_root, home)),
         (None, Some(r)) => PathBuf::from(expand_home(r, home)),
-        (None, None) => home.join("intents"),
+        (None, None) => home.join("capabilities"),
     };
     Dirs { config, root }
 }
@@ -241,7 +241,10 @@ struct RawConfig {
 }
 
 const DEFAULT_FILES: &[(&str, &str)] = &[
-    ("intents.toml", include_str!("../defaults/intents.toml")),
+    (
+        "capabilities.toml",
+        include_str!("../defaults/capabilities.toml"),
+    ),
     ("templates/issue.md", include_str!("../defaults/issue.md")),
     (
         "templates/issue.polish.md",
@@ -273,7 +276,7 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
             std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         }
     }
-    let path = dirs.config.join("intents.toml");
+    let path = dirs.config.join("capabilities.toml");
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let raw: RawConfig = toml::from_str(&text).with_context(|| path.display().to_string())?;
@@ -282,7 +285,7 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/"));
     let root = match &raw.root {
-        Some(r) if r != "~/intents" => PathBuf::from(expand_home(r, &home)),
+        Some(r) if r != "~/capabilities" => PathBuf::from(expand_home(r, &home)),
         _ => dirs.root.clone(),
     };
 
@@ -638,20 +641,20 @@ mod tests {
         );
         assert!(matches!(parse_mode(&["bogus".into()]), Mode::Usage(_)));
         assert!(
-            matches!(parse_mode(&["--version".into()]), Mode::Usage(t) if t.starts_with("herdr-intents "))
+            matches!(parse_mode(&["--version".into()]), Mode::Usage(t) if t.starts_with("herdr-capabilities "))
         );
     }
 
     #[test]
     fn dirs_prefer_env_then_plugin_then_home() {
         let home = Path::new("/home/u");
-        let d = resolve_dirs(lookup(&[("INTENTS_CONFIG_DIR", "/c/env")]), home, None);
+        let d = resolve_dirs(lookup(&[("CAPABILITIES_CONFIG_DIR", "/c/env")]), home, None);
         assert_eq!(d.config, Path::new("/c/env"));
-        assert_eq!(d.root, Path::new("/home/u/intents"));
+        assert_eq!(d.root, Path::new("/home/u/capabilities"));
 
         let d = resolve_dirs(
             lookup(&[
-                ("HERDR_PLUGIN_ID", "jefelabs.intents"),
+                ("HERDR_PLUGIN_ID", "jefelabs.capabilities"),
                 ("HERDR_PLUGIN_CONFIG_DIR", "/c/plugin"),
             ]),
             home,
@@ -669,12 +672,12 @@ mod tests {
         );
         assert_eq!(
             d.config,
-            Path::new("/home/u/.config/herdr/plugins/config/jefelabs.intents"),
+            Path::new("/home/u/.config/herdr/plugins/config/jefelabs.capabilities"),
             "another plugin's dir is not ours"
         );
 
-        let d = resolve_dirs(lookup(&[]), home, Some("~/notes/intents"));
-        assert_eq!(d.root, Path::new("/home/u/notes/intents"));
+        let d = resolve_dirs(lookup(&[]), home, Some("~/notes/capabilities"));
+        assert_eq!(d.root, Path::new("/home/u/notes/capabilities"));
     }
 
     #[test]
@@ -685,7 +688,7 @@ mod tests {
             root: tmp.path().join("root"),
         };
         let cfg = load_or_init(&dirs).unwrap();
-        assert!(dirs.config.join("intents.toml").is_file());
+        assert!(dirs.config.join("capabilities.toml").is_file());
         for k in ["issue", "enhancement", "idea"] {
             assert!(
                 dirs.config
@@ -770,7 +773,7 @@ mod tests {
         };
         load_or_init(&dirs).unwrap();
         fs::write(
-            dirs.config.join("intents.toml"),
+            dirs.config.join("capabilities.toml"),
             "polish_provider = \"mine\"\n[providers.mine]\npolish = [\"my-cli\", \"--prompt\", \"{prompt}\"]\noutput = \"text\"\nsend_kind = \"claude\"\n",
         )
         .unwrap();
@@ -820,9 +823,9 @@ mod tests {
     fn intents_root_env_overrides_the_root() {
         let home = Path::new("/home/u");
         let d = resolve_dirs(
-            lookup(&[("INTENTS_ROOT", "/work/repo/intents")]),
+            lookup(&[("CAPABILITIES_ROOT", "/work/repo/intents")]),
             home,
-            Some("~/intents"),
+            Some("~/capabilities"),
         );
         assert_eq!(d.root, Path::new("/work/repo/intents"));
     }
@@ -842,7 +845,7 @@ mod tests {
         };
         load_or_init(&dirs).unwrap();
         fs::write(
-            dirs.config.join("intents.toml"),
+            dirs.config.join("capabilities.toml"),
             "[providers.agy]\nmodel = \"gemini-4-argon-medium\"\n",
         )
         .unwrap();

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use herdr_intents::store::{
+use herdr_capabilities::store::{
     SaveError, State, Store, answer_question, criteria, open_questions, questions, slugify,
     toggle_criterion,
 };

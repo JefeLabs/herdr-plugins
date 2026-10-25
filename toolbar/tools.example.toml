@@ -3,7 +3,7 @@
 # its entries replace global ones with the same id, and its `order`, if present, wins.
 
 prefix = "ctrl-]"
-order  = ["issues", "intents", "db", "files", "jira"]
+order  = ["issues", "capabilities", "db", "files", "jira"]
 
 [[tool]]
 id      = "issues"
@@ -12,10 +12,10 @@ icon    = "◉"
 command = ["gh", "dash"]
 
 [[tool]]
-id      = "intents"
-name    = "Intents"
+id      = "capabilities"
+name    = "Capabilities"
 icon    = "✎"
-command = ["/absolute/path/to/herdr-plugins/target/release/herdr-intents"]
+command = ["/absolute/path/to/herdr-plugins/target/release/herdr-capabilities"]
 
 [[tool]]
 id      = "db"

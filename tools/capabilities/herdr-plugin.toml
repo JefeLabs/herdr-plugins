@@ -1,0 +1,32 @@
+id = "jefelabs.capabilities"
+name = "Capabilities"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Capture capabilities, refine them in a streaming conversation with an agent CLI, and send them to a new Herdr agent"
+platforms = ["macos", "linux"]
+
+# Runs on `herdr plugin install` only; a linked checkout is built by hand:
+#   cargo build --release -p herdr-capabilities
+# The workspace puts binaries in <repo>/target, two levels above this plugin.
+[[build]]
+command = ["cargo", "build", "--release", "-p", "herdr-capabilities"]
+
+[[panes]]
+id = "add"
+title = "New capability"
+placement = "popup"
+width = "60%"
+height = 12
+command = ["../../target/release/herdr-capabilities", "add", "--popup"]
+
+[[panes]]
+id = "capabilities"
+title = "Capabilities"
+placement = "split"
+command = ["../../target/release/herdr-capabilities"]
+
+[[actions]]
+id = "add"
+title = "Capabilities: capture"
+contexts = ["workspace"]
+command = ["../../target/release/herdr-capabilities", "add", "--popup"]

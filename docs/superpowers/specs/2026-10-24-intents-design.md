@@ -1,7 +1,7 @@
 # intents: capture, refine and send intents to agents
 
 **Date:** 2026-10-24
-**Status:** approved by the owner 2026-10-24
+**Status:** approved by the owner 2026-10-24. **Renamed 2026-10-25:** the tool and its unit are now *capabilities* (`herdr-capabilities`, plugin `jefelabs.capabilities`, `tools/capabilities/`); the text below keeps the original word.
 **Owner:** Edwin Cruz (jefelabs)
 **Home:** `jefelabs/herdr-plugins`, at `tools/intents/`, crate and binary `herdr-intents`.
 Runs as a slot in the toolbar (`toolbar/`, see `2026-10-24-herdr-toolbar-design.md`)
