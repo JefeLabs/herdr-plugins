@@ -276,6 +276,53 @@ impl App {
         Flow::Continue
     }
 
+    /// A click on an icon selects that tool. Inside the tool's area, mouse
+    /// events go to the tool when it has turned mouse reporting on, in the
+    /// mode and encoding it asked for, at its own coordinates.
+    pub fn apply_mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let area = Rect::new(0, 0, self.size.cols, self.size.rows);
+        let (content, bar) = ui::split(area);
+        if ev.column >= bar.x && bar.width > 0 {
+            // the last bar row holds the reload/armed marker, not an icon
+            let icon_rows = bar.height.saturating_sub(1);
+            if ev.kind == MouseEventKind::Down(MouseButton::Left)
+                && ev.row < icon_rows
+                && usize::from(ev.row) < self.slots.len()
+            {
+                self.message = None;
+                self.select(usize::from(ev.row));
+            }
+            return;
+        }
+        let tool_rows = self.content_size().rows;
+        if ev.column < content.x || ev.row < content.y || ev.row - content.y >= tool_rows {
+            return;
+        }
+        let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else {
+            return;
+        };
+        if p.state() != ToolState::Running {
+            return;
+        }
+        let (mode, encoding) = {
+            let screen = p.screen();
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        };
+        if let Some(bytes) = crate::keys::mouse_to_bytes(
+            &ev,
+            ev.column - content.x,
+            ev.row - content.y,
+            mode,
+            encoding,
+        ) {
+            let _ = p.write(&bytes);
+        }
+    }
+
     /// Forward pasted text to the selected running tool, sanitised (see `keys::paste_bytes`).
     pub fn paste(&mut self, text: &str) {
         let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else {
@@ -406,7 +453,11 @@ pub fn run(
     }));
 
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
     let area = terminal.size().unwrap_or(ratatui::layout::Size {
         width: 80,
         height: 24,
@@ -459,6 +510,7 @@ pub fn run(
             }
             Ok(Event::Resize(cols, rows)) => app.resize(Size { rows, cols }),
             Ok(Event::Paste(text)) => app.paste(&text),
+            Ok(Event::Mouse(m)) => app.apply_mouse(m),
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -514,11 +566,16 @@ fn install_signal_handlers() {
 /// which itself panics when stderr is dead and would abort the process from
 /// inside the panic hook.
 fn restore_terminal() {
-    use crossterm::{cursor::Show, event::DisableBracketedPaste, terminal::LeaveAlternateScreen};
+    use crossterm::{
+        cursor::Show,
+        event::{DisableBracketedPaste, DisableMouseCapture},
+        terminal::LeaveAlternateScreen,
+    };
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         Show
     );
@@ -534,6 +591,7 @@ mod tests {
 
     use crate::config::{Trust, WORKSPACE_FILE};
     use crate::pty::ToolState;
+    use tui_term::vt100;
 
     const SIZE: Size = Size { rows: 10, cols: 50 };
 
@@ -591,6 +649,72 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn click(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_an_icon_selects_its_tool() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        // the bar is the rightmost three columns, one icon per row
+        app.apply_mouse(click(SIZE.cols - 2, 2));
+        assert_eq!(app.selected, 2);
+        app.apply_mouse(click(SIZE.cols - 1, 0));
+        assert_eq!(app.selected, 0);
+        // below the icons nothing happens
+        app.apply_mouse(click(SIZE.cols - 2, 7));
+        assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    #[test]
+    fn clicks_reach_the_tool_only_when_it_asked_for_the_mouse() {
+        let fx = fixture("");
+        let out = fx._tmp.path().join("mouse.out");
+        let plain = fx._tmp.path().join("plain.out");
+        let cfg = tool(
+            "m",
+            &format!(
+                "printf '\\\\033[?1000h\\\\033[?1006h'; stty raw -echo; exec cat > {}",
+                out.display()
+            ),
+        ) + &tool(
+            "p",
+            &format!("stty raw -echo; exec cat > {}", plain.display()),
+        );
+        fs::write(&fx.paths.global, cfg).unwrap();
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        wait_until("tool m turns mouse reporting on", || {
+            app.slots[0]
+                .proc
+                .as_ref()
+                .is_some_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+        });
+        app.apply_mouse(click(3, 1));
+        wait_until("the click arrives as SGR, 1-based", || {
+            fs::read(&out).unwrap_or_default() == b"\x1b[<0;4;2M"
+        });
+        // a tool that never asked gets nothing
+        app.select(1);
+        wait_until("tool p runs", || {
+            app.slots[1]
+                .proc
+                .as_ref()
+                .is_some_and(|p| p.state() == ToolState::Running)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        app.apply_mouse(click(3, 1));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(fs::read(&plain).unwrap_or_default().is_empty());
+        app.shutdown();
     }
 
     fn pid(app: &App, i: usize) -> u32 {

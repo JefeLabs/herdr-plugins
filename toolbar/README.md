@@ -55,6 +55,7 @@ Everything goes to the hosted tool except a two-key prefix, default `Ctrl-]`:
 | `Ctrl-]` `q` | quit the toolbar |
 | `Ctrl-]` `Ctrl-]` | send a literal `Ctrl-]` to the tool |
 | `Enter` on an exited tool | restart it |
+| click an icon | select that tool |
 
 Change the prefix with `prefix = "ctrl-b"` (or `alt-t`, ...) at the top of `tools.toml`.
 
@@ -104,7 +105,7 @@ Trust is recorded as the file's path plus a hash of its content, so it has to be
 ## Known limits (v1)
 
 - **Text only.** The embedded terminal advertises `TERM=xterm-256color` without graphics, so tools fall back to text: `yazi` lists files without thumbnails, `mdcat` prints markdown without pictures. Passing Kitty graphics through is the first planned follow-up.
-- **Keyboard only.** Mouse events are not forwarded.
+- **Mouse.** Clicking an icon selects that tool. Clicks, drags and the wheel inside a tool reach it only when the tool has turned mouse reporting on (as `yazi`, `lazysql` and the capabilities tool do), in the mode and encoding it asked for. Because the toolbar captures the mouse, a plain drag no longer selects text in its pane; most terminals still select with Shift held.
 - One toolbar per workspace, in the tab where it was opened. Closing it stops its tools.
 
 ## Troubleshooting
