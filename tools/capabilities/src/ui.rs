@@ -418,6 +418,7 @@ mod tests {
             preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
+            artifacts_selected: 0,
             answering: None,
         };
         let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
@@ -470,6 +471,7 @@ pub enum Pane {
     Preconditions,
     Criteria,
     Questions,
+    Artifacts,
 }
 
 /// Greedy word wrap to `width` columns; a word longer than the width is split.
@@ -519,6 +521,7 @@ pub struct DetailView<'a> {
     pub preconditions_selected: usize,
     pub criteria_selected: usize,
     pub question_selected: usize,
+    pub artifacts_selected: usize,
     /// `(question index, text so far)` while an answer is being typed.
     pub answering: Option<(usize, &'a str)>,
 }
@@ -562,6 +565,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     };
     let c_rows = rows_of(&cs);
     let p_rows = rows_of(&ps);
+    let arts = crate::store::artifacts(&it.body);
     let third = (area.height / 3).max(3);
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -571,6 +575,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
             Constraint::Length((p_rows + 1).clamp(2, third.min(8))),
             Constraint::Length((c_rows + 1).clamp(2, third.min(8))),
             Constraint::Length((q_rows + 1).clamp(2, third + 2)),
+            Constraint::Length((arts.len() as u16 + 1).clamp(2, 6)),
         ])
         .split(area);
 
@@ -755,6 +760,64 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         }
         line.render(rect, buf);
     }
+
+    // artifacts
+    let block = pane_block(
+        &format!("Artifacts ({})", arts.len()),
+        v.focus == Pane::Artifacts,
+    );
+    let inner = block.inner(layout[5]);
+    block.render(layout[5], buf);
+    if arts.is_empty() {
+        Paragraph::new(Span::styled("none yet — specs, plans, ADRs and tickets the agents produce land here (a adds one by hand)", Style::default().add_modifier(Modifier::DIM))).wrap(Wrap { trim: false }).render(inner, buf);
+    }
+    let skip = if v.artifacts_selected >= inner.height as usize {
+        v.artifacts_selected + 1 - inner.height as usize
+    } else {
+        0
+    };
+    for (k, (i, a)) in arts.iter().enumerate().skip(skip).enumerate() {
+        let y = inner.y + k as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let rect = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        if v.focus == Pane::Artifacts && i == v.artifacts_selected {
+            buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+        }
+        Line::from(vec![
+            Span::styled(
+                format!("{:<9}", sanitize(&a.kind)),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::raw(sanitize(&a.target)),
+        ])
+        .render(rect, buf);
+    }
+}
+
+/// Read-only viewer for a Markdown artifact.
+pub fn render_reader(
+    title: &str,
+    lines: &[Line<'static>],
+    scroll: u16,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let block = Block::default().borders(Borders::TOP).title(format!(
+        " {} · Esc back · j/k PgUp/PgDn scroll ",
+        sanitize(title)
+    ));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+        .render(inner, buf);
 }
 
 /// A titled checklist pane with wrapped items; the selected one is highlighted when focused.
@@ -818,7 +881,8 @@ pub fn description_text(body: &str) -> String {
             let h = line.trim();
             skipping = h.eq_ignore_ascii_case("## Acceptance criteria")
                 || h.eq_ignore_ascii_case("## Open questions")
-                || h.eq_ignore_ascii_case("## Preconditions");
+                || h.eq_ignore_ascii_case("## Preconditions")
+                || h.eq_ignore_ascii_case("## Artifacts");
             if skipping {
                 continue;
             }

@@ -120,7 +120,11 @@ fn render_prompt_prefixes_work_start_only_for_building_handoffs_in_workbrokr_rep
         !p.contains("work start"),
         "planning handoffs never start a stack: {p}"
     );
-    assert!(p.starts_with("/grill-me"));
+    assert!(p.contains("/grill-me"), "{p}");
+    assert!(
+        p.find("## Artifacts").unwrap() < p.find("/grill-me").unwrap(),
+        "the artifacts note precedes the handoff: {p}"
+    );
 
     let p = render_prompt(issue, &it, &atts, false);
     assert!(!p.contains("work start"), "non-workbrokr repo: {p}");
@@ -265,4 +269,26 @@ fn prompts_ask_the_agent_to_verify_preconditions_first_when_there_are_any() {
     );
     let p = render_prompt(grill, &without, &[], false);
     assert!(!p.to_lowercase().contains("precondition"), "{p}");
+}
+
+#[test]
+fn prompts_tell_the_agent_where_to_record_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        config: tmp.path().join("cfg"),
+        root: tmp.path().join("root"),
+    };
+    let cfg = load_or_init(&dirs).unwrap();
+    let store = Store::open(&dirs.root).unwrap();
+    let it = store
+        .create(Path::new("Inbox"), "X", "idea", "## Description\nx\n", None)
+        .unwrap();
+    for h in &cfg.handoffs {
+        let p = render_prompt(h, &it, &[], false);
+        assert!(
+            p.contains("## Artifacts") && p.contains(&it.path.display().to_string()),
+            "{}: {p}",
+            h.name
+        );
+    }
 }

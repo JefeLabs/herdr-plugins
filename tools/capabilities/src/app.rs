@@ -115,6 +115,8 @@ pub enum InputAction {
     },
     /// Append an open question.
     AddQuestion,
+    /// Append `- kind: target` under Artifacts (input is "kind: target").
+    AddArtifact,
 }
 
 #[allow(clippy::large_enum_variant)] // Chat carries the live turn; boxing buys nothing here
@@ -132,6 +134,12 @@ pub enum Screen {
     Answer {
         index: usize,
         text: String,
+    },
+    /// Read-only Markdown viewer for an artifact file.
+    Reader {
+        title: String,
+        lines: Vec<ratatui::text::Line<'static>>,
+        scroll: u16,
     },
     Chat(ChatState),
     Diff {
@@ -193,6 +201,8 @@ pub struct View {
     pub question_selected: usize,
     pub criteria_selected: usize,
     pub answer_text: String,
+    pub artifact_count: usize,
+    pub reader_title: String,
 }
 
 pub struct App {
@@ -227,6 +237,7 @@ pub struct App {
     preconditions_selected: usize,
     criteria_selected: usize,
     question_selected: usize,
+    artifacts_selected: usize,
 }
 
 impl App {
@@ -257,6 +268,7 @@ impl App {
             preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
+            artifacts_selected: 0,
         };
         app.rebuild_rows();
         Ok(app)
@@ -369,6 +381,7 @@ impl App {
         self.preconditions_selected = 0;
         self.criteria_selected = 0;
         self.question_selected = 0;
+        self.artifacts_selected = 0;
     }
 
     fn select_path(&mut self, p: &Path) {
@@ -413,6 +426,11 @@ impl App {
                 pending,
             } => self.key_agent_pick(step, items, selected, pending, k),
             Screen::Answer { index, text } => self.key_answer(index, text, k),
+            Screen::Reader {
+                title,
+                lines,
+                scroll,
+            } => self.key_reader(title, lines, scroll, k),
             Screen::Chat(st) => self.key_chat(st, k),
             Screen::Diff {
                 proposal,
@@ -447,13 +465,15 @@ impl App {
                     Pane::Description => Pane::Preconditions,
                     Pane::Preconditions => Pane::Criteria,
                     Pane::Criteria => Pane::Questions,
-                    Pane::Questions => Pane::Tree,
+                    Pane::Questions => Pane::Artifacts,
+                    Pane::Artifacts => Pane::Tree,
                 };
                 return Flow::Continue;
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Pane::Tree => Pane::Questions,
+                    Pane::Tree => Pane::Artifacts,
+                    Pane::Artifacts => Pane::Questions,
                     Pane::Description => Pane::Tree,
                     Pane::Preconditions => Pane::Description,
                     Pane::Criteria => Pane::Preconditions,
@@ -465,6 +485,13 @@ impl App {
                 if self.selected_intent().is_some() {
                     self.focus = Pane::Questions;
                     self.question_selected = 0;
+                }
+                return Flow::Continue;
+            }
+            KeyCode::Char('V') => {
+                if self.selected_intent().is_some() {
+                    self.focus = Pane::Artifacts;
+                    self.artifacts_selected = 0;
                 }
                 return Flow::Continue;
             }
@@ -675,6 +702,10 @@ impl App {
                     },
                 ),
                 Pane::Questions => ("new open question", InputAction::AddQuestion),
+                Pane::Artifacts => (
+                    "new artifact as kind: path-or-url (spec, plan, adr, decision, issue)",
+                    InputAction::AddArtifact,
+                ),
                 _ => return Flow::Continue,
             };
             self.screen = Screen::Input {
@@ -762,8 +793,128 @@ impl App {
                     _ => {}
                 }
             }
+            Pane::Artifacts => {
+                let arts = crate::store::artifacts(&it.body);
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.artifacts_selected =
+                            (self.artifacts_selected + 1).min(arts.len().saturating_sub(1))
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.artifacts_selected = self.artifacts_selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char('o') => {
+                        if let Some(a) = arts.get(self.artifacts_selected).cloned() {
+                            self.open_artifact(&it, &a, k.code == KeyCode::Char('o'));
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Pane::Tree => {}
         }
+        Flow::Continue
+    }
+
+    /// Enter reads a Markdown file in the tool; tickets, URLs and `o` open externally.
+    fn open_artifact(&mut self, it: &Intent, a: &crate::store::Artifact, external: bool) {
+        let target = a.target.trim();
+        let is_ref = target.starts_with('#')
+            || target.starts_with("http://")
+            || target.starts_with("https://");
+        if is_ref || external {
+            if let Some(n) = target.strip_prefix('#') {
+                let repo = it
+                    .fm
+                    .repo
+                    .clone()
+                    .filter(|r| r.is_dir())
+                    .unwrap_or_else(std::env::temp_dir);
+                let _ = std::process::Command::new("gh")
+                    .args(["issue", "view", n, "--web"])
+                    .current_dir(repo)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                self.message = Some(format!("opened #{n} in the browser"));
+                return;
+            }
+            let arg = if is_ref {
+                target.to_string()
+            } else {
+                self.resolve_artifact_path(it, target).display().to_string()
+            };
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            match std::process::Command::new(opener)
+                .arg(&arg)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(_) => self.message = Some(format!("opened {arg}")),
+                Err(e) => self.message = Some(format!("cannot open {arg}: {e}")),
+            }
+            return;
+        }
+        let path = self.resolve_artifact_path(it, target);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let lines = crate::markdown::render_markdown(&text);
+                let title = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| target.to_string());
+                self.screen = Screen::Reader {
+                    title,
+                    lines,
+                    scroll: 0,
+                };
+            }
+            Err(e) => self.message = Some(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+
+    /// Relative targets resolve against the capability's repo, else its own folder.
+    fn resolve_artifact_path(&self, it: &Intent, target: &str) -> PathBuf {
+        let p = PathBuf::from(shellexpand::tilde(target).into_owned());
+        if p.is_absolute() {
+            return p;
+        }
+        match &it.fm.repo {
+            Some(repo) if repo.is_dir() => repo.join(&p),
+            _ => it.path.parent().map(|d| d.join(&p)).unwrap_or(p),
+        }
+    }
+
+    fn key_reader(
+        &mut self,
+        title: String,
+        lines: Vec<ratatui::text::Line<'static>>,
+        mut scroll: u16,
+        k: KeyEvent,
+    ) -> Flow {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.screen = Screen::Browse;
+                self.focus = Pane::Artifacts;
+                return Flow::Continue;
+            }
+            KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+            KeyCode::PageDown => scroll = scroll.saturating_add(10),
+            KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+            _ => {}
+        }
+        self.screen = Screen::Reader {
+            title,
+            lines,
+            scroll,
+        };
         Flow::Continue
     }
 
@@ -1610,6 +1761,25 @@ impl App {
                     .unwrap_or(1)
                     .saturating_sub(1);
             }
+            InputAction::AddArtifact => {
+                let (kind, target) = match value.split_once(':') {
+                    Some((k, t))
+                        if !k.trim().contains(' ')
+                            && !t.trim().is_empty()
+                            && !matches!(k.trim(), "http" | "https") =>
+                    {
+                        (k.trim().to_string(), t.trim().to_string())
+                    }
+                    _ => ("link".to_string(), value.to_string()),
+                };
+                self.edit_selected_body(|body| crate::store::add_artifact(body, &kind, &target));
+                self.focus = Pane::Artifacts;
+                self.artifacts_selected = self
+                    .selected_intent()
+                    .map(|it| crate::store::artifacts(&it.body).len())
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+            }
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
                 match self.store.move_group(&rel, Path::new(value)) {
@@ -1780,6 +1950,7 @@ impl App {
                 Pane::Preconditions => "preconditions",
                 Pane::Criteria => "criteria",
                 Pane::Questions => "questions",
+                Pane::Artifacts => "artifacts",
             },
             question_count: self
                 .selected_intent()
@@ -1788,6 +1959,11 @@ impl App {
             question_selected: self.question_selected,
             criteria_selected: self.criteria_selected,
             answer_text: String::new(),
+            artifact_count: self
+                .selected_intent()
+                .map(|i| crate::store::artifacts(&i.body).len())
+                .unwrap_or(0),
+            reader_title: String::new(),
         };
         match &self.screen {
             Screen::Browse => {}
@@ -1802,6 +1978,10 @@ impl App {
             Screen::Answer { text, .. } => {
                 v.screen = "answer";
                 v.answer_text = text.clone();
+            }
+            Screen::Reader { title, .. } => {
+                v.screen = "reader";
+                v.reader_title = title.clone();
             }
             Screen::Chat(st) => {
                 v.screen = "chat";
@@ -1895,6 +2075,11 @@ impl App {
         let chat_intent = |st: &ChatState| Store::load(&st.intent_path).ok();
         match &self.screen {
             Screen::Edit => self.editor.render(right, buf, true),
+            Screen::Reader {
+                title,
+                lines,
+                scroll,
+            } => ui::render_reader(title, lines, *scroll, right, buf),
             Screen::AgentPick {
                 step,
                 items,
@@ -1985,6 +2170,7 @@ impl App {
                             preconditions_selected: self.preconditions_selected,
                             criteria_selected: self.criteria_selected,
                             question_selected: self.question_selected,
+                            artifacts_selected: self.artifacts_selected,
                             answering,
                         },
                         right,
@@ -2012,14 +2198,16 @@ impl App {
             },
             Screen::SendPick { .. } | Screen::AgentPick { .. } => "j/k choose · Enter select · Esc back".to_string(),
             Screen::Answer { .. } => "type the answer · Enter saves · Esc cancels".to_string(),
+            Screen::Reader { .. } => "j/k · PgUp/PgDn scroll · Esc back".to_string(),
             Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
             Screen::Browse => match (&self.message, self.focus) {
                 (Some(m), _) => m.clone(),
-                (None, Pane::Tree) => "Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
+                (None, Pane::Tree) => "Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read here · o open outside · a add · Esc tree".to_string(),
             },
         };
         ui::render_status(&status_text, status, buf);
@@ -3137,9 +3325,11 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "questions");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "artifacts");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "questions");
+        assert_eq!(fx.app.view().focus, "artifacts");
         // j/k in the tree still move the selection only while the tree has focus
         key(&mut fx.app, KeyCode::Char('j'));
         assert_eq!(
@@ -3447,5 +3637,77 @@ mod tests {
         fx.app.rescan();
         key(&mut fx.app, KeyCode::Char('R'));
         assert_eq!(Store::load(&path).unwrap().fm.state, State::Ready);
+    }
+
+    #[test]
+    fn artifacts_pane_lists_links_and_enter_reads_a_markdown_file_in_the_tool() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx._tmp.path().join("repo");
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            repo.join("docs/spec.md"),
+            "# Spec title\n\nSome **bold** text.\n",
+        )
+        .unwrap();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(repo.clone());
+        it.body =
+            "## Description\nx\n\n## Artifacts\n- spec: docs/spec.md\n- decision: #5813\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('V'));
+        let v = fx.app.view();
+        assert_eq!(v.focus, "artifacts");
+        assert_eq!(v.artifact_count, 2);
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.screen, "reader", "{v:?}");
+        assert!(v.reader_title.contains("spec.md"));
+        let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, 80, 12), f.buffer_mut()))
+            .unwrap();
+        let text = format!("{:?}", t.backend().buffer());
+        assert!(
+            text.contains("Spec title") && !text.contains("# Spec"),
+            "rendered, not raw: {text}"
+        );
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().screen, "browse");
+        assert_eq!(fx.app.view().focus, "artifacts");
+        // add one by hand
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "plan: docs/plan.md");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(
+            Store::load(&path)
+                .unwrap()
+                .body
+                .contains("- plan: docs/plan.md")
+        );
+        assert_eq!(fx.app.view().artifact_count, 3);
+    }
+
+    #[test]
+    fn reading_a_missing_artifact_file_shows_a_message_not_a_crash() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(fx._tmp.path().to_path_buf());
+        it.body = "## Description\nx\n\n## Artifacts\n- spec: docs/nope.md\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('V'));
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("nope.md")
+        );
     }
 }

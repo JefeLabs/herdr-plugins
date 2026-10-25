@@ -2,8 +2,9 @@ use std::fs;
 use std::path::Path;
 
 use herdr_capabilities::store::{
-    SaveError, State, Store, add_checklist_item, add_question, answer_question, criteria,
-    open_questions, preconditions, questions, slugify, toggle_criterion, toggle_precondition,
+    SaveError, State, Store, add_artifact, add_checklist_item, add_question, answer_question,
+    artifacts, criteria, open_questions, preconditions, questions, slugify, toggle_criterion,
+    toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -430,4 +431,30 @@ fn add_checklist_item_appends_under_the_heading_creating_it_if_missing() {
     assert!(out.contains("- q?\n- new q?\n"), "{out}");
     let out = add_question("## Description\nonly\n", "first?");
     assert!(out.ends_with("## Open questions\n- first?\n"), "{out}");
+}
+
+#[test]
+fn artifacts_parse_kind_and_target_and_can_be_added() {
+    let body = "## Description\nx\n\n## Artifacts\n- spec: docs/superpowers/specs/2026-10-24-x-design.md\n- plan: docs/superpowers/plans/2026-10-24-x.md\n- adr: docs/adr/0007-event-sourced.md\n- decision: #5813\n- issue: https://github.com/o/r/issues/5821\n- note without a kind\n";
+    let a = artifacts(body);
+    assert_eq!(a.len(), 6);
+    assert_eq!(
+        (a[0].kind.as_str(), a[0].target.as_str()),
+        ("spec", "docs/superpowers/specs/2026-10-24-x-design.md")
+    );
+    assert_eq!(
+        (a[3].kind.as_str(), a[3].target.as_str()),
+        ("decision", "#5813")
+    );
+    assert_eq!(
+        (a[5].kind.as_str(), a[5].target.as_str()),
+        ("link", "note without a kind")
+    );
+    let out = add_artifact("## Description\nx\n", "spec", "docs/x.md");
+    assert!(out.contains("## Artifacts\n- spec: docs/x.md\n"), "{out}");
+    let out = add_artifact(&out, "plan", "docs/y.md");
+    assert!(
+        out.contains("- spec: docs/x.md\n- plan: docs/y.md\n"),
+        "{out}"
+    );
 }

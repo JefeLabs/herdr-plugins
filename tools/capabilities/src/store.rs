@@ -734,6 +734,54 @@ pub fn add_question(body: &str, text: &str) -> String {
     append_to_section(body, QUESTIONS_HEADING, &format!("- {}", text.trim()))
 }
 
+pub const ARTIFACTS_HEADING: &str = "## Artifacts";
+
+/// Something generated for the capability elsewhere: a spec, plan, ADR,
+/// decision ticket or issue. `target` is a path (relative to the repo) or a
+/// `#123` / URL reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub kind: String,
+    pub target: String,
+}
+
+/// `- <kind>: <target>` lines under `## Artifacts`; a line without a kind is a `link`.
+pub fn artifacts(body: &str) -> Vec<Artifact> {
+    section_lines(body, ARTIFACTS_HEADING)
+        .into_iter()
+        .filter_map(|(_, line)| {
+            let item = line.trim_start().strip_prefix("- ")?.trim();
+            if item.is_empty() {
+                return None;
+            }
+            // "kind: target" where kind is a single word and target is not a URL scheme
+            if let Some((k, t)) = item.split_once(':')
+                && !k.trim().is_empty()
+                && !k.trim().contains(' ')
+                && !t.trim().is_empty()
+                && !matches!(k.trim(), "http" | "https" | "file")
+            {
+                return Some(Artifact {
+                    kind: k.trim().to_lowercase(),
+                    target: t.trim().to_string(),
+                });
+            }
+            Some(Artifact {
+                kind: "link".into(),
+                target: item.to_string(),
+            })
+        })
+        .collect()
+}
+
+pub fn add_artifact(body: &str, kind: &str, target: &str) -> String {
+    append_to_section(
+        body,
+        ARTIFACTS_HEADING,
+        &format!("- {}: {}", kind.trim().to_lowercase(), target.trim()),
+    )
+}
+
 pub const CRITERIA_HEADING: &str = "## Acceptance criteria";
 pub const PRECONDITIONS_HEADING: &str = "## Preconditions";
 

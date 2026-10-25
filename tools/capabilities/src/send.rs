@@ -11,6 +11,13 @@ use crate::store::Intent;
 /// Handoffs that build code; planning handoffs never get the work-start preamble.
 const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec"];
 
+fn artifacts_preamble(intent: &Intent) -> String {
+    format!(
+        "Whenever you create something for this capability — a spec, a plan, an ADR or decision record, a wayfinder decision ticket, or a GitHub issue — append one line under `## Artifacts` in {} (create the section if missing): `- spec: <path>`, `- plan: <path>`, `- adr: <path>`, `- decision: #<n>`, `- issue: <url or #n>`. Paths are relative to the repo root.\n\n",
+        intent.path.display()
+    )
+}
+
 const PRECONDITIONS_PREAMBLE: &str = "Before anything else, verify each item under Preconditions against the code and the data: tell me which hold, which do not, and ask about any you cannot settle. Do not build on a precondition you have not confirmed.\n\n";
 
 const WORKBROKR_PREAMBLE: &str = "This repo uses workbrokr. Before touching code, run `work start --area <area> --type <fix|feature> --mode <fullstack|frontend>`; take the area from the intent's tags or group, and ask me if it is unclear.\n\n";
@@ -83,6 +90,7 @@ pub fn render_prompt(
         .replace("\\n", "\n")
         .replace("{intent}", &intent_text)
         .replace("{attachments}", &atts);
+    p = format!("{}{p}", artifacts_preamble(intent));
     if !crate::store::preconditions(&intent.body).is_empty() {
         p = format!("{PRECONDITIONS_PREAMBLE}{p}");
     }
