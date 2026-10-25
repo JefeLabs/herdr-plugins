@@ -7,8 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// What the app should do with a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Write these bytes to the selected tool.
-    Forward(Vec<u8>),
+    /// Send this key to the selected tool (encoded by `key_to_bytes` with the
+    /// tool's current cursor mode).
+    Forward(KeyEvent),
     /// Zero-based tool index.
     Select(usize),
     Next,
@@ -57,8 +58,18 @@ impl KeyChord {
         Ok(Self { code, modifiers })
     }
 
+    /// Compare by the bytes a terminal would send, not by crossterm's decoding:
+    /// crossterm reports the byte 0x1d (Ctrl-]) as Char('5') + CONTROL, so a
+    /// chord written "ctrl-]" must still match it.
     fn matches(&self, key: &KeyEvent) -> bool {
-        key.code == self.code && key.modifiers == self.modifiers
+        if key.code == self.code && key.modifiers == self.modifiers {
+            return true;
+        }
+        let chord = KeyEvent::new(self.code, self.modifiers);
+        match (key_to_bytes(key, false), key_to_bytes(&chord, false)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -87,15 +98,11 @@ impl Prefix {
                 self.armed = true;
                 return Action::Ignore;
             }
-            return key_to_bytes(&key)
-                .map(Action::Forward)
-                .unwrap_or(Action::Ignore);
+            return Action::Forward(key);
         }
         self.armed = false;
         if self.chord.matches(&key) {
-            return key_to_bytes(&key)
-                .map(Action::Forward)
-                .unwrap_or(Action::Ignore);
+            return Action::Forward(key);
         }
         match key.code {
             KeyCode::Char(c @ '1'..='9') if key.modifiers.is_empty() => {
@@ -112,10 +119,61 @@ impl Prefix {
 }
 
 /// Encode a key the way an xterm-compatible terminal would send it.
-/// Returns `None` for keys that have no byte form (modifier-only, media keys).
-pub fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+/// `app_cursor` is the tool's DECCKM state (`vt100::Screen::application_cursor`):
+/// when set, unmodified arrows and Home/End use SS3 (`ESC O A`) as ncurses expects.
+/// Modified special keys use xterm's `CSI 1 ; m X` / `CSI n ; m ~` form.
+/// Returns `None` for keys that have no byte form.
+pub fn key_to_bytes(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let modifier = 1 + (shift as u8) + (alt as u8) * 2 + (ctrl as u8) * 4;
+
+    // Keys whose encoding is a final letter: CSI letter, SS3 letter, or CSI 1;m letter.
+    let letter = match key.code {
+        KeyCode::Up => Some(b'A'),
+        KeyCode::Down => Some(b'B'),
+        KeyCode::Right => Some(b'C'),
+        KeyCode::Left => Some(b'D'),
+        KeyCode::Home => Some(b'H'),
+        KeyCode::End => Some(b'F'),
+        KeyCode::F(1) => Some(b'P'),
+        KeyCode::F(2) => Some(b'Q'),
+        KeyCode::F(3) => Some(b'R'),
+        KeyCode::F(4) => Some(b'S'),
+        _ => None,
+    };
+    if let Some(l) = letter {
+        let is_f = matches!(key.code, KeyCode::F(_));
+        return Some(if modifier > 1 {
+            format!("\x1b[1;{modifier}{}", l as char).into_bytes()
+        } else if is_f || app_cursor {
+            vec![0x1b, b'O', l]
+        } else {
+            vec![0x1b, b'[', l]
+        });
+    }
+
+    // Keys whose encoding is CSI number ~ (with ;m before the tilde when modified).
+    let tilde = match key.code {
+        KeyCode::Insert => Some(2),
+        KeyCode::Delete => Some(3),
+        KeyCode::PageUp => Some(5),
+        KeyCode::PageDown => Some(6),
+        KeyCode::F(5) => Some(15),
+        KeyCode::F(6) => Some(17),
+        KeyCode::F(7) => Some(18),
+        KeyCode::F(8) => Some(19),
+        KeyCode::F(9) => Some(20),
+        KeyCode::F(10) => Some(21),
+        KeyCode::F(11) => Some(23),
+        KeyCode::F(12) => Some(24),
+        _ => None,
+    };
+    if let Some(n) = tilde {
+        return Some(if modifier > 1 { format!("\x1b[{n};{modifier}~") } else { format!("\x1b[{n}~") }.into_bytes());
+    }
+
     let mut out: Vec<u8> = Vec::with_capacity(4);
     if alt {
         out.push(0x1b);
@@ -128,17 +186,6 @@ pub fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::F(n) => function_key(n)?,
         _ => return None,
     };
     out.extend(body);
@@ -176,23 +223,6 @@ fn control_byte(ch: char) -> Option<u8> {
     })
 }
 
-fn function_key(n: u8) -> Option<Vec<u8>> {
-    Some(match n {
-        1 => b"\x1bOP".to_vec(),
-        2 => b"\x1bOQ".to_vec(),
-        3 => b"\x1bOR".to_vec(),
-        4 => b"\x1bOS".to_vec(),
-        5 => b"\x1b[15~".to_vec(),
-        6 => b"\x1b[17~".to_vec(),
-        7 => b"\x1b[18~".to_vec(),
-        8 => b"\x1b[19~".to_vec(),
-        9 => b"\x1b[20~".to_vec(),
-        10 => b"\x1b[21~".to_vec(),
-        11 => b"\x1b[23~".to_vec(),
-        12 => b"\x1b[24~".to_vec(),
-        _ => return None,
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -202,6 +232,7 @@ mod tests {
     const NONE: KeyModifiers = KeyModifiers::NONE;
     const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
     const ALT: KeyModifiers = KeyModifiers::ALT;
+    const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 
     fn k(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
@@ -209,14 +240,26 @@ mod tests {
     fn p() -> Prefix {
         Prefix::new("ctrl-]").unwrap()
     }
+    /// crossterm 0.29 decodes the byte 0x1d (Ctrl-]) as Char('5') + CONTROL,
+    /// never as Char(']') + CONTROL. Tests must use what crossterm produces.
+    fn ctrl_bracket() -> KeyEvent {
+        k(Char('5'), CONTROL)
+    }
     fn arm(p: &mut Prefix) {
-        assert!(matches!(p.handle(k(Char(']'), CONTROL)), Action::Ignore));
+        assert!(matches!(p.handle(ctrl_bracket()), Action::Ignore));
         assert!(p.armed());
     }
 
     #[test]
-    fn plain_keys_forward() {
-        assert!(matches!(p().handle(k(Char('a'), NONE)), Action::Forward(b) if b == b"a"));
+    fn plain_keys_forward_the_event() {
+        assert!(matches!(p().handle(k(Char('a'), NONE)), Action::Forward(e) if e.code == Char('a')));
+    }
+
+    #[test]
+    fn prefix_arms_on_the_event_crossterm_actually_produces() {
+        let mut p = p();
+        assert!(matches!(p.handle(k(Char('5'), CONTROL)), Action::Ignore));
+        assert!(p.armed());
     }
 
     #[test]
@@ -231,7 +274,8 @@ mod tests {
     fn prefix_twice_sends_literal_0x1d() {
         let mut p = p();
         arm(&mut p);
-        assert!(matches!(p.handle(k(Char(']'), CONTROL)), Action::Forward(b) if b == vec![0x1d]));
+        let Action::Forward(e) = p.handle(ctrl_bracket()) else { panic!("expected Forward") };
+        assert_eq!(key_to_bytes(&e, false), Some(vec![0x1d]));
         assert!(!p.armed());
     }
 
@@ -246,31 +290,51 @@ mod tests {
     #[test]
     fn jk_r_x_q_map() {
         let mut p = p();
-        for (ch, want) in [
-            ('j', Action::Next),
-            ('k', Action::Prev),
-            ('r', Action::Reload),
-            ('x', Action::Restart),
-            ('q', Action::Quit),
-        ] {
+        for (ch, want) in [('j', Action::Next), ('k', Action::Prev), ('r', Action::Reload), ('x', Action::Restart), ('q', Action::Quit)] {
             arm(&mut p);
             assert_eq!(p.handle(k(Char(ch), NONE)), want, "key {ch}");
         }
     }
 
     #[test]
+    fn alt_prefix_matches_too() {
+        let mut p = Prefix::new("alt-t").unwrap();
+        assert!(matches!(p.handle(k(Char('t'), ALT)), Action::Ignore));
+        assert!(p.armed());
+    }
+
+    #[test]
     fn encodes_arrows_and_ctrl_chars() {
-        assert_eq!(key_to_bytes(&k(Up, NONE)), Some(vec![27, 91, 65]));
-        assert_eq!(key_to_bytes(&k(Char('c'), CONTROL)), Some(vec![3]));
-        assert_eq!(key_to_bytes(&k(Char('x'), ALT)), Some(vec![27, b'x']));
-        assert_eq!(key_to_bytes(&k(F(5), NONE)), Some(b"\x1b[15~".to_vec()));
-        assert_eq!(key_to_bytes(&k(Enter, NONE)), Some(vec![b'\r']));
-        assert_eq!(key_to_bytes(&k(Backspace, NONE)), Some(vec![0x7f]));
-        assert_eq!(
-            key_to_bytes(&k(Char('é'), NONE)),
-            Some("é".as_bytes().to_vec())
-        );
-        assert_eq!(key_to_bytes(&k(Char(' '), CONTROL)), Some(vec![0]));
+        assert_eq!(key_to_bytes(&k(Up, NONE), false), Some(vec![27, 91, 65]));
+        assert_eq!(key_to_bytes(&k(Char('c'), CONTROL), false), Some(vec![3]));
+        assert_eq!(key_to_bytes(&k(Char('x'), ALT), false), Some(vec![27, b'x']));
+        assert_eq!(key_to_bytes(&k(F(5), NONE), false), Some(b"\x1b[15~".to_vec()));
+        assert_eq!(key_to_bytes(&k(Enter, NONE), false), Some(vec![b'\r']));
+        assert_eq!(key_to_bytes(&k(Backspace, NONE), false), Some(vec![0x7f]));
+        assert_eq!(key_to_bytes(&k(Char('é'), NONE), false), Some("é".as_bytes().to_vec()));
+        assert_eq!(key_to_bytes(&k(Char(' '), CONTROL), false), Some(vec![0]));
+    }
+
+    #[test]
+    fn application_cursor_mode_uses_ss3_for_arrows_and_home_end() {
+        assert_eq!(key_to_bytes(&k(Up, NONE), true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(key_to_bytes(&k(Left, NONE), true), Some(b"\x1bOD".to_vec()));
+        assert_eq!(key_to_bytes(&k(Home, NONE), true), Some(b"\x1bOH".to_vec()));
+        assert_eq!(key_to_bytes(&k(End, NONE), true), Some(b"\x1bOF".to_vec()));
+        // not affected by the mode
+        assert_eq!(key_to_bytes(&k(PageUp, NONE), true), Some(b"\x1b[5~".to_vec()));
+    }
+
+    #[test]
+    fn modifiers_on_special_keys_use_xterm_encoding() {
+        assert_eq!(key_to_bytes(&k(Left, CONTROL), false), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(key_to_bytes(&k(Right, SHIFT), false), Some(b"\x1b[1;2C".to_vec()));
+        assert_eq!(key_to_bytes(&k(Up, ALT), false), Some(b"\x1b[1;3A".to_vec()));
+        assert_eq!(key_to_bytes(&k(F(5), SHIFT), false), Some(b"\x1b[15;2~".to_vec()));
+        assert_eq!(key_to_bytes(&k(F(1), CONTROL), false), Some(b"\x1b[1;5P".to_vec()));
+        assert_eq!(key_to_bytes(&k(Delete, CONTROL), false), Some(b"\x1b[3;5~".to_vec()));
+        // in application cursor mode a modified arrow still uses CSI
+        assert_eq!(key_to_bytes(&k(Left, CONTROL), true), Some(b"\x1b[1;5D".to_vec()));
     }
 
     #[test]

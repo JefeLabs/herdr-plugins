@@ -242,7 +242,7 @@ impl App {
 
     pub fn apply_key(&mut self, key: KeyEvent) -> Flow {
         match self.prefix.handle(key) {
-            Action::Forward(bytes) => {
+            Action::Forward(key) => {
                 self.message = None;
                 let Some(slot) = self.slots.get(self.selected) else {
                     return Flow::Continue;
@@ -250,7 +250,10 @@ impl App {
                 match slot.state() {
                     ToolState::Running => {
                         if let Some(p) = slot.proc.as_ref() {
-                            let _ = p.write(&bytes);
+                            let app_cursor = p.screen().application_cursor();
+                            if let Some(bytes) = crate::keys::key_to_bytes(&key, app_cursor) {
+                                let _ = p.write(&bytes);
+                            }
                         }
                     }
                     ToolState::Exited { .. } | ToolState::Failed(_)
@@ -658,7 +661,8 @@ mod tests {
         app.select(1);
         let (p0, p1) = (pid(&app, 0), pid(&app, 1));
         assert_eq!(
-            app.apply_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            // crossterm reports Ctrl-] as Char('5') + CONTROL
+            app.apply_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL)),
             Flow::Continue
         );
         assert_eq!(app.apply_key(key(KeyCode::Char('q'))), Flow::Quit);
