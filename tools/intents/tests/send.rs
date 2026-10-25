@@ -199,5 +199,32 @@ fn agent_name_is_valid_and_short() {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     );
     assert!(!n.ends_with('-'));
-    assert_eq!(agent_name("---"), "intent-x");
+    assert!(agent_name("---").starts_with("intent-x-"));
+}
+
+#[test]
+fn agent_names_are_unique_per_send() {
+    let a = agent_name("same-slug");
+    let b = agent_name("same-slug");
+    assert_ne!(
+        a, b,
+        "two sends of one intent must not collide on the agent name"
+    );
+    assert!(a.len() <= 32 && b.len() <= 32);
+}
+
+#[test]
+fn failed_start_reports_the_orphaned_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("herdr.log");
+    let env = vec![
+        ("FAKE_HERDR_LOG".to_string(), log.display().to_string()),
+        ("FAKE_AGENT_START_FAILS".to_string(), "1".to_string()),
+    ];
+    let e = send(&fake_herdr(), &env, tmp.path(), "t", "claude", "p").unwrap_err();
+    assert!(
+        e.detail.contains("w9"),
+        "names the workspace left behind: {}",
+        e.detail
+    );
 }

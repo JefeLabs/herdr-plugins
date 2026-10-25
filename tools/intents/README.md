@@ -19,7 +19,7 @@ On first run the tool seeds `intents.toml` and the kind templates in its config 
 herdr plugin config-dir jefelabs.intents      # ~/.config/herdr/plugins/config/jefelabs.intents
 ```
 
-Standalone runs use the same directory, so the toolbar and a plain terminal always see one config and one root (`~/intents` by default). `INTENTS_CONFIG_DIR` overrides it.
+Standalone runs use the same directory, so the toolbar and a plain terminal always see one config and one root (`~/intents` by default). `INTENTS_CONFIG_DIR` overrides the config dir and `INTENTS_ROOT` the root, so a workspace can point at its own `intents/` folder through the toolbar's per-worktree config (`env = { INTENTS_ROOT = "..." }`).
 
 ## In the toolbar
 
@@ -44,11 +44,11 @@ command = "jefelabs.intents.add"
 
 ## Keys
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group, `Enter`/`e` edit, `a` add an intent in the selected group, `n` new group, `m` move to a group (type its path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `s` send, `A` attach a file (type its path), `o` open the first attachment, `r` rescan, `q` quit.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group, `n` new group, `m` move the selected intent or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
 
 Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` refine (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 
-Refine (chat): type and `Enter` to send the next message, `Esc` cancels a running turn or leaves, `a` shows a diff of the latest proposal, `d` dismisses it. In the diff, `Enter` applies, `Esc` goes back.
+Refine (chat): type and `Enter` to send the next message, `Esc` cancels a running turn or leaves, `Ctrl-a` shows a diff of the latest proposal, `Ctrl-d` dismisses it, `PgUp`/`PgDn` scroll the transcript. Plain letters are always typed, so a message may start with "a" or "d". In the diff, only `Enter` applies; `Esc` goes back; `PgUp`/`PgDn` scroll.
 
 Send: pick a handoff, then on the confirm screen `Tab` cycles the provider, `j`/`k` scroll the prompt, `Enter` sends, `Esc` cancels.
 
@@ -67,7 +67,7 @@ The conversation id is stored per provider in the intent's front matter and resu
 | `codex` | `codex exec --json …` | `codex exec resume <id> …` | unverified (account returned 402) |
 | `copilot` | `copilot -p … --output-format json` | `--session-id <id>` | unverified (policy denied) |
 
-Any other CLI goes in `intents.toml` as a custom provider. The tool never passes `--allow-all*`, `--dangerously-skip-permissions` or similar flags: polish runs with whatever permissions the CLI grants by default, and nothing more.
+Any other CLI goes in `intents.toml` as a custom provider. Polish runs with no tools and no repository in reach: the built-in argv use `--permission-mode plan --tools "" --strict-mcp-config` (claude), `--mode plan` (agy), `--sandbox read-only` (codex) and `--deny-tool '*'` (copilot), and every turn runs in a neutral directory under the root (`<root>/.polish/<intent>`), never in your checkout. The tool never passes `--allow-all*` or `--dangerously-skip-permissions`.
 
 ```toml
 polish_provider = "agy"
@@ -103,7 +103,9 @@ Send runs `herdr workspace create` on the intent's repo (always the main checkou
   skoolscout/applications/…
 ```
 
-Front matter: `title, kind, state (raw|refining|ready|sent), created, updated, repo, tags, polished_at, sent_to, conversations`. Unknown fields you add by hand are preserved. If two toolbars edit the same intent, the second save asks before overwriting.
+Front matter: `title, kind, state (raw|refining|ready|sent), created, updated, repo, tags, polished_at, sent_to, conversations`. Hand edits are read leniently: unknown fields are preserved, a missing title falls back to the file name, dates may be `YYYY-MM-DD`, tags may be a scalar, states are case-insensitive, CRLF is fine. Every field change (state, kind, sent) reloads the file first, so two toolbars never clobber each other's text; a save or an apply over a file that changed since you opened it asks before overwriting.
+
+`send` needs `repo:` set to the main checkout; captures record it automatically (Herdr's `workspace_cwd` inside the toolbar, else the current directory). Without it the tool refuses to send rather than guess.
 
 ## Limits (v1)
 

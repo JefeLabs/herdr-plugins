@@ -98,46 +98,64 @@ pub struct Reply {
     pub questions: Vec<String>,
 }
 
-/// Find the fenced ```proposal block and the `questions:` list.
+/// Find the fenced proposal block and the `questions:` list. Fences follow
+/// CommonMark: the opener's backtick run length is remembered and only a bare
+/// fence of at least that length closes the block, so code blocks inside the
+/// proposal survive (templates ask for a four-backtick opener when needed).
 pub fn parse_reply(text: &str) -> Reply {
     let mut reply = Reply::default();
     let mut prose = String::new();
     let mut proposal = String::new();
-    let mut in_block = false;
+    let mut fence_len: Option<usize> = None;
     let mut in_questions = false;
     let mut saw_block = false;
     for line in text.lines() {
         let t = line.trim_end();
-        if !in_block && t.trim_start().starts_with("```proposal") {
-            in_block = true;
-            saw_block = true;
-            in_questions = false;
-            continue;
-        }
-        if in_block {
-            if t.trim_start() == "```" {
-                in_block = false;
+        let trimmed = t.trim_start();
+        if let Some(len) = fence_len {
+            let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+            if ticks >= len && trimmed[ticks..].trim().is_empty() {
+                fence_len = None;
             } else {
                 proposal.push_str(line);
                 proposal.push('\n');
             }
             continue;
         }
-        let lower = t.trim().to_ascii_lowercase();
-        if lower.starts_with("questions:") {
+        let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+        if ticks >= 3 && trimmed[ticks..].trim().eq_ignore_ascii_case("proposal") {
+            if saw_block {
+                proposal.clear(); // a later block replaces an earlier one
+            }
+            fence_len = Some(ticks);
+            saw_block = true;
+            in_questions = false;
+            continue;
+        }
+        let header = trimmed
+            .trim_matches(|c| c == '*' || c == '_')
+            .trim()
+            .to_ascii_lowercase();
+        if let Some(after) = header.strip_prefix("questions:") {
             in_questions = true;
-            let rest = t.trim()[10..].trim();
+            let rest = after.trim().to_string();
             if !rest.is_empty() && rest != "none" {
-                reply.questions.push(rest.to_string());
+                let original = trimmed.trim_matches(|c| c == '*' || c == '_').trim();
+                let idx = original
+                    .to_ascii_lowercase()
+                    .find("questions:")
+                    .map(|i| i + "questions:".len())
+                    .unwrap_or(0);
+                reply.questions.push(original[idx..].trim().to_string());
             }
             continue;
         }
         if in_questions {
-            if let Some(q) = t.trim_start().strip_prefix("- ") {
+            if let Some(q) = trimmed.strip_prefix("- ") {
                 reply.questions.push(q.trim().to_string());
                 continue;
             }
-            if t.trim().is_empty() {
+            if trimmed.is_empty() {
                 continue;
             }
             in_questions = false;

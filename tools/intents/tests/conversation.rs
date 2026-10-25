@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use herdr_intents::config::{Output, ProviderSpec, When};
-use herdr_intents::conversation::{Turn, TurnMsg, seed_prompt};
+use herdr_intents::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -204,4 +204,58 @@ fn seed_prompt_includes_body_and_focus_line_only_with_selection() {
     let p = seed_prompt(t, "## Observed\nx\n", Some("x"), "issue");
     assert!(p.to_lowercase().contains("focus on"), "{p}");
     assert!(p.contains("\nx\n") || p.contains("> x"));
+}
+
+// I9: one invalid UTF-8 line must not end the turn
+#[test]
+fn invalid_utf8_line_does_not_kill_the_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let events = tmp.path().join("bad.jsonl");
+    let mut bytes = std::fs::read(fixtures().join("events/agy.jsonl")).unwrap();
+    let mut with_bad = b"warming up \xff\xfe not utf8\n".to_vec();
+    with_bad.append(&mut bytes);
+    std::fs::write(&events, with_bad).unwrap();
+    let turn = Turn::start(
+        &spec(),
+        "x",
+        None,
+        tmp.path(),
+        &[("FAKE_EVENTS".to_string(), events.display().to_string())],
+    )
+    .unwrap();
+    let msgs = collect(&turn, Duration::from_secs(5));
+    assert!(
+        matches!(msgs.last(), Some(TurnMsg::Finished(r)) if r.proposal.is_some()),
+        "{:?}",
+        msgs.last()
+    );
+}
+
+// I8: with no conversation id (text providers, cancelled first turn) the
+// follow-up must carry the seed and the transcript, not just the new message
+#[test]
+fn follow_up_prompt_without_id_carries_seed_and_transcript() {
+    let p = follow_up_prompt(
+        "SEED",
+        &[
+            ("user".to_string(), "polish".to_string()),
+            ("agent".to_string(), "reply one".to_string()),
+        ],
+        "shorter please",
+        false,
+    );
+    assert!(
+        p.contains("SEED") && p.contains("reply one") && p.ends_with("shorter please\n"),
+        "{p}"
+    );
+    let p = follow_up_prompt(
+        "SEED",
+        &[("user".to_string(), "polish".to_string())],
+        "shorter please",
+        true,
+    );
+    assert_eq!(
+        p, "shorter please",
+        "with a resumable conversation only the new message is sent"
+    );
 }

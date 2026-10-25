@@ -140,3 +140,29 @@ fn empty_proposal_block_is_none_and_questions_none_is_empty() {
     assert!(r.proposal.is_none());
     assert!(r.questions.is_empty());
 }
+
+// I3: a code block inside the proposal must not close it
+#[test]
+fn proposal_block_survives_nested_code_fences() {
+    let text = "Intro\n\n````proposal\n## Steps\n```bash\nmake test\n```\n## Evidence\nlog\n````\nquestions: none\n";
+    let r = parse_reply(text);
+    assert_eq!(
+        r.proposal.as_deref(),
+        Some("## Steps\n```bash\nmake test\n```\n## Evidence\nlog\n")
+    );
+    // CommonMark: a bare fence shorter than the opener does not close it
+    let text = "`````proposal\nA\n````inner\nx\n````\nB\n`````\n";
+    let r = parse_reply(text);
+    assert_eq!(r.proposal.as_deref(), Some("A\n````inner\nx\n````\nB\n"));
+    // a plain three-backtick block with no nesting still works
+    let r = parse_reply("```proposal\nonly\n```\n");
+    assert_eq!(r.proposal.as_deref(), Some("only\n"));
+}
+
+#[test]
+fn questions_header_variants_are_recognised() {
+    let r = parse_reply("```proposal\nx\n```\n**Questions:**\n- One?\n");
+    assert_eq!(r.questions, ["One?"]);
+    let r = parse_reply("```proposal\nx\n```\nquestions: None\n");
+    assert!(r.questions.is_empty(), "{:?}", r.questions);
+}

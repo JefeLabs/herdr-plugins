@@ -1,4 +1,9 @@
 //! App state machine and run loop.
+//!
+//! `App` owns the tree and the current screen. Every field-only change goes
+//! through `Store::update_fields` (reload, change, save) so a stale in-memory
+//! row never clobbers another writer's body. The chat is about one intent path,
+//! records the change stamp it opened with, and apply prompts if that moved.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,8 +17,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
-use crate::config::{Config, Dirs, Handoff, KINDS, template};
-use crate::conversation::{Turn, TurnMsg, seed_prompt};
+use crate::config::{Config, Dirs, Handoff, KINDS, polish_cwd, template};
+use crate::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
 use crate::editor::TextArea;
 use crate::provider::Reply;
 use crate::store::{Group, Intent, SaveError, State, Store};
@@ -23,8 +28,8 @@ use crate::ui;
 pub enum Flow {
     Continue,
     Quit,
-    /// Leave the TUI, run `$EDITOR` on this file, come back and reload.
-    ExternalEdit(usize),
+    /// Leave the TUI, run `$EDITOR` on the intent in the editor, come back and reload.
+    ExternalEdit,
 }
 
 #[allow(clippy::large_enum_variant)] // one Intent per row is the point of the row
@@ -39,6 +44,11 @@ enum Row {
         intent: Intent,
         depth: usize,
     },
+    Broken {
+        path: PathBuf,
+        error: String,
+        depth: usize,
+    },
 }
 
 pub struct ChatState {
@@ -49,12 +59,22 @@ pub struct ChatState {
     pub provider: String,
     pub conv_id: Option<String>,
     pub hint: Option<String>,
+    /// The intent this chat is about (never "whatever row is selected now").
+    pub intent_path: PathBuf,
+    /// Change stamp of the intent when the chat opened; apply prompts if it moved.
+    pub opened_stamp: chrono::DateTime<chrono::Local>,
+    /// The seed prompt, re-sent with the transcript when the provider cannot resume.
+    pub seed: String,
+    /// Go back to the editor (buffer intact) rather than browse on Esc.
+    pub from_editor: bool,
+    /// Wrapped lines scrolled back from the tail of the transcript.
+    pub scroll: u16,
 }
 
 pub enum Pending {
     OverwriteSave,
     DiscardEdits,
-    OverwriteApply(String),
+    OverwriteApply { body: String },
 }
 
 pub enum InputAction {
@@ -62,6 +82,7 @@ pub enum InputAction {
     NewGroup { parent: PathBuf },
     Attach,
     MoveTo,
+    MoveGroup { group: PathBuf },
 }
 
 #[allow(clippy::large_enum_variant)] // Chat carries the live turn; boxing buys nothing here
@@ -72,6 +93,7 @@ pub enum Screen {
     Diff {
         proposal: String,
         questions: Vec<String>,
+        scroll: u16,
     },
     SendPick {
         handoffs: Vec<Handoff>,
@@ -114,6 +136,11 @@ pub struct View {
     pub turn_running: bool,
     pub transcript: Vec<(String, String)>,
     pub transcript_len: usize,
+    pub chat_input: String,
+    pub chat_scroll: u16,
+    pub diff_scroll: u16,
+    pub input_text: String,
+    pub send_prompt: Option<String>,
 }
 
 pub struct App {
@@ -136,7 +163,7 @@ pub struct App {
     pub provider_env: Vec<(String, String)>,
     /// Extra environment for `herdr` calls on send (tests use the fake).
     pub herdr_env: Vec<(String, String)>,
-    /// Chat state kept while the Diff screen is showing.
+    /// Chat state kept while the Diff or a Prompt screen is showing.
     parked_chat: Option<ChatState>,
 }
 
@@ -169,6 +196,9 @@ impl App {
 
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
+        fn count_intents(g: &Group) -> usize {
+            g.intents.len() + g.groups.iter().map(count_intents).sum::<usize>()
+        }
         fn walk(
             g: &Group,
             depth: usize,
@@ -181,12 +211,11 @@ impl App {
                 if seen.insert(sub.path.clone()) && depth >= 1 {
                     collapsed.insert(sub.path.clone());
                 }
-                let count = count_intents(sub);
                 rows.push(Row::Group {
                     path: sub.path.clone(),
                     name: sub.name.clone(),
                     depth,
-                    count,
+                    count: count_intents(sub),
                 });
                 if !collapsed.contains(&sub.path) {
                     walk(sub, depth + 1, collapsed, seen, rows);
@@ -198,9 +227,13 @@ impl App {
                     depth,
                 });
             }
-        }
-        fn count_intents(g: &Group) -> usize {
-            g.intents.len() + g.groups.iter().map(count_intents).sum::<usize>()
+            for (path, error) in &g.broken {
+                rows.push(Row::Broken {
+                    path: path.clone(),
+                    error: error.clone(),
+                    depth,
+                });
+            }
         }
         walk(
             &self.tree,
@@ -222,10 +255,8 @@ impl App {
             Err(e) => self.message = Some(format!("rescan failed: {e:#}")),
         }
         self.rebuild_rows();
-        if let Some(p) = keep
-            && let Some(i) = self.rows.iter().position(|r| row_path(r) == p)
-        {
-            self.selected = i;
+        if let Some(p) = keep {
+            self.select_path(&p);
         }
     }
 
@@ -240,19 +271,16 @@ impl App {
         }
     }
 
-    fn selected_intent_mut(&mut self) -> Option<&mut Intent> {
-        match self.rows.get_mut(self.selected) {
-            Some(Row::Intent { intent, .. }) => Some(intent),
-            _ => None,
-        }
-    }
-
     /// Group directory the selection belongs to (the group itself, or the intent's parent).
     fn selected_group_dir(&self) -> PathBuf {
         match self.rows.get(self.selected) {
             Some(Row::Group { path, .. }) => path.clone(),
             Some(Row::Intent { intent, .. }) => intent
                 .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.store.root().to_path_buf()),
+            Some(Row::Broken { path, .. }) => path
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.store.root().to_path_buf()),
@@ -272,14 +300,15 @@ impl App {
         }
     }
 
-    // ---- persistence helpers ----------------------------------------------
-
-    fn save_selected(&mut self, mut f: impl FnMut(&mut Intent)) {
-        if let Some(it) = self.selected_intent_mut() {
-            f(it);
-            if let Err(e) = Store::save_force(it) {
-                self.message = Some(format!("save failed: {e:#}"));
-            }
+    /// A field-only change: reload from disk, change, save, rescan. Never
+    /// writes the cached row's body (C2).
+    fn update_selected_fields(&mut self, f: impl FnOnce(&mut crate::store::FrontMatter)) {
+        let Some(path) = self.selected_intent().map(|i| i.path.clone()) else {
+            return;
+        };
+        match Store::update_fields(&path, f) {
+            Ok(_) => self.rescan(),
+            Err(e) => self.message = Some(format!("save failed: {e:#}")),
         }
     }
 
@@ -300,7 +329,8 @@ impl App {
             Screen::Diff {
                 proposal,
                 questions,
-            } => self.key_diff(proposal, questions, k),
+                scroll,
+            } => self.key_diff(proposal, questions, scroll, k),
             Screen::SendPick { handoffs, selected } => self.key_send_pick(handoffs, selected, k),
             Screen::SendConfirm {
                 handoff,
@@ -340,13 +370,18 @@ impl App {
                     self.rebuild_rows();
                 }
             }
-            KeyCode::Enter | KeyCode::Char('e') => {
-                if let Some(it) = self.selected_intent().cloned() {
+            KeyCode::Enter | KeyCode::Char('e') => match self.rows.get(self.selected) {
+                Some(Row::Intent { intent, .. }) => {
+                    let it = intent.clone();
                     self.editor = TextArea::from_text(&it.body);
                     self.editing = Some(it);
                     self.screen = Screen::Edit;
                 }
-            }
+                Some(Row::Broken { error, .. }) => {
+                    self.message = Some(format!("cannot load: {error}"))
+                }
+                _ => {}
+            },
             KeyCode::Char('a') => {
                 let group = self.selected_group_dir();
                 self.screen = Screen::Input {
@@ -363,15 +398,24 @@ impl App {
                     action: InputAction::NewGroup { parent },
                 };
             }
-            KeyCode::Char('m') => {
-                if self.selected_intent().is_some() {
+            KeyCode::Char('m') => match self.rows.get(self.selected) {
+                Some(Row::Intent { .. }) => {
                     self.screen = Screen::Input {
                         label: "move to group".into(),
                         text: String::new(),
                         action: InputAction::MoveTo,
+                    }
+                }
+                Some(Row::Group { path, .. }) => {
+                    let group = path.clone();
+                    self.screen = Screen::Input {
+                        label: "move group under".into(),
+                        text: String::new(),
+                        action: InputAction::MoveGroup { group },
                     };
                 }
-            }
+                _ => {}
+            },
             KeyCode::Char('A') => {
                 if self.selected_intent().is_some() {
                     self.screen = Screen::Input {
@@ -383,26 +427,36 @@ impl App {
             }
             KeyCode::Char('o') => {
                 if let Some(it) = self.selected_intent() {
-                    let first = Store::attachments(it).into_iter().next();
-                    if let Some((name, _)) = first {
-                        let path = it.assets_dir().join(name);
-                        let _ = std::process::Command::new("open").arg(&path).spawn();
-                    } else {
-                        self.message = Some("no attachments".into());
+                    match Store::attachments(it).into_iter().next() {
+                        Some((name, _)) => {
+                            let path = it.assets_dir().join(name);
+                            let opener = if cfg!(target_os = "macos") {
+                                "open"
+                            } else {
+                                "xdg-open"
+                            };
+                            if let Err(e) = std::process::Command::new(opener)
+                                .arg(&path)
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn()
+                            {
+                                self.message = Some(format!("cannot open attachment: {e}"));
+                            }
+                        }
+                        None => self.message = Some("no attachments".into()),
                     }
                 }
             }
-            KeyCode::Char('K') => {
-                self.save_selected(|it| {
-                    let i = KINDS.iter().position(|k| *k == it.fm.kind).unwrap_or(0);
-                    it.fm.kind = KINDS[(i + 1) % KINDS.len()].to_string();
-                });
-            }
-            KeyCode::Char('R') => self.save_selected(|it| it.fm.state = State::Ready),
-            KeyCode::Char('U') => self.save_selected(|it| it.fm.state = State::Refining),
+            KeyCode::Char('K') => self.update_selected_fields(|fm| {
+                let i = KINDS.iter().position(|k| *k == fm.kind).unwrap_or(0);
+                fm.kind = KINDS[(i + 1) % KINDS.len()].to_string();
+            }),
+            KeyCode::Char('R') => self.update_selected_fields(|fm| fm.state = State::Ready),
+            KeyCode::Char('U') => self.update_selected_fields(|fm| fm.state = State::Refining),
             KeyCode::Char('p') => {
                 if let Some(it) = self.selected_intent().cloned() {
-                    self.open_chat(&it, None);
+                    self.open_chat(&it, None, false);
                 }
             }
             KeyCode::Char('s') => {
@@ -438,10 +492,16 @@ impl App {
                 let sel = self.editor.selection();
                 if let Some(mut it) = self.editing.clone() {
                     it.body = self.editor.text();
-                    self.open_chat(&it, sel.as_deref());
+                    self.open_chat(&it, sel.as_deref(), true);
                 }
             }
-            (KeyCode::Char('e'), true) => return Flow::ExternalEdit(self.selected),
+            (KeyCode::Char('e'), true) => {
+                // hand the file to $EDITOR only once the buffer is on disk
+                self.save_editor(false);
+                if matches!(self.screen, Screen::Edit) {
+                    return Flow::ExternalEdit;
+                }
+            }
             (KeyCode::Esc, _) => {
                 let dirty = self
                     .editing
@@ -493,9 +553,12 @@ impl App {
 
     // ---- chat -------------------------------------------------------------
 
-    fn open_chat(&mut self, intent: &Intent, selection: Option<&str>) {
+    fn open_chat(&mut self, intent: &Intent, selection: Option<&str>, from_editor: bool) {
         let provider = self.cfg.polish_provider.clone();
         let conv_id = intent.fm.conversations.get(&provider).cloned();
+        let tpl = template(&self.dirs, &intent.fm.kind, true)
+            .unwrap_or_else(|_| "Refine this intent.".to_string());
+        let seed = seed_prompt(&tpl, &intent.body, selection, &intent.fm.kind);
         let mut st = ChatState {
             turn: None,
             transcript: Vec::new(),
@@ -504,11 +567,13 @@ impl App {
             provider,
             conv_id,
             hint: None,
+            intent_path: intent.path.clone(),
+            opened_stamp: intent.loaded_updated,
+            seed: seed.clone(),
+            from_editor,
+            scroll: 0,
         };
         self.select_path(&intent.path);
-        let tpl = template(&self.dirs, &intent.fm.kind, true)
-            .unwrap_or_else(|_| "Refine this intent.".to_string());
-        let prompt = seed_prompt(&tpl, &intent.body, selection, &intent.fm.kind);
         let shown = match selection {
             Some(s) => format!(
                 "polish (focus: {})",
@@ -521,7 +586,7 @@ impl App {
             ),
             None => "polish".to_string(),
         };
-        self.start_turn(&mut st, intent, &prompt, &shown);
+        self.start_turn(&mut st, intent, &seed, &shown);
         self.screen = Screen::Chat(st);
     }
 
@@ -530,16 +595,12 @@ impl App {
             st.hint = Some(format!("unknown provider `{}`", st.provider));
             return;
         };
-        let cwd = intent
-            .fm
-            .repo
-            .clone()
-            .unwrap_or_else(|| self.store.root().to_path_buf());
-        let cwd = if cwd.is_dir() {
-            cwd
-        } else {
-            self.store.root().to_path_buf()
-        };
+        // neutral per-intent directory: no repository in the provider's reach
+        let cwd = polish_cwd(self.store.root(), &intent.stem());
+        if let Err(e) = std::fs::create_dir_all(&cwd) {
+            st.hint = Some(format!("cannot create {}: {e}", cwd.display()));
+            return;
+        }
         match Turn::start(
             &spec,
             prompt,
@@ -552,6 +613,7 @@ impl App {
                 st.transcript.push(("agent".into(), String::new()));
                 st.latest = None;
                 st.hint = None;
+                st.scroll = 0;
                 st.turn = Some(turn);
                 let _ = Store::append_transcript(intent, "user", shown);
             }
@@ -559,9 +621,19 @@ impl App {
         }
     }
 
+    fn leave_chat(&mut self, st: ChatState) {
+        self.screen = if st.from_editor && self.editing.is_some() {
+            Screen::Edit
+        } else {
+            Screen::Browse
+        };
+        self.rescan();
+    }
+
     fn key_chat(&mut self, mut st: ChatState, k: KeyEvent) -> Flow {
-        match k.code {
-            KeyCode::Esc => {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match (k.code, ctrl) {
+            (KeyCode::Esc, _) => {
                 if let Some(mut t) = st.turn.take() {
                     t.cancel();
                     if let Some(last) = st.transcript.last_mut() {
@@ -569,21 +641,29 @@ impl App {
                     }
                     self.screen = Screen::Chat(st);
                 } else {
-                    self.screen = Screen::Browse;
-                    self.rescan();
+                    self.leave_chat(st);
                 }
             }
-            KeyCode::Enter if st.turn.is_none() => {
+            (KeyCode::Enter, _) if st.turn.is_none() => {
                 let text = st.input.trim().to_string();
                 if !text.is_empty()
-                    && let Some(it) = self.selected_intent().cloned()
+                    && let Ok(it) = Store::load(&st.intent_path)
                 {
                     st.input.clear();
-                    self.start_turn(&mut st, &it, &text, &text);
+                    let resumable = st.conv_id.is_some()
+                        && self
+                            .cfg
+                            .providers
+                            .get(&st.provider)
+                            .map(|p| !p.resume.is_empty())
+                            .unwrap_or(false);
+                    let prompt = follow_up_prompt(&st.seed, &st.transcript, &text, resumable);
+                    self.start_turn(&mut st, &it, &prompt, &text);
                 }
                 self.screen = Screen::Chat(st);
             }
-            KeyCode::Char('a') if st.turn.is_none() && st.input.is_empty() => {
+            // apply and dismiss live on Ctrl so a message starting with "a" or "d" is just typed (C1)
+            (KeyCode::Char('a'), true) if st.turn.is_none() => {
                 match st.latest.as_ref().and_then(|r| r.proposal.clone()) {
                     Some(proposal) => {
                         let questions = st
@@ -591,11 +671,12 @@ impl App {
                             .as_ref()
                             .map(|r| r.questions.clone())
                             .unwrap_or_default();
+                        self.parked_chat = Some(st);
                         self.screen = Screen::Diff {
                             proposal,
                             questions,
+                            scroll: 0,
                         };
-                        self.parked_chat = Some(st);
                     }
                     None => {
                         st.hint = Some("no proposal to apply in the latest reply".into());
@@ -603,16 +684,24 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('d') if st.turn.is_none() && st.input.is_empty() => {
+            (KeyCode::Char('d'), true) if st.turn.is_none() => {
                 st.latest = None;
                 st.hint = Some("proposal dismissed".into());
                 self.screen = Screen::Chat(st);
             }
-            KeyCode::Backspace => {
+            (KeyCode::PageUp, _) => {
+                st.scroll = st.scroll.saturating_add(5);
+                self.screen = Screen::Chat(st);
+            }
+            (KeyCode::PageDown, _) => {
+                st.scroll = st.scroll.saturating_sub(5);
+                self.screen = Screen::Chat(st);
+            }
+            (KeyCode::Backspace, _) => {
                 st.input.pop();
                 self.screen = Screen::Chat(st);
             }
-            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Char(c), false) => {
                 st.input.push(c);
                 self.screen = Screen::Chat(st);
             }
@@ -621,53 +710,79 @@ impl App {
         Flow::Continue
     }
 
-    fn key_diff(&mut self, proposal: String, questions: Vec<String>, k: KeyEvent) -> Flow {
+    fn key_diff(
+        &mut self,
+        proposal: String,
+        questions: Vec<String>,
+        scroll: u16,
+        k: KeyEvent,
+    ) -> Flow {
         match k.code {
-            KeyCode::Enter => {
-                self.apply_proposal(&proposal, &questions, false);
-            }
+            KeyCode::Enter => self.apply_proposal(&merge_questions(&proposal, &questions), false),
             KeyCode::Esc => {
                 self.screen = match self.parked_chat.take() {
                     Some(st) => Screen::Chat(st),
                     None => Screen::Browse,
                 };
             }
+            KeyCode::PageDown | KeyCode::Char('j') | KeyCode::Down => {
+                self.screen = Screen::Diff {
+                    proposal,
+                    questions,
+                    scroll: scroll.saturating_add(5),
+                }
+            }
+            KeyCode::PageUp | KeyCode::Char('k') | KeyCode::Up => {
+                self.screen = Screen::Diff {
+                    proposal,
+                    questions,
+                    scroll: scroll.saturating_sub(5),
+                }
+            }
+            // any other key does nothing: applying needs an explicit Enter
             _ => {
                 self.screen = Screen::Diff {
                     proposal,
                     questions,
+                    scroll,
                 }
             }
         }
         Flow::Continue
     }
 
-    fn apply_proposal(&mut self, proposal: &str, questions: &[String], force: bool) {
-        let Some(mut it) = self.selected_intent().cloned() else {
+    /// Write `body` into the chat's intent. Unless forced, refuse when the file
+    /// changed since the chat opened (another toolbar, another editor) and ask.
+    fn apply_proposal(&mut self, body: &str, force: bool) {
+        let Some(st) = self.parked_chat.as_ref() else {
             self.screen = Screen::Browse;
             return;
         };
-        // reload for the freshest `updated`, then apply
-        if let Ok(fresh) = Store::load(&it.path) {
-            it.loaded_updated = fresh.loaded_updated;
-            it.fm = fresh.fm;
+        let path = st.intent_path.clone();
+        let opened = st.opened_stamp;
+        let provider = st.provider.clone();
+        let conv_id = st.conv_id.clone();
+        let mut it = match Store::load(&path) {
+            Ok(it) => it,
+            Err(e) => {
+                self.message = Some(format!("apply failed: {e:#}"));
+                self.screen = Screen::Browse;
+                return;
+            }
+        };
+        if !force && it.loaded_updated.timestamp() != opened.timestamp() {
+            self.screen = Screen::Prompt { question: "File changed on disk since this chat opened. Overwrite with the proposal? (y/n)".into(), pending: Pending::OverwriteApply { body: body.to_string() } };
+            return;
         }
-        it.body = merge_questions(proposal, questions);
+        it.body = body.to_string();
         it.fm.polished_at = Some(chrono::Local::now());
         if it.fm.state == State::Raw {
             it.fm.state = State::Refining;
         }
-        if let Some(st) = self.parked_chat.as_ref()
-            && let Some(id) = &st.conv_id
-        {
-            it.fm.conversations.insert(st.provider.clone(), id.clone());
+        if let Some(id) = conv_id {
+            it.fm.conversations.insert(provider, id);
         }
-        let result = if force {
-            Store::save_force(&mut it).map_err(SaveError::Io)
-        } else {
-            Store::save(&mut it)
-        };
-        match result {
+        match Store::save_force(&mut it) {
             Ok(()) => {
                 self.message = Some("proposal applied".into());
                 self.rescan();
@@ -675,25 +790,23 @@ impl App {
                     Some(mut st) => {
                         st.latest = None;
                         st.hint = Some("applied".into());
+                        st.opened_stamp = it.loaded_updated;
                         Screen::Chat(st)
                     }
                     None => Screen::Browse,
                 };
             }
-            Err(SaveError::Conflict) => {
-                self.screen = Screen::Prompt {
-                    question: "File changed on disk. Overwrite with the proposal? (y/n)".into(),
-                    pending: Pending::OverwriteApply(merge_questions(proposal, questions)),
-                };
-            }
-            Err(SaveError::Io(e)) => {
+            Err(e) => {
                 self.message = Some(format!("apply failed: {e:#}"));
-                self.screen = Screen::Browse;
+                self.screen = match self.parked_chat.take() {
+                    Some(st) => Screen::Chat(st),
+                    None => Screen::Browse,
+                };
             }
         }
     }
 
-    // ---- send (screens; the work is in `send.rs`, Task 7) --------------------
+    // ---- send ----------------------------------------------------------------
 
     fn key_send_pick(&mut self, handoffs: Vec<Handoff>, mut selected: usize, k: KeyEvent) -> Flow {
         match k.code {
@@ -713,22 +826,31 @@ impl App {
                 } else {
                     handoff.provider.clone()
                 };
-                match self.selected_intent().cloned() {
-                    Some(it) => {
-                        let (repo, prompt) = crate::send::prepare(
-                            &self.cfg,
-                            &handoff,
-                            &it,
-                            &Store::attachments(&it),
-                        );
-                        self.screen = Screen::SendConfirm {
-                            handoff,
-                            provider,
-                            repo,
-                            prompt,
-                            scroll: 0,
-                        };
-                    }
+                // render from disk, never from the cached row (C2)
+                let fresh = self
+                    .selected_intent()
+                    .and_then(|i| Store::load(&i.path).ok());
+                match fresh {
+                    Some(it) => match crate::send::prepare(
+                        &self.cfg,
+                        &handoff,
+                        &it,
+                        &Store::attachments(&it),
+                    ) {
+                        Ok((repo, prompt)) => {
+                            self.screen = Screen::SendConfirm {
+                                handoff,
+                                provider,
+                                repo,
+                                prompt,
+                                scroll: 0,
+                            }
+                        }
+                        Err(e) => {
+                            self.message = Some(e);
+                            self.screen = Screen::Browse;
+                        }
+                    },
                     None => self.screen = Screen::Browse,
                 }
             }
@@ -761,7 +883,7 @@ impl App {
                     scroll,
                 };
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
                 scroll = scroll.saturating_add(1);
                 self.screen = Screen::SendConfirm {
                     handoff,
@@ -771,7 +893,7 @@ impl App {
                     scroll,
                 };
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
                 scroll = scroll.saturating_sub(1);
                 self.screen = Screen::SendConfirm {
                     handoff,
@@ -799,9 +921,10 @@ impl App {
     }
 
     fn do_send(&mut self, handoff: &Handoff, provider: &str, repo: &Path, prompt: &str) {
-        let Some(it) = self.selected_intent().cloned() else {
+        let Some(path) = self.selected_intent().map(|i| i.path.clone()) else {
             return;
         };
+        let Ok(it) = Store::load(&path) else { return };
         let kind = self
             .cfg
             .providers
@@ -810,20 +933,30 @@ impl App {
             .unwrap_or_else(|| provider.to_string());
         match crate::send::send_intent(&self.herdr_env, repo, &it, &kind, prompt) {
             Ok(outcome) => {
-                let handoff_name = handoff.name.clone();
-                self.save_selected(|i| {
-                    i.fm.state = State::Sent;
-                    i.fm.sent_to = Some(crate::store::SentTo {
-                        handoff: handoff_name.clone(),
-                        workspace_id: outcome.workspace_id.clone(),
-                        agent: outcome.agent.clone(),
-                        at: chrono::Local::now(),
-                    });
-                });
-                self.message = Some(format!(
-                    "sent to {} in workspace {} (agent {})",
-                    handoff.name, outcome.workspace_id, outcome.agent
-                ));
+                let record = crate::store::SentTo {
+                    handoff: handoff.name.clone(),
+                    workspace_id: outcome.workspace_id.clone(),
+                    agent: outcome.agent.clone(),
+                    at: chrono::Local::now(),
+                };
+                match Store::update_fields(&path, |fm| {
+                    fm.state = State::Sent;
+                    fm.sent_to = Some(record);
+                }) {
+                    Ok(_) => {
+                        self.message = Some(format!(
+                            "sent to {} in workspace {} (agent {})",
+                            handoff.name, outcome.workspace_id, outcome.agent
+                        ))
+                    }
+                    Err(e) => {
+                        self.message = Some(format!(
+                            "sent to {} in workspace {}, but recording it failed: {e:#}",
+                            handoff.name, outcome.workspace_id
+                        ))
+                    }
+                }
+                self.rescan();
             }
             Err(e) => self.message = Some(format!("send failed at {}: {}", e.step, e.detail)),
         }
@@ -842,14 +975,12 @@ impl App {
                     self.editing = None;
                     self.screen = Screen::Browse;
                 }
-                Pending::OverwriteApply(body) => {
-                    self.apply_proposal(&body, &[], true);
-                }
+                Pending::OverwriteApply { body } => self.apply_proposal(&body, true),
             },
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.screen = match pending {
                     Pending::OverwriteSave | Pending::DiscardEdits => Screen::Edit,
-                    Pending::OverwriteApply(_) => match self.parked_chat.take() {
+                    Pending::OverwriteApply { .. } => match self.parked_chat.take() {
                         Some(st) => Screen::Chat(st),
                         None => Screen::Browse,
                     },
@@ -883,60 +1014,7 @@ impl App {
                 if value.is_empty() {
                     return Flow::Continue;
                 }
-                match action {
-                    InputAction::AddIntent { group } => {
-                        let rel = self.rel(&group);
-                        let kind = "idea";
-                        let body = template(&self.dirs, kind, false).unwrap_or_default();
-                        match self.store.create(
-                            &rel,
-                            &value,
-                            kind,
-                            &body,
-                            crate::send::main_checkout(
-                                &std::env::current_dir().unwrap_or_default(),
-                            )
-                            .ok(),
-                        ) {
-                            Ok(it) => {
-                                self.collapsed.remove(&group);
-                                self.rescan();
-                                self.select_path(&it.path);
-                            }
-                            Err(e) => self.message = Some(format!("create failed: {e:#}")),
-                        }
-                    }
-                    InputAction::NewGroup { parent } => {
-                        let rel = self.rel(&parent);
-                        match self.store.create_group(&rel, &value) {
-                            Ok(p) => {
-                                self.rescan();
-                                self.select_path(&p);
-                            }
-                            Err(e) => self.message = Some(format!("group failed: {e:#}")),
-                        }
-                    }
-                    InputAction::Attach => {
-                        if let Some(it) = self.selected_intent().cloned() {
-                            let src = PathBuf::from(shellexpand::tilde(&value).into_owned());
-                            match Store::attach(&it, &src) {
-                                Ok(_) => self.message = Some("attached".into()),
-                                Err(e) => self.message = Some(format!("attach failed: {e:#}")),
-                            }
-                        }
-                    }
-                    InputAction::MoveTo => {
-                        if let Some(it) = self.selected_intent().cloned() {
-                            match self.store.move_intent(&it, Path::new(&value)) {
-                                Ok(moved) => {
-                                    self.rescan();
-                                    self.select_path(&moved.path);
-                                }
-                                Err(e) => self.message = Some(format!("move failed: {e:#}")),
-                            }
-                        }
-                    }
-                }
+                self.run_input_action(action, &value);
             }
             KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                 text.push(c);
@@ -957,15 +1035,97 @@ impl App {
         Flow::Continue
     }
 
+    fn run_input_action(&mut self, action: InputAction, value: &str) {
+        match action {
+            InputAction::AddIntent { group } => {
+                let rel = self.rel(&group);
+                let kind = "idea";
+                let body = template(&self.dirs, kind, false).unwrap_or_default();
+                match self
+                    .store
+                    .create(&rel, value, kind, &body, crate::send::capture_repo())
+                {
+                    Ok(it) => {
+                        self.collapsed.remove(&group);
+                        self.rescan();
+                        self.select_path(&it.path);
+                    }
+                    Err(e) => self.message = Some(format!("create failed: {e:#}")),
+                }
+            }
+            InputAction::NewGroup { parent } => {
+                let rel = self.rel(&parent);
+                match self.store.create_group(&rel, value) {
+                    Ok(p) => {
+                        self.rescan();
+                        self.select_path(&p);
+                    }
+                    Err(e) => self.message = Some(format!("group failed: {e:#}")),
+                }
+            }
+            InputAction::Attach => {
+                if let Some(it) = self.selected_intent().cloned() {
+                    let src = PathBuf::from(shellexpand::tilde(value).into_owned());
+                    match Store::attach(&it, &src) {
+                        Ok(_) => self.message = Some("attached".into()),
+                        Err(e) => self.message = Some(format!("attach failed: {e:#}")),
+                    }
+                }
+            }
+            InputAction::MoveTo => {
+                if let Some(it) = self.selected_intent().cloned() {
+                    match self.store.move_intent(&it, Path::new(value)) {
+                        Ok(moved) => {
+                            self.rescan();
+                            self.select_path(&moved.path);
+                        }
+                        Err(e) => self.message = Some(format!("move failed: {e:#}")),
+                    }
+                }
+            }
+            InputAction::MoveGroup { group } => {
+                let rel = self.rel(&group);
+                match self.store.move_group(&rel, Path::new(value)) {
+                    Ok(p) => {
+                        self.rescan();
+                        self.select_path(&p);
+                    }
+                    Err(e) => self.message = Some(format!("move failed: {e:#}")),
+                }
+            }
+        }
+    }
+
+    /// Pasted text goes to whichever text input is active; CR line endings are normalised.
+    pub fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        match &mut self.screen {
+            Screen::Edit => {
+                for ch in text.chars() {
+                    let code = if ch == '\n' {
+                        KeyCode::Enter
+                    } else {
+                        KeyCode::Char(ch)
+                    };
+                    self.editor
+                        .handle(KeyEvent::new(code, KeyModifiers::NONE), 20);
+                }
+            }
+            Screen::Chat(st) => st.input.push_str(text.trim_end_matches('\n')),
+            Screen::Input { text: t, .. } => t.push_str(text.trim_end_matches('\n')),
+            _ => {}
+        }
+    }
+
     // ---- ticking ------------------------------------------------------------
 
     /// Drain messages from a running turn.
     pub fn tick(&mut self) {
-        let intent = self.selected_intent().cloned();
         let Screen::Chat(st) = &mut self.screen else {
             return;
         };
         let Some(turn) = st.turn.as_ref() else { return };
+        let path = st.intent_path.clone();
         let mut finished = false;
         while let Some(msg) = turn.try_recv() {
             match msg {
@@ -976,20 +1136,20 @@ impl App {
                 }
                 TurnMsg::ConversationId(id) => {
                     st.conv_id = Some(id.clone());
-                    if let Some(it) = intent.as_ref() {
-                        let mut it = it.clone();
-                        it.fm.conversations.insert(st.provider.clone(), id);
-                        let _ = Store::save_force(&mut it);
-                    }
+                    // bookkeeping only: reload, record, no `updated` bump (C2)
+                    let provider = st.provider.clone();
+                    let _ = Store::update_meta(&path, |fm| {
+                        fm.conversations.insert(provider, id);
+                    });
                 }
                 TurnMsg::Finished(reply) => {
-                    if let Some(it) = intent.as_ref()
+                    if let Ok(it) = Store::load(&path)
                         && let Some(last) = st.transcript.last()
                     {
-                        let _ = Store::append_transcript(it, "agent", &last.1);
+                        let _ = Store::append_transcript(&it, "agent", &last.1);
                     }
                     st.hint = if reply.proposal.is_some() {
-                        Some("a = apply, d = dismiss".into())
+                        Some("Ctrl-a = apply, Ctrl-d = dismiss".into())
                     } else {
                         Some("no proposal in this reply; ask for one".into())
                     };
@@ -1038,40 +1198,73 @@ impl App {
                     is_group: false,
                     questions: intent.open_questions(),
                 },
+                Row::Broken { path, depth, .. } => RowView {
+                    depth: *depth,
+                    label: format!(
+                        "! {}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    ),
+                    is_group: false,
+                    questions: 0,
+                },
             })
             .collect();
-        let (screen, can_apply, hint, turn_running, transcript) = match &self.screen {
-            Screen::Browse => ("browse", false, None, false, Vec::new()),
-            Screen::Edit => ("edit", false, None, false, Vec::new()),
-            Screen::Chat(st) => (
-                "chat",
-                st.latest
-                    .as_ref()
-                    .map(|r| r.proposal.is_some())
-                    .unwrap_or(false),
-                st.hint.clone(),
-                st.turn.is_some(),
-                st.transcript.clone(),
-            ),
-            Screen::Diff { .. } => ("diff", true, None, false, Vec::new()),
-            Screen::SendPick { .. } => ("send-pick", false, None, false, Vec::new()),
-            Screen::SendConfirm { .. } => ("send-confirm", false, None, false, Vec::new()),
-            Screen::Prompt { question, .. } => {
-                ("prompt", false, Some(question.clone()), false, Vec::new())
-            }
-            Screen::Input { label, .. } => ("input", false, Some(label.clone()), false, Vec::new()),
-        };
-        View {
+        let mut v = View {
             rows,
             selected: self.selected,
-            screen,
-            can_apply,
-            hint,
+            screen: "browse",
+            can_apply: false,
+            hint: None,
             message: self.message.clone(),
-            turn_running,
-            transcript_len: transcript.len(),
-            transcript,
+            turn_running: false,
+            transcript: Vec::new(),
+            transcript_len: 0,
+            chat_input: String::new(),
+            chat_scroll: 0,
+            diff_scroll: 0,
+            input_text: String::new(),
+            send_prompt: None,
+        };
+        match &self.screen {
+            Screen::Browse => {}
+            Screen::Edit => v.screen = "edit",
+            Screen::Chat(st) => {
+                v.screen = "chat";
+                v.can_apply = st
+                    .latest
+                    .as_ref()
+                    .map(|r| r.proposal.is_some())
+                    .unwrap_or(false);
+                v.hint = st.hint.clone();
+                v.turn_running = st.turn.is_some();
+                v.transcript = st.transcript.clone();
+                v.transcript_len = st.transcript.len();
+                v.chat_input = st.input.clone();
+                v.chat_scroll = st.scroll;
+            }
+            Screen::Diff { scroll, .. } => {
+                v.screen = "diff";
+                v.can_apply = true;
+                v.diff_scroll = *scroll;
+            }
+            Screen::SendPick { .. } => v.screen = "send-pick",
+            Screen::SendConfirm { prompt, .. } => {
+                v.screen = "send-confirm";
+                v.send_prompt = Some(prompt.clone());
+            }
+            Screen::Prompt { question, .. } => {
+                v.screen = "prompt";
+                v.hint = Some(question.clone());
+            }
+            Screen::Input { label, text, .. } => {
+                v.screen = "input";
+                v.hint = Some(label.clone());
+                v.input_text = text.clone();
+            }
         }
+        v
     }
 
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
@@ -1093,6 +1286,7 @@ impl App {
                     questions: 0,
                     state: None,
                     count: *count,
+                    broken: false,
                 },
                 Row::Intent { intent, depth } => ui::TreeRow {
                     depth: *depth,
@@ -1102,6 +1296,17 @@ impl App {
                     questions: intent.open_questions(),
                     state: Some(intent.fm.state),
                     count: 0,
+                    broken: false,
+                },
+                Row::Broken { path, depth, .. } => ui::TreeRow {
+                    depth: *depth,
+                    label: path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                    is_group: false,
+                    collapsed: false,
+                    questions: 0,
+                    state: None,
+                    count: 0,
+                    broken: true,
                 },
             })
             .collect();
@@ -1114,12 +1319,13 @@ impl App {
         };
         ui::render_tree(&tree_rows, self.selected, tree_scroll, left, buf);
 
+        let chat_intent = |st: &ChatState| Store::load(&st.intent_path).ok();
         match &self.screen {
             Screen::Edit => self.editor.render(right, buf, true),
             Screen::Chat(st) => {
                 let (top, bottom) = ui::split_chat(right);
-                if let Some(it) = self.selected_intent() {
-                    ui::render_detail(it, &Store::attachments(it), top, buf);
+                if let Some(it) = chat_intent(st) {
+                    ui::render_detail(&it, &Store::attachments(&it), top, buf);
                 }
                 ui::render_chat(
                     &st.transcript,
@@ -1127,16 +1333,29 @@ impl App {
                     st.turn.is_some(),
                     st.hint.as_deref(),
                     &st.provider,
+                    st.scroll,
                     bottom,
                     buf,
                 );
             }
-            Screen::Diff { proposal, .. } => {
+            Screen::Diff {
+                proposal,
+                questions,
+                scroll,
+            } => {
                 let old = self
-                    .selected_intent()
-                    .map(|i| i.body.clone())
+                    .parked_chat
+                    .as_ref()
+                    .and_then(chat_intent)
+                    .map(|i| i.body)
                     .unwrap_or_default();
-                ui::render_diff(&old, proposal, right, buf);
+                ui::render_diff(
+                    &old,
+                    &merge_questions(proposal, questions),
+                    *scroll,
+                    right,
+                    buf,
+                );
             }
             Screen::SendPick { handoffs, selected } => {
                 let items: Vec<String> = handoffs
@@ -1153,33 +1372,40 @@ impl App {
                 scroll,
             } => {
                 let header = format!(
-                    "handoff: {}   provider: {} (Tab to change)   repo: {}\n\nEnter = send, Esc = cancel\n\n",
+                    "handoff: {}   provider: {} (Tab to change)   repo: {}\n\nEnter = send, Esc = cancel, j/k scroll\n\n",
                     handoff.name,
                     provider,
                     repo.display()
                 );
-                let text = header + prompt;
+                let text = header + &ui::sanitize(prompt);
                 ratatui::widgets::Paragraph::new(text)
                     .wrap(ratatui::widgets::Wrap { trim: false })
                     .scroll((*scroll, 0))
                     .render(right, buf);
             }
-            _ => {
-                if let Some(it) = self.selected_intent() {
-                    ui::render_detail(it, &Store::attachments(it), right, buf);
-                } else {
-                    ratatui::widgets::Paragraph::new("a add intent · n new group · ? help")
-                        .render(right, buf);
+            _ => match self.rows.get(self.selected) {
+                Some(Row::Intent { intent, .. }) => {
+                    ui::render_detail(intent, &Store::attachments(intent), right, buf)
                 }
-            }
+                Some(Row::Broken { path, error, .. }) => {
+                    ratatui::widgets::Paragraph::new(format!("{}\n\n{}", path.display(), error))
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .render(right, buf)
+                }
+                _ => ratatui::widgets::Paragraph::new("a add intent · n new group · ? help")
+                    .render(right, buf),
+            },
         }
 
         let status_text = match &self.screen {
             Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
             Screen::Prompt { question, .. } => question.clone(),
             Screen::Edit => "Ctrl-s save · Ctrl-p polish · Ctrl-e $EDITOR · Esc back".to_string(),
-            Screen::Chat(_) => "Enter send · a apply · d dismiss · Esc cancel/back".to_string(),
-            _ => match &self.message {
+            Screen::Chat(_) => "Enter send · Ctrl-a apply · Ctrl-d dismiss · PgUp/PgDn scroll · Esc cancel/back".to_string(),
+            Screen::Diff { .. } => "Enter apply · Esc back · PgUp/PgDn scroll".to_string(),
+            Screen::SendPick { .. } => "j/k choose · Enter next · Esc cancel".to_string(),
+            Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
+            Screen::Browse => match &self.message {
                 Some(m) => m.clone(),
                 None => "a add  n group  m move  e edit  p polish  s send  R ready  K kind  A attach  o open  r rescan  q quit".to_string(),
             },
@@ -1192,6 +1418,7 @@ fn row_path(r: &Row) -> PathBuf {
     match r {
         Row::Group { path, .. } => path.clone(),
         Row::Intent { intent, .. } => intent.path.clone(),
+        Row::Broken { path, .. } => path.clone(),
     }
 }
 
@@ -1221,8 +1448,7 @@ pub fn merge_questions(proposal: &str, questions: &[String]) -> String {
     if new.is_empty() {
         return body;
     }
-    if !existing.is_empty() || body.to_lowercase().contains("## open questions") {
-        // append to the existing section (which is at the end by convention)
+    if body.to_lowercase().contains("## open questions") {
         body = body.trim_end().to_string();
         body.push('\n');
     } else {
@@ -1239,6 +1465,8 @@ pub fn merge_questions(proposal: &str, questions: &[String]) -> String {
 // ---- run loop (same shape as the toolbar's) -------------------------------------
 
 static STOP: AtomicBool = AtomicBool::new(false);
+/// While set, the event thread does not read the tty (an external editor owns it).
+static PAUSE_INPUT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: i32) {
     STOP.store(true, Ordering::Relaxed);
@@ -1278,6 +1506,25 @@ fn init_terminal() -> ratatui::DefaultTerminal {
     t
 }
 
+/// Run `$EDITOR` (or the configured editor) on `path` with the tty handed over.
+fn external_edit(cfg: &Config, path: &Path) {
+    PAUSE_INPUT.store(true, Ordering::Relaxed);
+    // let the event thread finish its current poll before the editor takes the tty
+    std::thread::sleep(Duration::from_millis(120));
+    restore_terminal();
+    let editor = match cfg.editor.as_str() {
+        "$EDITOR" | "" => std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string()),
+        other => other.to_string(),
+    };
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("--")
+        .arg(path)
+        .status();
+    PAUSE_INPUT.store(false, Ordering::Relaxed);
+}
+
 pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
     install_signal_handlers();
     let default_hook = std::panic::take_hook();
@@ -1290,9 +1537,22 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
 
     let (events_tx, events_rx) = channel::<Event>();
     std::thread::spawn(move || {
-        while let Ok(ev) = crossterm::event::read() {
-            if events_tx.send(ev).is_err() {
-                break;
+        loop {
+            if PAUSE_INPUT.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            match crossterm::event::poll(Duration::from_millis(100)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(ev) => {
+                        if events_tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
             }
         }
         STOP.store(true, Ordering::Relaxed);
@@ -1312,16 +1572,11 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
         match events_rx.recv_timeout(Duration::from_millis(33)) {
             Ok(Event::Key(k)) => match app.key(k) {
                 Flow::Quit => return Ok(()),
-                Flow::ExternalEdit(_) => {
+                Flow::ExternalEdit => {
                     if let Some(it) = app.editing.clone() {
-                        restore_terminal();
-                        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-                        let _ = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(format!("{editor} \"$1\""))
-                            .arg("--")
-                            .arg(&it.path)
-                            .status();
+                        external_edit(&app.cfg, &it.path);
+                        // drop anything the editor left in the queue, then rebuild the TUI
+                        while events_rx.try_recv().is_ok() {}
                         terminal = init_terminal();
                         if let Ok(fresh) = Store::load(&it.path) {
                             app.editor = TextArea::from_text(&fresh.body);
@@ -1332,19 +1587,7 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
                 }
                 Flow::Continue => {}
             },
-            Ok(Event::Paste(text)) => {
-                if matches!(app.screen, Screen::Edit) {
-                    for ch in text.chars() {
-                        let code = if ch == '\n' {
-                            KeyCode::Enter
-                        } else {
-                            KeyCode::Char(ch)
-                        };
-                        app.editor
-                            .handle(KeyEvent::new(code, KeyModifiers::NONE), 20);
-                    }
-                }
-            }
+            Ok(Event::Paste(text)) => app.paste(&text),
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -1368,9 +1611,10 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
 }
 
 /// `add` mode: popup asks for a title; otherwise title from args or stdin's first line, body = rest.
-pub fn add(cfg: Config, _dirs: Dirs, title: Option<String>, popup: bool) -> anyhow::Result<()> {
+pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyhow::Result<()> {
     let store = Store::open(&cfg.root)?;
-    let repo = crate::send::main_checkout(&std::env::current_dir().unwrap_or_default()).ok();
+    let repo = crate::send::capture_repo();
+    let body = template(&dirs, "idea", false).unwrap_or_default();
     if popup {
         let mut terminal = init_terminal();
         let mut text = title.unwrap_or_default();
@@ -1378,72 +1622,68 @@ pub fn add(cfg: Config, _dirs: Dirs, title: Option<String>, popup: bool) -> anyh
             terminal.draw(|f| {
                 let area = f.area();
                 let p = ratatui::widgets::Paragraph::new(format!(
-                    "New intent (Inbox)\n\ntitle: {text}▏\n\nEnter = save, Esc = cancel"
+                    "New intent (Inbox)\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
                 ));
                 p.render(area, f.buffer_mut());
             })?;
-            if let Event::Key(k) = crossterm::event::read()? {
-                match k.code {
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Enter => return Ok(Some(text.clone())),
-                    KeyCode::Backspace => {
-                        text.pop();
+            match crossterm::event::read()? {
+                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
+                        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => return Ok(None),
+                        (KeyCode::Enter, _) => return Ok(Some(text.clone())),
+                        (KeyCode::Backspace, _) => {
+                            text.pop();
+                        }
+                        (KeyCode::Char(c), false) => text.push(c),
+                        _ => {}
                     }
-                    KeyCode::Char(c) => text.push(c),
-                    _ => {}
                 }
+                Event::Paste(p) => text.push_str(p.replace(['\r', '\n'], " ").trim()),
+                _ => {}
             }
         })();
         restore_terminal();
         if let Some(t) = result? {
             let t = t.trim();
             if !t.is_empty() {
-                let body = template(
-                    &Dirs {
-                        config: cfg_dir_for(&cfg),
-                        root: cfg.root.clone(),
-                    },
-                    "idea",
-                    false,
-                )
-                .unwrap_or_default();
                 store.create(Path::new(crate::store::INBOX), t, "idea", &body, repo)?;
             }
         }
         return Ok(());
     }
     let mut input = String::new();
-    if title.is_none() || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if title.is_none() && stdin_is_tty {
+        anyhow::bail!(
+            "usage: herdr-intents add <title>   (or pipe a title line and body on stdin)"
+        );
+    }
+    if !stdin_is_tty {
         use std::io::Read;
         let _ = std::io::stdin().read_to_string(&mut input);
     }
-    let (t, body) = match title {
-        Some(t) => (t, input),
+    let input = input.replace("\r\n", "\n").replace('\r', "\n");
+    let (t, body_text) = match title {
+        Some(t) => (t, if input.trim().is_empty() { body } else { input }),
         None => {
             let mut lines = input.lines();
             let t = lines
                 .next()
                 .context("no title given and stdin is empty")?
                 .to_string();
-            (t, lines.collect::<Vec<_>>().join("\n"))
+            let rest = lines.collect::<Vec<_>>().join("\n");
+            (t, if rest.trim().is_empty() { body } else { rest })
         }
     };
     let it = store.create(
         Path::new(crate::store::INBOX),
         t.trim(),
         "idea",
-        &body,
+        &body_text,
         repo,
     )?;
     println!("{}", it.path.display());
     Ok(())
-}
-
-fn cfg_dir_for(_cfg: &Config) -> PathBuf {
-    // `add` has no Dirs in scope for templates when called standalone; the
-    // caller passes dirs through `run`; here we only need the kind skeleton,
-    // and an empty body is acceptable if the template cannot be read.
-    PathBuf::new()
 }
 
 #[cfg(test)]
@@ -1554,6 +1794,14 @@ mod tests {
             app,
             log,
         }
+    }
+
+    /// Give the selected intent a repo so `send` has somewhere to go.
+    fn set_repo(app: &mut App, repo: &Path) {
+        let path = app.selected_intent().unwrap().path.clone();
+        let repo = repo.to_path_buf();
+        Store::update_fields(&path, |fm| fm.repo = Some(repo)).unwrap();
+        app.rescan();
     }
 
     fn key(app: &mut App, code: KeyCode) -> Flow {
@@ -1707,7 +1955,7 @@ mod tests {
             v.hint.as_deref().unwrap_or("").contains("no proposal"),
             "{v:?}"
         );
-        key(&mut fx2.app, KeyCode::Char('a'));
+        ctrl(&mut fx2.app, 'a');
         assert_ne!(fx2.app.view().screen, "diff");
     }
 
@@ -1719,7 +1967,7 @@ mod tests {
         wait_until(&mut fx.app, "turn finished", |a| {
             !a.view().turn_running && a.view().can_apply
         });
-        key(&mut fx.app, KeyCode::Char('a'));
+        ctrl(&mut fx.app, 'a');
         assert_eq!(fx.app.view().screen, "diff");
         key(&mut fx.app, KeyCode::Enter);
         let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
@@ -1851,6 +2099,8 @@ mod tests {
             ("FAKE_HERDR_LOG".into(), log.display().to_string()),
         ];
         select(&mut fx.app, "Alpha");
+        let repo = fx._tmp.path().to_path_buf();
+        set_repo(&mut fx.app, &repo);
         key(&mut fx.app, KeyCode::Char('s'));
         assert_eq!(fx.app.view().screen, "send-pick");
         key(&mut fx.app, KeyCode::Enter); // first applicable handoff for an idea: grill
@@ -1877,6 +2127,8 @@ mod tests {
             ("FAKE_AGENT_START_FAILS".into(), "1".into()),
         ];
         select(&mut fx2.app, "Beta");
+        let repo2 = fx2._tmp.path().to_path_buf();
+        set_repo(&mut fx2.app, &repo2);
         key(&mut fx2.app, KeyCode::Char('R'));
         key(&mut fx2.app, KeyCode::Char('s'));
         key(&mut fx2.app, KeyCode::Enter);
@@ -1896,6 +2148,8 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         fx.app.herdr_env = vec![("HERDR_BIN_PATH".into(), String::new())];
         select(&mut fx.app, "Alpha");
+        let repo = fx._tmp.path().to_path_buf();
+        set_repo(&mut fx.app, &repo);
         key(&mut fx.app, KeyCode::Char('s'));
         key(&mut fx.app, KeyCode::Enter);
         key(&mut fx.app, KeyCode::Enter);
@@ -1963,6 +2217,230 @@ mod tests {
         assert!(
             text.contains(&selected_label),
             "selected row {selected_label} must be drawn; buffer:\n{text}"
+        );
+    }
+
+    // C1: typing a message starting with "a" or "d" must not apply or dismiss
+    #[test]
+    fn chat_letters_are_typed_and_apply_is_ctrl_a() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('p'));
+        wait_until(&mut fx.app, "turn", |a| {
+            !a.view().turn_running && a.view().can_apply
+        });
+        type_str(&mut fx.app, "also mention");
+        assert_eq!(fx.app.view().screen, "chat", "`a` is typed, not apply");
+        assert_eq!(fx.app.view().chat_input, "also mention");
+        ctrl(&mut fx.app, 'a');
+        assert_eq!(fx.app.view().screen, "diff", "Ctrl-a opens the diff");
+        type_str(&mut fx.app, "xyz");
+        assert_eq!(
+            fx.app.view().screen,
+            "diff",
+            "printable keys do nothing on the diff screen"
+        );
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().screen, "chat");
+        assert_eq!(
+            fx.app.view().chat_input,
+            "also mention",
+            "input survives the round trip"
+        );
+        ctrl(&mut fx.app, 'd');
+        assert!(!fx.app.view().can_apply, "Ctrl-d dismisses");
+    }
+
+    // C2: field changes and the conversation-id save must not clobber another writer
+    #[test]
+    fn state_change_and_conversation_id_keep_another_writers_body() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut other = Store::load(&path).unwrap();
+        other.body = "other toolbar wrote this\n".into();
+        Store::save_force(&mut other).unwrap();
+        key(&mut fx.app, KeyCode::Char('R'));
+        let it = Store::load(&path).unwrap();
+        assert_eq!(it.fm.state, State::Ready);
+        assert_eq!(
+            it.body, "other toolbar wrote this\n",
+            "R must not overwrite the body"
+        );
+        key(&mut fx.app, KeyCode::Char('p'));
+        wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
+        let it = Store::load(&path).unwrap();
+        assert_eq!(
+            it.body, "other toolbar wrote this\n",
+            "the id save must not overwrite the body"
+        );
+        assert!(it.fm.conversations.contains_key("fake"));
+    }
+
+    #[test]
+    fn apply_prompts_when_the_file_changed_during_the_chat() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('p'));
+        wait_until(&mut fx.app, "turn", |a| {
+            !a.view().turn_running && a.view().can_apply
+        });
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut other = Store::load(&path).unwrap();
+        other.body = "changed elsewhere\n".into();
+        Store::save_force(&mut other).unwrap();
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "prompt", "{:?}", fx.app.view());
+        assert_eq!(
+            Store::load(&path).unwrap().body,
+            "changed elsewhere\n",
+            "nothing written yet"
+        );
+        key(&mut fx.app, KeyCode::Char('n'));
+        assert_eq!(Store::load(&path).unwrap().body, "changed elsewhere\n");
+    }
+
+    #[test]
+    fn send_confirm_renders_the_prompt_from_disk_not_the_cached_row() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.herdr_env = vec![
+            (
+                "HERDR_BIN_PATH".into(),
+                fixtures().join("fake-herdr.sh").display().to_string(),
+            ),
+            (
+                "FAKE_HERDR_LOG".into(),
+                fx._tmp.path().join("h.log").display().to_string(),
+            ),
+        ];
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut other = Store::load(&path).unwrap();
+        other.body = "fresh body from disk\n".into();
+        other.fm.repo = Some(fx._tmp.path().to_path_buf());
+        Store::save_force(&mut other).unwrap();
+        key(&mut fx.app, KeyCode::Char('s'));
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(
+            fx.app
+                .view()
+                .send_prompt
+                .unwrap()
+                .contains("fresh body from disk")
+        );
+    }
+
+    // I5: polishing from the editor returns to the editor with the buffer intact
+    #[test]
+    fn chat_from_editor_returns_to_editor_with_unsaved_text() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Enter);
+        key(&mut fx.app, KeyCode::End);
+        type_str(&mut fx.app, " unsaved");
+        ctrl(&mut fx.app, 'p');
+        wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().screen, "edit");
+        assert_eq!(fx.app.editor.text(), "alpha body unsaved\n");
+    }
+
+    // I6: long chat and diff content scroll
+    #[test]
+    fn chat_and_diff_scroll_with_page_keys() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('p'));
+        wait_until(&mut fx.app, "turn", |a| {
+            !a.view().turn_running && a.view().can_apply
+        });
+        key(&mut fx.app, KeyCode::PageUp);
+        assert!(
+            fx.app.view().chat_scroll > 0,
+            "PageUp scrolls the transcript back"
+        );
+        key(&mut fx.app, KeyCode::PageDown);
+        assert_eq!(fx.app.view().chat_scroll, 0);
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::PageDown);
+        assert!(fx.app.view().diff_scroll > 0, "PageDown scrolls the diff");
+    }
+
+    // I7: paste goes into whichever text input is active, with CR normalised
+    #[test]
+    fn paste_reaches_inputs_and_normalises_line_endings() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('A'));
+        fx.app.paste("/tmp/shot.png\r\n");
+        assert_eq!(fx.app.view().hint.as_deref(), Some("attach file path"));
+        assert_eq!(fx.app.view().input_text, "/tmp/shot.png");
+        key(&mut fx.app, KeyCode::Esc);
+        key(&mut fx.app, KeyCode::Enter);
+        fx.app.paste("one\r\ntwo\rthree");
+        assert_eq!(fx.app.editor.text(), "one\ntwo\nthreealpha body\n");
+    }
+
+    // I11: no repo → refuse to send
+    #[test]
+    fn send_refuses_when_the_intent_has_no_repo() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.herdr_env = vec![
+            (
+                "HERDR_BIN_PATH".into(),
+                fixtures().join("fake-herdr.sh").display().to_string(),
+            ),
+            (
+                "FAKE_HERDR_LOG".into(),
+                fx._tmp.path().join("h.log").display().to_string(),
+            ),
+        ];
+        select(&mut fx.app, "Alpha"); // created with repo None
+        key(&mut fx.app, KeyCode::Char('s'));
+        key(&mut fx.app, KeyCode::Enter);
+        assert_ne!(fx.app.view().screen, "send-confirm");
+        assert!(
+            fx.app.view().message.unwrap_or_default().contains("repo"),
+            "{:?}",
+            fx.app.view().message
+        );
+    }
+
+    // I12: groups can be moved too
+    #[test]
+    fn move_works_on_groups() {
+        let mut fx = setup("agy.jsonl");
+        let root = fx.app.store.root().to_path_buf();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('m'));
+        type_str(&mut fx.app, "archive");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(root.join("archive/skoolscout/").is_dir(), "group moved");
+        assert!(!root.join("skoolscout").exists());
+    }
+
+    // I2: a broken file shows as a row with its error
+    #[test]
+    fn broken_files_show_as_rows() {
+        let mut fx = setup("agy.jsonl");
+        fs::write(
+            fx.app.store.root().join("Inbox/bad.md"),
+            "---\ntitle: [oops\n---\nx\n",
+        )
+        .unwrap();
+        fx.app.rescan();
+        let v = fx.app.view();
+        assert!(
+            v.rows
+                .iter()
+                .any(|r| r.label.contains("bad.md") && r.label.contains("!")),
+            "{:?}",
+            v.rows
         );
     }
 }

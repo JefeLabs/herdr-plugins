@@ -87,40 +87,63 @@ pub fn render_prompt(
     p
 }
 
-/// Repo and rendered prompt for the confirm screen.
+/// Repo and rendered prompt for the confirm screen. An intent without a repo
+/// cannot be sent: guessing would fire an agent at the wrong checkout.
 pub fn prepare(
     cfg: &Config,
     h: &Handoff,
     it: &Intent,
     attachments: &[(String, u64)],
-) -> (PathBuf, String) {
-    let repo = it
-        .fm
-        .repo
-        .clone()
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|d| main_checkout(&d).ok())
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
+) -> Result<(PathBuf, String), String> {
+    let repo = it.fm.repo.clone().ok_or_else(|| {
+        "intent has no repo: set `repo:` in its front matter to the main checkout to send it"
+            .to_string()
+    })?;
+    if !repo.is_dir() {
+        return Err(format!("repo {} does not exist", repo.display()));
+    }
     let prompt = render_prompt(h, it, attachments, uses_workbrokr(&repo, cfg.workbrokr));
-    (repo, prompt)
+    Ok((repo, prompt))
 }
 
-/// `intent-<slug prefix>`, valid for Herdr agent names (`[a-z][a-z0-9_-]{0,31}`).
+/// The directory a capture should record as `repo`: Herdr's `workspace_cwd`
+/// when the tool runs as a plugin (actions may start in the plugin dir), else
+/// the current directory; always resolved to the main checkout.
+pub fn capture_repo() -> Option<PathBuf> {
+    let from_herdr = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
+        .ok()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+        .and_then(|v| {
+            v.get("workspace_cwd")
+                .and_then(|w| w.as_str())
+                .map(PathBuf::from)
+        });
+    let start = from_herdr.or_else(|| std::env::current_dir().ok())?;
+    main_checkout(&start).ok()
+}
+
+/// `intent-<slug prefix>-<4 random chars>`, valid for Herdr agent names
+/// (`[a-z][a-z0-9_-]{0,31}`) and unique per send, so sending the same intent
+/// twice never collides.
 pub fn agent_name(slug: &str) -> String {
     let cleaned: String = slug
         .to_ascii_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    let mut name = format!("intent-{}", &cleaned[..cleaned.len().min(25)]);
-    name = name.trim_end_matches('-').to_string();
-    if name == "intent" {
-        name.push_str("-x");
+    let mut head = cleaned[..cleaned.len().min(20)]
+        .trim_end_matches('-')
+        .to_string();
+    if head.is_empty() {
+        head = "x".to_string();
     }
-    name
+    let suffix: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(4)
+        .collect();
+    format!("intent-{head}-{suffix}")
 }
 
 fn herdr(
@@ -202,6 +225,13 @@ pub fn send(
         })?
         .to_string();
     let agent = agent_name(&crate::store::slugify(title));
+    let orphan = |mut e: SendError| {
+        e.detail = format!(
+            "{} (workspace {workspace_id} was created and is left open)",
+            e.detail
+        );
+        e
+    };
     herdr(
         herdr_bin,
         env,
@@ -215,13 +245,15 @@ pub fn send(
             &pane_id,
         ],
         "agent start",
-    )?;
+    )
+    .map_err(orphan)?;
     herdr(
         herdr_bin,
         env,
         &["agent", "prompt", &agent, prompt],
         "agent prompt",
-    )?;
+    )
+    .map_err(orphan)?;
     Ok(SendOutcome {
         workspace_id,
         pane_id,

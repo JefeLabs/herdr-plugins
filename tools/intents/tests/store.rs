@@ -206,3 +206,126 @@ fn slugify_is_short_and_safe() {
     );
     assert!(slugify(&"x".repeat(200)).len() <= 60);
 }
+
+// I2: realistic hand-edits must still load
+#[test]
+fn lenient_front_matter_loads_hand_edits() {
+    let (tmp, _s) = store();
+    let cases: &[(&str, &str)] = &[
+        ("empty-tags", "---\ntitle: T\nkind: idea\ntags:\n---\nb\n"),
+        (
+            "number-tags",
+            "---\ntitle: T\nkind: idea\ntags: [2024, x]\n---\nb\n",
+        ),
+        ("no-title", "---\nkind: idea\n---\nb\n"),
+        (
+            "state-done",
+            "---\ntitle: T\nkind: idea\nstate: done\n---\nb\n",
+        ),
+        (
+            "state-caps",
+            "---\ntitle: T\nkind: idea\nstate: Ready\n---\nb\n",
+        ),
+        ("crlf", "---\r\ntitle: T\r\nkind: idea\r\n---\r\nb\r\n"),
+        (
+            "date-only",
+            "---\ntitle: T\nkind: idea\ncreated: 2026-10-24\n---\nb\n",
+        ),
+        (
+            "space-ts",
+            "---\ntitle: T\nkind: idea\ncreated: 2026-10-24 18:02:11\n---\nb\n",
+        ),
+    ];
+    for (name, text) in cases {
+        let p = tmp.path().join("root/Inbox").join(format!("{name}.md"));
+        fs::write(&p, text).unwrap();
+        let it = Store::load(&p).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(it.body.trim(), "b", "{name}");
+    }
+    let it = Store::load(&tmp.path().join("root/Inbox/number-tags.md")).unwrap();
+    assert_eq!(it.fm.tags, ["2024", "x"]);
+    let it = Store::load(&tmp.path().join("root/Inbox/no-title.md")).unwrap();
+    assert_eq!(it.fm.title, "no-title", "title defaults to the file stem");
+    assert_eq!(
+        Store::load(&tmp.path().join("root/Inbox/state-caps.md"))
+            .unwrap()
+            .fm
+            .state,
+        State::Ready
+    );
+    assert_eq!(
+        Store::load(&tmp.path().join("root/Inbox/state-done.md"))
+            .unwrap()
+            .fm
+            .state,
+        State::Raw,
+        "unknown state reads as raw"
+    );
+}
+
+#[test]
+fn unparseable_file_shows_up_as_a_broken_entry_not_silently_dropped() {
+    let (tmp, s) = store();
+    fs::write(
+        tmp.path().join("root/Inbox/bad.md"),
+        "---\ntitle: [unclosed\n---\nb\n",
+    )
+    .unwrap();
+    let tree = s.scan().unwrap();
+    let inbox = tree.groups.iter().find(|g| g.name == "Inbox").unwrap();
+    assert_eq!(inbox.broken.len(), 1, "{:?}", inbox.broken);
+    assert!(inbox.broken[0].0.ends_with("bad.md"));
+    assert!(!inbox.broken[0].1.is_empty(), "carries the parse error");
+}
+
+#[test]
+fn missing_updated_does_not_cause_a_false_conflict() {
+    let (tmp, _s) = store();
+    let p = tmp.path().join("root/Inbox/old.md");
+    fs::write(&p, "---\ntitle: Old\nkind: idea\n---\nb\n").unwrap();
+    let mut it = Store::load(&p).unwrap();
+    it.body = "c\n".into();
+    Store::save(&mut it).expect("first save of a file without `updated` must not conflict");
+}
+
+// C2: field-only changes must not clobber another writer's edits
+#[test]
+fn update_fields_reloads_before_writing() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("Inbox"), "Shared", "idea", "a\n", None)
+        .unwrap();
+    let stale = Store::load(&it.path).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let mut other = Store::load(&it.path).unwrap();
+    other.body = "other wrote this\n".into();
+    Store::save_force(&mut other).unwrap();
+    let fresh = Store::update_fields(&stale.path, |fm| fm.state = State::Ready).unwrap();
+    assert_eq!(
+        fresh.body, "other wrote this\n",
+        "body from disk, not from the stale copy"
+    );
+    assert_eq!(fresh.fm.state, State::Ready);
+    assert_eq!(Store::load(&it.path).unwrap().body, "other wrote this\n");
+}
+
+#[test]
+fn save_meta_does_not_bump_updated() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("Inbox"), "Meta", "idea", "a\n", None)
+        .unwrap();
+    let before = Store::load(&it.path).unwrap().fm.updated;
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    Store::update_meta(&it.path, |fm| {
+        fm.conversations.insert("agy".into(), "c1".into());
+    })
+    .unwrap();
+    let after = Store::load(&it.path).unwrap();
+    assert_eq!(
+        after.fm.updated.unwrap().timestamp(),
+        before.unwrap().timestamp(),
+        "meta writes keep `updated`"
+    );
+    assert_eq!(after.fm.conversations["agy"], "c1");
+}

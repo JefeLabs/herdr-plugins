@@ -1,7 +1,7 @@
 //! Streaming conversation turns: spawn a provider CLI in print mode, stream its
 //! events over a channel, cancel by killing its process group.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -66,7 +66,7 @@ impl Turn {
         {
             let tx = tx.clone();
             std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                for line in lossy_lines(stderr) {
                     if tx.send(TurnMsg::Delta(format!("{line}\n"))).is_err() {
                         break;
                     }
@@ -83,7 +83,7 @@ impl Turn {
                 let mut text = String::new();
                 let mut sent_id: Option<String> = None;
                 let mut error: Option<String> = None;
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                for line in lossy_lines(stdout) {
                     match parse_line(&spec, &line) {
                         Event::Text(t) => {
                             text.push_str(&t);
@@ -167,6 +167,49 @@ impl Drop for Turn {
             let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
         }
     }
+}
+
+/// Lines decoded leniently: one invalid UTF-8 byte must not end the stream
+/// (`lines()` would stop there and the child would die of SIGPIPE).
+fn lossy_lines<R: Read + Send + 'static>(r: R) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(r);
+    std::iter::from_fn(move || {
+        let mut buf = Vec::new();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => {
+                while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                    buf.pop();
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
+        }
+    })
+}
+
+/// The next message of a conversation. With a resumable id the provider
+/// remembers context, so only the new message goes. Without one (text
+/// providers, a cancelled first turn) the seed and the transcript so far are
+/// re-sent, as the spec's degraded mode requires.
+pub fn follow_up_prompt(
+    seed: &str,
+    transcript: &[(String, String)],
+    message: &str,
+    resumable: bool,
+) -> String {
+    if resumable {
+        return message.to_string();
+    }
+    let mut p = String::new();
+    p.push_str(seed.trim_end());
+    p.push_str("\n\nConversation so far:\n");
+    for (role, text) in transcript {
+        p.push_str(&format!("\n[{role}]\n{}\n", text.trim_end()));
+    }
+    p.push_str("\n[user]\n");
+    p.push_str(message.trim_end());
+    p.push('\n');
+    p
 }
 
 /// First message of a conversation: the kind's polish template, the intent,

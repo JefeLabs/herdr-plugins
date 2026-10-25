@@ -288,7 +288,15 @@ impl TextArea {
             for (j, ch) in line.chars().enumerate().skip(hscroll).take(width) {
                 let x = area.x + (j - hscroll) as u16;
                 let cell = &mut buf[(x, y)];
-                cell.set_symbol(&ch.to_string());
+                // never hand a control character to the terminal (OSC title/clipboard writes)
+                let shown = if ch.is_control() && ch != '\t' {
+                    '·'
+                } else if ch == '\t' {
+                    ' '
+                } else {
+                    ch
+                };
+                cell.set_symbol(&shown.to_string());
                 if let Some((s, e)) = sel
                     && (row, j) >= s
                     && (row, j) < e
@@ -446,5 +454,21 @@ mod tests {
         assert_eq!(ta.text(), "brand new");
         assert_eq!(ta.cursor(), (0, 0));
         assert!(ta.selection().is_none());
+    }
+
+    #[test]
+    fn control_characters_render_as_placeholders() {
+        let ta = TextArea::from_text("a\x1b]0;evil\x07b\tc");
+        let mut t = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        t.draw(|f| ta.render(Rect::new(0, 0, 20, 2), f.buffer_mut(), false))
+            .unwrap();
+        let row: String = (0..20)
+            .map(|x| t.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            !row.contains('\x1b') && !row.contains('\x07'),
+            "raw controls leaked: {row:?}"
+        );
+        assert!(row.starts_with("a·"), "placeholder for ESC: {row:?}");
     }
 }

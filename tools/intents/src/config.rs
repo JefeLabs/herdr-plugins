@@ -69,9 +69,10 @@ pub fn resolve_dirs(
     } else {
         home.join(".config/herdr/plugins/config").join(PLUGIN_ID)
     };
-    let root = match cfg_root {
-        Some(r) => PathBuf::from(expand_home(r, home)),
-        None => home.join("intents"),
+    let root = match (get("INTENTS_ROOT"), cfg_root) {
+        (Some(env_root), _) => PathBuf::from(expand_home(&env_root, home)),
+        (None, Some(r)) => PathBuf::from(expand_home(r, home)),
+        (None, None) => home.join("intents"),
     };
     Dirs { config, root }
 }
@@ -253,6 +254,13 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
     })
 }
 
+/// Where polish turns run: a neutral, stable directory per intent under the
+/// root, so the provider has no repository in reach and claude's same-cwd
+/// resume keeps working.
+pub fn polish_cwd(root: &Path, stem: &str) -> PathBuf {
+    root.join(".polish").join(stem)
+}
+
 /// Body skeleton (`polish == false`) or polish prompt template for a kind.
 pub fn template(dirs: &Dirs, kind: &str, polish: bool) -> anyhow::Result<String> {
     let file = if polish {
@@ -307,6 +315,8 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--print-timeout",
                 "90s",
                 "--disable-slash-commands",
+                "--mode",
+                "plan",
             ]),
             resume: argv(&[
                 "agy",
@@ -318,6 +328,8 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--print-timeout",
                 "90s",
                 "--disable-slash-commands",
+                "--mode",
+                "plan",
             ]),
             output: jsonl(
                 "event",
@@ -336,23 +348,33 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
             name: "claude".into(),
             polish: argv(&[
                 "claude",
-                "-p",
-                "{prompt}",
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
                 "--session-id",
                 "{conv}",
+                "--permission-mode",
+                "plan",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "-p",
+                "{prompt}",
             ]),
             resume: argv(&[
                 "claude",
                 "--resume",
                 "{conv}",
-                "-p",
-                "{prompt}",
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
+                "--permission-mode",
+                "plan",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "-p",
+                "{prompt}",
             ]),
             output: jsonl(
                 "type",
@@ -369,8 +391,26 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
         "codex".to_string(),
         ProviderSpec {
             name: "codex".into(),
-            polish: argv(&["codex", "exec", "--json", "{prompt}"]),
-            resume: argv(&["codex", "exec", "resume", "{conv}", "{prompt}", "--json"]),
+            polish: argv(&[
+                "codex",
+                "exec",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "--",
+                "{prompt}",
+            ]),
+            resume: argv(&[
+                "codex",
+                "exec",
+                "resume",
+                "--json",
+                "--sandbox",
+                "read-only",
+                "{conv}",
+                "--",
+                "{prompt}",
+            ]),
             output: jsonl(
                 "type",
                 "/item/text",
@@ -386,15 +426,25 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
         "copilot".to_string(),
         ProviderSpec {
             name: "copilot".into(),
-            polish: argv(&["copilot", "-p", "{prompt}", "--output-format", "json"]),
+            polish: argv(&[
+                "copilot",
+                "--output-format",
+                "json",
+                "--deny-tool",
+                "*",
+                "-p",
+                "{prompt}",
+            ]),
             resume: argv(&[
                 "copilot",
                 "--session-id",
                 "{conv}",
-                "-p",
-                "{prompt}",
                 "--output-format",
                 "json",
+                "--deny-tool",
+                "*",
+                "-p",
+                "{prompt}",
             ]),
             output: jsonl(
                 "type",
@@ -554,16 +604,8 @@ mod tests {
         }
         let agy = &cfg.providers["agy"];
         assert_eq!(
-            agy.polish,
-            [
-                "agy",
-                "-p={prompt}",
-                "--output-format",
-                "stream-json",
-                "--print-timeout",
-                "90s",
-                "--disable-slash-commands"
-            ]
+            agy.polish[..4],
+            ["agy", "-p={prompt}", "--output-format", "stream-json"]
         );
         assert!(agy.resume.iter().any(|a| a == "--conversation"));
         let claude = &cfg.providers["claude"];
@@ -575,7 +617,7 @@ mod tests {
             cfg.providers["codex"].polish[..3],
             ["codex", "exec", "--json"]
         );
-        assert_eq!(cfg.providers["copilot"].polish[..2], ["copilot", "-p"]);
+        assert!(cfg.providers["copilot"].polish.iter().any(|a| a == "-p"));
         for p in cfg.providers.values() {
             assert!(
                 !p.polish
@@ -617,5 +659,54 @@ mod tests {
         );
         assert!(matches!(cfg.providers["mine"].output, Output::Text));
         assert!(cfg.providers.contains_key("agy"), "built-ins still present");
+    }
+
+    #[test]
+    fn builtin_providers_restrict_tools_and_repo_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        let has = |p: &ProviderSpec, flag: &str| {
+            p.polish.iter().any(|a| a == flag) && p.resume.iter().any(|a| a == flag)
+        };
+        assert!(
+            has(&cfg.providers["claude"], "--permission-mode")
+                && has(&cfg.providers["claude"], "--strict-mcp-config")
+        );
+        let claude = &cfg.providers["claude"];
+        let i = claude.polish.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(claude.polish[i + 1], "", "claude gets an empty tool list");
+        assert!(
+            has(&cfg.providers["agy"], "--mode")
+                && cfg.providers["agy"].polish.iter().any(|a| a == "plan")
+        );
+        assert!(
+            has(&cfg.providers["codex"], "--sandbox")
+                && cfg.providers["codex"]
+                    .polish
+                    .iter()
+                    .any(|a| a == "read-only")
+        );
+        assert!(has(&cfg.providers["copilot"], "--deny-tool"));
+    }
+
+    #[test]
+    fn intents_root_env_overrides_the_root() {
+        let home = Path::new("/home/u");
+        let d = resolve_dirs(
+            lookup(&[("INTENTS_ROOT", "/work/repo/intents")]),
+            home,
+            Some("~/intents"),
+        );
+        assert_eq!(d.root, Path::new("/work/repo/intents"));
+    }
+
+    #[test]
+    fn polish_cwd_is_a_neutral_dir_under_the_root() {
+        let p = polish_cwd(Path::new("/r"), "2026-10-24-slug");
+        assert_eq!(p, Path::new("/r/.polish/2026-10-24-slug"));
     }
 }
