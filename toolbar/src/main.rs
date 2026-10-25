@@ -4,6 +4,8 @@
 //! closes the workspace's toolbar pane; `select <tool>` switches the running
 //! toolbar to a tool by id or 1-based index.
 
+mod config;
+
 use std::process::ExitCode;
 
 #[derive(Debug, PartialEq, Eq)]

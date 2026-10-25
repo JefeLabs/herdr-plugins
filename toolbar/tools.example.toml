@@ -1,0 +1,38 @@
+# herdr-toolbar tools. Copy to the path printed by `herdr plugin config-dir jefelabs.toolbar`
+# as tools.toml. A worktree may add `.herdr-toolbar.toml` at its root with the same schema;
+# its entries replace global ones with the same id, and its `order`, if present, wins.
+
+prefix = "ctrl-]"
+order  = ["issues", "todo", "db", "files", "jira"]
+
+[[tool]]
+id      = "issues"
+name    = "GitHub issues"
+icon    = "◉"
+command = ["gh", "dash"]
+
+[[tool]]
+id      = "todo"
+name    = "Todo"
+icon    = "☑"
+command = ["taskwarrior-tui"]
+
+[[tool]]
+id      = "db"
+name    = "Database"
+icon    = "▤"
+command = ["lazysql"]
+cwd     = "~"
+
+[[tool]]
+id      = "files"
+name    = "Files"
+icon    = "▭"
+command = ["yazi"]
+
+[[tool]]
+id      = "jira"
+name    = "Jira"
+icon    = "◆"
+command = ["jira", "issue", "list"]
+env     = { JIRA_PROJECT = "SKOOL" }
