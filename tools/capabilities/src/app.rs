@@ -245,6 +245,42 @@ impl SortOrder {
     }
 }
 
+/// The list's filter, cycled with `f`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFilter {
+    All,
+    /// Everything not yet complete, drafts included.
+    InProgress,
+    /// Sent with every acceptance criterion ticked.
+    Completed,
+}
+
+impl ListFilter {
+    pub fn next(self) -> Self {
+        match self {
+            ListFilter::All => ListFilter::InProgress,
+            ListFilter::InProgress => ListFilter::Completed,
+            ListFilter::Completed => ListFilter::All,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ListFilter::All => "All",
+            ListFilter::InProgress => "In progress",
+            ListFilter::Completed => "Completed",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        [
+            ListFilter::All,
+            ListFilter::InProgress,
+            ListFilter::Completed,
+        ]
+        .into_iter()
+        .find(|f| f.label() == s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowView {
     pub depth: usize,
@@ -287,6 +323,8 @@ pub struct View {
     pub list_selected: usize,
     /// The list's sort order label.
     pub sort: &'static str,
+    /// The list's filter label.
+    pub filter: &'static str,
 }
 
 pub struct App {
@@ -326,8 +364,12 @@ pub struct App {
     found_cache: Option<(PathBuf, Vec<crate::store::Artifact>)>,
     pub layout: Layout,
     pub sort: SortOrder,
-    /// Every capability in the tree, in list order (all groups, collapsed or not).
+    pub filter: ListFilter,
+    /// Every capability in the tree that passes the filter, in list order
+    /// (all groups, collapsed or not).
     list: Vec<Intent>,
+    /// How many capabilities there are before filtering.
+    list_total: usize,
     list_selected: usize,
     /// Plan tasks per capability path, as last reported by the poller.
     plan_evidence: HashMap<PathBuf, Vec<crate::progress::PlanTasks>>,
@@ -381,7 +423,9 @@ impl App {
             found_cache: None,
             layout: Layout::Tree,
             sort: SortOrder::Updated,
+            filter: ListFilter::All,
             list: Vec::new(),
+            list_total: 0,
             list_selected: 0,
             plan_evidence: HashMap::new(),
             pr_states: HashMap::new(),
@@ -397,6 +441,9 @@ impl App {
         }
         if let Some(o) = last.sort.as_deref().and_then(SortOrder::parse) {
             app.sort = o;
+        }
+        if let Some(f) = last.filter.as_deref().and_then(ListFilter::parse) {
+            app.filter = f;
         }
         app.rebuild_rows();
         Ok(app)
@@ -473,6 +520,15 @@ impl App {
         }
         let mut list = Vec::new();
         collect(&self.tree, &mut list);
+        self.list_total = list.len();
+        let complete = |i: &Intent| {
+            crate::progress::progress(i, &self.evidence_for(i)).is_some_and(|p| p.complete)
+        };
+        match self.filter {
+            ListFilter::All => {}
+            ListFilter::InProgress => list.retain(|i| !complete(i)),
+            ListFilter::Completed => list.retain(complete),
+        }
         match self.sort {
             SortOrder::Updated => list.sort_by_key(|i| std::cmp::Reverse(crate::store::stamp(i))),
             SortOrder::Captured => list.sort_by_key(|i| std::cmp::Reverse(i.fm.created)),
@@ -754,6 +810,16 @@ impl App {
                 self.rebuild_list();
                 let _ =
                     crate::config::save_view(&self.dirs, self.layout.label(), self.sort.label());
+            }
+            KeyCode::Char('f') => {
+                self.filter = self.filter.next();
+                self.rebuild_list();
+                let _ = crate::config::save_view_with(
+                    &self.dirs,
+                    self.layout.label(),
+                    self.sort.label(),
+                    Some(self.filter.label()),
+                );
             }
             KeyCode::Char('r') => self.rescan(),
             KeyCode::Char('s') => self.start_send(),
@@ -1692,6 +1758,7 @@ impl App {
                 model: model.clone(),
                 layout: Some(self.layout.label().to_string()),
                 sort: Some(self.sort.label().to_string()),
+                filter: Some(self.filter.label().to_string()),
             },
         );
         let conv_id = intent.fm.conversations.get(provider).cloned();
@@ -2499,6 +2566,7 @@ impl App {
             list_titles: self.list.iter().map(|i| i.fm.title.clone()).collect(),
             list_selected: self.list_selected,
             sort: self.sort.label(),
+            filter: self.filter.label(),
         };
         match &self.screen {
             Screen::Browse => {}
@@ -2649,14 +2717,28 @@ impl App {
                 }
             })
             .collect();
-        let header = format!(
-            "Capabilities · {} · sorted by {}",
-            self.list.len(),
-            self.sort.label()
-        );
-        ui::render_capability_list(&rows, self.list_selected, &header, list_area, buf);
+        let header = match self.filter {
+            ListFilter::All => format!(
+                "Capabilities · {} · sorted by {}",
+                self.list.len(),
+                self.sort.label()
+            ),
+            f => format!(
+                "Capabilities · sorted by {} · showing {} ({} of {})",
+                self.sort.label(),
+                f.label(),
+                self.list.len(),
+                self.list_total
+            ),
+        };
+        let empty = if self.list_total == 0 {
+            "no capabilities yet: v back to the tree, then a adds one"
+        } else {
+            "nothing matches this filter: f changes it"
+        };
+        ui::render_capability_list(&rows, self.list_selected, &header, empty, list_area, buf);
         let text = self.message.clone().unwrap_or_else(|| {
-            "j/k move  Enter open in tree  v tree  S sort  s send  g agent  r rescan  q quit"
+            "j/k move  Enter open in tree  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
                 .to_string()
         });
         ui::render_status(&text, status, buf);
@@ -3836,6 +3918,63 @@ mod tests {
         // the choice is remembered like the others
         let again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
         assert_eq!(again.view().sort, "Created Asc");
+    }
+
+    /// Press `f` until the list is filtered by `filter`.
+    fn filter_by(app: &mut App, filter: &str) {
+        for _ in 0..4 {
+            if app.view().filter == filter {
+                return;
+            }
+            key(app, KeyCode::Char('f'));
+        }
+        panic!("no filter {filter}");
+    }
+
+    #[test]
+    fn f_filters_in_progress_completed_and_all() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        assert_eq!(fx.app.view().filter, "All", "the default");
+        assert_eq!(fx.app.view().list_titles.len(), 7);
+        filter_by(&mut fx.app, "In progress");
+        let titles = fx.app.view().list_titles;
+        assert_eq!(titles.len(), 6, "{titles:?}");
+        assert!(
+            !titles.iter().any(|t| t.starts_with("Invitees")),
+            "{titles:?}"
+        );
+        assert!(
+            titles.iter().any(|t| t == "a"),
+            "drafts count as in progress"
+        );
+        filter_by(&mut fx.app, "Completed");
+        assert_eq!(
+            fx.app.view().list_titles,
+            vec!["Invitees skip the join request"]
+        );
+        let shown = render(&fx.app, 120, 20);
+        assert!(shown.contains("showing Completed (1 of 7)"), "{shown}");
+        let narrow = render(&fx.app, 80, 20);
+        assert!(
+            narrow.contains("showing Completed (1 of 7)"),
+            "the header is never cut for hints: {narrow}"
+        );
+        // remembered like the sort order
+        let again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        assert_eq!(again.view().filter, "Completed");
+        filter_by(&mut fx.app, "All");
+        assert_eq!(fx.app.view().list_titles.len(), 7);
+    }
+
+    #[test]
+    fn an_empty_filter_says_so() {
+        let mut fx = setup("agy.jsonl"); // nothing sent, nothing complete
+        key(&mut fx.app, KeyCode::Char('v'));
+        filter_by(&mut fx.app, "Completed");
+        let shown = render(&fx.app, 100, 12);
+        assert!(shown.contains("nothing matches this filter"), "{shown}");
     }
 
     #[test]

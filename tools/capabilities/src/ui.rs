@@ -956,7 +956,7 @@ pub fn fit(text: &str, max: usize) -> String {
     out
 }
 
-const LIST_HINTS: &str = "v tree · S sort · s send · g agent";
+const LIST_HINTS: &str = "v tree · S sort · f filter · s send · g agent";
 const STATUS_W: usize = 6;
 const BAR_W: usize = 10;
 const WHEN_W: usize = 12;
@@ -997,6 +997,7 @@ pub fn render_capability_list(
     rows: &[ListRow],
     selected: usize,
     header: &str,
+    empty: &str,
     area: Rect,
     buf: &mut Buffer,
 ) {
@@ -1006,13 +1007,17 @@ pub fn render_capability_list(
     let dim = Style::default().add_modifier(Modifier::DIM);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let w = area.width as usize;
+    // the header wins; the key hints (also on the status line) show only if
+    // they fit beside it
     let hints_w = Span::raw(LIST_HINTS).width();
-    let head = fit(header, w.saturating_sub(hints_w + 2));
-    let gap = w.saturating_sub(Span::raw(head.as_str()).width() + hints_w);
+    let head = fit(header, w);
+    let head_w = Span::raw(head.as_str()).width();
+    let show_hints = head_w + 2 + hints_w <= w;
+    let gap = if show_hints { w - head_w - hints_w } else { 0 };
     Line::from(vec![
         Span::styled(head, bold),
         Span::raw(" ".repeat(gap)),
-        Span::styled(if gap > 0 { LIST_HINTS } else { "" }, dim),
+        Span::styled(if show_hints { LIST_HINTS } else { "" }, dim),
     ])
     .render(Rect { height: 1, ..area }, buf);
     let body = Rect {
@@ -1027,11 +1032,7 @@ pub fn render_capability_list(
             height: body.height.saturating_sub(1),
             ..body
         };
-        Paragraph::new(Span::styled(
-            "no capabilities yet: v back to the tree, then a adds one",
-            dim,
-        ))
-        .render(body, buf);
+        Paragraph::new(Span::styled(empty.to_string(), dim)).render(body, buf);
         return;
     }
     let inner_w = w.saturating_sub(2);

@@ -1,9 +1,9 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 3661
+assertion_line: 3743
 expression: wide
 ---
-Capabilities · 7 · sorted by Updated                                                  v tree · S sort · s send · g agent
+Capabilities · 7 · sorted by Updated                                       v tree · S sort · f filter · s send · g agent
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
  Oct 25 08:10 │ sent   │ ! needs you │ 2h 14m  │ ███████░░░ PR #42 open
@@ -62,4 +62,4 @@ Capabilities · 7 · sorted by Updated                                          
 
 
 
-j/k move  Enter open in tree  v tree  S sort  s send  g agent  r rescan  q quit
+j/k move  Enter open in tree  v tree  S sort  f filter  s send  g agent  r rescan  q quit

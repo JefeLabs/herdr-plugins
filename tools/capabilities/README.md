@@ -131,10 +131,10 @@ Send runs `herdr workspace create` on the capability's repo (always the main che
 
 ## List view
 
-`v` flips the browser between the group tree and one full-screen list of every capability, across all groups (collapsed or not). The selection carries across both ways, and the layout and sort order are remembered.
+`v` flips the browser between the group tree and one full-screen list of every capability, across all groups (collapsed or not). The selection carries across both ways, and the layout, sort order and filter are remembered.
 
 ```
-Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g agent
+Capabilities · 7 · sorted by Updated
 ────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
  Oct 25 08:10 │ sent   │ ! needs you │ 2h 14m  │ ███████░░░ PR #42 open
@@ -165,7 +165,7 @@ Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`
 
 Ticked criteria fill only their own share of the bar; they never stand in for building or merging. The agent field shows the live Herdr state of the agent the capability was sent to: `working`, `idle`, `done`, `! needs you` when it is waiting on you, `closed` when its pane is gone, `…` until Herdr has answered, and `—` before sending.
 
-Keys in the list: `j`/`k` (and `PgUp`/`PgDn`) move, `Enter` opens the capability in the tree, `v` back to the tree, `S` cycles the sort order (Updated, Progress with the least advanced first, Longest running with running agents sent longest ago first, Captured with the newest first, Created Asc with the oldest first, Title), `s` send (same gate), `g` focus the sent agent, `r` rescan, `q` quit. Agent states refresh every few seconds while the list shows; plans and PR states on entry, on `r` and about once a minute. `herdr`, `gh` and git run on background threads, and any of them failing only blanks its column. `gh` is found through `GH_BIN_PATH`, else on `PATH`.
+Keys in the list: `j`/`k` (and `PgUp`/`PgDn`) move, `Enter` opens the capability in the tree, `v` back to the tree, `S` cycles the sort order (Updated, Progress with the least advanced first, Longest running with running agents sent longest ago first, Captured with the newest first, Created Asc with the oldest first, Title), `f` cycles the filter (All, In progress for everything not yet complete, Completed for sent capabilities with every acceptance criterion ticked; the header then reads `showing Completed (1 of 7)`), `s` send (same gate), `g` focus the sent agent, `r` rescan, `q` quit. Agent states refresh every few seconds while the list shows; plans and PR states on entry, on `r` and about once a minute. `herdr`, `gh` and git run on background threads, and any of them failing only blanks its column. `gh` is found through `GH_BIN_PATH`, else on `PATH`.
 
 ## Files
 

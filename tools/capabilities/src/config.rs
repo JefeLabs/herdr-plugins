@@ -159,9 +159,12 @@ pub struct LastUsed {
     /// `tree` or `list`: the layout the browser opens in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,
-    /// The list's sort order (`Updated`, `Progress`, `Captured`, `Title`).
+    /// The list's sort order (`Updated`, `Progress`, `Captured`, `Title`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
+    /// The list's filter (`All`, `In progress`, `Completed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
 }
 
 fn last_used_path(dirs: &Dirs) -> PathBuf {
@@ -188,12 +191,25 @@ pub fn last_used(dirs: &Dirs, cfg: &Config) -> LastUsed {
 /// Record the browser's layout and sort order without touching the provider
 /// and model stored beside them.
 pub fn save_view(dirs: &Dirs, layout: &str, sort: &str) -> anyhow::Result<()> {
+    save_view_with(dirs, layout, sort, None)
+}
+
+/// `save_view`, also recording the list filter when given.
+pub fn save_view_with(
+    dirs: &Dirs,
+    layout: &str,
+    sort: &str,
+    filter: Option<&str>,
+) -> anyhow::Result<()> {
     let mut last = std::fs::read_to_string(last_used_path(dirs))
         .ok()
         .and_then(|t| toml::from_str::<LastUsed>(&t).ok())
         .unwrap_or_default();
     last.layout = Some(layout.to_string());
     last.sort = Some(sort.to_string());
+    if let Some(f) = filter {
+        last.filter = Some(f.to_string());
+    }
     save_last_used(dirs, &last)
 }
 
