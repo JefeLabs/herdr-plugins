@@ -19,6 +19,18 @@ pub enum Event {
 /// Fill `{prompt}`, `{conv}` and `{outfile}`. With no conversation id the
 /// `polish` argv is used and `{conv}` becomes a fresh uuid (claude sets its
 /// own session id that way); with one, the `resume` argv is used.
+/// A conversation id is safe to place in argv only if it is a plain token:
+/// letters, digits, `-`, `_`, `.`, not starting with `-` (an option) and not
+/// empty. Anything else falls back to a fresh conversation.
+pub fn safe_conversation_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('-')
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 pub fn render_argv(
     spec: &ProviderSpec,
     prompt: &str,
@@ -26,7 +38,9 @@ pub fn render_argv(
     outfile: &Path,
 ) -> Vec<String> {
     let (template, conv_value) = match conv {
-        Some(id) if !spec.resume.is_empty() => (&spec.resume, id.to_string()),
+        Some(id) if !spec.resume.is_empty() && safe_conversation_id(id) => {
+            (&spec.resume, id.to_string())
+        }
         _ => (&spec.polish, uuid::Uuid::new_v4().to_string()),
     };
     template

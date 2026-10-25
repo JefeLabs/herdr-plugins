@@ -166,3 +166,23 @@ fn questions_header_variants_are_recognised() {
     let r = parse_reply("```proposal\nx\n```\nquestions: None\n");
     assert!(r.questions.is_empty(), "{:?}", r.questions);
 }
+
+// security: a conversation id that looks like an option must never reach argv
+#[test]
+fn hostile_conversation_id_falls_back_to_a_fresh_conversation() {
+    let spec = &builtin_providers()["codex"];
+    let out = Path::new("/tmp/o");
+    for bad in ["--sandbox=danger-full-access", "-x", "a b", "id;rm", ""] {
+        let argv = render_argv(spec, "p", Some(bad), out);
+        assert!(
+            !argv.iter().any(|a| a == bad),
+            "{bad:?} leaked into {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "resume"),
+            "{bad:?} must not resume: {argv:?}"
+        );
+    }
+    let good = render_argv(spec, "p", Some("019a0c1e-aaaa-7000-8000-000000000001"), out);
+    assert!(good.iter().any(|a| a == "resume"));
+}

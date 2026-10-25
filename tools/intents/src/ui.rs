@@ -72,7 +72,7 @@ pub fn render_tree(rows: &[TreeRow], selected: usize, scroll: usize, area: Rect,
         if row.is_group {
             spans.push(Span::raw(if row.collapsed { "▸ " } else { "▾ " }));
             spans.push(Span::styled(
-                row.label.to_string(),
+                sanitize(row.label),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             if row.count > 0 {
@@ -83,7 +83,7 @@ pub fn render_tree(rows: &[TreeRow], selected: usize, scroll: usize, area: Rect,
             }
         } else if row.broken {
             spans.push(Span::styled(
-                format!("! {}", row.label),
+                format!("! {}", sanitize(row.label)),
                 Style::default().add_modifier(Modifier::DIM),
             ));
         } else {
@@ -118,13 +118,13 @@ pub fn render_tree(rows: &[TreeRow], selected: usize, scroll: usize, area: Rect,
 pub fn render_detail(intent: &Intent, attachments: &[(String, u64)], area: Rect, buf: &mut Buffer) {
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            format!("# {}", intent.fm.title),
+            format!("# {}", sanitize(&intent.fm.title)),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!(
                 "kind: {}   state: {}{}{}",
-                intent.fm.kind,
+                sanitize(&intent.fm.kind),
                 intent.fm.state.label(),
                 if intent.open_questions() > 0 {
                     format!("   ?{}", intent.open_questions())
@@ -237,10 +237,10 @@ pub fn render_chat(
         .wrap(Wrap { trim: false })
         .scroll((offset as u16, 0))
         .render(body, buf);
-    let prompt = match hint {
+    let prompt = sanitize(&match hint {
         Some(h) => format!("› {input}   [{h}]"),
         None => format!("› {input}"),
-    };
+    });
     buf.set_style(input_row, Style::default().add_modifier(Modifier::REVERSED));
     Line::from(prompt).render(input_row, buf);
 }
@@ -290,7 +290,7 @@ pub fn render_diff(old: &str, new: &str, scroll: u16, area: Rect, buf: &mut Buff
 
 pub fn render_status(text: &str, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, Style::default().add_modifier(Modifier::REVERSED));
-    Line::from(text.to_string()).render(area, buf);
+    Line::from(sanitize(text)).render(area, buf);
 }
 
 pub fn render_list(title: &str, items: &[String], selected: usize, area: Rect, buf: &mut Buffer) {
@@ -308,6 +308,82 @@ pub fn render_list(title: &str, items: &[String], selected: usize, area: Rect, b
         if i == selected {
             buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
         }
-        Line::from(format!(" {item}")).render(rect, buf);
+        Line::from(format!(" {}", sanitize(item))).render(rect, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn text_of(t: &Terminal<TestBackend>) -> String {
+        format!("{:?}", t.backend().buffer())
+    }
+
+    #[test]
+    fn titles_and_broken_rows_are_sanitised() {
+        let rows = vec![
+            TreeRow {
+                depth: 0,
+                label: "evil\x1b]0;x\x07group",
+                is_group: true,
+                collapsed: false,
+                questions: 0,
+                state: None,
+                count: 0,
+                broken: false,
+            },
+            TreeRow {
+                depth: 0,
+                label: "bad\x1b[2Jfile.md",
+                is_group: false,
+                collapsed: false,
+                questions: 0,
+                state: None,
+                count: 0,
+                broken: true,
+            },
+            TreeRow {
+                depth: 0,
+                label: "ti\x1btle",
+                is_group: false,
+                collapsed: false,
+                questions: 0,
+                state: Some(State::Raw),
+                count: 0,
+                broken: false,
+            },
+        ];
+        let mut t = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        t.draw(|f| render_tree(&rows, 0, 0, f.area(), f.buffer_mut()))
+            .unwrap();
+        let text = text_of(&t);
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "raw controls in tree: {text}"
+        );
+    }
+
+    #[test]
+    fn detail_header_and_status_are_sanitised() {
+        let mut it = crate::store::Intent {
+            path: std::path::PathBuf::from("/x/a.md"),
+            fm: serde_yaml_ng::from_str("title: \"t\\e]52;c;evil\\a\"\nkind: \"k\\e[2J\"\n")
+                .unwrap(),
+            body: String::new(),
+            loaded_updated: chrono::Local::now(),
+        };
+        it.fm.title = "t\x1b]52;c;evil\x07".into();
+        it.fm.kind = "k\x1b[2J".into();
+        let mut t = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        t.draw(|f| render_detail(&it, &[], f.area(), f.buffer_mut()))
+            .unwrap();
+        assert!(!text_of(&t).contains('\u{1b}'), "raw ESC in detail");
+        let mut t = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        t.draw(|f| render_status("msg \x1b[31mred", f.area(), f.buffer_mut()))
+            .unwrap();
+        assert!(!text_of(&t).contains('\u{1b}'), "raw ESC in status");
     }
 }

@@ -1387,11 +1387,11 @@ impl App {
                 Some(Row::Intent { intent, .. }) => {
                     ui::render_detail(intent, &Store::attachments(intent), right, buf)
                 }
-                Some(Row::Broken { path, error, .. }) => {
-                    ratatui::widgets::Paragraph::new(format!("{}\n\n{}", path.display(), error))
-                        .wrap(ratatui::widgets::Wrap { trim: false })
-                        .render(right, buf)
-                }
+                Some(Row::Broken { path, error, .. }) => ratatui::widgets::Paragraph::new(
+                    ui::sanitize(&format!("{}\n\n{}", path.display(), error)),
+                )
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .render(right, buf),
                 _ => ratatui::widgets::Paragraph::new("a add intent · n new group · ? help")
                     .render(right, buf),
             },
