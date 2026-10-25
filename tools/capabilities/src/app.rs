@@ -3561,6 +3561,34 @@ mod tests {
     }
 
     #[test]
+    fn card_titles_are_bold_and_cards_open_with_a_rule() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let (w, h) = (100u16, 30u16);
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let row = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let title_y = (0..h)
+            .find(|&y| row(y).starts_with(" Invitees skip"))
+            .expect("card title row");
+        assert!(
+            buf[(1, title_y)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "title is bold"
+        );
+        assert!(
+            row(title_y - 1).starts_with("────"),
+            "the card opens with a rule: {:?}",
+            row(title_y - 1)
+        );
+    }
+
+    #[test]
     fn s_in_the_list_is_gated_and_sends_when_ready() {
         let mut fx = list_fixture(true);
         key(&mut fx.app, KeyCode::Char('v'));

@@ -977,15 +977,15 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// The list layout: a header, then one card per capability:
+/// The list layout: a header, then one card per capability, each opening
+/// with a horizontal rule:
 ///
 /// ```text
+/// ────────────────────────────────────────
 ///  Title
 ///  TIMESTAMP │ STATUS │ AGENT │ PROGRESS
 ///  description, up to two wrapped lines
 /// ```
-///
-/// A blank line separates cards.
 pub fn render_capability_list(
     rows: &[ListRow],
     selected: usize,
@@ -1008,20 +1008,18 @@ pub fn render_capability_list(
         Span::styled(if gap > 0 { LIST_HINTS } else { "" }, dim),
     ])
     .render(Rect { height: 1, ..area }, buf);
-    Line::styled("─".repeat(w), dim).render(
-        Rect {
-            y: area.y + 1,
-            height: 1,
-            ..area
-        },
-        buf,
-    );
     let body = Rect {
-        y: area.y + 2,
-        height: area.height - 2,
+        y: area.y + 1,
+        height: area.height - 1,
         ..area
     };
     if rows.is_empty() {
+        Line::styled("─".repeat(w), dim).render(Rect { height: 1, ..body }, buf);
+        let body = Rect {
+            y: body.y + 1,
+            height: body.height.saturating_sub(1),
+            ..body
+        };
         Paragraph::new(Span::styled(
             "no capabilities yet: v back to the tree, then a adds one",
             dim,
@@ -1034,10 +1032,10 @@ pub fn render_capability_list(
         .iter()
         .map(|r| card_description(r.description, inner_w))
         .collect();
-    // title + fields rows + description, then a spacer
-    let height = |i: usize| 2 + descs[i].len() + 1;
+    // rule + title + fields rows + description
+    let height = |i: usize| 1 + 2 + descs[i].len();
     // first card shown: the selected card must fit completely
-    let room = body.height as usize + 1; // the last card needs no spacer
+    let room = body.height as usize;
     let mut first = 0;
     while first < selected && (first..=selected).map(height).sum::<usize>() > room {
         first += 1;
@@ -1049,7 +1047,6 @@ pub fn render_capability_list(
         if y >= bottom {
             break;
         }
-        let card_top = y;
         let mut put = |line: Line, y: &mut u16| {
             if *y < bottom {
                 line.render(
@@ -1063,6 +1060,8 @@ pub fn render_capability_list(
             }
             *y += 1;
         };
+        put(Line::styled("─".repeat(w), dim), &mut y);
+        let card_top = y;
         // row one: the title alone
         put(
             Line::from(vec![
@@ -1117,6 +1116,5 @@ pub fn render_capability_list(
                 Style::default().add_modifier(Modifier::REVERSED),
             );
         }
-        y += 1; // spacer
     }
 }
