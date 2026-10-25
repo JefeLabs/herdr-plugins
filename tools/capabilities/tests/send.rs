@@ -391,3 +391,34 @@ fn a_file_only_in_a_worktree_resolves() {
         vec![tmp.path().join("not-a-repo")]
     );
 }
+
+#[test]
+fn a_handoff_names_the_other_areas_a_capability_affects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        config: tmp.path().join("cfg"),
+        root: tmp.path().join("root"),
+    };
+    let cfg = load_or_init(&dirs).unwrap();
+    let store = Store::open(&dirs.root).unwrap();
+    let it = store
+        .create(
+            Path::new("Inbox"),
+            "Wide",
+            "idea",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    let grill = cfg.handoffs.iter().find(|h| h.name == "grill").unwrap();
+    assert!(!render_prompt(grill, &it, &[], false).contains("also affects"));
+    let it = Store::update_fields(&it.path, |fm| {
+        fm.areas = vec!["skoolscout/org".into(), "skoolscout/family".into()]
+    })
+    .unwrap();
+    let p = render_prompt(grill, &it, &[], false);
+    assert!(
+        p.contains("also affects these areas: skoolscout/org, skoolscout/family"),
+        "{p}"
+    );
+}

@@ -2867,12 +2867,22 @@ impl App {
                     (Some(sent), State::Sent) => Some(crate::progress::ago(sent.at, now)),
                     _ => None,
                 };
-                let group = i
+                // its home group, then the other areas it affects
+                let home = i
                     .path
                     .parent()
                     .and_then(|d| d.strip_prefix(self.store.root()).ok())
                     .map(|d| d.display().to_string())
                     .unwrap_or_default();
+                let group = std::iter::once(home)
+                    .chain(
+                        i.fm.areas
+                            .iter()
+                            .map(|a| a.trim().trim_matches('/').to_string())
+                            .filter(|a| !a.is_empty()),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(" · ");
                 // the sent agent's worktree, relative to the repo when inside it
                 let worktree = match (&i.fm.sent_to, &self.agents, i.fm.state) {
                     (Some(sent), Some(agents), State::Sent) => {
@@ -4030,7 +4040,7 @@ mod tests {
             "skoolscout/org",
             "pr",
             &format!(
-                "title: Notify primary contact to schedule a meeting\nkind: idea\ncreated: 2026-10-25 00:34:00\nupdated: 2026-10-25 08:10:00\n{}",
+                "title: Notify primary contact to schedule a meeting\nkind: idea\ncreated: 2026-10-25 00:34:00\nupdated: 2026-10-25 08:10:00\nareas:\n  - Inbox\n{}",
                 sent("intent-notify-547e", "08:10")
             ),
             "## Description\nThe primary contact gets no prompt to book the intro meeting.\n\n## Acceptance criteria\n- [ ] gets an email\n\n## Artifacts\n- spec: docs/superpowers/specs/notify.md\n- pr: #42\n",
@@ -4259,7 +4269,11 @@ mod tests {
         };
         // sent card: title, tree path, metadata, worktree path and slot, blank, description
         let t = row(" Notify primary contact");
-        assert_eq!(lines[t + 1], " skoolscout/org", "tree path under the title");
+        assert_eq!(
+            lines[t + 1],
+            " skoolscout/org · Inbox",
+            "its home, then the other areas it affects"
+        );
         assert!(
             lines[t + 2].starts_with(" Oct 25 08:10 │ sent"),
             "{}",

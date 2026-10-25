@@ -1,12 +1,12 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 4029
+assertion_line: 4158
 expression: wide
 ---
 Capabilities · 7 · sorted by Updated                                       v tree · S sort · f filter · s send · g agent
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
- skoolscout/org
+ skoolscout/org · Inbox
  Oct 25 08:10 │ sent   │ ! needs you │ 2h ago  │ ▉▉▉██▉▉░░░ PR #42 open
  .claude/worktrees/org/notify │ slot 3
 

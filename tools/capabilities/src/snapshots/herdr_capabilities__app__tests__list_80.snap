@@ -1,12 +1,12 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 4040
+assertion_line: 4169
 expression: narrow
 ---
 Capabilities · 7 · sorted by Updated
 ────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
- skoolscout/org
+ skoolscout/org · Inbox
  Oct 25 08:10 │ sent   │ ! needs you │ 2h ago  │ ▉▉▉██▉▉░░░ PR #42 open
  .claude/worktrees/org/notify │ slot 3
 

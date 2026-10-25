@@ -139,6 +139,19 @@ pub fn render_prompt(
         .replace("{intent}", &intent_text)
         .replace("{attachments}", &atts);
     p = format!("{EDGE_CASES_PREAMBLE}{}{p}", artifacts_preamble(intent));
+    let areas: Vec<&str> = intent
+        .fm
+        .areas
+        .iter()
+        .map(|a| a.trim().trim_matches('/'))
+        .filter(|a| !a.is_empty())
+        .collect();
+    if !areas.is_empty() {
+        p = format!(
+            "Besides its own group, this capability also affects these areas: {}. A change that spans areas may need one work area per area.\n\n{p}",
+            areas.join(", ")
+        );
+    }
     if !crate::store::preconditions(&intent.body).is_empty() {
         p = format!("{PRECONDITIONS_PREAMBLE}{p}");
     }
