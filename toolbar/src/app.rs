@@ -80,13 +80,15 @@ pub struct App {
 }
 
 impl App {
+    /// A broken config is not fatal: the bar starts empty with the error as the
+    /// message, so `r` (reload) can recover once the file is fixed. `Err` is
+    /// reserved for things no reload can fix (none today).
     pub fn new(paths: ConfigPaths, env: SpawnEnv, size: Size) -> anyhow::Result<Self> {
-        let loaded = load_merged(&paths.global, &paths.workspace_root, &paths.trust)?;
         let (wake_tx, wake_rx) = channel();
         let mut app = Self {
             slots: Vec::new(),
             selected: 0,
-            prefix: Prefix::new(&loaded.config.prefix)?,
+            prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
             size,
             env,
@@ -94,10 +96,7 @@ impl App {
             wake_tx,
             wake_rx,
         };
-        app.apply_loaded(loaded);
-        if !app.slots.is_empty() {
-            app.select(0);
-        }
+        app.reload();
         Ok(app)
     }
 
@@ -684,5 +683,27 @@ mod tests {
         app.select(0);
         assert!(app.view().has_screen);
         app.shutdown();
+    }
+
+    #[test]
+    fn broken_config_at_startup_gives_an_empty_bar_and_a_message() {
+        let f = fixture("[[tool]\nid = 1");
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE)
+            .expect("startup must not fail on config");
+        assert!(app.slots.is_empty());
+        assert!(app.view().message.unwrap_or_default().contains("line 1"));
+        // and reload recovers
+        fs::write(&f.paths.global, three()).unwrap();
+        app.reload();
+        assert_eq!(app.slots.len(), 3);
+        assert!(app.view().message.is_none());
+        app.shutdown();
+    }
+
+    #[test]
+    fn unknown_order_id_at_startup_is_a_message_not_a_crash() {
+        let f = fixture(&(String::from("order = [\"nope\"]\n") + &three()));
+        let app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        assert!(app.view().message.unwrap_or_default().contains("`nope`"));
     }
 }

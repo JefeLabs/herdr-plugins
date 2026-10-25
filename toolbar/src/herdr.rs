@@ -21,6 +21,11 @@ const PASSTHROUGH: &[&str] = &[
     "HERDR_WORKSPACE_ID",
     "HERDR_TAB_ID",
     "HERDR_PANE_ID",
+    // so `herdr-toolbar trust` works from a shell hosted in the toolbar
+    "HERDR_PLUGIN_ID",
+    "HERDR_PLUGIN_CONFIG_DIR",
+    "HERDR_PLUGIN_STATE_DIR",
+    "HERDR_PLUGIN_CONTEXT_JSON",
 ];
 
 #[derive(Debug, Clone)]
@@ -122,11 +127,24 @@ pub fn toggle(ctx: &HerdrContext) -> anyhow::Result<()> {
     let file = pane_file(ctx);
     if let Ok(recorded) = std::fs::read_to_string(&file) {
         let id = recorded.trim();
-        if !id.is_empty() && ctx.herdr(&["pane", "get", id])?.status.success() {
-            ctx.herdr(&["pane", "close", id])?;
-            let _ = std::fs::remove_file(&file);
-            let _ = std::fs::remove_file(socket_path(ctx));
-            return Ok(());
+        if !id.is_empty() {
+            let out = ctx.herdr(&["pane", "get", id])?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            // Pane ids may be reused after a Herdr restart: close only a pane
+            // that still looks like ours.
+            let is_toolbar = text.contains(PLUGIN_ID) || text.contains("\"label\":\"Toolbar\"");
+            if out.status.success() && is_toolbar {
+                let closed = ctx.herdr(&["pane", "close", id])?;
+                if !closed.status.success() {
+                    bail!(
+                        "herdr pane close {id} failed: {}",
+                        String::from_utf8_lossy(&closed.stderr).trim()
+                    );
+                }
+                let _ = std::fs::remove_file(&file);
+                let _ = std::fs::remove_file(socket_path(ctx));
+                return Ok(());
+            }
         }
     }
     let cwd = ctx.workspace_cwd.display().to_string();

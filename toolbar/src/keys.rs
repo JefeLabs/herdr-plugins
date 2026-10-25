@@ -171,7 +171,14 @@ pub fn key_to_bytes(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         _ => None,
     };
     if let Some(n) = tilde {
-        return Some(if modifier > 1 { format!("\x1b[{n};{modifier}~") } else { format!("\x1b[{n}~") }.into_bytes());
+        return Some(
+            if modifier > 1 {
+                format!("\x1b[{n};{modifier}~")
+            } else {
+                format!("\x1b[{n}~")
+            }
+            .into_bytes(),
+        );
     }
 
     let mut out: Vec<u8> = Vec::with_capacity(4);
@@ -223,7 +230,6 @@ fn control_byte(ch: char) -> Option<u8> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,7 +258,9 @@ mod tests {
 
     #[test]
     fn plain_keys_forward_the_event() {
-        assert!(matches!(p().handle(k(Char('a'), NONE)), Action::Forward(e) if e.code == Char('a')));
+        assert!(
+            matches!(p().handle(k(Char('a'), NONE)), Action::Forward(e) if e.code == Char('a'))
+        );
     }
 
     #[test]
@@ -274,7 +282,9 @@ mod tests {
     fn prefix_twice_sends_literal_0x1d() {
         let mut p = p();
         arm(&mut p);
-        let Action::Forward(e) = p.handle(ctrl_bracket()) else { panic!("expected Forward") };
+        let Action::Forward(e) = p.handle(ctrl_bracket()) else {
+            panic!("expected Forward")
+        };
         assert_eq!(key_to_bytes(&e, false), Some(vec![0x1d]));
         assert!(!p.armed());
     }
@@ -290,7 +300,13 @@ mod tests {
     #[test]
     fn jk_r_x_q_map() {
         let mut p = p();
-        for (ch, want) in [('j', Action::Next), ('k', Action::Prev), ('r', Action::Reload), ('x', Action::Restart), ('q', Action::Quit)] {
+        for (ch, want) in [
+            ('j', Action::Next),
+            ('k', Action::Prev),
+            ('r', Action::Reload),
+            ('x', Action::Restart),
+            ('q', Action::Quit),
+        ] {
             arm(&mut p);
             assert_eq!(p.handle(k(Char(ch), NONE)), want, "key {ch}");
         }
@@ -307,11 +323,20 @@ mod tests {
     fn encodes_arrows_and_ctrl_chars() {
         assert_eq!(key_to_bytes(&k(Up, NONE), false), Some(vec![27, 91, 65]));
         assert_eq!(key_to_bytes(&k(Char('c'), CONTROL), false), Some(vec![3]));
-        assert_eq!(key_to_bytes(&k(Char('x'), ALT), false), Some(vec![27, b'x']));
-        assert_eq!(key_to_bytes(&k(F(5), NONE), false), Some(b"\x1b[15~".to_vec()));
+        assert_eq!(
+            key_to_bytes(&k(Char('x'), ALT), false),
+            Some(vec![27, b'x'])
+        );
+        assert_eq!(
+            key_to_bytes(&k(F(5), NONE), false),
+            Some(b"\x1b[15~".to_vec())
+        );
         assert_eq!(key_to_bytes(&k(Enter, NONE), false), Some(vec![b'\r']));
         assert_eq!(key_to_bytes(&k(Backspace, NONE), false), Some(vec![0x7f]));
-        assert_eq!(key_to_bytes(&k(Char('é'), NONE), false), Some("é".as_bytes().to_vec()));
+        assert_eq!(
+            key_to_bytes(&k(Char('é'), NONE), false),
+            Some("é".as_bytes().to_vec())
+        );
         assert_eq!(key_to_bytes(&k(Char(' '), CONTROL), false), Some(vec![0]));
     }
 
@@ -322,19 +347,43 @@ mod tests {
         assert_eq!(key_to_bytes(&k(Home, NONE), true), Some(b"\x1bOH".to_vec()));
         assert_eq!(key_to_bytes(&k(End, NONE), true), Some(b"\x1bOF".to_vec()));
         // not affected by the mode
-        assert_eq!(key_to_bytes(&k(PageUp, NONE), true), Some(b"\x1b[5~".to_vec()));
+        assert_eq!(
+            key_to_bytes(&k(PageUp, NONE), true),
+            Some(b"\x1b[5~".to_vec())
+        );
     }
 
     #[test]
     fn modifiers_on_special_keys_use_xterm_encoding() {
-        assert_eq!(key_to_bytes(&k(Left, CONTROL), false), Some(b"\x1b[1;5D".to_vec()));
-        assert_eq!(key_to_bytes(&k(Right, SHIFT), false), Some(b"\x1b[1;2C".to_vec()));
-        assert_eq!(key_to_bytes(&k(Up, ALT), false), Some(b"\x1b[1;3A".to_vec()));
-        assert_eq!(key_to_bytes(&k(F(5), SHIFT), false), Some(b"\x1b[15;2~".to_vec()));
-        assert_eq!(key_to_bytes(&k(F(1), CONTROL), false), Some(b"\x1b[1;5P".to_vec()));
-        assert_eq!(key_to_bytes(&k(Delete, CONTROL), false), Some(b"\x1b[3;5~".to_vec()));
+        assert_eq!(
+            key_to_bytes(&k(Left, CONTROL), false),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(&k(Right, SHIFT), false),
+            Some(b"\x1b[1;2C".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(&k(Up, ALT), false),
+            Some(b"\x1b[1;3A".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(&k(F(5), SHIFT), false),
+            Some(b"\x1b[15;2~".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(&k(F(1), CONTROL), false),
+            Some(b"\x1b[1;5P".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(&k(Delete, CONTROL), false),
+            Some(b"\x1b[3;5~".to_vec())
+        );
         // in application cursor mode a modified arrow still uses CSI
-        assert_eq!(key_to_bytes(&k(Left, CONTROL), true), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(
+            key_to_bytes(&k(Left, CONTROL), true),
+            Some(b"\x1b[1;5D".to_vec())
+        );
     }
 
     #[test]

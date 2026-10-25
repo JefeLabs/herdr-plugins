@@ -28,3 +28,9 @@ id = "select"
 title = "Toolbar: select tool"
 contexts = ["workspace"]
 command = ["../target/release/herdr-toolbar", "select"]
+
+[[actions]]
+id = "trust"
+title = "Toolbar: trust this workspace's .herdr-toolbar.toml"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "trust"]

@@ -50,21 +50,22 @@ pub struct SpawnEnv {
     pub tool_id: String,
 }
 
-/// Variables copied from the toolbar's own environment into every tool.
-const BASE_ENV: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "LANG",
-    "TMPDIR",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_STATE_HOME",
-    "COLORTERM",
+/// Variables removed from the inherited environment: they tell a tool it sits
+/// in a graphics-capable terminal, which the embedded one is not (text-only v1).
+const DENIED_ENV: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_PUBLIC_KEY",
+    "ITERM_SESSION_ID",
+    "GHOSTTY_RESOURCES_DIR",
 ];
+const DENIED_ENV_PREFIXES: &[&str] = &["WEZTERM_", "KITTY_"];
+
+fn env_is_denied(name: &str) -> bool {
+    DENIED_ENV.contains(&name) || DENIED_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+}
 
 pub struct ToolProcess {
     parser: Arc<RwLock<vt100::Parser>>,
@@ -112,14 +113,11 @@ impl ToolProcess {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| env.cwd.clone()),
         );
+        // Inherit the toolbar's environment so tools behave as they do standalone
+        // (SSH agent, EDITOR, tokens, proxies), minus graphics identifiers.
         cmd.env_clear();
-        for name in BASE_ENV {
-            if let Ok(v) = std::env::var(name) {
-                cmd.env(name, v);
-            }
-        }
         for (k, v) in std::env::vars() {
-            if k.starts_with("LC_") {
+            if !env_is_denied(&k) {
                 cmd.env(k, v);
             }
         }

@@ -153,3 +153,26 @@ fn wake_is_sent_on_output() {
     );
     p.kill();
 }
+
+#[test]
+fn parent_environment_is_inherited_except_graphics_identifiers() {
+    // SAFETY: tests in this binary that read the environment do so through the child.
+    unsafe {
+        std::env::set_var("TOOLBAR_TEST_SSH_AUTH_SOCK", "/run/agent.sock");
+        std::env::set_var("TERM_PROGRAM", "ghostty");
+        std::env::set_var("KITTY_WINDOW_ID", "7");
+        std::env::set_var("WEZTERM_PANE", "3");
+    }
+    let (tx, _rx) = channel();
+    let mut p = ToolProcess::spawn(
+        &cfg(&["sh", "-c", "echo \"[$TOOLBAR_TEST_SSH_AUTH_SOCK][${TERM_PROGRAM:-unset}][${KITTY_WINDOW_ID:-unset}][${WEZTERM_PANE:-unset}]\"; sleep 30"]),
+        &env(),
+        Size { rows: 5, cols: 60 },
+        tx,
+    )
+    .unwrap();
+    wait_until("echo", || {
+        contents(&p).contains("[/run/agent.sock][unset][unset][unset]")
+    });
+    p.kill();
+}

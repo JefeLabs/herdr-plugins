@@ -130,6 +130,7 @@ fn from_env_reads_context_json() {
         ("HERDR_ENV", "1".to_string()),
         ("HERDR_WORKSPACE_ID", "w7".to_string()),
         ("HERDR_PANE_ID", "w7:p2".to_string()),
+        ("HERDR_PLUGIN_ID", "jefelabs.toolbar".to_string()),
         (
             "HERDR_PLUGIN_CONFIG_DIR",
             tmp.path().join("c").display().to_string(),
@@ -167,6 +168,17 @@ fn from_env_reads_context_json() {
     );
     assert!(ctx.inherit.iter().any(|(k, _)| k == "HERDR_SOCKET_PATH"));
     assert!(ctx.inherit.iter().any(|(k, _)| k == "HERDR_ENV"));
+    for k in [
+        "HERDR_PLUGIN_ID",
+        "HERDR_PLUGIN_CONFIG_DIR",
+        "HERDR_PLUGIN_STATE_DIR",
+        "HERDR_PLUGIN_CONTEXT_JSON",
+    ] {
+        assert!(
+            ctx.inherit.iter().any(|(n, _)| n == k),
+            "hosted tools need {k} to run `herdr-toolbar trust`"
+        );
+    }
     assert_eq!(pane_file(&ctx), tmp.path().join("s/w7.pane"));
     assert_eq!(socket_path(&ctx), tmp.path().join("s/w7.sock"));
 }
@@ -183,4 +195,42 @@ fn toggle_without_a_target_pane_is_a_clear_error() {
 fn from_env_without_herdr_is_an_error() {
     let e = HerdrContext::from_vars(|_| None).unwrap_err().to_string();
     assert!(e.contains("HERDR_BIN_PATH"), "got: {e}");
+}
+
+#[test]
+fn manifest_declares_a_trust_action() {
+    let manifest =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("herdr-plugin.toml"))
+            .unwrap();
+    let v: toml::Value = toml::from_str(&manifest).unwrap();
+    let ids: Vec<&str> = v["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"trust"), "actions: {ids:?}");
+}
+
+// I6: toggle must not close a pane that merely has the recorded id.
+#[test]
+fn toggle_does_not_close_a_pane_that_is_not_the_toolbar() {
+    let mut fx = fx();
+    fs::write(pane_file(&fx.ctx), "w1:p4\n").unwrap();
+    fx.ctx
+        .extra_env
+        .push(("FAKE_PANE_EXISTS".into(), "1".into()));
+    fx.ctx
+        .extra_env
+        .push(("FAKE_PANE_LABEL".into(), "Some agent".into()));
+    toggle(&fx.ctx).unwrap();
+    let l = log(&fx);
+    assert!(
+        !l.contains("pane close"),
+        "must not close a foreign pane:\n{l}"
+    );
+    assert!(
+        l.contains("plugin pane open"),
+        "opens a fresh toolbar instead:\n{l}"
+    );
 }

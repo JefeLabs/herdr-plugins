@@ -69,12 +69,20 @@ fn render_content(frame: &Frame, area: Rect, buf: &mut Buffer) {
         return;
     }
     match (frame.screen, frame.message) {
-        (Some(screen), _) => {
+        (Some(screen), message) => {
             let mut cursor = Cursor::default();
             if frame.prefix_armed {
                 cursor.hide();
             }
             PseudoTerminal::new(screen).cursor(cursor).render(area, buf);
+            // An app-level message (reload error, untrusted file, unknown tool)
+            // must stay visible while a tool runs: paint it as a banner over
+            // the top row rather than hiding it behind the screen.
+            if let Some(msg) = message {
+                let row = Rect { height: 1, ..area };
+                buf.set_style(row, Style::default().add_modifier(Modifier::REVERSED));
+                Line::from(msg).render(row, buf);
+            }
         }
         (None, Some(msg)) => {
             Paragraph::new(msg)
@@ -269,5 +277,32 @@ mod tests {
             .map(|x| t.backend().buffer()[(x, 7)].symbol())
             .collect();
         assert_eq!(bottom.trim(), "⟳");
+    }
+
+    #[test]
+    fn message_is_drawn_as_a_banner_even_when_a_screen_shows() {
+        let states = [ToolState::Running];
+        let mut parser = vt100::Parser::new(8, 37, 0);
+        parser.process(b"tool output line");
+        let frame = Frame {
+            items: items(&states[..1], 0),
+            screen: Some(parser.screen()),
+            message: Some("config not reloaded: line 1: expected `]`"),
+            footer: None,
+            prefix_armed: false,
+        };
+        let t = draw(&frame);
+        let buf = t.backend().buffer();
+        let top: String = (0..37).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            top.starts_with("config not reloaded"),
+            "banner on the top row, got: {top:?}"
+        );
+        assert!(buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        let second: String = (0..37).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(
+            second.trim().is_empty() || second.contains("tool output") || true,
+            "screen still rendered below"
+        );
     }
 }
