@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stand-in for `gh` in progress tests. Logs every call; `pr view <n>` answers
+# with the state stored in $FAKE_GH_DIR/<n>, and fails when there is none.
+printf '%s\n' "$*" >> "${FAKE_GH_LOG:-/dev/null}"
+if [ "$1 $2" = "pr view" ] && [ -f "$FAKE_GH_DIR/$3" ]; then
+  printf '{"state":"%s"}\n' "$(cat "$FAKE_GH_DIR/$3")"
+  exit 0
+fi
+echo "no pull requests found" >&2
+exit 1

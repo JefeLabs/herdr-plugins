@@ -1,7 +1,10 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use herdr_capabilities::progress::{
-    Evidence, PlanTasks, PrState, bar, plan_tasks, pr_number, progress,
+    Evidence, PlanTasks, Poller, PrState, Update, agent_statuses, bar, plan_evidence, plan_tasks,
+    pr_number, pr_state, progress,
 };
 use herdr_capabilities::store::{Intent, State, Store};
 
@@ -230,4 +233,158 @@ fn bar_draws_partial_cells() {
     assert_eq!(bar(0.0, 4), "░░░░");
     assert_eq!(bar(10.0, 10), "██████████");
     assert_eq!(bar(12.0, 10), "██████████", "clamped");
+}
+
+fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "git {args:?} in {}", dir.display());
+}
+
+/// Live-shaped `herdr agent list`: one named blocked agent, two unnamed.
+const AGENT_LIST: &str = r#"{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"working","pane_id":"w5:p25"},{"agent":"claude","agent_status":"blocked","name":"intent-notify-547e","pane_id":"w9:p1"},{"agent":"claude","agent_status":"idle","pane_id":"w5:p9"}],"type":"agent_list"}}"#;
+
+fn herdr_env(tmp: &Path, with_list: bool) -> Vec<(String, String)> {
+    let mut env = vec![
+        (
+            "HERDR_BIN_PATH".to_string(),
+            fixtures().join("fake-herdr.sh").display().to_string(),
+        ),
+        (
+            "FAKE_HERDR_LOG".to_string(),
+            tmp.join("herdr.log").display().to_string(),
+        ),
+    ];
+    if with_list {
+        let list = tmp.join("agents.json");
+        fs::write(&list, AGENT_LIST).unwrap();
+        env.push(("FAKE_AGENT_LIST".to_string(), list.display().to_string()));
+    }
+    env
+}
+
+#[test]
+fn agents_without_names_are_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = herdr_env(tmp.path(), true);
+    let map = agent_statuses(&fixtures().join("fake-herdr.sh"), &env).unwrap();
+    assert_eq!(map.len(), 1, "{map:?}");
+    assert_eq!(map["intent-notify-547e"], "blocked");
+}
+
+#[test]
+fn a_failing_herdr_gives_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = herdr_env(tmp.path(), false);
+    assert!(agent_statuses(&fixtures().join("fake-herdr.sh"), &env).is_none());
+    assert!(agent_statuses(&tmp.path().join("no-such-herdr"), &env).is_none());
+}
+
+#[test]
+fn pr_state_reads_gh_and_degrades() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("prs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("7"), "MERGED").unwrap();
+    fs::write(dir.join("9"), "OPEN").unwrap();
+    let env = vec![("FAKE_GH_DIR".to_string(), dir.display().to_string())];
+    let gh = fixtures().join("fake-gh.sh");
+    assert_eq!(pr_state(&gh, tmp.path(), 7, &env), PrState::Merged);
+    assert_eq!(pr_state(&gh, tmp.path(), 9, &env), PrState::Open);
+    assert_eq!(pr_state(&gh, tmp.path(), 8, &env), PrState::Unknown);
+    assert_eq!(
+        pr_state(&tmp.path().join("no-gh"), tmp.path(), 7, &env),
+        PrState::Unknown
+    );
+}
+
+fn sent_with(body: &str) -> (tempfile::TempDir, herdr_capabilities::store::Intent) {
+    intent(State::Sent, body)
+}
+
+#[test]
+fn plan_evidence_finds_the_ledger_in_a_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("main");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+    fs::create_dir_all(wt.join("docs/superpowers/plans")).unwrap();
+    fs::write(
+        wt.join("docs/superpowers/plans/p.md"),
+        "### Task 1: a\n### Task 2: b\n",
+    )
+    .unwrap();
+    let sdd = wt.join(".superpowers/sdd/p");
+    fs::create_dir_all(&sdd).unwrap();
+    fs::write(
+        sdd.join("progress.md"),
+        "# SDD ledger — plan: docs/superpowers/plans/p.md\nTask 1: complete (x)\n",
+    )
+    .unwrap();
+    // a ledger for another plan must not be used
+    let other = wt.join(".superpowers/sdd/q");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(
+        other.join("progress.md"),
+        "# SDD ledger — plan: docs/superpowers/plans/q.md\nTask 1: complete\nTask 2: complete\n",
+    )
+    .unwrap();
+    let (_t, it) = sent_with("## Artifacts\n- plan: docs/superpowers/plans/p.md\n");
+    assert_eq!(plan_evidence(Some(&repo), &it), vec![tasks(1, 2)]);
+}
+
+#[test]
+fn plan_evidence_without_repo_marks_unreadable() {
+    let (_t, it) = sent_with("## Artifacts\n- plan: docs/superpowers/plans/p.md\n");
+    assert_eq!(
+        plan_evidence(None, &it),
+        vec![PlanTasks {
+            done: 0,
+            total: 0,
+            readable: false
+        }]
+    );
+}
+
+#[test]
+fn poller_reports_on_a_channel_without_duplicates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut poller = Poller::new(herdr_env(tmp.path(), true));
+    poller.request_agents();
+    poller.request_agents(); // already in flight: not run twice
+    let start = Instant::now();
+    let mut updates = Vec::new();
+    while updates.is_empty() && start.elapsed() < Duration::from_secs(5) {
+        updates.extend(poller.drain());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    updates.extend(poller.drain());
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert!(matches!(&updates[0], Update::Agents(Some(m)) if m.len() == 1));
+    let calls = fs::read_to_string(tmp.path().join("herdr.log")).unwrap();
+    assert_eq!(calls.matches("agent list").count(), 1);
 }
