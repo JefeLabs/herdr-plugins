@@ -65,6 +65,51 @@ pub fn main_checkout(from: &Path) -> anyhow::Result<PathBuf> {
     Ok(std::fs::canonicalize(&top).unwrap_or(top))
 }
 
+/// Every working tree of `repo`, main checkout first (`git worktree list
+/// --porcelain`), canonicalised. Just `[repo]` when git cannot answer.
+pub fn worktrees(repo: &Path) -> Vec<PathBuf> {
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output();
+    let Ok(out) = out else {
+        return vec![repo.to_path_buf()];
+    };
+    if !out.status.success() {
+        return vec![repo.to_path_buf()];
+    }
+    let roots: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(|p| {
+            let p = PathBuf::from(p);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect();
+    if roots.is_empty() {
+        vec![repo.to_path_buf()]
+    } else {
+        roots
+    }
+}
+
+/// A linked target as a file on disk: `~` and absolute paths as written (if
+/// they exist), otherwise the first `<worktree>/<target>` that exists, main
+/// checkout first. Specs and plans usually live in a worktree until merged.
+pub fn resolve_in_repo(repo: &Path, target: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(shellexpand::tilde(target.trim()).into_owned());
+    if p.is_absolute() {
+        return p.exists().then_some(p);
+    }
+    if !repo.is_dir() {
+        return None;
+    }
+    worktrees(repo)
+        .into_iter()
+        .map(|root| root.join(&p))
+        .find(|candidate| candidate.exists())
+}
+
 pub fn uses_workbrokr(repo: &Path, override_: Option<bool>) -> bool {
     match override_ {
         Some(v) => v,

@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use herdr_capabilities::config::{Dirs, load_or_init};
 use herdr_capabilities::send::{
-    EDGE_CASES_PREAMBLE, agent_name, main_checkout, render_prompt, send, uses_workbrokr,
+    EDGE_CASES_PREAMBLE, agent_name, main_checkout, render_prompt, resolve_in_repo, send,
+    uses_workbrokr, worktrees,
 };
 use herdr_capabilities::store::Store;
 
@@ -328,4 +329,65 @@ fn every_handoff_says_edge_cases_are_the_agents_and_asks_for_pr_lines() {
             h.name
         );
     }
+}
+
+#[test]
+fn a_file_only_in_a_worktree_resolves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("main");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let id = ["-c", "user.email=t@t", "-c", "user.name=t"];
+    let commit: Vec<&str> = id
+        .iter()
+        .copied()
+        .chain(["commit", "-q", "--allow-empty", "-m", "init"])
+        .collect();
+    git(&repo, &commit);
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+    fs::create_dir_all(wt.join("docs/superpowers/plans")).unwrap();
+    fs::write(wt.join("docs/superpowers/plans/p.md"), "# P\n").unwrap();
+    let abs = tmp.path().join("elsewhere.md");
+    fs::write(&abs, "x").unwrap();
+
+    let roots = worktrees(&repo);
+    assert_eq!(
+        roots[0],
+        repo.canonicalize().unwrap(),
+        "main checkout first"
+    );
+    assert!(roots.contains(&wt.canonicalize().unwrap()), "{roots:?}");
+    assert_eq!(
+        resolve_in_repo(&repo, "docs/superpowers/plans/p.md")
+            .unwrap()
+            .canonicalize()
+            .unwrap(),
+        wt.join("docs/superpowers/plans/p.md")
+            .canonicalize()
+            .unwrap()
+    );
+    assert_eq!(resolve_in_repo(&repo, "docs/nope.md"), None);
+    assert_eq!(
+        resolve_in_repo(&tmp.path().join("not-a-repo"), "x.md"),
+        None
+    );
+    assert_eq!(
+        resolve_in_repo(&repo, abs.to_str().unwrap()),
+        Some(abs.clone())
+    );
+    assert_eq!(
+        worktrees(&tmp.path().join("not-a-repo")),
+        vec![tmp.path().join("not-a-repo")]
+    );
 }

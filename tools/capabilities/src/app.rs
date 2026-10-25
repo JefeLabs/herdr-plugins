@@ -952,6 +952,14 @@ impl App {
 
     /// Relative targets resolve against the capability's repo, else its own folder.
     fn resolve_artifact_path(&self, it: &Intent, target: &str) -> PathBuf {
+        if let Some(found) = it
+            .fm
+            .repo
+            .as_deref()
+            .and_then(|repo| crate::send::resolve_in_repo(repo, target))
+        {
+            return found;
+        }
         let p = PathBuf::from(shellexpand::tilde(target).into_owned());
         if p.is_absolute() {
             return p;
