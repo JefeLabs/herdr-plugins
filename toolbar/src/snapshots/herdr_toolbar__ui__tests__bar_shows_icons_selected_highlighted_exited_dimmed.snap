@@ -1,0 +1,12 @@
+---
+source: toolbar/src/ui.rs
+expression: t.backend()
+---
+"hello from a tool█                    ◉ "
+"                                      ☑ "
+"                                      ▤ "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                      ⟳ "
