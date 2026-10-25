@@ -210,6 +210,11 @@ fn manifest_declares_a_trust_action() {
         .map(|a| a["id"].as_str().unwrap())
         .collect();
     assert!(ids.contains(&"trust"), "actions: {ids:?}");
+    // Herdr actions take no arguments, so switching from another pane needs one action per slot.
+    for n in 1..=5 {
+        let id = format!("select-{n}");
+        assert!(ids.contains(&id.as_str()), "missing action {id}: {ids:?}");
+    }
 }
 
 // I6: toggle must not close a pane that merely has the recorded id.

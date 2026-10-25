@@ -32,15 +32,15 @@ key = "prefix+t"
 type = "plugin_action"
 command = "jefelabs.toolbar.toggle"
 
-# switch tools while focus stays on your agent
+# switch tools while focus stays on your agent (one action per slot)
 [[keys.command]]
 key = "prefix+1"
 type = "plugin_action"
-command = "jefelabs.toolbar.select 1"
-# ... prefix+2 .. prefix+5 likewise
+command = "jefelabs.toolbar.select-1"
+# ... prefix+2 .. prefix+5 with select-2 .. select-5
 ```
 
-`toggle` opens the toolbar as a right split next to the focused pane without taking focus, and closes it again when it is open. `select <n>` takes a 1-based index or a tool id.
+`toggle` opens the toolbar as a right split next to the focused pane without taking focus, and closes it again when it is open. `select-1` to `select-5` switch the running toolbar to that slot; the binary's own `select <id-or-index>` mode accepts a tool id as well.
 
 ## Keys inside the toolbar
 

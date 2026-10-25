@@ -23,11 +23,36 @@ title = "Toolbar: toggle"
 contexts = ["workspace"]
 command = ["../target/release/herdr-toolbar", "toggle"]
 
+# Herdr actions take no arguments: one action per slot, bindable from any pane.
 [[actions]]
-id = "select"
-title = "Toolbar: select tool"
+id = "select-1"
+title = "Toolbar: tool 1"
 contexts = ["workspace"]
-command = ["../target/release/herdr-toolbar", "select"]
+command = ["../target/release/herdr-toolbar", "select", "1"]
+
+[[actions]]
+id = "select-2"
+title = "Toolbar: tool 2"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "select", "2"]
+
+[[actions]]
+id = "select-3"
+title = "Toolbar: tool 3"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "select", "3"]
+
+[[actions]]
+id = "select-4"
+title = "Toolbar: tool 4"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "select", "4"]
+
+[[actions]]
+id = "select-5"
+title = "Toolbar: tool 5"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "select", "5"]
 
 [[actions]]
 id = "trust"
