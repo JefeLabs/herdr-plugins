@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use herdr_capabilities::config::{Output, ProviderSpec, When};
-use herdr_capabilities::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
+use herdr_capabilities::conversation::{
+    FORMAT_REMINDER, HAPPY_PATH_RULE, Turn, TurnMsg, follow_up_prompt, seed_prompt,
+};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -300,4 +302,21 @@ fn follow_up_prompts_always_carry_the_format_reminder() {
         fresh.contains("SEED") && fresh.contains("## Preconditions"),
         "{fresh}"
     );
+}
+
+#[test]
+fn every_turn_carries_the_happy_path_rule() {
+    assert_eq!(
+        HAPPY_PATH_RULE,
+        "Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off."
+    );
+    assert!(FORMAT_REMINDER.contains(HAPPY_PATH_RULE));
+    assert!(seed_prompt("template", "body", None, "idea").contains(HAPPY_PATH_RULE));
+    for t in [
+        include_str!("../defaults/idea.polish.md"),
+        include_str!("../defaults/issue.polish.md"),
+        include_str!("../defaults/enhancement.polish.md"),
+    ] {
+        assert!(t.contains(HAPPY_PATH_RULE), "bundled polish template: {t}");
+    }
 }

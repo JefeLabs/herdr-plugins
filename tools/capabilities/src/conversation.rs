@@ -209,7 +209,10 @@ fn lossy_lines<R: Read + Send + 'static>(r: R) -> impl Iterator<Item = String> {
 /// re-sent, as the spec's degraded mode requires.
 /// Restated on every turn, so a conversation that began under an older
 /// template still answers in the current structure.
-pub const FORMAT_REMINDER: &str = "(Reply format: first line `capability: <who> can <what>`; then a fenced ```proposal block with the complete body as `## Description`, `## Preconditions` (`- [ ]` items, keep `[x]` on confirmed ones), `## Acceptance criteria` (`- [ ]` checks), `## Open questions` (`- ` items, keep answered ones with their `→` answer); then `questions:` with `- ` items or `questions: none`.)";
+/// What the refinement conversation may ask about: the happy path only.
+pub const HAPPY_PATH_RULE: &str = "Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off.";
+
+pub const FORMAT_REMINDER: &str = "(Reply format: first line `capability: <who> can <what>`; then a fenced ```proposal block with the complete body as `## Description`, `## Preconditions` (`- [ ]` items, keep `[x]` on confirmed ones), `## Acceptance criteria` (`- [ ]` checks), `## Open questions` (`- ` items, keep answered ones with their `→` answer); then `questions:` with `- ` items or `questions: none`. Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off.)";
 
 pub fn follow_up_prompt(
     seed: &str,
@@ -258,5 +261,8 @@ pub fn seed_prompt(
             p.push('\n');
         }
     }
+    p.push('\n');
+    p.push_str(FORMAT_REMINDER);
+    p.push('\n');
     p
 }

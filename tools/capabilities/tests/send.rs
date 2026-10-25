@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herdr_capabilities::config::{Dirs, load_or_init};
-use herdr_capabilities::send::{agent_name, main_checkout, render_prompt, send, uses_workbrokr};
+use herdr_capabilities::send::{
+    EDGE_CASES_PREAMBLE, agent_name, main_checkout, render_prompt, send, uses_workbrokr,
+};
 use herdr_capabilities::store::Store;
 
 fn fake_herdr() -> PathBuf {
@@ -287,6 +289,41 @@ fn prompts_tell_the_agent_where_to_record_artifacts() {
         let p = render_prompt(h, &it, &[], false);
         assert!(
             p.contains("## Artifacts") && p.contains(&it.path.display().to_string()),
+            "{}: {p}",
+            h.name
+        );
+    }
+}
+
+#[test]
+fn every_handoff_says_edge_cases_are_the_agents_and_asks_for_pr_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        config: tmp.path().join("cfg"),
+        root: tmp.path().join("root"),
+    };
+    let cfg = load_or_init(&dirs).unwrap();
+    let store = Store::open(&dirs.root).unwrap();
+    let it = store
+        .create(
+            Path::new("Inbox"),
+            "Edge",
+            "idea",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    assert!(EDGE_CASES_PREAMBLE.starts_with("The happy path is settled: every open question below has its answer. Edge cases are now yours to find. List the ones you see, ask about those that change what gets built, and record each decision as you go."));
+    assert!(!cfg.handoffs.is_empty());
+    for h in &cfg.handoffs {
+        let p = render_prompt(h, &it, &[], false);
+        assert!(
+            p.contains(EDGE_CASES_PREAMBLE.trim_end()),
+            "{}: {p}",
+            h.name
+        );
+        assert!(
+            p.contains("`- pr: #<n>` when you open a pull request"),
             "{}: {p}",
             h.name
         );

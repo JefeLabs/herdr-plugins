@@ -13,10 +13,13 @@ const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec"];
 
 fn artifacts_preamble(intent: &Intent) -> String {
     format!(
-        "Whenever you create something for this capability — a spec, a plan, an ADR or decision record, a wayfinder decision ticket, or a GitHub issue — append one line under `## Artifacts` in {} (create the section if missing): `- spec: <path>`, `- plan: <path>`, `- adr: <path>`, `- decision: #<n>`, `- issue: <url or #n>`. Paths are relative to the repo root.\n\n",
+        "Whenever you create something for this capability — a spec, a plan, an ADR or decision record, a wayfinder decision ticket, or a GitHub issue — append one line under `## Artifacts` in {} (create the section if missing): `- spec: <path>`, `- plan: <path>`, `- adr: <path>`, `- decision: #<n>`, `- issue: <url or #n>`, and `- pr: #<n>` when you open a pull request. Paths are relative to the repo root.\n\n",
         intent.path.display()
     )
 }
+
+/// Every hand-off: the happy path is settled, edge cases are the agent's to find.
+pub const EDGE_CASES_PREAMBLE: &str = "The happy path is settled: every open question below has its answer. Edge cases are now yours to find. List the ones you see, ask about those that change what gets built, and record each decision as you go.\n\n";
 
 const PRECONDITIONS_PREAMBLE: &str = "Before anything else, verify each item under Preconditions against the code and the data: tell me which hold, which do not, and ask about any you cannot settle. Do not build on a precondition you have not confirmed.\n\n";
 
@@ -90,7 +93,7 @@ pub fn render_prompt(
         .replace("\\n", "\n")
         .replace("{intent}", &intent_text)
         .replace("{attachments}", &atts);
-    p = format!("{}{p}", artifacts_preamble(intent));
+    p = format!("{EDGE_CASES_PREAMBLE}{}{p}", artifacts_preamble(intent));
     if !crate::store::preconditions(&intent.body).is_empty() {
         p = format!("{PRECONDITIONS_PREAMBLE}{p}");
     }
