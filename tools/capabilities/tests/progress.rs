@@ -514,11 +514,11 @@ fn segments_follow_the_stages_reached() {
     );
     let pr = progress(&it, &ev).unwrap();
     assert_eq!(pr.segments, [1.0, 1.0, 1.0, 1.0 / 3.0, 0.0, 0.0, 0.5]);
-    assert_eq!(stage_bar(&pr), "█ █ █ ▍ ░ ░ █░", "one S plan, a third done");
+    assert_eq!(stage_bar(&pr), "▉▉▉▍▕░▕░▕█░", "one S plan, a third done");
     // ticks alone light only the verified block
     let (_tmp, it) = intent(State::Sent, "## Acceptance criteria\n- [x] a\n- [ ] b\n");
     let pr = progress(&it, &Evidence::default()).unwrap();
-    assert_eq!(stage_bar(&pr), "█ ░ ░ ░░░ ░ ░ █░");
+    assert_eq!(stage_bar(&pr), "▉░▕░▕░░░▕░▕░▕█░");
     // a merged PR fills every stage up to merged
     let ev = Evidence {
         plans: vec![],
@@ -526,7 +526,7 @@ fn segments_follow_the_stages_reached() {
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
     let pr = progress(&it, &ev).unwrap();
-    assert_eq!(stage_bar(&pr), "█ █ █ ███ █ █ ░░");
+    assert_eq!(stage_bar(&pr), "▉▉▉██▉▉▉░░");
 }
 
 #[test]
@@ -606,7 +606,7 @@ fn building_holds_one_block_per_sized_plan() {
         "## Artifacts\n- spec: s.md\n- plan: c.md\n- plan: b.md\n- plan: o.md\n- plan: f.md\n",
     );
     let pr = progress(&it, &ev).unwrap();
-    assert_eq!(stage_bar(&pr), "█ █ █ ███ ███ ▒▒ █ ░ ░░");
+    assert_eq!(stage_bar(&pr), "▉▉▉██▉██▉▒▒▕▉░▕░░");
     // a counted plan fills by its ledger share: M is two cells, a quarter done
     let ev = Evidence {
         plans: vec![PlanTasks {
@@ -622,13 +622,26 @@ fn building_holds_one_block_per_sized_plan() {
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- plan: p.md\n");
     assert_eq!(
         stage_bar(&progress(&it, &ev).unwrap()),
-        "█ █ █ ▌░ ░ ░ ░░",
+        "▉▉▉▌░▕░▕░▕░░",
         "a linked plan implies the spec stage"
     );
     // no sized plan: the building block keeps its three cells
     let (_tmp, it) = intent(State::Sent, "x\n");
     assert_eq!(
         stage_bar(&progress(&it, &Evidence::default()).unwrap()),
-        "█ ░ ░ ░░░ ░ ░ ░░"
+        "▉░▕░▕░░░▕░▕░▕░░"
     );
+}
+
+#[test]
+fn blocks_touch_and_borders_show_where_they_meet() {
+    // a filled block ends in a seven-eighths cell; anything else gets a thin border
+    let ev = Evidence {
+        plans: vec![],
+        prs: vec![(1, PrState::Open)],
+    };
+    let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
+    let bar = stage_bar(&progress(&it, &ev).unwrap());
+    assert!(!bar.contains(' '), "no gaps: {bar}");
+    assert_eq!(bar, "▉▉▉██▉▉░▕░░");
 }

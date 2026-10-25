@@ -125,27 +125,40 @@ pub struct Progress {
 /// Cells per stage in the bar, in `Progress::segments` order.
 const STAGE_CELLS: [usize; 7] = [1, 1, 1, 3, 1, 1, 2];
 
-/// The bar as one block per stage, separated by spaces, so the filled part
-/// reads as "these stages are done" rather than as a percentage. The building
-/// stage is one block per sized plan (`▒` while its pull request is in review).
+/// The bar as one block per stage with no gaps, so the filled part reads as
+/// "these stages are done" rather than as a percentage. The building stage is
+/// one block per sized plan (`▒` while its pull request is in review). Where
+/// blocks meet, a filled block ends in a seven-eighths cell (`▉`) whose thin
+/// right sliver is the border; any other block is followed by a thin `▕`.
 pub fn stage_bar(p: &Progress) -> String {
     let seg = |i: usize| bar(p.segments[i].clamp(0.0, 1.0) * 10.0, STAGE_CELLS[i]);
-    let building = if p.plans.is_empty() {
-        seg(3)
+    let mut blocks = vec![seg(0), seg(1), seg(2)];
+    if p.plans.is_empty() {
+        blocks.push(seg(3));
     } else {
-        p.plans
-            .iter()
-            .map(|b| {
-                if b.in_review {
-                    "▒".repeat(b.cells)
-                } else {
-                    bar(b.fill.clamp(0.0, 1.0) * 10.0, b.cells)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    [seg(0), seg(1), seg(2), building, seg(4), seg(5), seg(6)].join(" ")
+        blocks.extend(p.plans.iter().map(|b| {
+            if b.in_review {
+                "▒".repeat(b.cells)
+            } else {
+                bar(b.fill.clamp(0.0, 1.0) * 10.0, b.cells)
+            }
+        }));
+    }
+    blocks.extend([seg(4), seg(5), seg(6)]);
+    let last = blocks.len() - 1;
+    let mut out = String::new();
+    for (i, block) in blocks.into_iter().enumerate() {
+        if i == last {
+            out.push_str(&block);
+        } else if let Some(body) = block.strip_suffix('█') {
+            out.push_str(body);
+            out.push('▉');
+        } else {
+            out.push_str(&block);
+            out.push('▕');
+        }
+    }
+    out
 }
 
 /// Stage weights, summing to 10.

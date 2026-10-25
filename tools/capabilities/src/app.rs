@@ -4295,7 +4295,7 @@ mod tests {
             .to_string();
         assert!(line.contains("PR #77 open"), "{line}");
         assert!(
-            line.contains("█ █ █ ▒ █ ░ ░░"),
+            line.contains("▉▉▉▒▕▉░▕░░"),
             "the plan's own block shows it in review: {line}"
         );
     }
