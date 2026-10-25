@@ -1,0 +1,207 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use herdr_intents::config::{Output, ProviderSpec, When};
+use herdr_intents::conversation::{Turn, TurnMsg, seed_prompt};
+
+fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// A fake provider that replays the agy fixture.
+fn spec() -> ProviderSpec {
+    ProviderSpec {
+        name: "fake".into(),
+        polish: vec![
+            fixtures().join("fake-provider.sh").display().to_string(),
+            "--prompt={prompt}".into(),
+        ],
+        resume: vec![
+            fixtures().join("fake-provider.sh").display().to_string(),
+            "--resume={conv}".into(),
+            "--prompt={prompt}".into(),
+        ],
+        output: Output::Jsonl {
+            type_key: "event".into(),
+            text_path: "/step_update/text_delta".into(),
+            text_types: vec!["step_update".into()],
+            text_when: Some(When {
+                path: "/step_update/step_type".into(),
+                value: "agent_response".into(),
+            }),
+            id_paths: vec![
+                "/conversation_id".into(),
+                "/step_update/conversation_id".into(),
+            ],
+            done_type: Some("result".into()),
+        },
+        send_kind: "claude".into(),
+    }
+}
+
+fn collect(turn: &Turn, limit: Duration) -> Vec<TurnMsg> {
+    let start = Instant::now();
+    let mut out = Vec::new();
+    while start.elapsed() < limit {
+        if let Some(m) = turn.try_recv() {
+            let finished = matches!(m, TurnMsg::Finished(_) | TurnMsg::Failed(_));
+            out.push(m);
+            if finished {
+                break;
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    out
+}
+
+fn env(events: Option<&str>, mode: Option<&str>) -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    if let Some(e) = events {
+        v.push((
+            "FAKE_EVENTS".into(),
+            fixtures().join("events").join(e).display().to_string(),
+        ));
+    }
+    if let Some(m) = mode {
+        v.push(("FAKE_MODE".into(), m.into()));
+    }
+    v
+}
+
+#[test]
+fn turn_streams_deltas_then_finished_with_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let turn = Turn::start(
+        &spec(),
+        "polish this",
+        None,
+        tmp.path(),
+        &env(Some("agy.jsonl"), None),
+    )
+    .unwrap();
+    let msgs = collect(&turn, Duration::from_secs(5));
+    let deltas: String = msgs
+        .iter()
+        .filter_map(|m| {
+            if let TurnMsg::Delta(d) = m {
+                Some(d.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        deltas.starts_with("Here is a tighter version."),
+        "{deltas:?}"
+    );
+    let Some(TurnMsg::Finished(reply)) = msgs.last() else {
+        panic!("last message: {:?}", msgs.last())
+    };
+    assert!(reply.proposal.as_deref().unwrap().contains("## Observed"));
+    assert_eq!(reply.questions.len(), 2);
+}
+
+#[test]
+fn turn_reports_conversation_id_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let turn = Turn::start(
+        &spec(),
+        "x",
+        None,
+        tmp.path(),
+        &env(Some("agy.jsonl"), None),
+    )
+    .unwrap();
+    let msgs = collect(&turn, Duration::from_secs(5));
+    let ids: Vec<&String> = msgs
+        .iter()
+        .filter_map(|m| {
+            if let TurnMsg::ConversationId(i) = m {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        [&"dde502fd-bcf1-4bfb-a275-4e6de5ad9a7d".to_string()],
+        "exactly one id message"
+    );
+}
+
+#[test]
+fn resume_uses_the_resume_argv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("argv.log");
+    let mut e = env(Some("agy.jsonl"), None);
+    e.push(("FAKE_PROVIDER_LOG".into(), log.display().to_string()));
+    let turn = Turn::start(&spec(), "again", Some("conv-9"), tmp.path(), &e).unwrap();
+    let _ = collect(&turn, Duration::from_secs(5));
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(logged.contains("--resume=conv-9"), "{logged}");
+}
+
+#[test]
+fn cancel_kills_a_hanging_provider_within_a_second() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut turn = Turn::start(
+        &spec(),
+        "x",
+        None,
+        tmp.path(),
+        &env(Some("agy.jsonl"), Some("hang")),
+    )
+    .unwrap();
+    let _ = collect(&turn, Duration::from_millis(400)); // deltas arrive, no Finished (process hangs)
+    let pid = turn.pid().unwrap();
+    let t0 = Instant::now();
+    turn.cancel();
+    assert!(t0.elapsed() < Duration::from_secs(1));
+    let start = Instant::now();
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "provider still alive"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let msgs = collect(&turn, Duration::from_millis(500));
+    assert!(
+        matches!(msgs.last(), Some(TurnMsg::Failed(m)) if m.contains("cancel")),
+        "{:?}",
+        msgs.last()
+    );
+}
+
+#[test]
+fn garbage_lines_become_text_not_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let turn = Turn::start(
+        &spec(),
+        "x",
+        None,
+        tmp.path(),
+        &env(Some("agy.jsonl"), Some("garbage")),
+    )
+    .unwrap();
+    let msgs = collect(&turn, Duration::from_secs(5));
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, TurnMsg::Delta(d) if d.contains("warming up")))
+    );
+    assert!(matches!(msgs.last(), Some(TurnMsg::Finished(_))));
+}
+
+#[test]
+fn seed_prompt_includes_body_and_focus_line_only_with_selection() {
+    let t = "ROLE\n\nKind: issue\n\n{contract}";
+    let p = seed_prompt(t, "## Observed\nx\n", None, "issue");
+    assert!(p.contains("ROLE") && p.contains("## Observed\nx"));
+    assert!(!p.to_lowercase().contains("focus on"));
+    let p = seed_prompt(t, "## Observed\nx\n", Some("x"), "issue");
+    assert!(p.to_lowercase().contains("focus on"), "{p}");
+    assert!(p.contains("\nx\n") || p.contains("> x"));
+}
