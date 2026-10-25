@@ -41,10 +41,15 @@ enum Row {
         name: String,
         depth: usize,
         count: usize,
+        /// Capabilities living elsewhere that affect this group or its sub-groups.
+        refs: usize,
     },
     Intent {
         intent: Intent,
         depth: usize,
+        /// `Some(group)` when shown under `group` because it affects it; the
+        /// capability itself lives elsewhere.
+        reference: Option<PathBuf>,
     },
     Broken {
         path: PathBuf,
@@ -287,6 +292,8 @@ pub struct RowView {
     pub label: String,
     pub is_group: bool,
     pub questions: usize,
+    /// Shown here because it affects this group; it lives elsewhere.
+    pub reference: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,11 +472,39 @@ impl App {
         fn count_intents(g: &Group) -> usize {
             g.intents.len() + g.groups.iter().map(count_intents).sum::<usize>()
         }
+        // capabilities by the groups they affect, keyed by group folder
+        fn index(g: &Group, root: &Path, out: &mut HashMap<PathBuf, Vec<Intent>>) {
+            for it in &g.intents {
+                for area in &it.fm.areas {
+                    let area = area.trim().trim_matches('/');
+                    if area.is_empty() {
+                        continue;
+                    }
+                    let dir = root.join(area);
+                    if Some(dir.as_path()) != it.path.parent() {
+                        out.entry(dir).or_default().push(it.clone());
+                    }
+                }
+            }
+            for sub in &g.groups {
+                index(sub, root, out);
+            }
+        }
+        let mut affecting: HashMap<PathBuf, Vec<Intent>> = HashMap::new();
+        index(&self.tree, self.store.root(), &mut affecting);
+        fn count_refs(g: &Group, affecting: &HashMap<PathBuf, Vec<Intent>>) -> usize {
+            affecting.get(&g.path).map_or(0, Vec::len)
+                + g.groups
+                    .iter()
+                    .map(|s| count_refs(s, affecting))
+                    .sum::<usize>()
+        }
         fn walk(
             g: &Group,
             depth: usize,
             collapsed: &mut HashSet<PathBuf>,
             seen: &mut HashSet<PathBuf>,
+            affecting: &HashMap<PathBuf, Vec<Intent>>,
             rows: &mut Vec<Row>,
         ) {
             for sub in &g.groups {
@@ -482,15 +517,24 @@ impl App {
                     name: sub.name.clone(),
                     depth,
                     count: count_intents(sub),
+                    refs: count_refs(sub, affecting),
                 });
                 if !collapsed.contains(&sub.path) {
-                    walk(sub, depth + 1, collapsed, seen, rows);
+                    walk(sub, depth + 1, collapsed, seen, affecting, rows);
                 }
             }
             for it in &g.intents {
                 rows.push(Row::Intent {
                     intent: it.clone(),
                     depth,
+                    reference: None,
+                });
+            }
+            for it in affecting.get(&g.path).into_iter().flatten() {
+                rows.push(Row::Intent {
+                    intent: it.clone(),
+                    depth,
+                    reference: Some(g.path.clone()),
                 });
             }
             for (path, error) in &g.broken {
@@ -506,6 +550,7 @@ impl App {
             0,
             &mut self.collapsed,
             &mut self.seen_groups,
+            &affecting,
             &mut rows,
         );
         self.rows = rows;
@@ -2648,12 +2693,18 @@ impl App {
                     label: name.clone(),
                     is_group: true,
                     questions: 0,
+                    reference: false,
                 },
-                Row::Intent { intent, depth } => RowView {
+                Row::Intent {
+                    intent,
+                    depth,
+                    reference,
+                } => RowView {
                     depth: *depth,
                     label: intent.fm.title.clone(),
                     is_group: false,
                     questions: intent.open_questions(),
+                    reference: reference.is_some(),
                 },
                 Row::Broken { path, depth, .. } => RowView {
                     depth: *depth,
@@ -2665,6 +2716,7 @@ impl App {
                     ),
                     is_group: false,
                     questions: 0,
+                    reference: false,
                 },
             })
             .collect();
@@ -2924,6 +2976,7 @@ impl App {
                     name,
                     depth,
                     count,
+                    refs,
                 } => ui::TreeRow {
                     depth: *depth,
                     label: name,
@@ -2933,8 +2986,14 @@ impl App {
                     state: None,
                     count: *count,
                     broken: false,
+                    reference: false,
+                    refs: *refs,
                 },
-                Row::Intent { intent, depth } => ui::TreeRow {
+                Row::Intent {
+                    intent,
+                    depth,
+                    reference,
+                } => ui::TreeRow {
                     depth: *depth,
                     label: &intent.fm.title,
                     is_group: false,
@@ -2943,6 +3002,8 @@ impl App {
                     state: Some(intent.fm.state),
                     count: 0,
                     broken: false,
+                    reference: reference.is_some(),
+                    refs: 0,
                 },
                 Row::Broken { path, depth, .. } => ui::TreeRow {
                     depth: *depth,
@@ -2953,6 +3014,8 @@ impl App {
                     state: None,
                     count: 0,
                     broken: true,
+                    reference: false,
+                    refs: 0,
                 },
             })
             .collect();
@@ -3118,6 +3181,20 @@ fn binary_mtime() -> Option<std::time::SystemTime> {
 fn row_path(r: &Row) -> PathBuf {
     match r {
         Row::Group { path, .. } => path.clone(),
+        // a reference row is its own place in the tree, so selections and
+        // reveals by the capability's path land on its home row
+        Row::Intent {
+            intent,
+            reference: Some(group),
+            ..
+        } => group.join(format!(
+            "↳{}",
+            intent
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        )),
         Row::Intent { intent, .. } => intent.path.clone(),
         Row::Broken { path, .. } => path.clone(),
     }
@@ -3746,6 +3823,48 @@ mod tests {
         let v = fx.app.view();
         assert_eq!(v.layout, "tree", "a second click opens it");
         assert!(v.rows[v.selected].label.starts_with("Org admins"));
+    }
+
+    #[test]
+    fn a_capability_appears_in_each_area_it_affects() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&path, |fm| {
+            fm.areas = vec!["Inbox".into(), "nowhere".into()]
+        })
+        .unwrap();
+        fx.app.rescan();
+        let v = fx.app.view();
+        let at = |label: &str, reference: bool| {
+            v.rows
+                .iter()
+                .position(|r| r.label == label && r.reference == reference)
+        };
+        let inbox = at("Inbox", false).unwrap();
+        let reference = at("Alpha", true).expect("a reference row under Inbox");
+        let home = at("Alpha", false).expect("the capability at home");
+        let skoolscout = at("skoolscout", false).unwrap();
+        assert!(inbox < reference && reference < skoolscout, "{:?}", v.rows);
+        assert!(home > skoolscout);
+        // an area that is no group is ignored
+        assert_eq!(v.rows.iter().filter(|r| r.label == "Alpha").count(), 2);
+        // the reference row acts on the real capability
+        for _ in 0..10 {
+            if fx.app.view().selected == reference {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('k'));
+        }
+        assert_eq!(fx.app.view().selected, reference);
+        assert_eq!(fx.app.selected_intent().unwrap().path, path);
+        // and the group shows its own count plus what affects it
+        let mut t = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, 100, 20), f.buffer_mut()))
+            .unwrap();
+        let text = format!("{:?}", t.backend().buffer());
+        assert!(text.contains("Inbox (1 +1)"), "{text}");
+        assert!(text.contains("↳ Alpha"), "{text}");
     }
 
     #[test]

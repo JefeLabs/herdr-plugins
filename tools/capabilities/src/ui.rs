@@ -19,6 +19,10 @@ pub struct TreeRow<'a> {
     pub count: usize,
     /// A file that failed to parse; `label` is the file name.
     pub broken: bool,
+    /// A capability shown here because it affects this group (it lives elsewhere).
+    pub reference: bool,
+    /// For a group: capabilities living elsewhere that affect it or its sub-groups.
+    pub refs: usize,
 }
 
 /// Control characters other than tab/newline become a visible placeholder so
@@ -75,12 +79,23 @@ pub fn render_tree(rows: &[TreeRow], selected: usize, scroll: usize, area: Rect,
                 sanitize(row.label),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-            if row.count > 0 {
+            let counts = match (row.count, row.refs) {
+                (0, 0) => String::new(),
+                (n, 0) => format!(" ({n})"),
+                (0, r) => format!(" (+{r})"),
+                (n, r) => format!(" ({n} +{r})"),
+            };
+            if !counts.is_empty() {
                 spans.push(Span::styled(
-                    format!(" ({})", row.count),
+                    counts,
                     Style::default().add_modifier(Modifier::DIM),
                 ));
             }
+        } else if row.reference {
+            spans.push(Span::styled(
+                format!("↳ {}", sanitize(row.label)),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
         } else if row.broken {
             spans.push(Span::styled(
                 format!("! {}", sanitize(row.label)),
@@ -346,6 +361,8 @@ mod tests {
                 state: None,
                 count: 0,
                 broken: false,
+                reference: false,
+                refs: 0,
             },
             TreeRow {
                 depth: 0,
@@ -356,6 +373,8 @@ mod tests {
                 state: None,
                 count: 0,
                 broken: true,
+                reference: false,
+                refs: 0,
             },
             TreeRow {
                 depth: 0,
@@ -366,6 +385,8 @@ mod tests {
                 state: Some(State::Raw),
                 count: 0,
                 broken: false,
+                reference: false,
+                refs: 0,
             },
         ];
         let mut t = Terminal::new(TestBackend::new(40, 5)).unwrap();

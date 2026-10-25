@@ -578,3 +578,22 @@ fn readiness_follows_state_and_open_questions() {
     assert_eq!(send_refusal(&refining_answered), None);
     assert_eq!(send_refusal(&ready), None);
 }
+
+#[test]
+fn affected_areas_round_trip_and_stay_out_of_the_file_when_empty() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("Inbox"), "Spans areas", "idea", "x\n", None)
+        .unwrap();
+    assert!(!std::fs::read_to_string(&it.path).unwrap().contains("areas:"));
+    Store::update_fields(&it.path, |fm| {
+        fm.areas = vec!["skoolscout/org".into(), "skoolscout/family".into()]
+    })
+    .unwrap();
+    let back = Store::load(&it.path).unwrap();
+    assert_eq!(back.fm.areas, vec!["skoolscout/org", "skoolscout/family"]);
+    assert!(
+        back.fm.extra.is_empty(),
+        "areas is a known field, not extra"
+    );
+}

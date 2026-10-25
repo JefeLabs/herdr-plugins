@@ -79,6 +79,14 @@ pub struct FrontMatter {
     pub sent_to: Option<SentTo>,
     #[serde(default)]
     pub conversations: BTreeMap<String, String>,
+    /// Other groups this capability affects (group paths under the root,
+    /// e.g. `skoolscout/org/candidates`); it lives in one, appears in each.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub areas: Vec<String>,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -294,6 +302,7 @@ impl Store {
             polished_at: None,
             sent_to: None,
             conversations: BTreeMap::new(),
+            areas: Vec::new(),
             extra: BTreeMap::new(),
         };
         let mut it = Intent {
