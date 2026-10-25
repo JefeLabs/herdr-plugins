@@ -1,0 +1,20 @@
+---
+source: tools/intents/src/app.rs
+expression: t.backend()
+---
+"▾ Inbox (1)               │a add intent · n new group · ? help                            "
+"  ○ In the inbox ?2       │                                                               "
+"▾ skoolscout (2)          │                                                               "
+"  ○ Alpha                 │                                                               "
+"  ○ Beta                  │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"a add  n group  m move  e edit  p polish  s send  R ready  K kind  A attach  o open  r res"
