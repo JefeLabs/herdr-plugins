@@ -2518,12 +2518,13 @@ impl App {
                     .and_then(|d| d.strip_prefix(self.store.root()).ok())
                     .map(|d| d.display().to_string())
                     .unwrap_or_default();
+                // every non-empty line of the description; the card wraps it
                 let description = ui::description_text(&i.body)
                     .lines()
                     .map(str::trim)
-                    .find(|l| !l.is_empty() && !l.starts_with('#'))
-                    .unwrap_or("")
-                    .to_string();
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let flag = match (&i.fm.sent_to, &self.agents, i.fm.state) {
                     (Some(sent), Some(agents), State::Sent) => match agents.get(&sent.agent) {
                         Some(st) if st == "blocked" => Some("! needs you"),
@@ -3440,7 +3441,7 @@ mod tests {
             "skoolscout/org",
             "open",
             "title: Families can skip a folder without seeing Pending\nkind: issue\nstate: refining\ncreated: 2026-10-24 09:00:00\nupdated: 2026-10-24 18:02:00\n",
-            "## Description\nWhen a parent uses Skip for now on the report-card folder, the folder still shows up labelled Pending.\n\n## Open questions\n- Which org saw this?\n- Since when?\n",
+            "## Description\nWhen a parent uses Skip for now on the report-card folder, the folder still shows up labelled Pending.\nIt reads as if something is still owed, so families write in to ask what they missed and staff have to explain it every time.\nA third line that should be cut.\n\n## Open questions\n- Which org saw this?\n- Since when?\n",
         );
         write_cap(
             root,
@@ -3545,7 +3546,7 @@ mod tests {
         let mut fx = list_fixture(true);
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
-        let wide = render(&fx.app, 120, 18);
+        let wide = render(&fx.app, 120, 40);
         assert!(wide.contains("! needs you"), "{wide}");
         assert!(wide.contains("PR #42 open"), "{wide}");
         assert!(wide.contains("building 1/3"), "{wide}");
@@ -3556,7 +3557,7 @@ mod tests {
             "group label when wide: {wide}"
         );
         insta::assert_snapshot!("list_120", wide);
-        let narrow = render(&fx.app, 80, 18);
+        let narrow = render(&fx.app, 80, 40);
         assert!(
             !narrow.contains("skoolscout/org"),
             "no group label below 100: {narrow}"
@@ -3566,7 +3567,10 @@ mod tests {
             "long titles cut with an ellipsis: {narrow}"
         );
         assert!(!narrow.contains('\u{7}'));
-        assert!(wide.contains("A very long title"), "the long row exists: {wide}");
+        assert!(
+            wide.contains("A very long title"),
+            "the long row exists: {wide}"
+        );
         insta::assert_snapshot!("list_80", narrow);
     }
 
@@ -3639,7 +3643,7 @@ mod tests {
         let mut fx = list_fixture(false);
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
-        let text = render(&fx.app, 120, 18);
+        let text = render(&fx.app, 120, 40);
         assert!(text.contains("✓ complete"), "{text}");
         assert!(
             text.contains("building ?"),

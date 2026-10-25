@@ -1,23 +1,45 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 3570
+assertion_line: 3574
 expression: narrow
 ---
 Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g agent
 ────────────────────────────────────────────────────────────────────────────────
-sent   ███████░░░ PR #42 open      ! needs you Notify primary cont… Oct 25 08:10
-       The primary contact gets no prompt to book the intro meeting.
-raw                                            a                    Oct 25 07:30
-       (no description yet)
-?2                                             Families can skip a… Oct 24 18:02
-       When a parent uses Skip for now on the report-card folder, the folder s…
-ready                                          Org admins can expo… Oct 23 09:41
-       Admins need a one-click export of the filtered candidates table.
-sent   ████░░░░░░ building 1/3                 Counselors can reas… Oct 22 16:15
-       Reassignment needs a support ticket today.
-sent   ✓ complete                  closed      Invitees skip the j… Oct 20 10:30
-       Invited parents no longer file a join request.
-raw                                            A very long title t… Oct 18 09:00
-       short
+ Notify primary contact to schedule a meeting                      Oct 25 08:10
+ sent   ███████░░░ PR #42 open  ! needs you
+ The primary contact gets no prompt to book the intro meeting.
+
+ a                                                                 Oct 25 07:30
+ raw
+ (no description yet)
+
+ Families can skip a folder without seeing Pending                 Oct 24 18:02
+ ?2
+ When a parent uses Skip for now on the report-card folder, the folder still
+ shows up labelled Pending.…
+
+ Org admins can export candidate lists as CSV                      Oct 23 09:41
+ ready
+ Admins need a one-click export of the filtered candidates table.
+
+ Counselors can reassign a student between orgs                    Oct 22 16:15
+ sent   ████░░░░░░ building 1/3
+ Reassignment needs a support ticket today.
+
+ Invitees skip the join request                                    Oct 20 10:30
+ sent   ✓ complete  closed
+ Invited parents no longer file a join request.
+
+ A very long title that keeps going · well past any reasonable wi… Oct 18 09:00
+ raw
+ short
+
+
+
+
+
+
+
+
 
 j/k move  Enter open in tree  v tree  S sort  s send  g agent  r rescan  q quit

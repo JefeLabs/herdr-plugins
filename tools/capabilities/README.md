@@ -134,14 +134,23 @@ Send runs `herdr workspace create` on the capability's repo (always the main che
 `v` flips the browser between the group tree and one full-screen list of every capability, across all groups (collapsed or not). The selection carries across both ways, and the layout and sort order are remembered.
 
 ```
-Capabilities · 7 · sorted by Updated                       v tree · S sort · s send · g agent
-──────────────────────────────────────────────────────────────────────────────────────────────
-sent   ███████░░░ PR #42 open      ! needs you Notify primary contact to sched…   Oct 25 08:10
-       The primary contact gets no prompt to book the intro meeting.
-?2                                             Families can skip a folder wit…   Oct 24 18:02
-       When a parent uses Skip for now on the report-card folder, the folder…
-sent   ✓ complete                  closed      Invitees skip the join request    Oct 20 10:30
+Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g agent
+────────────────────────────────────────────────────────────────────────────────
+ Notify primary contact to schedule a meeting                      Oct 25 08:10
+ sent   ███████░░░ PR #42 open  ! needs you
+ The primary contact gets no prompt to book the intro meeting.
+
+ Families can skip a folder without seeing Pending                 Oct 24 18:02
+ ?2
+ When a parent uses Skip for now on the report-card folder, the folder still
+ shows up labelled Pending.…
+
+ Invitees skip the join request                                    Oct 20 10:30
+ sent   ✓ complete  closed
+ Invited parents no longer file a join request.
 ```
+
+Each capability is a card: the title on its own row (with its group when the pane is at least 100 columns wide) and the time, then the status and, once sent, the delivery bar, then up to two wrapped lines of the description.
 
 Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a ten-cell bar shows how far the feature has got, from evidence that already exists:
 

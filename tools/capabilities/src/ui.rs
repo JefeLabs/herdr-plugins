@@ -956,12 +956,31 @@ pub fn fit(text: &str, max: usize) -> String {
 const LIST_HINTS: &str = "v tree · S sort · s send · g agent";
 const STATUS_W: usize = 6;
 const BAR_W: usize = 10;
-const LABEL_W: usize = 16;
-const FLAG_W: usize = 11;
 const WHEN_W: usize = 12;
+/// Description lines shown on a card at most.
+const DESC_LINES: usize = 2;
 
-/// The list layout: a header, then two lines per capability (status,
-/// progress, title, time; then the description's first line).
+/// The description as it appears on a card: wrapped to `width`, at most
+/// `DESC_LINES` lines, the last ending in `…` when more was cut.
+fn card_description(text: &str, width: usize) -> Vec<String> {
+    if text.trim().is_empty() {
+        return vec!["(no description yet)".to_string()];
+    }
+    let lines = wrap_text(&sanitize(text), width.max(1));
+    let mut out: Vec<String> = lines.iter().take(DESC_LINES).cloned().collect();
+    if lines.len() > DESC_LINES
+        && let Some(last) = out.last_mut()
+    {
+        let cut = fit(last, width.saturating_sub(1));
+        *last = format!("{}…", cut.trim_end_matches('…').trim_end());
+    }
+    out
+}
+
+/// The list layout: a header, then one card per capability. Row one is the
+/// title (bold), the group when the pane is wide, and the time; row two is the
+/// status, the delivery bar with its label and flag once sent; then up to two
+/// wrapped lines of description. A blank line separates cards.
 pub fn render_capability_list(
     rows: &[ListRow],
     selected: usize,
@@ -973,12 +992,13 @@ pub fn render_capability_list(
         return;
     }
     let dim = Style::default().add_modifier(Modifier::DIM);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
     let w = area.width as usize;
     let hints_w = Span::raw(LIST_HINTS).width();
     let head = fit(header, w.saturating_sub(hints_w + 2));
     let gap = w.saturating_sub(Span::raw(head.as_str()).width() + hints_w);
     Line::from(vec![
-        Span::styled(head, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(head, bold),
         Span::raw(" ".repeat(gap)),
         Span::styled(if gap > 0 { LIST_HINTS } else { "" }, dim),
     ])
@@ -1004,54 +1024,41 @@ pub fn render_capability_list(
         .render(body, buf);
         return;
     }
-    let show_progress = rows.iter().any(|r| r.progress.is_some());
-    let progress_w = if show_progress {
-        BAR_W + 1 + LABEL_W + 1 + FLAG_W + 1
-    } else {
-        0
-    };
-    let show_group = w >= 100;
-    let title_w = w.saturating_sub(STATUS_W + 1 + progress_w + 1 + WHEN_W);
-    let per_page = (body.height as usize / 2).max(1);
-    let scroll = if selected >= per_page {
-        selected + 1 - per_page
-    } else {
-        0
-    };
-    for (k, (i, r)) in rows.iter().enumerate().skip(scroll).enumerate() {
-        let y = body.y + (k * 2) as u16;
-        if y >= body.y + body.height {
+    let inner_w = w.saturating_sub(2);
+    let descs: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| card_description(r.description, inner_w))
+        .collect();
+    // title + status rows + description, then a spacer
+    let height = |i: usize| 2 + descs[i].len() + 1;
+    // first card shown: the selected card must fit completely
+    let room = body.height as usize + 1; // the last card needs no spacer
+    let mut first = 0;
+    while first < selected && (first..=selected).map(height).sum::<usize>() > room {
+        first += 1;
+    }
+    let bottom = body.y + body.height;
+    let mut y = body.y;
+    for (i, r) in rows.iter().enumerate().skip(first) {
+        if y >= bottom {
             break;
         }
-        let mut spans = vec![Span::raw(format!(
-            "{:<width$} ",
-            fit(&r.status, STATUS_W),
-            width = STATUS_W
-        ))];
-        if show_progress {
-            match &r.progress {
-                Some((_, _, true)) => spans.push(Span::raw(format!(
-                    "{:<width$}",
-                    "✓ complete",
-                    width = BAR_W + 1 + LABEL_W + 1
-                ))),
-                Some((fill, label, false)) => {
-                    spans.push(Span::raw(crate::progress::bar(*fill, BAR_W)));
-                    spans.push(Span::raw(format!(" {:<LABEL_W$} ", fit(label, LABEL_W))));
-                }
-                None => spans.push(Span::raw(" ".repeat(BAR_W + 1 + LABEL_W + 1))),
+        let card_top = y;
+        let mut put = |line: Line, y: &mut u16| {
+            if *y < bottom {
+                line.render(
+                    Rect {
+                        y: *y,
+                        height: 1,
+                        ..body
+                    },
+                    buf,
+                );
             }
-            let flag = r.flag.unwrap_or("");
-            let flag_style = if flag.starts_with('!') {
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(ratatui::style::Color::Yellow)
-            } else {
-                dim
-            };
-            spans.push(Span::styled(format!("{flag:<FLAG_W$} "), flag_style));
-        }
-        let group = if show_group && !r.group.is_empty() {
+            *y += 1;
+        };
+        // row one: title, group, time
+        let group = if w >= 100 && !r.group.is_empty() {
             fit(r.group, 24)
         } else {
             String::new()
@@ -1061,51 +1068,64 @@ pub fn render_capability_list(
         } else {
             Span::raw(group.as_str()).width() + 2
         };
-        let title = fit(r.title, title_w.saturating_sub(group_w));
-        let pad = title_w.saturating_sub(Span::raw(title.as_str()).width() + group_w);
-        spans.push(Span::raw(title));
-        spans.push(Span::raw(" ".repeat(pad)));
+        let title_w = inner_w.saturating_sub(WHEN_W + 1 + group_w);
+        let title = fit(r.title, title_w);
+        let pad = title_w.saturating_sub(Span::raw(title.as_str()).width());
+        let mut top = vec![
+            Span::raw(" "),
+            Span::styled(title, bold),
+            Span::raw(" ".repeat(pad)),
+        ];
         if !group.is_empty() {
-            spans.push(Span::styled(format!(" {group} "), dim));
+            top.push(Span::styled(format!("  {group}"), dim));
         }
-        spans.push(Span::raw(format!(" {:>WHEN_W$}", fit(&r.when, WHEN_W))));
-        Line::from(spans).render(
-            Rect {
-                y,
-                height: 1,
-                ..body
-            },
-            buf,
-        );
-        let has_second = y + 1 < body.y + body.height;
-        if has_second {
-            let desc = if r.description.trim().is_empty() {
-                "(no description yet)".to_string()
+        top.push(Span::styled(
+            format!(" {:>WHEN_W$}", fit(&r.when, WHEN_W)),
+            dim,
+        ));
+        put(Line::from(top), &mut y);
+
+        // row two: status, progress, flag
+        let mut second = vec![Span::raw(format!(
+            " {:<STATUS_W$} ",
+            fit(&r.status, STATUS_W)
+        ))];
+        match &r.progress {
+            Some((_, _, true)) => second.push(Span::raw("✓ complete  ")),
+            Some((fill, label, false)) => {
+                second.push(Span::raw(crate::progress::bar(*fill, BAR_W)));
+                second.push(Span::raw(format!(" {}  ", fit(label, 24))));
+            }
+            None => {}
+        }
+        if let Some(flag) = r.flag {
+            let style = if flag.starts_with('!') {
+                bold.fg(ratatui::style::Color::Yellow)
             } else {
-                fit(r.description, w.saturating_sub(STATUS_W + 2))
+                dim
             };
-            Line::from(vec![
-                Span::raw(" ".repeat(STATUS_W + 1)),
-                Span::styled(desc, dim),
-            ])
-            .render(
-                Rect {
-                    y: y + 1,
-                    height: 1,
-                    ..body
-                },
-                buf,
+            second.push(Span::styled(flag.to_string(), style));
+        }
+        put(Line::from(second), &mut y);
+
+        // description
+        for d in &descs[i] {
+            put(
+                Line::from(vec![Span::raw(" "), Span::styled(d.clone(), dim)]),
+                &mut y,
             );
         }
         if i == selected {
+            let h = y.min(bottom).saturating_sub(card_top);
             buf.set_style(
                 Rect {
-                    y,
-                    height: if has_second { 2 } else { 1 },
+                    y: card_top,
+                    height: h,
                     ..body
                 },
                 Style::default().add_modifier(Modifier::REVERSED),
             );
         }
+        y += 1; // spacer
     }
 }
