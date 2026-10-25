@@ -23,6 +23,12 @@ title = "Toolbar: toggle"
 contexts = ["workspace"]
 command = ["../target/release/herdr-toolbar", "toggle"]
 
+[[actions]]
+id = "focus"
+title = "Toolbar: focus in / out"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "focus"]
+
 # Herdr actions take no arguments: one action per slot, bindable from any pane.
 [[actions]]
 id = "select-1"

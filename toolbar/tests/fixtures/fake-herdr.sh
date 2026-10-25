@@ -9,6 +9,9 @@ case "$1 $2" in
       exit 0
     fi
     exit 1 ;;
+  "pane layout")
+    # tab 200 wide: agent 110, toolbar 90 (45%)
+    printf '{"id":"cli:pane:layout","result":{"layout":{"area":{"x":0,"y":0,"width":200,"height":50},"panes":[{"pane_id":"w1:p3","rect":{"x":0,"y":0,"width":110,"height":50}},{"pane_id":"w1:p9","rect":{"x":110,"y":0,"width":90,"height":50}}]}}}\n' ;;
   "plugin pane")
     # Real 0.9.5 shape: result.plugin_pane.pane.pane_id
     printf '{"id":"cli:plugin","result":{"plugin_pane":{"entrypoint":"toolbar","pane":{"pane_id":"w1:p9","tab_id":"w1:t1"},"plugin_id":"jefelabs.toolbar"},"type":"plugin_pane_opened"}}\n' ;;

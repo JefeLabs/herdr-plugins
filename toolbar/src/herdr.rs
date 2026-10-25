@@ -187,6 +187,76 @@ pub fn toggle(ctx: &HerdrContext) -> anyhow::Result<()> {
         });
     if let Some(id) = pane_id {
         std::fs::write(&file, format!("{id}\n"))?;
+        fit_width(ctx, &id);
+    }
+    Ok(())
+}
+
+/// The toolbar should take about a third of the tab. Herdr opens a split at
+/// roughly half, so measure the new pane and move the divider right by the
+/// difference (`pane resize --direction right` shrinks a right-hand pane).
+/// Best effort: any failure leaves Herdr's default width.
+const TARGET_WIDTH_FRACTION: f64 = 0.33;
+
+fn fit_width(ctx: &HerdrContext, pane_id: &str) {
+    let Ok(out) = ctx.herdr(&["pane", "layout", "--pane", pane_id]) else {
+        return;
+    };
+    let Ok(v) =
+        serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&out.stdout).trim())
+    else {
+        return;
+    };
+    let layout = &v["result"]["layout"];
+    let total = layout["area"]["width"].as_f64().unwrap_or(0.0);
+    let mine = layout["panes"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["pane_id"].as_str() == Some(pane_id)))
+        .and_then(|p| p["rect"]["width"].as_f64())
+        .unwrap_or(0.0);
+    if total <= 0.0 || mine <= 0.0 {
+        return;
+    }
+    let delta = mine / total - TARGET_WIDTH_FRACTION;
+    if delta > 0.02 {
+        let amount = format!("{:.2}", delta);
+        let _ = ctx.herdr(&[
+            "pane",
+            "resize",
+            "--pane",
+            pane_id,
+            "--direction",
+            "right",
+            "--amount",
+            &amount,
+        ]);
+    }
+}
+
+/// Move focus into the toolbar, or back out to the pane on its left when the
+/// toolbar already has it. The toolbar is always opened as a right split of
+/// the pane that was focused, so left/right neighbours are the right ones.
+pub fn focus(ctx: &HerdrContext) -> anyhow::Result<()> {
+    let recorded = std::fs::read_to_string(pane_file(ctx)).unwrap_or_default();
+    let toolbar = recorded.trim();
+    if toolbar.is_empty() {
+        bail!("toolbar is not open in this workspace");
+    }
+    let focused = ctx.target_pane_id.as_deref().unwrap_or("");
+    let (pane, direction) = if focused == toolbar {
+        (toolbar, "left")
+    } else {
+        (focused, "right")
+    };
+    if pane.is_empty() {
+        bail!("no focused pane in the action context");
+    }
+    let out = ctx.herdr(&["pane", "focus", "--pane", pane, "--direction", direction])?;
+    if !out.status.success() {
+        bail!(
+            "herdr pane focus failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }

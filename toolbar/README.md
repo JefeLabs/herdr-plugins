@@ -40,7 +40,7 @@ command = "jefelabs.toolbar.select-1"
 # ... prefix+2 .. prefix+5 with select-2 .. select-5
 ```
 
-`toggle` opens the toolbar as a right split next to the focused pane without taking focus, and closes it again when it is open. `select-1` to `select-5` switch the running toolbar to that slot; the binary's own `select <id-or-index>` mode accepts a tool id as well.
+`toggle` opens the toolbar as a right split next to the focused pane without taking focus, sized to about a third of the tab, and closes it again when it is open. `focus` jumps into the toolbar, or back out to the pane on its left when the toolbar already has focus; bind it to `prefix+f`. `select-1` to `select-5` switch the running toolbar to that slot; the binary's own `select <id-or-index>` mode accepts a tool id as well.
 
 ## Keys inside the toolbar
 
@@ -106,7 +106,6 @@ Trust is recorded as the file's path plus a hash of its content, so it has to be
 - **Text only.** The embedded terminal advertises `TERM=xterm-256color` without graphics, so tools fall back to text: `yazi` lists files without thumbnails, `mdcat` prints markdown without pictures. Passing Kitty graphics through is the first planned follow-up.
 - **Keyboard only.** Mouse events are not forwarded.
 - One toolbar per workspace, in the tab where it was opened. Closing it stops its tools.
-- The split opens at Herdr's default width; resize it with Herdr's pane keys.
 
 ## Troubleshooting
 

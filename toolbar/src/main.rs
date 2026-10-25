@@ -17,16 +17,19 @@ enum Mode {
     Toggle,
     Select(String),
     Trust,
+    Focus,
     Usage(String),
 }
 
-const USAGE: &str = "usage: herdr-toolbar [toggle | select <tool-id|index> | trust | --version]";
+const USAGE: &str =
+    "usage: herdr-toolbar [toggle | focus | select <tool-id|index> | trust | --version]";
 
 fn parse_mode(args: &[String]) -> Mode {
     match args {
         [] => Mode::Tui,
         [a] if a == "toggle" => Mode::Toggle,
         [a] if a == "trust" => Mode::Trust,
+        [a] if a == "focus" => Mode::Focus,
         [a, tool] if a == "select" => Mode::Select(tool.clone()),
         [a] if a == "--version" || a == "-V" => {
             Mode::Usage(format!("herdr-toolbar {}", env!("CARGO_PKG_VERSION")))
@@ -42,6 +45,7 @@ fn main() -> ExitCode {
         Mode::Toggle => run_toggle(),
         Mode::Select(tool) => run_select(&tool),
         Mode::Trust => run_trust(),
+        Mode::Focus => HerdrContext::from_env().and_then(|ctx| herdr::focus(&ctx)),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-toolbar ");
             println!("{text}");
@@ -131,6 +135,7 @@ mod tests {
             Mode::Select("db".into())
         );
         assert_eq!(parse_mode(&["trust".into()]), Mode::Trust);
+        assert_eq!(parse_mode(&["focus".into()]), Mode::Focus);
         assert!(matches!(parse_mode(&["bogus".into()]), Mode::Usage(_)));
     }
 }

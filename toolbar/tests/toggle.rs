@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herdr_toolbar::app::ControlCmd;
-use herdr_toolbar::herdr::{Control, HerdrContext, pane_file, select, socket_path, toggle};
+use herdr_toolbar::herdr::{Control, HerdrContext, focus, pane_file, select, socket_path, toggle};
 
 fn fake_herdr() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-herdr.sh")
@@ -215,6 +215,7 @@ fn manifest_declares_a_trust_action() {
         let id = format!("select-{n}");
         assert!(ids.contains(&id.as_str()), "missing action {id}: {ids:?}");
     }
+    assert!(ids.contains(&"focus"), "actions: {ids:?}");
 }
 
 // I6: toggle must not close a pane that merely has the recorded id.
@@ -238,4 +239,37 @@ fn toggle_does_not_close_a_pane_that_is_not_the_toolbar() {
         l.contains("plugin pane open"),
         "opens a fresh toolbar instead:\n{l}"
     );
+}
+
+// `focus`: jump into the toolbar from the agent pane, and back out again.
+#[test]
+fn focus_moves_into_the_toolbar_when_focus_is_elsewhere() {
+    let fx = fx();
+    fs::write(pane_file(&fx.ctx), "w1:p9\n").unwrap();
+    focus(&fx.ctx).unwrap();
+    let l = log(&fx);
+    assert!(
+        l.contains("pane focus --pane w1:p3 --direction right"),
+        "log was:\n{l}"
+    );
+}
+
+#[test]
+fn focus_moves_back_out_when_the_toolbar_has_focus() {
+    let mut fx = fx();
+    fs::write(pane_file(&fx.ctx), "w1:p9\n").unwrap();
+    fx.ctx.target_pane_id = Some("w1:p9".into()); // the toolbar itself is focused
+    focus(&fx.ctx).unwrap();
+    let l = log(&fx);
+    assert!(
+        l.contains("pane focus --pane w1:p9 --direction left"),
+        "log was:\n{l}"
+    );
+}
+
+#[test]
+fn focus_without_a_toolbar_is_a_clear_error() {
+    let fx = fx();
+    let e = focus(&fx.ctx).unwrap_err().to_string();
+    assert!(e.contains("not open"), "got: {e}");
 }
