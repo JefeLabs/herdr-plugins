@@ -24,7 +24,7 @@ use crate::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
 use crate::editor::TextArea;
 use crate::provider::Reply;
 use crate::store::{Group, Intent, SaveError, State, Store};
-use crate::ui;
+use crate::ui::{self, Pane};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -95,21 +95,11 @@ pub enum Pending {
 }
 
 pub enum InputAction {
-    AddIntent {
-        group: PathBuf,
-    },
-    NewGroup {
-        parent: PathBuf,
-    },
+    AddIntent { group: PathBuf },
+    NewGroup { parent: PathBuf },
     Attach,
     MoveTo,
-    MoveGroup {
-        group: PathBuf,
-    },
-    /// Answer question `index` of the selected intent.
-    Answer {
-        index: usize,
-    },
+    MoveGroup { group: PathBuf },
 }
 
 #[allow(clippy::large_enum_variant)] // Chat carries the live turn; boxing buys nothing here
@@ -123,15 +113,10 @@ pub enum Screen {
         selected: usize,
         pending: PendingChat,
     },
-    /// Pick a question to answer (`Q`).
-    QuestionPick {
-        items: Vec<String>,
-        selected: usize,
-    },
-    /// Toggle acceptance criteria (`C`); stays open until Esc.
-    CriteriaPick {
-        items: Vec<String>,
-        selected: usize,
+    /// Typing an answer for question `index` inline in the questions pane.
+    Answer {
+        index: usize,
+        text: String,
     },
     Chat(ChatState),
     Diff {
@@ -187,6 +172,11 @@ pub struct View {
     pub send_prompt: Option<String>,
     pub pick_items: Vec<String>,
     pub pick_selected: usize,
+    pub focus: &'static str,
+    pub question_count: usize,
+    pub question_selected: usize,
+    pub criteria_selected: usize,
+    pub answer_text: String,
 }
 
 pub struct App {
@@ -211,6 +201,10 @@ pub struct App {
     pub herdr_env: Vec<(String, String)>,
     /// Chat state kept while the Diff or a Prompt screen is showing.
     parked_chat: Option<ChatState>,
+    pub focus: Pane,
+    description_scroll: u16,
+    criteria_selected: usize,
+    question_selected: usize,
 }
 
 impl App {
@@ -233,6 +227,10 @@ impl App {
             provider_env: Vec::new(),
             herdr_env: Vec::new(),
             parked_chat: None,
+            focus: Pane::Tree,
+            description_scroll: 0,
+            criteria_selected: 0,
+            question_selected: 0,
         };
         app.rebuild_rows();
         Ok(app)
@@ -340,6 +338,12 @@ impl App {
             .unwrap_or_else(|_| abs.to_path_buf())
     }
 
+    fn reset_pane_cursors(&mut self) {
+        self.description_scroll = 0;
+        self.criteria_selected = 0;
+        self.question_selected = 0;
+    }
+
     fn select_path(&mut self, p: &Path) {
         if let Some(i) = self.rows.iter().position(|r| row_path(r) == p) {
             self.selected = i;
@@ -377,8 +381,7 @@ impl App {
                 selected,
                 pending,
             } => self.key_agent_pick(step, items, selected, pending, k),
-            Screen::QuestionPick { items, selected } => self.key_question_pick(items, selected, k),
-            Screen::CriteriaPick { items, selected } => self.key_criteria_pick(items, selected, k),
+            Screen::Answer { index, text } => self.key_answer(index, text, k),
             Screen::Chat(st) => self.key_chat(st, k),
             Screen::Diff {
                 proposal,
@@ -404,14 +407,57 @@ impl App {
 
     fn key_browse(&mut self, k: KeyEvent) -> Flow {
         self.screen = Screen::Browse;
+        // pane focus: Tab / Shift-Tab cycle, Esc returns to the tree
+        match k.code {
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Pane::Tree => Pane::Description,
+                    Pane::Description => Pane::Criteria,
+                    Pane::Criteria => Pane::Questions,
+                    Pane::Questions => Pane::Tree,
+                };
+                return Flow::Continue;
+            }
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Pane::Tree => Pane::Questions,
+                    Pane::Description => Pane::Tree,
+                    Pane::Criteria => Pane::Description,
+                    Pane::Questions => Pane::Criteria,
+                };
+                return Flow::Continue;
+            }
+            KeyCode::Char('Q') => {
+                if self.selected_intent().is_some() {
+                    self.focus = Pane::Questions;
+                    self.question_selected = 0;
+                }
+                return Flow::Continue;
+            }
+            KeyCode::Char('C') => {
+                if self.selected_intent().is_some() {
+                    self.focus = Pane::Criteria;
+                    self.criteria_selected = 0;
+                }
+                return Flow::Continue;
+            }
+            _ => {}
+        }
+        if self.focus != Pane::Tree {
+            return self.key_detail_pane(k);
+        }
         match k.code {
             KeyCode::Char('q') => return Flow::Quit,
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.selected + 1 < self.rows.len() {
                     self.selected += 1;
+                    self.reset_pane_cursors();
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                self.reset_pane_cursors();
+            }
             KeyCode::Char('h') | KeyCode::Left => {
                 if let Some(Row::Group { path, .. }) = self.rows.get(self.selected) {
                     self.collapsed.insert(path.clone());
@@ -536,93 +582,139 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('Q') => {
-                if let Some(it) = self.selected_intent() {
-                    let items = question_items(&it.body);
-                    if items.is_empty() {
-                        self.message = Some("no open questions on this intent".into());
-                    } else {
-                        self.screen = Screen::QuestionPick { items, selected: 0 };
-                    }
-                }
-            }
-            KeyCode::Char('C') => {
-                if let Some(it) = self.selected_intent() {
-                    let items = criteria_items(&it.body);
-                    if items.is_empty() {
-                        self.message = Some("no acceptance criteria on this intent".into());
-                    } else {
-                        self.screen = Screen::CriteriaPick { items, selected: 0 };
-                    }
-                }
-            }
             KeyCode::Char('r') => self.rescan(),
             _ => {}
         }
         Flow::Continue
     }
 
-    fn key_question_pick(&mut self, items: Vec<String>, mut selected: usize, k: KeyEvent) -> Flow {
-        match k.code {
-            KeyCode::Esc => self.screen = Screen::Browse,
-            KeyCode::Char('j') | KeyCode::Down => {
-                selected = (selected + 1).min(items.len().saturating_sub(1));
-                self.screen = Screen::QuestionPick { items, selected };
+    /// Keys while one of the three detail panes has focus.
+    fn key_detail_pane(&mut self, k: KeyEvent) -> Flow {
+        let Some(it) = self.selected_intent().cloned() else {
+            self.focus = Pane::Tree;
+            return Flow::Continue;
+        };
+        match self.focus {
+            Pane::Description => match k.code {
+                KeyCode::Esc => self.focus = Pane::Tree,
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                    self.description_scroll = self
+                        .description_scroll
+                        .saturating_add(if k.code == KeyCode::PageDown { 5 } else { 1 })
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                    self.description_scroll = self
+                        .description_scroll
+                        .saturating_sub(if k.code == KeyCode::PageUp { 5 } else { 1 })
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.editor = TextArea::from_text(&it.body);
+                    self.editing = Some(it);
+                    self.screen = Screen::Edit;
+                }
+                _ => {}
+            },
+            Pane::Criteria => {
+                let n = crate::store::criteria(&it.body).len();
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.criteria_selected =
+                            (self.criteria_selected + 1).min(n.saturating_sub(1))
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.criteria_selected = self.criteria_selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_criterion(),
+                    _ => {}
+                }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                selected = selected.saturating_sub(1);
-                self.screen = Screen::QuestionPick { items, selected };
+            Pane::Questions => {
+                let qs = crate::store::questions(&it.body);
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.question_selected =
+                            (self.question_selected + 1).min(qs.len().saturating_sub(1))
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.question_selected = self.question_selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter => {
+                        if let Some(q) = qs.get(self.question_selected) {
+                            self.screen = Screen::Answer {
+                                index: self.question_selected,
+                                text: q.answer.clone().unwrap_or_default(),
+                            };
+                        }
+                    }
+                    _ => {}
+                }
             }
-            KeyCode::Enter => {
-                let existing = self
-                    .selected_intent()
-                    .map(|it| crate::store::questions(&it.body))
-                    .and_then(|qs| qs.get(selected).and_then(|q| q.answer.clone()))
-                    .unwrap_or_default();
-                self.screen = Screen::Input {
-                    label: format!("answer: {}", items[selected]),
-                    text: existing,
-                    action: InputAction::Answer { index: selected },
-                };
-            }
-            _ => self.screen = Screen::QuestionPick { items, selected },
+            Pane::Tree => {}
         }
         Flow::Continue
     }
 
-    fn key_criteria_pick(&mut self, items: Vec<String>, mut selected: usize, k: KeyEvent) -> Flow {
+    fn toggle_selected_criterion(&mut self) {
+        let Some(path) = self.selected_intent().map(|i| i.path.clone()) else {
+            return;
+        };
+        match Store::load(&path) {
+            Ok(mut it) => {
+                if let Some(body) = crate::store::toggle_criterion(&it.body, self.criteria_selected)
+                {
+                    it.body = body;
+                    if let Err(e) = Store::save(&mut it) {
+                        self.message = Some(format!("save failed: {e}"));
+                    }
+                }
+                self.rescan();
+            }
+            Err(e) => self.message = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Inline answer box under the selected question.
+    fn key_answer(&mut self, index: usize, mut text: String, k: KeyEvent) -> Flow {
         match k.code {
             KeyCode::Esc => self.screen = Screen::Browse,
-            KeyCode::Char('j') | KeyCode::Down => {
-                selected = (selected + 1).min(items.len().saturating_sub(1));
-                self.screen = Screen::CriteriaPick { items, selected };
+            KeyCode::Backspace => {
+                text.pop();
+                self.screen = Screen::Answer { index, text };
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                selected = selected.saturating_sub(1);
-                self.screen = Screen::CriteriaPick { items, selected };
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Enter => {
+                self.screen = Screen::Browse;
+                let value = text.trim().to_string();
+                if value.is_empty() {
+                    return Flow::Continue;
+                }
                 if let Some(path) = self.selected_intent().map(|i| i.path.clone()) {
                     match Store::load(&path) {
                         Ok(mut it) => {
-                            if let Some(body) = crate::store::toggle_criterion(&it.body, selected) {
-                                it.body = body;
-                                if let Err(e) = Store::save(&mut it) {
-                                    self.message = Some(format!("save failed: {e}"));
+                            match crate::store::answer_question(&it.body, index, &value) {
+                                Some(body) => {
+                                    it.body = body;
+                                    match Store::save(&mut it) {
+                                        Ok(()) => {
+                                            self.message = Some("answer recorded".into());
+                                            self.rescan();
+                                        }
+                                        Err(e) => self.message = Some(format!("save failed: {e}")),
+                                    }
                                 }
+                                None => self.message = Some("that question is gone".into()),
                             }
-                            self.rescan();
                         }
                         Err(e) => self.message = Some(format!("{e:#}")),
                     }
                 }
-                let items = self
-                    .selected_intent()
-                    .map(|it| criteria_items(&it.body))
-                    .unwrap_or_default();
-                self.screen = Screen::CriteriaPick { items, selected };
             }
-            _ => self.screen = Screen::CriteriaPick { items, selected },
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                text.push(c);
+                self.screen = Screen::Answer { index, text };
+            }
+            _ => self.screen = Screen::Answer { index, text },
         }
         Flow::Continue
     }
@@ -1341,26 +1433,6 @@ impl App {
                     }
                 }
             }
-            InputAction::Answer { index } => {
-                if let Some(path) = self.selected_intent().map(|i| i.path.clone()) {
-                    match Store::load(&path) {
-                        Ok(mut it) => match crate::store::answer_question(&it.body, index, value) {
-                            Some(body) => {
-                                it.body = body;
-                                match Store::save(&mut it) {
-                                    Ok(()) => {
-                                        self.message = Some("answer recorded".into());
-                                        self.rescan();
-                                    }
-                                    Err(e) => self.message = Some(format!("save failed: {e}")),
-                                }
-                            }
-                            None => self.message = Some("that question is gone".into()),
-                        },
-                        Err(e) => self.message = Some(format!("{e:#}")),
-                    }
-                }
-            }
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
                 match self.store.move_group(&rel, Path::new(value)) {
@@ -1391,6 +1463,7 @@ impl App {
             }
             Screen::Chat(st) => st.input.push_str(text.trim_end_matches('\n')),
             Screen::Input { text: t, .. } => t.push_str(text.trim_end_matches('\n')),
+            Screen::Answer { text: t, .. } => t.push_str(text.trim_end_matches('\n')),
             _ => {}
         }
     }
@@ -1506,6 +1579,19 @@ impl App {
             send_prompt: None,
             pick_items: Vec::new(),
             pick_selected: 0,
+            focus: match self.focus {
+                Pane::Tree => "tree",
+                Pane::Description => "description",
+                Pane::Criteria => "criteria",
+                Pane::Questions => "questions",
+            },
+            question_count: self
+                .selected_intent()
+                .map(|i| crate::store::questions(&i.body).len())
+                .unwrap_or(0),
+            question_selected: self.question_selected,
+            criteria_selected: self.criteria_selected,
+            answer_text: String::new(),
         };
         match &self.screen {
             Screen::Browse => {}
@@ -1517,15 +1603,9 @@ impl App {
                 v.pick_items = items.clone();
                 v.pick_selected = *selected;
             }
-            Screen::QuestionPick { items, selected } => {
-                v.screen = "question-pick";
-                v.pick_items = items.clone();
-                v.pick_selected = *selected;
-            }
-            Screen::CriteriaPick { items, selected } => {
-                v.screen = "criteria-pick";
-                v.pick_items = items.clone();
-                v.pick_selected = *selected;
+            Screen::Answer { text, .. } => {
+                v.screen = "answer";
+                v.answer_text = text.clone();
             }
             Screen::Chat(st) => {
                 v.screen = "chat";
@@ -1631,20 +1711,6 @@ impl App {
                 };
                 ui::render_list(&title, items, *selected, right, buf);
             }
-            Screen::QuestionPick { items, selected } => ui::render_list(
-                "answer which question? (Enter)",
-                items,
-                *selected,
-                right,
-                buf,
-            ),
-            Screen::CriteriaPick { items, selected } => ui::render_list(
-                "acceptance criteria: Enter toggles, Esc done",
-                items,
-                *selected,
-                right,
-                buf,
-            ),
             Screen::Chat(st) => {
                 let (top, bottom) = ui::split_chat(right);
                 if let Some(it) = chat_intent(st) {
@@ -1708,7 +1774,24 @@ impl App {
             }
             _ => match self.rows.get(self.selected) {
                 Some(Row::Intent { intent, .. }) => {
-                    ui::render_detail(intent, &Store::attachments(intent), right, buf)
+                    let answering = match &self.screen {
+                        Screen::Answer { index, text } => Some((*index, text.as_str())),
+                        _ => None,
+                    };
+                    let attachments = Store::attachments(intent);
+                    ui::render_capability(
+                        &ui::DetailView {
+                            intent,
+                            attachments: &attachments,
+                            focus: self.focus,
+                            description_scroll: self.description_scroll,
+                            criteria_selected: self.criteria_selected,
+                            question_selected: self.question_selected,
+                            answering,
+                        },
+                        right,
+                        buf,
+                    );
                 }
                 Some(Row::Broken { path, error, .. }) => ratatui::widgets::Paragraph::new(
                     ui::sanitize(&format!("{}\n\n{}", path.display(), error)),
@@ -1726,32 +1809,19 @@ impl App {
             Screen::Edit => "Ctrl-s save · Ctrl-p polish · Ctrl-e $EDITOR · Esc back".to_string(),
             Screen::Chat(_) => "Enter send · Ctrl-a apply · Ctrl-d dismiss · PgUp/PgDn scroll · Esc cancel/back".to_string(),
             Screen::Diff { .. } => "Enter apply · Esc back · PgUp/PgDn scroll".to_string(),
-            Screen::SendPick { .. } | Screen::AgentPick { .. } | Screen::QuestionPick { .. } | Screen::CriteriaPick { .. } => "j/k choose · Enter select · Esc back".to_string(),
+            Screen::SendPick { .. } | Screen::AgentPick { .. } => "j/k choose · Enter select · Esc back".to_string(),
+            Screen::Answer { .. } => "type the answer · Enter saves · Esc cancels".to_string(),
             Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
-            Screen::Browse => match &self.message {
-                Some(m) => m.clone(),
-                None => "a add  n group  e edit  p polish  Q answer  C criteria  s send  R ready  K kind  m move  A attach  r rescan  q quit".to_string(),
+            Screen::Browse => match (&self.message, self.focus) {
+                (Some(m), _) => m.clone(),
+                (None, Pane::Tree) => "Tab panes  a add  n group  e edit  p polish  Q answer  C criteria  s send  R ready  K kind  m move  A attach  r rescan  q quit".to_string(),
+                (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Questions) => "Questions: j/k choose · Enter answer · Tab next pane · Esc tree".to_string(),
             },
         };
         ui::render_status(&status_text, status, buf);
     }
-}
-
-fn question_items(body: &str) -> Vec<String> {
-    crate::store::questions(body)
-        .into_iter()
-        .map(|q| match q.answer {
-            Some(a) => format!("✓ {}  → {a}", q.text),
-            None => format!("? {}", q.text),
-        })
-        .collect()
-}
-
-fn criteria_items(body: &str) -> Vec<String> {
-    crate::store::criteria(body)
-        .into_iter()
-        .map(|c| format!("{} {}", if c.done { "[x]" } else { "[ ]" }, c.text))
-        .collect()
 }
 
 fn row_path(r: &Row) -> PathBuf {
@@ -2845,33 +2915,68 @@ mod tests {
     }
 
     #[test]
-    fn q_lists_questions_and_writes_the_chosen_answer() {
+    fn tab_cycles_focus_through_the_three_panes() {
         let mut fx = setup("agy.jsonl");
-        select(&mut fx.app, "In the inbox"); // body has "## Open questions\n- a?\n- b?"
-        key(&mut fx.app, KeyCode::Char('Q'));
-        let v = fx.app.view();
-        assert_eq!(v.screen, "question-pick");
-        assert_eq!(v.pick_items.len(), 2);
-        assert!(v.pick_items[0].contains("a?"));
+        select(&mut fx.app, "In the inbox");
+        assert_eq!(fx.app.view().focus, "tree");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "description");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "criteria");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "questions");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "tree");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "questions");
+        // j/k in the tree still move the selection only while the tree has focus
         key(&mut fx.app, KeyCode::Char('j'));
-        key(&mut fx.app, KeyCode::Enter);
-        assert_eq!(fx.app.view().screen, "input");
-        type_str(&mut fx.app, "because of b");
-        key(&mut fx.app, KeyCode::Enter);
-        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
-        assert!(it.body.contains("- b?\n  → because of b\n"), "{}", it.body);
-        assert_eq!(it.open_questions(), 1, "a? still open");
-        assert!(
-            fx.app
-                .view()
-                .rows
-                .iter()
-                .any(|r| r.label == "In the inbox" && r.questions == 1)
+        assert_eq!(
+            fx.app.view().rows[fx.app.view().selected].label,
+            "In the inbox"
         );
     }
 
     #[test]
-    fn c_toggles_an_acceptance_criterion() {
+    fn q_focuses_questions_and_enter_opens_an_inline_answer_box() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox"); // body has "## Open questions\n- a?\n- b?"
+        key(&mut fx.app, KeyCode::Char('Q'));
+        let v = fx.app.view();
+        assert_eq!(v.focus, "questions");
+        assert_eq!(v.question_count, 2);
+        key(&mut fx.app, KeyCode::Char('j'));
+        assert_eq!(fx.app.view().question_selected, 1);
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "answer");
+        type_str(&mut fx.app, "because of b");
+        fx.app.paste(" (pasted)");
+        assert_eq!(fx.app.view().answer_text, "because of b (pasted)");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "browse");
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert!(
+            it.body.contains("- b?\n  → because of b (pasted)\n"),
+            "{}",
+            it.body
+        );
+        assert_eq!(it.open_questions(), 1);
+        // Esc cancels an answer without writing
+        key(&mut fx.app, KeyCode::Char('k'));
+        key(&mut fx.app, KeyCode::Enter);
+        type_str(&mut fx.app, "nope");
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(
+            !Store::load(&fx.app.selected_intent().unwrap().path)
+                .unwrap()
+                .body
+                .contains("nope")
+        );
+    }
+
+    #[test]
+    fn c_focuses_criteria_and_enter_toggles_in_place() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
         let path = fx.app.selected_intent().unwrap().path.clone();
@@ -2880,16 +2985,38 @@ mod tests {
         Store::save_force(&mut it).unwrap();
         fx.app.rescan();
         key(&mut fx.app, KeyCode::Char('C'));
-        assert_eq!(fx.app.view().screen, "criteria-pick");
+        assert_eq!(fx.app.view().focus, "criteria");
         key(&mut fx.app, KeyCode::Char('j'));
         key(&mut fx.app, KeyCode::Enter);
         assert!(Store::load(&path).unwrap().body.contains("- [x] two"));
         assert_eq!(
-            fx.app.view().screen,
-            "criteria-pick",
-            "stays open to toggle more"
+            fx.app.view().focus,
+            "criteria",
+            "focus stays for more toggles"
+        );
+        key(&mut fx.app, KeyCode::Char(' '));
+        assert!(
+            Store::load(&path).unwrap().body.contains("- [ ] two"),
+            "space toggles back"
         );
         key(&mut fx.app, KeyCode::Esc);
-        assert_eq!(fx.app.view().screen, "browse");
+        assert_eq!(fx.app.view().focus, "tree");
+    }
+
+    #[test]
+    fn detail_draws_three_separate_panes() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox");
+        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, 100, 24), f.buffer_mut()))
+            .unwrap();
+        let text = format!("{:?}", t.backend().buffer());
+        for title in ["Description", "Acceptance criteria", "Open questions"] {
+            assert!(text.contains(title), "pane {title} missing");
+        }
+        assert!(
+            text.contains("? a?") && text.contains("? b?"),
+            "questions listed with their open mark: {text}"
+        );
     }
 }

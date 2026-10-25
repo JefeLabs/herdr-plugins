@@ -60,11 +60,11 @@ What this is, in the author's words (for an issue: observed, expected, steps).
 - Since when?
 ```
 
-Questions can be answered one at a time: `Q` lists them, `Enter` on one opens an input, and the answer is written as an indented `→` line under the question. Answered questions no longer count as open (the `?N` mark in the tree counts only unanswered ones), and the agent is told to keep them with their answers rather than re-ask. `C` lists the acceptance criteria and `Enter` toggles the checkbox; the list stays open until `Esc` so several can be ticked.
+The right-hand side shows the three parts as separate panes under a header. `Tab` and `Shift-Tab` move focus between the tree, Description, Acceptance criteria and Open questions; `Esc` returns to the tree. In Description, `j`/`k` scroll and `Enter` edits. In Acceptance criteria, `j`/`k` choose and `Enter` or space toggles the checkbox, staying in the pane so several can be ticked. In Open questions, `j`/`k` choose and `Enter` opens an answer box right under the question; type (or paste), `Enter` saves, `Esc` cancels. Answers are stored as an indented `→` line under the question, answered questions no longer count as open (the `?N` mark counts only unanswered ones), and the agent is told to keep them with their answers rather than re-ask. `Q` and `C` jump straight to the questions and criteria panes.
 
 ## Keys
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group, `n` new group, `m` move the selected intent or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `Q` answer a question, `C` tick acceptance criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group, `n` new group, `m` move the selected intent or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `Tab` move between panes, `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
 
 Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` refine (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 

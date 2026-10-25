@@ -387,3 +387,233 @@ mod tests {
         assert!(!text_of(&t).contains('\u{1b}'), "raw ESC in status");
     }
 }
+
+/// Which of the three detail panes has keyboard focus (or the tree).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Tree,
+    Description,
+    Criteria,
+    Questions,
+}
+
+/// Everything the three-pane detail view needs from the app.
+pub struct DetailView<'a> {
+    pub intent: &'a Intent,
+    pub attachments: &'a [(String, u64)],
+    pub focus: Pane,
+    pub description_scroll: u16,
+    pub criteria_selected: usize,
+    pub question_selected: usize,
+    /// `(question index, text so far)` while an answer is being typed.
+    pub answering: Option<(usize, &'a str)>,
+}
+
+fn pane_block(title: &str, focused: bool) -> Block<'static> {
+    let style = if focused {
+        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    Block::default()
+        .borders(Borders::TOP)
+        .title(Span::styled(format!(" {title} "), style))
+}
+
+/// Header, then Description / Acceptance criteria / Open questions as three
+/// separately scrollable, separately focusable panes.
+pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
+    use crate::store::{criteria, questions};
+    let it = v.intent;
+    let qs = questions(&it.body);
+    let cs = criteria(&it.body);
+    let q_rows = qs
+        .iter()
+        .map(|q| 1 + usize::from(q.answer.is_some()))
+        .sum::<usize>() as u16
+        + if v.answering.is_some() { 2 } else { 0 };
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length((cs.len() as u16 + 1).clamp(2, 8)),
+            Constraint::Length((q_rows + 1).clamp(2, 12)),
+        ])
+        .split(area);
+
+    // header
+    let open = it.open_questions();
+    let header = vec![
+        Line::from(Span::styled(
+            format!("# {}", sanitize(&it.fm.title)),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "kind: {}   state: {}{}{}{}",
+                sanitize(&it.fm.kind),
+                it.fm.state.label(),
+                if open > 0 {
+                    format!("   ?{open}")
+                } else {
+                    String::new()
+                },
+                it.fm
+                    .sent_to
+                    .as_ref()
+                    .map(|s| format!("   sent → {} ({})", s.handoff, s.workspace_id))
+                    .unwrap_or_default(),
+                if v.attachments.is_empty() {
+                    String::new()
+                } else {
+                    format!("   {} attachment(s)", v.attachments.len())
+                }
+            ),
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ];
+    Paragraph::new(header).render(layout[0], buf);
+
+    // description: everything outside the two list sections
+    let block = pane_block("Description", v.focus == Pane::Description);
+    let inner = block.inner(layout[1]);
+    block.render(layout[1], buf);
+    let desc = description_text(&it.body);
+    Paragraph::new(sanitize(&desc))
+        .wrap(Wrap { trim: false })
+        .scroll((v.description_scroll, 0))
+        .render(inner, buf);
+
+    // criteria
+    let block = pane_block(
+        &format!(
+            "Acceptance criteria ({}/{})",
+            cs.iter().filter(|c| c.done).count(),
+            cs.len()
+        ),
+        v.focus == Pane::Criteria,
+    );
+    let inner = block.inner(layout[2]);
+    block.render(layout[2], buf);
+    if cs.is_empty() {
+        Paragraph::new(Span::styled(
+            "none yet — add `- [ ]` items in the editor or let polish propose them",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .render(inner, buf);
+    }
+    for (i, c) in cs.iter().enumerate().take(inner.height as usize) {
+        let rect = Rect {
+            y: inner.y + i as u16,
+            height: 1,
+            ..inner
+        };
+        if v.focus == Pane::Criteria && i == v.criteria_selected {
+            buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+        }
+        Line::from(format!(
+            "{} {}",
+            if c.done { "[x]" } else { "[ ]" },
+            sanitize(&c.text)
+        ))
+        .render(rect, buf);
+    }
+
+    // questions
+    let block = pane_block(
+        &format!("Open questions ({} open)", open),
+        v.focus == Pane::Questions,
+    );
+    let inner = block.inner(layout[3]);
+    block.render(layout[3], buf);
+    if qs.is_empty() {
+        Paragraph::new(Span::styled(
+            "none",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .render(inner, buf);
+    }
+    let mut y = inner.y;
+    // keep the selected question visible: skip rows above it when needed
+    let mut rows: Vec<(usize, Line)> = Vec::new();
+    for (i, q) in qs.iter().enumerate() {
+        let mark = if q.answer.is_some() { "✓" } else { "?" };
+        rows.push((i, Line::from(format!("{mark} {}", sanitize(&q.text)))));
+        if let Some((idx, text)) = v.answering
+            && idx == i
+        {
+            rows.push((
+                i,
+                Line::from(Span::styled(
+                    format!("  › {}▏", sanitize(text)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+            ));
+            rows.push((
+                i,
+                Line::from(Span::styled(
+                    "    Enter saves · Esc cancels",
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+            ));
+        } else if let Some(a) = &q.answer {
+            rows.push((
+                i,
+                Line::from(Span::styled(
+                    format!("  → {}", sanitize(a)),
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+            ));
+        }
+    }
+    let first_sel = rows
+        .iter()
+        .position(|(i, _)| *i == v.question_selected)
+        .unwrap_or(0);
+    let visible = inner.height as usize;
+    let skip = if first_sel >= visible {
+        first_sel + 1 - visible
+    } else {
+        0
+    };
+    for (i, line) in rows.into_iter().skip(skip) {
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let rect = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        if v.focus == Pane::Questions && i == v.question_selected && v.answering.is_none() {
+            buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+        }
+        line.render(rect, buf);
+        y += 1;
+    }
+}
+
+/// The body without the two list sections.
+pub fn description_text(body: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in body.lines() {
+        if line.starts_with("## ") {
+            let h = line.trim();
+            skipping = h.eq_ignore_ascii_case("## Acceptance criteria")
+                || h.eq_ignore_ascii_case("## Open questions");
+            if skipping {
+                continue;
+            }
+            if h.eq_ignore_ascii_case("## Description") {
+                continue; // the pane title already says it
+            }
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
+}
