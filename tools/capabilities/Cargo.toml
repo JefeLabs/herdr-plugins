@@ -20,6 +20,7 @@ anyhow = "1"
 shellexpand = "3"
 nix = { version = "0.31", features = ["signal", "process"] }
 uuid = { version = "1", features = ["v4"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 insta = "1"

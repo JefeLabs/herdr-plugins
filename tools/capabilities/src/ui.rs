@@ -222,10 +222,22 @@ pub fn render_chat(
         )));
         wrapped_total += 1;
         let clean = sanitize(text);
-        for l in clean.lines() {
-            lines.push(Line::from(l.to_string()));
+        if role == "user" {
+            for l in clean.lines() {
+                lines.push(Line::from(l.to_string()));
+            }
+            wrapped_total += wrapped_lines(&clean, width);
+        } else {
+            // agent replies are Markdown; render them
+            let rendered = crate::markdown::render_markdown(&clean);
+            let w = width.max(1);
+            wrapped_total += rendered
+                .iter()
+                .map(|l| l.to_string().chars().count().max(1).div_ceil(w))
+                .sum::<usize>()
+                .max(1);
+            lines.extend(rendered);
         }
-        wrapped_total += wrapped_lines(&clean, width);
         lines.push(Line::from(""));
         wrapped_total += 1;
     }
@@ -480,7 +492,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(layout[1]);
     block.render(layout[1], buf);
     let desc = description_text(&it.body);
-    Paragraph::new(sanitize(&desc))
+    Paragraph::new(crate::markdown::render_markdown(&desc))
         .wrap(Wrap { trim: false })
         .scroll((v.description_scroll, 0))
         .render(inner, buf);
