@@ -5,7 +5,7 @@
 //! row never clobbers another writer's body. The chat is about one intent path,
 //! records the change stamp it opened with, and apply prompts if that moved.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
@@ -170,6 +170,71 @@ pub enum Screen {
     },
 }
 
+/// What the browser shows: the group tree with detail panes, or one flat list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    Tree,
+    List,
+}
+
+impl Layout {
+    pub fn label(self) -> &'static str {
+        match self {
+            Layout::Tree => "tree",
+            Layout::List => "list",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tree" => Some(Layout::Tree),
+            "list" => Some(Layout::List),
+            _ => None,
+        }
+    }
+}
+
+/// The list's sort orders, cycled with `S`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    /// Most recently changed first.
+    Updated,
+    /// Least advanced first: raw, ?N, ready, sent by bar fill, complete.
+    Progress,
+    /// Newest created first.
+    Captured,
+    /// A to Z.
+    Title,
+}
+
+impl SortOrder {
+    pub fn next(self) -> Self {
+        match self {
+            SortOrder::Updated => SortOrder::Progress,
+            SortOrder::Progress => SortOrder::Captured,
+            SortOrder::Captured => SortOrder::Title,
+            SortOrder::Title => SortOrder::Updated,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            SortOrder::Updated => "Updated",
+            SortOrder::Progress => "Progress",
+            SortOrder::Captured => "Captured",
+            SortOrder::Title => "Title",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        [
+            SortOrder::Updated,
+            SortOrder::Progress,
+            SortOrder::Captured,
+            SortOrder::Title,
+        ]
+        .into_iter()
+        .find(|o| o.label() == s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowView {
     pub depth: usize,
@@ -205,6 +270,13 @@ pub struct View {
     /// Artifacts found in the repo but not yet linked.
     pub found_count: usize,
     pub reader_title: String,
+    /// `tree` or `list`.
+    pub layout: &'static str,
+    /// Every capability's title in list order.
+    pub list_titles: Vec<String>,
+    pub list_selected: usize,
+    /// The list's sort order label.
+    pub sort: &'static str,
 }
 
 pub struct App {
@@ -242,6 +314,13 @@ pub struct App {
     artifacts_selected: usize,
     /// Artifacts found in the selected capability's repo, cached per path.
     found_cache: Option<(PathBuf, Vec<crate::store::Artifact>)>,
+    pub layout: Layout,
+    pub sort: SortOrder,
+    /// Every capability in the tree, in list order (all groups, collapsed or not).
+    list: Vec<Intent>,
+    list_selected: usize,
+    /// Plan and PR evidence per capability path, for progress.
+    evidence: HashMap<PathBuf, crate::progress::Evidence>,
 }
 
 impl App {
@@ -274,7 +353,19 @@ impl App {
             question_selected: 0,
             artifacts_selected: 0,
             found_cache: None,
+            layout: Layout::Tree,
+            sort: SortOrder::Updated,
+            list: Vec::new(),
+            list_selected: 0,
+            evidence: HashMap::new(),
         };
+        let last = crate::config::last_used(&app.dirs, &app.cfg);
+        if let Some(l) = last.layout.as_deref().and_then(Layout::parse) {
+            app.layout = l;
+        }
+        if let Some(o) = last.sort.as_deref().and_then(SortOrder::parse) {
+            app.sort = o;
+        }
         app.rebuild_rows();
         Ok(app)
     }
@@ -333,11 +424,139 @@ impl App {
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
+        self.rebuild_list();
+    }
+
+    // ---- list -------------------------------------------------------------
+
+    /// Every capability in the tree, sorted by `self.sort`, keeping the list
+    /// selection on the same capability when it still exists.
+    fn rebuild_list(&mut self) {
+        let keep = self.list.get(self.list_selected).map(|i| i.path.clone());
+        fn collect(g: &Group, out: &mut Vec<Intent>) {
+            out.extend(g.intents.iter().cloned());
+            for sub in &g.groups {
+                collect(sub, out);
+            }
+        }
+        let mut list = Vec::new();
+        collect(&self.tree, &mut list);
+        let empty = crate::progress::Evidence::default();
+        match self.sort {
+            SortOrder::Updated => list.sort_by_key(|i| std::cmp::Reverse(crate::store::stamp(i))),
+            SortOrder::Captured => list.sort_by_key(|i| std::cmp::Reverse(i.fm.created)),
+            SortOrder::Title => list.sort_by_key(|i| i.fm.title.to_lowercase()),
+            SortOrder::Progress => {
+                let key = |i: &Intent| {
+                    use crate::store::Readiness;
+                    let ev = self.evidence.get(&i.path).unwrap_or(&empty);
+                    let prog = crate::progress::progress(i, ev);
+                    let (rank, open, fill) = match crate::store::readiness(i) {
+                        Readiness::Raw => (0, 0, 0.0),
+                        Readiness::Open(n) => (1, n, 0.0),
+                        Readiness::Ready => (2, 0, 0.0),
+                        Readiness::Sent => match prog {
+                            Some(p) if p.complete => (4, 0, 10.0),
+                            Some(p) => (3, 0, p.fill),
+                            None => (3, 0, 0.0),
+                        },
+                    };
+                    (rank, open, fill, crate::store::stamp(i))
+                };
+                list.sort_by(|a, b| {
+                    let (ra, oa, fa, sa) = key(a);
+                    let (rb, ob, fb, sb) = key(b);
+                    ra.cmp(&rb)
+                        .then(ob.cmp(&oa)) // more open questions first
+                        .then(fa.total_cmp(&fb))
+                        .then(sb.cmp(&sa)) // then most recently changed
+                });
+            }
+        }
+        self.list = list;
+        self.list_selected = keep
+            .and_then(|p| self.list.iter().position(|i| i.path == p))
+            .unwrap_or(self.list_selected)
+            .min(self.list.len().saturating_sub(1));
+    }
+
+    /// Switch layout, carrying the selected capability across.
+    fn set_layout(&mut self, layout: Layout) {
+        match layout {
+            Layout::List => {
+                // the tree's capability, or the first one under a selected group
+                let target = match self.rows.get(self.selected) {
+                    Some(Row::Intent { intent, .. }) => Some(intent.path.clone()),
+                    Some(Row::Group { path, .. }) => self
+                        .list
+                        .iter()
+                        .filter(|i| i.path.starts_with(path))
+                        .map(|i| i.path.clone())
+                        .next(),
+                    _ => None,
+                };
+                self.layout = Layout::List;
+                if let Some(i) = target.and_then(|p| self.list.iter().position(|i| i.path == p)) {
+                    self.list_selected = i;
+                }
+            }
+            Layout::Tree => {
+                let target = self.list.get(self.list_selected).map(|i| i.path.clone());
+                self.layout = Layout::Tree;
+                if let Some(p) = target {
+                    self.reveal(&p);
+                }
+            }
+        }
+        let _ = crate::config::save_view(&self.dirs, self.layout.label(), self.sort.label());
+    }
+
+    /// Expand every group above `path` in the tree and select it.
+    fn reveal(&mut self, path: &Path) {
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(self.store.root()) {
+                break;
+            }
+            self.collapsed.remove(d);
+            dir = d.parent();
+        }
+        self.rebuild_rows();
+        self.select_path(path);
+    }
+
+    fn key_list(&mut self, k: KeyEvent) -> Flow {
+        let last = self.list.len().saturating_sub(1);
+        match k.code {
+            KeyCode::Char('q') => return Flow::Quit,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.list_selected = (self.list_selected + 1).min(last)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.list_selected = self.list_selected.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.list_selected = (self.list_selected + 10).min(last),
+            KeyCode::PageUp => self.list_selected = self.list_selected.saturating_sub(10),
+            KeyCode::Char('v') => self.set_layout(Layout::Tree),
+            KeyCode::Enter => self.set_layout(Layout::Tree),
+            KeyCode::Char('S') => {
+                self.sort = self.sort.next();
+                self.rebuild_list();
+                let _ =
+                    crate::config::save_view(&self.dirs, self.layout.label(), self.sort.label());
+            }
+            KeyCode::Char('r') => self.rescan(),
+            _ => {}
+        }
+        Flow::Continue
     }
 
     pub fn rescan(&mut self) {
         self.found_cache = None;
-        let keep = self.selected_path();
+        let keep = match self.layout {
+            Layout::Tree => self.selected_path(),
+            Layout::List => self.list.get(self.list_selected).map(|i| i.path.clone()),
+        };
         match self.store.scan() {
             Ok(t) => self.tree = t,
             Err(e) => self.message = Some(format!("rescan failed: {e:#}")),
@@ -345,6 +564,9 @@ impl App {
         self.rebuild_rows();
         if let Some(p) = keep {
             self.select_path(&p);
+            if let Some(i) = self.list.iter().position(|i| i.path == p) {
+                self.list_selected = i;
+            }
         }
         self.refresh_found();
     }
@@ -353,7 +575,12 @@ impl App {
         self.rows.get(self.selected).map(row_path)
     }
 
+    /// The capability under the cursor: the list's in the list layout, the
+    /// tree's otherwise.
     pub fn selected_intent(&self) -> Option<&Intent> {
+        if self.layout == Layout::List {
+            return self.list.get(self.list_selected);
+        }
         match self.rows.get(self.selected) {
             Some(Row::Intent { intent, .. }) => Some(intent),
             _ => None,
@@ -502,6 +729,13 @@ impl App {
 
     fn key_browse(&mut self, k: KeyEvent) -> Flow {
         self.screen = Screen::Browse;
+        if self.layout == Layout::List {
+            return self.key_list(k);
+        }
+        if k.code == KeyCode::Char('v') {
+            self.set_layout(Layout::List);
+            return Flow::Continue;
+        }
         // pane focus: Tab / Shift-Tab cycle, Esc returns to the tree
         match k.code {
             KeyCode::Tab => {
@@ -1256,6 +1490,8 @@ impl App {
             &LastUsed {
                 provider: provider.to_string(),
                 model: model.clone(),
+                layout: Some(self.layout.label().to_string()),
+                sort: Some(self.sort.label().to_string()),
             },
         );
         let conv_id = intent.fm.conversations.get(provider).cloned();
@@ -2044,6 +2280,10 @@ impl App {
                 .unwrap_or(0),
             found_count: self.found_artifacts().len(),
             reader_title: String::new(),
+            layout: self.layout.label(),
+            list_titles: self.list.iter().map(|i| i.fm.title.clone()).collect(),
+            list_selected: self.list_selected,
+            sort: self.sort.label(),
         };
         match &self.screen {
             Screen::Browse => {}
@@ -2712,6 +2952,193 @@ mod tests {
         key(&mut fx.app, KeyCode::Char('s'));
         assert_eq!(fx.app.view().screen, "browse");
         assert!(fx.app.view().message.unwrap_or_default().contains("raw"));
+    }
+
+    fn list_title(app: &App) -> String {
+        let v = app.view();
+        v.list_titles[v.list_selected].clone()
+    }
+
+    fn set_state(app: &mut App, needle: &str, state: State) {
+        let path = app
+            .store
+            .scan()
+            .unwrap()
+            .groups
+            .iter()
+            .flat_map(|g| g.intents.iter())
+            .find(|i| i.fm.title.contains(needle))
+            .unwrap()
+            .path
+            .clone();
+        Store::update_fields(&path, |fm| fm.state = state).unwrap();
+        app.rescan();
+    }
+
+    /// Press `S` until the list is sorted by `order`.
+    fn sort_by(app: &mut App, order: &str) {
+        for _ in 0..4 {
+            if app.view().sort == order {
+                return;
+            }
+            key(app, KeyCode::Char('S'));
+        }
+        panic!("no sort order {order}");
+    }
+
+    #[test]
+    fn v_toggles_the_list_and_keeps_the_selection() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(fx.app.view().layout, "list");
+        assert_eq!(list_title(&fx.app), "Beta");
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Beta");
+        key(&mut fx.app, KeyCode::Char('j'));
+        if list_title(&fx.app) == "Beta" {
+            key(&mut fx.app, KeyCode::Char('k')); // Beta was last
+        }
+        let now = list_title(&fx.app);
+        assert_ne!(now, "Beta");
+        key(&mut fx.app, KeyCode::Char('v'));
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree");
+        assert!(v.rows[v.selected].label.contains(&now), "{:?}", v.rows);
+    }
+
+    #[test]
+    fn the_list_holds_every_capability_across_groups() {
+        let mut fx = setup("agy.jsonl");
+        let sub = fx
+            .app
+            .store
+            .create_group(Path::new("skoolscout"), "deep")
+            .unwrap();
+        let rel = sub.strip_prefix(fx.app.store.root()).unwrap().to_path_buf();
+        fx.app
+            .store
+            .create(&rel, "Hidden deep", "idea", "x\n", None)
+            .unwrap();
+        fx.app.rescan();
+        assert!(
+            !fx.app
+                .view()
+                .rows
+                .iter()
+                .any(|r| r.label.contains("Hidden deep")),
+            "collapsed in the tree"
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        let v = fx.app.view();
+        assert_eq!(v.list_titles.len(), 4, "{:?}", v.list_titles);
+        assert!(v.list_titles.iter().any(|t| t == "Hidden deep"));
+        // Enter on it opens the tree with its group expanded and it selected
+        sort_by(&mut fx.app, "Title");
+        for _ in 0..10 {
+            key(&mut fx.app, KeyCode::Char('k'));
+        }
+        for _ in 0..10 {
+            if list_title(&fx.app) == "Hidden deep" {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        assert_eq!(list_title(&fx.app), "Hidden deep", "{:?}", fx.app.view());
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree");
+        assert!(
+            v.rows[v.selected].label.contains("Hidden deep"),
+            "{:?}",
+            v.rows
+        );
+    }
+
+    #[test]
+    fn s_cycles_sort_orders() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(fx.app.view().sort, "Updated", "the default");
+        sort_by(&mut fx.app, "Title");
+        assert_eq!(
+            fx.app.view().list_titles,
+            vec!["Alpha", "Beta", "In the inbox"]
+        );
+        // Progress: raw first, then ?N, then ready
+        set_state(&mut fx.app, "In the inbox", State::Refining); // ?2
+        set_state(&mut fx.app, "Beta", State::Refining); // no questions: ready
+        sort_by(&mut fx.app, "Progress");
+        assert_eq!(
+            fx.app.view().list_titles,
+            vec!["Alpha", "In the inbox", "Beta"]
+        );
+        // Captured: newest created first
+        let scan = fx.app.store.scan().unwrap();
+        for (i, it) in scan
+            .groups
+            .iter()
+            .flat_map(|g| g.intents.iter())
+            .enumerate()
+        {
+            let when = chrono::Local::now() - chrono::Duration::days(10 - i as i64);
+            let title = it.fm.title.clone();
+            Store::update_fields(&it.path, |fm| {
+                fm.created = when;
+                fm.title = title;
+            })
+            .unwrap();
+        }
+        fx.app.rescan();
+        sort_by(&mut fx.app, "Captured");
+        let titles = fx.app.view().list_titles;
+        let created: Vec<_> = titles
+            .iter()
+            .map(|t| {
+                fx.app
+                    .store
+                    .scan()
+                    .unwrap()
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.intents.iter())
+                    .find(|i| &i.fm.title == t)
+                    .unwrap()
+                    .fm
+                    .created
+            })
+            .collect();
+        assert!(created.windows(2).all(|w| w[0] >= w[1]), "{titles:?}");
+    }
+
+    #[test]
+    fn the_layout_and_sort_are_remembered() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Progress");
+        let again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        let v = again.view();
+        assert_eq!(v.layout, "list");
+        assert_eq!(v.sort, "Progress");
+    }
+
+    #[test]
+    fn save_view_keeps_the_provider() {
+        let fx = setup("agy.jsonl");
+        crate::config::save_last_used(
+            &fx.app.dirs,
+            &LastUsed {
+                provider: "claude".into(),
+                model: Some("opus".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::config::save_view(&fx.app.dirs, "list", "Title").unwrap();
+        let last = crate::config::last_used(&fx.app.dirs, &fx.app.cfg);
+        assert_eq!(last.provider, "claude");
+        assert_eq!(last.model.as_deref(), Some("opus"));
+        assert_eq!(last.layout.as_deref(), Some("list"));
+        assert_eq!(last.sort.as_deref(), Some("Title"));
     }
 
     /// Give the selected intent a repo so `send` has somewhere to go.

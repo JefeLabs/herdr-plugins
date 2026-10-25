@@ -151,11 +151,17 @@ fn default_model_flag() -> String {
 }
 
 /// The provider and model used last time; preselected in the picker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastUsed {
     pub provider: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// `tree` or `list`: the layout the browser opens in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// The list's sort order (`Updated`, `Progress`, `Captured`, `Title`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
 }
 
 fn last_used_path(dirs: &Dirs) -> PathBuf {
@@ -164,14 +170,31 @@ fn last_used_path(dirs: &Dirs) -> PathBuf {
 
 /// Last choice if recorded, else the config's polish provider with no model.
 pub fn last_used(dirs: &Dirs, cfg: &Config) -> LastUsed {
-    std::fs::read_to_string(last_used_path(dirs))
+    let saved = std::fs::read_to_string(last_used_path(dirs))
         .ok()
         .and_then(|t| toml::from_str::<LastUsed>(&t).ok())
-        .filter(|l| cfg.providers.contains_key(&l.provider))
-        .unwrap_or(LastUsed {
-            provider: cfg.polish_provider.clone(),
-            model: None,
-        })
+        .unwrap_or_default();
+    if cfg.providers.contains_key(&saved.provider) {
+        return saved;
+    }
+    // an unknown (or never chosen) provider falls back, the view settings stay
+    LastUsed {
+        provider: cfg.polish_provider.clone(),
+        model: None,
+        ..saved
+    }
+}
+
+/// Record the browser's layout and sort order without touching the provider
+/// and model stored beside them.
+pub fn save_view(dirs: &Dirs, layout: &str, sort: &str) -> anyhow::Result<()> {
+    let mut last = std::fs::read_to_string(last_used_path(dirs))
+        .ok()
+        .and_then(|t| toml::from_str::<LastUsed>(&t).ok())
+        .unwrap_or_default();
+    last.layout = Some(layout.to_string());
+    last.sort = Some(sort.to_string());
+    save_last_used(dirs, &last)
 }
 
 pub fn save_last_used(dirs: &Dirs, last: &LastUsed) -> anyhow::Result<()> {
@@ -888,7 +911,8 @@ mod tests {
             first,
             LastUsed {
                 provider: "agy".into(),
-                model: None
+                model: None,
+                ..Default::default()
             },
             "no file yet: the config's polish provider"
         );
@@ -897,6 +921,7 @@ mod tests {
             &LastUsed {
                 provider: "agy".into(),
                 model: Some("gemini-4-argon-high".into()),
+                ..Default::default()
             },
         )
         .unwrap();
