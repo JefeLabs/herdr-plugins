@@ -21,7 +21,9 @@ const USAGE: &str = "usage: herdr-intents [add [--popup] [title] | --version]";
 pub fn parse_mode(args: &[String]) -> Mode {
     match args.first().map(String::as_str) {
         None => Mode::Tui,
-        Some("--version") | Some("-V") => Mode::Usage(format!("herdr-intents {}", env!("CARGO_PKG_VERSION"))),
+        Some("--version") | Some("-V") => {
+            Mode::Usage(format!("herdr-intents {}", env!("CARGO_PKG_VERSION")))
+        }
         Some("add") => {
             let mut popup = false;
             let mut title = Vec::new();
@@ -32,7 +34,14 @@ pub fn parse_mode(args: &[String]) -> Mode {
                     title.push(a.as_str());
                 }
             }
-            Mode::Add { title: if title.is_empty() { None } else { Some(title.join(" ")) }, popup }
+            Mode::Add {
+                title: if title.is_empty() {
+                    None
+                } else {
+                    Some(title.join(" "))
+                },
+                popup,
+            }
         }
         Some(_) => Mode::Usage(USAGE.to_string()),
     }
@@ -46,10 +55,16 @@ pub struct Dirs {
 
 /// Config dir: `INTENTS_CONFIG_DIR`, else this plugin's `HERDR_PLUGIN_CONFIG_DIR`,
 /// else `~/.config/herdr/plugins/config/jefelabs.intents`. Root from config or `~/intents`.
-pub fn resolve_dirs(get: impl Fn(&str) -> Option<String>, home: &Path, cfg_root: Option<&str>) -> Dirs {
+pub fn resolve_dirs(
+    get: impl Fn(&str) -> Option<String>,
+    home: &Path,
+    cfg_root: Option<&str>,
+) -> Dirs {
     let config = if let Some(c) = get("INTENTS_CONFIG_DIR") {
         PathBuf::from(c)
-    } else if get("HERDR_PLUGIN_ID").as_deref() == Some(PLUGIN_ID) && get("HERDR_PLUGIN_CONFIG_DIR").is_some() {
+    } else if get("HERDR_PLUGIN_ID").as_deref() == Some(PLUGIN_ID)
+        && get("HERDR_PLUGIN_CONFIG_DIR").is_some()
+    {
         PathBuf::from(get("HERDR_PLUGIN_CONFIG_DIR").unwrap())
     } else {
         home.join(".config/herdr/plugins/config").join(PLUGIN_ID)
@@ -69,22 +84,41 @@ fn expand_home(p: &str, home: &Path) -> String {
     }
 }
 
+/// `(JSON pointer, expected string value)` guard on an event.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct When {
+    pub path: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "output")]
 pub enum Output {
-    /// JSON lines: `text_path` is read from events whose `type` is in `text_types`;
-    /// `id_path` from any event; the turn is done when `type == done_type` (and on EOF).
+    /// JSON lines. The event's kind is the string at `type_key` (default `type`).
+    /// Text deltas are read from `text_path` on events whose kind is in
+    /// `text_types` and that satisfy `text_when` (if set). A conversation id is
+    /// read from the first `id_paths` entry that exists on any event. The turn is
+    /// done when the kind equals `done_type` (and always on EOF). Events that
+    /// repeat the whole reply (a final `result`) must not be in `text_types`.
     Jsonl {
+        #[serde(default = "default_type_key")]
+        type_key: String,
         text_path: String,
         #[serde(default)]
         text_types: Vec<String>,
         #[serde(default)]
-        id_path: Option<String>,
+        text_when: Option<When>,
+        #[serde(default)]
+        id_paths: Vec<String>,
         #[serde(default)]
         done_type: Option<String>,
     },
     /// Plain text: the whole stdout is the reply.
     Text,
+}
+
+fn default_type_key() -> String {
+    "type".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -146,11 +180,23 @@ struct RawConfig {
 const DEFAULT_FILES: &[(&str, &str)] = &[
     ("intents.toml", include_str!("../defaults/intents.toml")),
     ("templates/issue.md", include_str!("../defaults/issue.md")),
-    ("templates/issue.polish.md", include_str!("../defaults/issue.polish.md")),
-    ("templates/enhancement.md", include_str!("../defaults/enhancement.md")),
-    ("templates/enhancement.polish.md", include_str!("../defaults/enhancement.polish.md")),
+    (
+        "templates/issue.polish.md",
+        include_str!("../defaults/issue.polish.md"),
+    ),
+    (
+        "templates/enhancement.md",
+        include_str!("../defaults/enhancement.md"),
+    ),
+    (
+        "templates/enhancement.polish.md",
+        include_str!("../defaults/enhancement.polish.md"),
+    ),
     ("templates/idea.md", include_str!("../defaults/idea.md")),
-    ("templates/idea.polish.md", include_str!("../defaults/idea.polish.md")),
+    (
+        "templates/idea.polish.md",
+        include_str!("../defaults/idea.polish.md"),
+    ),
 ];
 
 /// Write the default files that are missing (never overwrite), then load.
@@ -165,10 +211,13 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
         }
     }
     let path = dirs.config.join("intents.toml");
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let raw: RawConfig = toml::from_str(&text).with_context(|| path.display().to_string())?;
 
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"));
     let root = match &raw.root {
         Some(r) if r != "~/intents" => PathBuf::from(expand_home(r, &home)),
         _ => dirs.root.clone(),
@@ -206,7 +255,11 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
 
 /// Body skeleton (`polish == false`) or polish prompt template for a kind.
 pub fn template(dirs: &Dirs, kind: &str, polish: bool) -> anyhow::Result<String> {
-    let file = if polish { format!("{kind}.polish.md") } else { format!("{kind}.md") };
+    let file = if polish {
+        format!("{kind}.polish.md")
+    } else {
+        format!("{kind}.md")
+    };
     let path = dirs.config.join("templates").join(&file);
     std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
@@ -215,48 +268,145 @@ fn argv(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-fn jsonl(text_path: &str, text_types: &[&str], id_path: Option<&str>, done_type: Option<&str>) -> Output {
+fn jsonl(
+    type_key: &str,
+    text_path: &str,
+    text_types: &[&str],
+    text_when: Option<(&str, &str)>,
+    id_paths: &[&str],
+    done_type: &str,
+) -> Output {
     Output::Jsonl {
+        type_key: type_key.to_string(),
         text_path: text_path.to_string(),
-        text_types: text_types.iter().map(|s| s.to_string()).collect(),
-        id_path: id_path.map(str::to_string),
-        done_type: done_type.map(str::to_string),
+        text_types: argv(text_types),
+        text_when: text_when.map(|(p, v)| When {
+            path: p.to_string(),
+            value: v.to_string(),
+        }),
+        id_paths: argv(id_paths),
+        done_type: Some(done_type.to_string()),
     }
 }
 
-/// The four CLIs present on the owner's machine (2026-10-24). Event paths are
-/// the builder's best reading of each stream and are corrected against a real
-/// capture in the provider tests.
+/// The four CLIs present on the owner's machine (2026-10-24). agy and claude
+/// event shapes come from real captures; codex and copilot follow their
+/// documented shapes and are unverified (codex account 402, copilot denied by
+/// policy on the capture machine).
 pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
     let mut m = BTreeMap::new();
-    m.insert("agy".to_string(), ProviderSpec {
-        name: "agy".into(),
-        polish: argv(&["agy", "-p={prompt}", "--output-format", "stream-json", "--print-timeout", "90s", "--disable-slash-commands"]),
-        resume: argv(&["agy", "--conversation", "{conv}", "-p={prompt}", "--output-format", "stream-json", "--print-timeout", "90s", "--disable-slash-commands"]),
-        output: jsonl("/content", &["text"], Some("/conversation_id"), Some("result")),
-        send_kind: "agy".into(),
-    });
-    m.insert("claude".to_string(), ProviderSpec {
-        name: "claude".into(),
-        polish: argv(&["claude", "-p", "{prompt}", "--output-format", "stream-json", "--include-partial-messages", "--session-id", "{conv}"]),
-        resume: argv(&["claude", "--resume", "{conv}", "-p", "{prompt}", "--output-format", "stream-json", "--include-partial-messages"]),
-        output: jsonl("/event/delta/text", &["stream_event"], Some("/session_id"), Some("result")),
-        send_kind: "claude".into(),
-    });
-    m.insert("codex".to_string(), ProviderSpec {
-        name: "codex".into(),
-        polish: argv(&["codex", "exec", "--json", "{prompt}"]),
-        resume: argv(&["codex", "exec", "resume", "{conv}", "{prompt}", "--json"]),
-        output: jsonl("/item/text", &["item.completed"], Some("/thread_id"), Some("turn.completed")),
-        send_kind: "codex".into(),
-    });
-    m.insert("copilot".to_string(), ProviderSpec {
-        name: "copilot".into(),
-        polish: argv(&["copilot", "-p", "{prompt}", "--output-format", "json"]),
-        resume: argv(&["copilot", "--session-id", "{conv}", "-p", "{prompt}", "--output-format", "json"]),
-        output: jsonl("/content", &["assistant.message", "message"], Some("/session_id"), Some("result")),
-        send_kind: "copilot".into(),
-    });
+    m.insert(
+        "agy".to_string(),
+        ProviderSpec {
+            name: "agy".into(),
+            polish: argv(&[
+                "agy",
+                "-p={prompt}",
+                "--output-format",
+                "stream-json",
+                "--print-timeout",
+                "90s",
+                "--disable-slash-commands",
+            ]),
+            resume: argv(&[
+                "agy",
+                "--conversation",
+                "{conv}",
+                "-p={prompt}",
+                "--output-format",
+                "stream-json",
+                "--print-timeout",
+                "90s",
+                "--disable-slash-commands",
+            ]),
+            output: jsonl(
+                "event",
+                "/step_update/text_delta",
+                &["step_update"],
+                Some(("/step_update/step_type", "agent_response")),
+                &["/conversation_id", "/step_update/conversation_id"],
+                "result",
+            ),
+            send_kind: "agy".into(),
+        },
+    );
+    m.insert(
+        "claude".to_string(),
+        ProviderSpec {
+            name: "claude".into(),
+            polish: argv(&[
+                "claude",
+                "-p",
+                "{prompt}",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+                "--session-id",
+                "{conv}",
+            ]),
+            resume: argv(&[
+                "claude",
+                "--resume",
+                "{conv}",
+                "-p",
+                "{prompt}",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+            ]),
+            output: jsonl(
+                "type",
+                "/event/delta/text",
+                &["stream_event"],
+                Some(("/event/type", "content_block_delta")),
+                &["/session_id"],
+                "result",
+            ),
+            send_kind: "claude".into(),
+        },
+    );
+    m.insert(
+        "codex".to_string(),
+        ProviderSpec {
+            name: "codex".into(),
+            polish: argv(&["codex", "exec", "--json", "{prompt}"]),
+            resume: argv(&["codex", "exec", "resume", "{conv}", "{prompt}", "--json"]),
+            output: jsonl(
+                "type",
+                "/item/text",
+                &["item.completed"],
+                Some(("/item/type", "agent_message")),
+                &["/thread_id"],
+                "turn.completed",
+            ),
+            send_kind: "codex".into(),
+        },
+    );
+    m.insert(
+        "copilot".to_string(),
+        ProviderSpec {
+            name: "copilot".into(),
+            polish: argv(&["copilot", "-p", "{prompt}", "--output-format", "json"]),
+            resume: argv(&[
+                "copilot",
+                "--session-id",
+                "{conv}",
+                "-p",
+                "{prompt}",
+                "--output-format",
+                "json",
+            ]),
+            output: jsonl(
+                "type",
+                "/data/deltaContent",
+                &["assistant.message_delta"],
+                None,
+                &["/data/sessionId"],
+                "session.idle",
+            ),
+            send_kind: "copilot".into(),
+        },
+    );
     m
 }
 
@@ -268,8 +418,16 @@ pub fn builtin_handoffs() -> Vec<Handoff> {
         prompt: prompt.into(),
     };
     vec![
-        h("issue-report", &["issue"], "Use the issue-report skill on this finding. Do not file anything until you have confirmed the root cause with me.\n\n{intent}\n\nAttachments:\n{attachments}"),
-        h("enhancement-spec", &["enhancement"], "Use the enhancement-spec skill to write this up as a GitHub issue. Show me the draft before posting.\n\n{intent}"),
+        h(
+            "issue-report",
+            &["issue"],
+            "Use the issue-report skill on this finding. Do not file anything until you have confirmed the root cause with me.\n\n{intent}\n\nAttachments:\n{attachments}",
+        ),
+        h(
+            "enhancement-spec",
+            &["enhancement"],
+            "Use the enhancement-spec skill to write this up as a GitHub issue. Show me the draft before posting.\n\n{intent}",
+        ),
         h("grill", &["*"], "/grill-me\n\n{intent}"),
         h("wayfinder", &["*"], "/wayfinder\n\nDestination:\n{intent}"),
     ]
@@ -281,19 +439,34 @@ mod tests {
     use std::fs;
 
     fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
     #[test]
     fn parse_mode_variants() {
         assert_eq!(parse_mode(&[]), Mode::Tui);
-        assert_eq!(parse_mode(&["add".into()]), Mode::Add { title: None, popup: false });
+        assert_eq!(
+            parse_mode(&["add".into()]),
+            Mode::Add {
+                title: None,
+                popup: false
+            }
+        );
         assert_eq!(
             parse_mode(&["add".into(), "--popup".into(), "Fix x".into()]),
-            Mode::Add { title: Some("Fix x".into()), popup: true }
+            Mode::Add {
+                title: Some("Fix x".into()),
+                popup: true
+            }
         );
         assert!(matches!(parse_mode(&["bogus".into()]), Mode::Usage(_)));
-        assert!(matches!(parse_mode(&["--version".into()]), Mode::Usage(t) if t.starts_with("herdr-intents ")));
+        assert!(
+            matches!(parse_mode(&["--version".into()]), Mode::Usage(t) if t.starts_with("herdr-intents "))
+        );
     }
 
     #[test]
@@ -303,11 +476,29 @@ mod tests {
         assert_eq!(d.config, Path::new("/c/env"));
         assert_eq!(d.root, Path::new("/home/u/intents"));
 
-        let d = resolve_dirs(lookup(&[("HERDR_PLUGIN_ID", "jefelabs.intents"), ("HERDR_PLUGIN_CONFIG_DIR", "/c/plugin")]), home, None);
+        let d = resolve_dirs(
+            lookup(&[
+                ("HERDR_PLUGIN_ID", "jefelabs.intents"),
+                ("HERDR_PLUGIN_CONFIG_DIR", "/c/plugin"),
+            ]),
+            home,
+            None,
+        );
         assert_eq!(d.config, Path::new("/c/plugin"));
 
-        let d = resolve_dirs(lookup(&[("HERDR_PLUGIN_ID", "jefelabs.toolbar"), ("HERDR_PLUGIN_CONFIG_DIR", "/c/toolbar")]), home, None);
-        assert_eq!(d.config, Path::new("/home/u/.config/herdr/plugins/config/jefelabs.intents"), "another plugin's dir is not ours");
+        let d = resolve_dirs(
+            lookup(&[
+                ("HERDR_PLUGIN_ID", "jefelabs.toolbar"),
+                ("HERDR_PLUGIN_CONFIG_DIR", "/c/toolbar"),
+            ]),
+            home,
+            None,
+        );
+        assert_eq!(
+            d.config,
+            Path::new("/home/u/.config/herdr/plugins/config/jefelabs.intents"),
+            "another plugin's dir is not ours"
+        );
 
         let d = resolve_dirs(lookup(&[]), home, Some("~/notes/intents"));
         assert_eq!(d.root, Path::new("/home/u/notes/intents"));
@@ -316,41 +507,90 @@ mod tests {
     #[test]
     fn first_run_writes_defaults_and_never_overwrites() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = Dirs { config: tmp.path().join("cfg"), root: tmp.path().join("root") };
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
         let cfg = load_or_init(&dirs).unwrap();
         assert!(dirs.config.join("intents.toml").is_file());
         for k in ["issue", "enhancement", "idea"] {
-            assert!(dirs.config.join("templates").join(format!("{k}.md")).is_file(), "{k}.md");
-            assert!(dirs.config.join("templates").join(format!("{k}.polish.md")).is_file(), "{k}.polish.md");
+            assert!(
+                dirs.config
+                    .join("templates")
+                    .join(format!("{k}.md"))
+                    .is_file(),
+                "{k}.md"
+            );
+            assert!(
+                dirs.config
+                    .join("templates")
+                    .join(format!("{k}.polish.md"))
+                    .is_file(),
+                "{k}.polish.md"
+            );
         }
         assert_eq!(cfg.root, dirs.root);
         fs::write(dirs.config.join("templates/issue.md"), "## Mine\n").unwrap();
         load_or_init(&dirs).unwrap();
         assert_eq!(template(&dirs, "issue", false).unwrap(), "## Mine\n");
-        assert!(template(&dirs, "issue", true).unwrap().contains("```proposal"));
+        assert!(
+            template(&dirs, "issue", true)
+                .unwrap()
+                .contains("```proposal")
+        );
     }
 
     #[test]
     fn builtin_providers_and_handoffs_present() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = Dirs { config: tmp.path().join("cfg"), root: tmp.path().join("root") };
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
         let cfg = load_or_init(&dirs).unwrap();
         assert_eq!(cfg.polish_provider, "agy");
         for p in ["agy", "claude", "codex", "copilot"] {
             assert!(cfg.providers.contains_key(p), "provider {p}");
         }
         let agy = &cfg.providers["agy"];
-        assert_eq!(agy.polish, ["agy", "-p={prompt}", "--output-format", "stream-json", "--print-timeout", "90s", "--disable-slash-commands"]);
+        assert_eq!(
+            agy.polish,
+            [
+                "agy",
+                "-p={prompt}",
+                "--output-format",
+                "stream-json",
+                "--print-timeout",
+                "90s",
+                "--disable-slash-commands"
+            ]
+        );
         assert!(agy.resume.iter().any(|a| a == "--conversation"));
         let claude = &cfg.providers["claude"];
-        assert!(claude.polish.contains(&"--session-id".to_string()) && claude.polish.contains(&"{conv}".to_string()));
-        assert_eq!(cfg.providers["codex"].polish[..3], ["codex", "exec", "--json"]);
+        assert!(
+            claude.polish.contains(&"--session-id".to_string())
+                && claude.polish.contains(&"{conv}".to_string())
+        );
+        assert_eq!(
+            cfg.providers["codex"].polish[..3],
+            ["codex", "exec", "--json"]
+        );
         assert_eq!(cfg.providers["copilot"].polish[..2], ["copilot", "-p"]);
         for p in cfg.providers.values() {
-            assert!(!p.polish.iter().chain(p.resume.iter()).any(|a| a.contains("allow-all") || a.contains("dangerously")), "{} grants tools", p.name);
+            assert!(
+                !p.polish
+                    .iter()
+                    .chain(p.resume.iter())
+                    .any(|a| a.contains("allow-all") || a.contains("dangerously")),
+                "{} grants tools",
+                p.name
+            );
         }
         let names: Vec<&str> = cfg.handoffs.iter().map(|h| h.name.as_str()).collect();
-        assert_eq!(names, ["issue-report", "enhancement-spec", "grill", "wayfinder"]);
+        assert_eq!(
+            names,
+            ["issue-report", "enhancement-spec", "grill", "wayfinder"]
+        );
         assert!(cfg.handoffs.iter().all(|h| h.provider == "claude"));
         assert_eq!(cfg.handoffs[0].kinds, ["issue"]);
         assert_eq!(cfg.handoffs[2].kinds, ["*"]);
@@ -359,7 +599,10 @@ mod tests {
     #[test]
     fn custom_provider_from_toml_merges() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = Dirs { config: tmp.path().join("cfg"), root: tmp.path().join("root") };
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
         load_or_init(&dirs).unwrap();
         fs::write(
             dirs.config.join("intents.toml"),
@@ -368,7 +611,10 @@ mod tests {
         .unwrap();
         let cfg = load_or_init(&dirs).unwrap();
         assert_eq!(cfg.polish_provider, "mine");
-        assert_eq!(cfg.providers["mine"].polish, ["my-cli", "--prompt", "{prompt}"]);
+        assert_eq!(
+            cfg.providers["mine"].polish,
+            ["my-cli", "--prompt", "{prompt}"]
+        );
         assert!(matches!(cfg.providers["mine"].output, Output::Text));
         assert!(cfg.providers.contains_key("agy"), "built-ins still present");
     }

@@ -18,13 +18,34 @@ fn open_creates_root_and_inbox() {
 #[test]
 fn create_writes_front_matter_and_body() {
     let (tmp, s) = store();
-    let it = s.create(Path::new("Inbox"), "Pending label on skipped folder", "issue", "## Observed\n\nx\n", None).unwrap();
+    let it = s
+        .create(
+            Path::new("Inbox"),
+            "Pending label on skipped folder",
+            "issue",
+            "## Observed\n\nx\n",
+            None,
+        )
+        .unwrap();
     let name = it.path.file_name().unwrap().to_string_lossy().to_string();
-    assert!(name.ends_with("-pending-label-on-skipped-folder.md"), "{name}");
+    assert!(
+        name.ends_with("-pending-label-on-skipped-folder.md"),
+        "{name}"
+    );
     assert_eq!(&name[4..5], "-", "date prefix YYYY-MM-DD-: {name}");
     let text = fs::read_to_string(&it.path).unwrap();
     assert!(text.starts_with("---\n"));
-    for key in ["title:", "kind: issue", "state: raw", "created:", "updated:", "tags: []", "polished_at: null", "sent_to: null", "conversations: {}"] {
+    for key in [
+        "title:",
+        "kind: issue",
+        "state: raw",
+        "created:",
+        "updated:",
+        "tags: []",
+        "polished_at: null",
+        "sent_to: null",
+        "conversations: {}",
+    ] {
         assert!(text.contains(key), "missing {key} in:\n{text}");
     }
     assert!(text.ends_with("## Observed\n\nx\n"));
@@ -36,7 +57,11 @@ fn create_writes_front_matter_and_body() {
 fn round_trip_preserves_unknown_fields_and_defaults_missing() {
     let (tmp, _s) = store();
     let p = tmp.path().join("root/Inbox/hand.md");
-    fs::write(&p, "---\ntitle: Hand written\nkind: idea\ncustom: 1\ntags: a\n---\nbody\n").unwrap();
+    fs::write(
+        &p,
+        "---\ntitle: Hand written\nkind: idea\ncustom: 1\ntags: a\n---\nbody\n",
+    )
+    .unwrap();
     let mut it = Store::load(&p).unwrap();
     assert_eq!(it.fm.state, State::Raw, "missing state defaults to raw");
     assert_eq!(it.fm.tags, ["a"], "scalar tags become a one-item list");
@@ -52,10 +77,26 @@ fn round_trip_preserves_unknown_fields_and_defaults_missing() {
 fn scan_builds_tree_sorted() {
     let (_tmp, s) = store();
     s.create_group(Path::new(""), "skoolscout").unwrap();
-    s.create_group(Path::new("skoolscout"), "applications").unwrap();
-    s.create(Path::new("skoolscout/applications"), "Zed thing", "idea", "", None).unwrap();
-    s.create(Path::new("skoolscout/applications"), "Alpha thing", "idea", "", None).unwrap();
-    s.create(Path::new("Inbox"), "In the inbox", "issue", "", None).unwrap();
+    s.create_group(Path::new("skoolscout"), "applications")
+        .unwrap();
+    s.create(
+        Path::new("skoolscout/applications"),
+        "Zed thing",
+        "idea",
+        "",
+        None,
+    )
+    .unwrap();
+    s.create(
+        Path::new("skoolscout/applications"),
+        "Alpha thing",
+        "idea",
+        "",
+        None,
+    )
+    .unwrap();
+    s.create(Path::new("Inbox"), "In the inbox", "issue", "", None)
+        .unwrap();
     let tree = s.scan().unwrap();
     let names: Vec<&str> = tree.groups.iter().map(|g| g.name.as_str()).collect();
     assert_eq!(names, ["Inbox", "skoolscout"]);
@@ -70,23 +111,42 @@ fn scan_builds_tree_sorted() {
 fn move_intent_takes_assets_and_transcript_along() {
     let (tmp, s) = store();
     s.create_group(Path::new(""), "later").unwrap();
-    let it = s.create(Path::new("Inbox"), "Movable", "idea", "", None).unwrap();
+    let it = s
+        .create(Path::new("Inbox"), "Movable", "idea", "", None)
+        .unwrap();
     let shot = tmp.path().join("shot.png");
     fs::write(&shot, b"png").unwrap();
     Store::attach(&it, &shot).unwrap();
     Store::append_transcript(&it, "user", "hello").unwrap();
     let moved = s.move_intent(&it, Path::new("later")).unwrap();
     assert!(moved.path.starts_with(tmp.path().join("root/later")));
-    let stem = moved.path.file_stem().unwrap().to_string_lossy().to_string();
-    assert!(tmp.path().join("root/later").join(format!("{stem}.assets/shot.png")).is_file());
-    assert!(tmp.path().join("root/later").join(format!("{stem}.chat.md")).is_file());
+    let stem = moved
+        .path
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        tmp.path()
+            .join("root/later")
+            .join(format!("{stem}.assets/shot.png"))
+            .is_file()
+    );
+    assert!(
+        tmp.path()
+            .join("root/later")
+            .join(format!("{stem}.chat.md"))
+            .is_file()
+    );
     assert!(!it.path.exists());
 }
 
 #[test]
 fn save_detects_concurrent_change() {
     let (_tmp, s) = store();
-    let it = s.create(Path::new("Inbox"), "Shared", "idea", "a\n", None).unwrap();
+    let it = s
+        .create(Path::new("Inbox"), "Shared", "idea", "a\n", None)
+        .unwrap();
     let mut first = Store::load(&it.path).unwrap();
     let mut second = Store::load(&it.path).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -101,18 +161,28 @@ fn save_detects_concurrent_change() {
 #[test]
 fn attach_copies_file_and_lists_size() {
     let (tmp, s) = store();
-    let it = s.create(Path::new("Inbox"), "With shot", "issue", "", None).unwrap();
+    let it = s
+        .create(Path::new("Inbox"), "With shot", "issue", "", None)
+        .unwrap();
     let shot = tmp.path().join("screen.png");
     fs::write(&shot, vec![0u8; 1234]).unwrap();
     let dest = Store::attach(&it, &shot).unwrap();
-    assert!(dest.ends_with("with-shot.assets/screen.png") || dest.to_string_lossy().contains(".assets/screen.png"));
-    assert_eq!(Store::attachments(&it), vec![("screen.png".to_string(), 1234u64)]);
+    assert!(
+        dest.ends_with("with-shot.assets/screen.png")
+            || dest.to_string_lossy().contains(".assets/screen.png")
+    );
+    assert_eq!(
+        Store::attachments(&it),
+        vec![("screen.png".to_string(), 1234u64)]
+    );
 }
 
 #[test]
 fn transcript_appends_role_blocks() {
     let (_tmp, s) = store();
-    let it = s.create(Path::new("Inbox"), "Chatty", "idea", "", None).unwrap();
+    let it = s
+        .create(Path::new("Inbox"), "Chatty", "idea", "", None)
+        .unwrap();
     Store::append_transcript(&it, "user", "make it crisper").unwrap();
     Store::append_transcript(&it, "agent", "Here you go").unwrap();
     let text = fs::read_to_string(it.path.with_extension("chat.md")).unwrap();
@@ -130,6 +200,9 @@ fn open_questions_counts_only_that_section() {
 
 #[test]
 fn slugify_is_short_and_safe() {
-    assert_eq!(slugify("Pending label on skipped folder!"), "pending-label-on-skipped-folder");
+    assert_eq!(
+        slugify("Pending label on skipped folder!"),
+        "pending-label-on-skipped-folder"
+    );
     assert!(slugify(&"x".repeat(200)).len() <= 60);
 }

@@ -1,0 +1,5 @@
+{"event": "init", "conversation_id": "dde502fd-bcf1-4bfb-a275-4e6de5ad9a7d", "init": {"cwd": "/x", "tools": ["ask_question"]}}
+{"event": "step_update", "step_update": {"conversation_id": "dde502fd-bcf1-4bfb-a275-4e6de5ad9a7d", "step_index": 0, "state": "DONE", "step_type": "user_input"}}
+{"event": "step_update", "step_update": {"conversation_id": "dde502fd-bcf1-4bfb-a275-4e6de5ad9a7d", "step_index": 1, "state": "ACTIVE", "step_type": "agent_response", "text_delta": "Here is a tighter version.\n\n``"}}
+{"event": "step_update", "step_update": {"conversation_id": "dde502fd-bcf1-4bfb-a275-4e6de5ad9a7d", "step_index": 1, "state": "DONE", "step_type": "agent_response", "text_delta": "`proposal\n## Observed\nParents who skip the report card folder see Pending.\n```\nquestions:\n- Which org?\n- Since when?\n", "duration_seconds": 12.0}}
+{"event": "result", "result": {"conversation_id": "dde502fd-bcf1-4bfb-a275-4e6de5ad9a7d", "status": "SUCCESS", "response": "Here is a tighter version.\n\n```proposal\n## Observed\nParents who skip the report card folder see Pending.\n```\nquestions:\n- Which org?\n- Since when?\n", "num_turns": 1}}

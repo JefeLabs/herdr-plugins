@@ -14,7 +14,11 @@ fn main() -> ExitCode {
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-intents ");
             println!("{text}");
-            return if is_version { ExitCode::SUCCESS } else { ExitCode::from(2) };
+            return if is_version {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            };
         }
     };
     match result {

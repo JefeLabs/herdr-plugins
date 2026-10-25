@@ -102,7 +102,10 @@ pub struct Intent {
 
 impl Intent {
     pub fn stem(&self) -> String {
-        self.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+        self.path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
     pub fn assets_dir(&self) -> PathBuf {
         self.path.with_file_name(format!("{}.assets", self.stem()))
@@ -146,8 +149,11 @@ pub struct Store {
 impl Store {
     /// Open (creating) the root and its `Inbox`.
     pub fn open(root: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(root.join(INBOX)).with_context(|| format!("creating {}", root.display()))?;
-        Ok(Self { root: root.to_path_buf() })
+        std::fs::create_dir_all(root.join(INBOX))
+            .with_context(|| format!("creating {}", root.display()))?;
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -155,7 +161,11 @@ impl Store {
     }
 
     fn abs(&self, group: &Path) -> PathBuf {
-        if group.as_os_str().is_empty() { self.root.clone() } else { self.root.join(group) }
+        if group.as_os_str().is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(group)
+        }
     }
 
     pub fn scan(&self) -> anyhow::Result<Group> {
@@ -184,12 +194,24 @@ impl Store {
                 }
             }
         }
-        groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        intents.sort_by(|a, b| a.fm.title.to_lowercase().cmp(&b.fm.title.to_lowercase()));
-        Ok(Group { path: dir.to_path_buf(), name, groups, intents })
+        groups.sort_by_key(|g| g.name.to_lowercase());
+        intents.sort_by_key(|i| i.fm.title.to_lowercase());
+        Ok(Group {
+            path: dir.to_path_buf(),
+            name,
+            groups,
+            intents,
+        })
     }
 
-    pub fn create(&self, group: &Path, title: &str, kind: &str, body: &str, repo: Option<PathBuf>) -> anyhow::Result<Intent> {
+    pub fn create(
+        &self,
+        group: &Path,
+        title: &str,
+        kind: &str,
+        body: &str,
+        repo: Option<PathBuf>,
+    ) -> anyhow::Result<Intent> {
         let dir = self.abs(group);
         std::fs::create_dir_all(&dir)?;
         let date = Local::now().format("%Y-%m-%d");
@@ -215,17 +237,30 @@ impl Store {
             conversations: BTreeMap::new(),
             extra: BTreeMap::new(),
         };
-        let mut it = Intent { path, fm, body: body.to_string(), loaded_updated: ts };
+        let mut it = Intent {
+            path,
+            fm,
+            body: body.to_string(),
+            loaded_updated: ts,
+        };
         write_intent(&it)?;
         it.loaded_updated = it.fm.updated;
         Ok(it)
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Intent> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let (fm_text, body) = split_front_matter(&text).with_context(|| format!("{}: no front matter", path.display()))?;
-        let fm: FrontMatter = serde_yaml_ng::from_str(fm_text).with_context(|| format!("{}: front matter", path.display()))?;
-        Ok(Intent { path: path.to_path_buf(), loaded_updated: fm.updated, fm, body: body.to_string() })
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let (fm_text, body) = split_front_matter(&text)
+            .with_context(|| format!("{}: no front matter", path.display()))?;
+        let fm: FrontMatter = serde_yaml_ng::from_str(fm_text)
+            .with_context(|| format!("{}: front matter", path.display()))?;
+        Ok(Intent {
+            path: path.to_path_buf(),
+            loaded_updated: fm.updated,
+            fm,
+            body: body.to_string(),
+        })
     }
 
     /// Save, refusing if the file changed on disk since it was loaded.
@@ -309,8 +344,16 @@ impl Store {
 
     pub fn append_transcript(intent: &Intent, role: &str, text: &str) -> anyhow::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(intent.transcript_path())?;
-        writeln!(f, "### {role} {}\n\n{}\n", Local::now().format("%Y-%m-%d %H:%M"), text.trim_end())?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(intent.transcript_path())?;
+        writeln!(
+            f,
+            "### {role} {}\n\n{}\n",
+            Local::now().format("%Y-%m-%d %H:%M"),
+            text.trim_end()
+        )?;
         Ok(())
     }
 }
@@ -319,14 +362,21 @@ fn write_intent(intent: &Intent) -> anyhow::Result<()> {
     let yaml = serde_yaml_ng::to_string(&intent.fm)?;
     let yaml = normalise_nulls(&yaml);
     let text = format!("---\n{yaml}---\n{}", intent.body);
-    std::fs::write(&intent.path, text).with_context(|| format!("writing {}", intent.path.display()))?;
+    std::fs::write(&intent.path, text)
+        .with_context(|| format!("writing {}", intent.path.display()))?;
     Ok(())
 }
 
 /// serde_yaml_ng writes `~` for None; `null` reads better and matches the spec.
 fn normalise_nulls(yaml: &str) -> String {
     yaml.lines()
-        .map(|l| if let Some(k) = l.strip_suffix(": ~") { format!("{k}: null") } else { l.to_string() })
+        .map(|l| {
+            if let Some(k) = l.strip_suffix(": ~") {
+                format!("{k}: null")
+            } else {
+                l.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
@@ -344,7 +394,11 @@ pub fn slugify(title: &str) -> String {
         s.truncate(SLUG_MAX);
         s = s.trim_end_matches('-').to_string();
     }
-    if s.is_empty() { "untitled".to_string() } else { s }
+    if s.is_empty() {
+        "untitled".to_string()
+    } else {
+        s
+    }
 }
 
 /// Number of `- ` items under `## Open questions`.

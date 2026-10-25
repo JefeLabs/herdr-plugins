@@ -1,0 +1,4 @@
+{"type": "thread.started", "thread_id": "019a0c1e-aaaa-7000-8000-000000000001"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "Here is a tighter version.\n\n```proposal\n## Observed\nParents who skip the report card folder see Pending.\n```\nquestions:\n- Which org?\n- Since when?\n"}}
+{"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 20}}

@@ -1,0 +1,5 @@
+{"type": "session.start", "data": {"sessionId": "cp-sess-1"}, "id": "1"}
+{"type": "assistant.message_delta", "data": {"deltaContent": "Here is a tighter version"}, "id": "2"}
+{"type": "assistant.message_delta", "data": {"deltaContent": ".\n\n```proposal\n## Observed\nParents who skip the report card folder see Pending.\n```\nquestions:\n- Which org?\n- Since when?\n"}, "id": "3"}
+{"type": "assistant.message", "data": {"content": "Here is a tighter version.\n\n```proposal\n## Observed\nParents who skip the report card folder see Pending.\n```\nquestions:\n- Which org?\n- Since when?\n"}, "id": "4"}
+{"type": "session.idle", "data": {}, "id": "5"}

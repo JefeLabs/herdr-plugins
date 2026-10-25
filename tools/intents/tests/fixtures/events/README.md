@@ -1,0 +1,1 @@
+agy.jsonl and claude.jsonl are trimmed from real captures (2026-10-24). codex.jsonl and copilot.jsonl follow the documented event shapes and are UNVERIFIED: codex's account returned 402 and Copilot was denied by policy on the capture machine.
