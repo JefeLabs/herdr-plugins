@@ -44,12 +44,16 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { prefix: DEFAULT_PREFIX.to_string(), tools: Vec::new() }
+        Self {
+            prefix: DEFAULT_PREFIX.to_string(),
+            tools: Vec::new(),
+        }
     }
 }
 
 pub fn parse(text: &str) -> anyhow::Result<RawConfig> {
-    let raw: RawConfig = toml::from_str(text).map_err(|e| anyhow::anyhow!("{}", describe(&e, text)))?;
+    let raw: RawConfig =
+        toml::from_str(text).map_err(|e| anyhow::anyhow!("{}", describe(&e, text)))?;
     for t in &raw.tool {
         if t.command.is_empty() {
             bail!("tool `{}` has no command", t.id);
@@ -76,11 +80,24 @@ fn describe(e: &toml::de::Error, text: &str) -> String {
 /// Environment variables a workspace file may never set: they change how
 /// the tool's binary is loaded or found, so a cloned repo must not control them.
 const DENIED_WORKSPACE_ENV_PREFIXES: &[&str] = &["LD_", "DYLD_"];
-const DENIED_WORKSPACE_ENV: &[&str] = &["PATH", "SHELL", "HOME", "IFS", "BASH_ENV", "ENV", "PERL5OPT", "PYTHONPATH", "NODE_OPTIONS", "RUBYOPT"];
+const DENIED_WORKSPACE_ENV: &[&str] = &[
+    "PATH",
+    "SHELL",
+    "HOME",
+    "IFS",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PYTHONPATH",
+    "NODE_OPTIONS",
+    "RUBYOPT",
+];
 
 fn env_is_denied(name: &str) -> bool {
     DENIED_WORKSPACE_ENV.contains(&name)
-        || DENIED_WORKSPACE_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+        || DENIED_WORKSPACE_ENV_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
 }
 
 /// A direnv-style allowlist: a workspace file is honoured only while its
@@ -114,7 +131,9 @@ impl Trust {
     }
 
     fn is_regular_file(file: &Path) -> bool {
-        std::fs::symlink_metadata(file).map(|m| m.file_type().is_file()).unwrap_or(false)
+        std::fs::symlink_metadata(file)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
     }
 
     pub fn is_trusted(&self, file: &Path, text: &str) -> bool {
@@ -124,10 +143,13 @@ impl Trust {
     /// Record the file's current content as trusted. Refuses symlinks.
     pub fn allow(&self, file: &Path) -> anyhow::Result<()> {
         if !Self::is_regular_file(file) {
-            bail!("{} is not a regular file (symlinks are never trusted)", file.display());
+            bail!(
+                "{} is not a regular file (symlinks are never trusted)",
+                file.display()
+            );
         }
-        let text = std::fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let text =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         let mut map = self.read();
         map.insert(Self::key(file), Self::hash(&text));
         if let Some(dir) = self.path.parent() {
@@ -149,8 +171,8 @@ pub struct Loaded {
 /// Read the global file (required to exist, may be empty) and, if present and
 /// trusted, `<workspace_root>/.herdr-toolbar.toml`; merge by id; apply order.
 pub fn load_merged(global: &Path, workspace_root: &Path, trust: &Trust) -> anyhow::Result<Loaded> {
-    let global_text = std::fs::read_to_string(global)
-        .with_context(|| format!("reading {}", global.display()))?;
+    let global_text =
+        std::fs::read_to_string(global).with_context(|| format!("reading {}", global.display()))?;
     let global_raw = parse(&global_text).with_context(|| global.display().to_string())?;
 
     let ws_path = workspace_root.join(WORKSPACE_FILE);
@@ -172,7 +194,10 @@ pub fn load_merged(global: &Path, workspace_root: &Path, trust: &Trust) -> anyho
         None
     };
 
-    Ok(Loaded { config: merge(global_raw, ws_raw)?, ignored_untrusted })
+    Ok(Loaded {
+        config: merge(global_raw, ws_raw)?,
+        ignored_untrusted,
+    })
 }
 
 pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<Config> {
@@ -213,7 +238,10 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         }
     }
 
-    Ok(Config { prefix: prefix.unwrap_or_else(|| DEFAULT_PREFIX.to_string()), tools })
+    Ok(Config {
+        prefix: prefix.unwrap_or_else(|| DEFAULT_PREFIX.to_string()),
+        tools,
+    })
 }
 
 #[cfg(test)]
@@ -232,7 +260,10 @@ mod tests {
         trust
     }
 
-    fn dirs(global: &str, workspace: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn dirs(
+        global: &str,
+        workspace: Option<&str>,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let g = tmp.path().join("tools.toml");
         fs::write(&g, global).unwrap();
@@ -250,7 +281,9 @@ mod tests {
         assert_eq!(raw.tool.len(), 5);
         assert_eq!(raw.tool[2].id, "db");
         assert_eq!(raw.tool[4].env["JIRA_PROJECT"], "SKOOL");
-        let want: Vec<String> = ["issues", "todo", "db", "files", "jira"].map(String::from).to_vec();
+        let want: Vec<String> = ["issues", "todo", "db", "files", "jira"]
+            .map(String::from)
+            .to_vec();
         assert_eq!(raw.order.as_deref(), Some(&want[..]));
         assert_eq!(raw.prefix.as_deref(), Some("ctrl-]"));
     }
@@ -307,7 +340,9 @@ command = ["lazysql", "postgres://localhost:5433/x"]
     fn unknown_id_in_order_is_an_error() {
         let ws = "order = [\"nope\"]\n";
         let (t, g, w) = dirs(GLOBAL, Some(ws));
-        let e = load_merged(&g, &w, &trusting(&t, &w)).unwrap_err().to_string();
+        let e = load_merged(&g, &w, &trusting(&t, &w))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("`nope`"), "got: {e}");
     }
 
@@ -325,7 +360,11 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let (t, g, w) = dirs(GLOBAL, Some(ws));
         let trust = Trust::new(t.path().join("trusted.json"));
         let loaded = load_merged(&g, &w, &trust).unwrap();
-        assert_eq!(loaded.config.tools.len(), 5, "workspace tool must not be merged");
+        assert_eq!(
+            loaded.config.tools.len(),
+            5,
+            "workspace tool must not be merged"
+        );
         assert_eq!(loaded.ignored_untrusted, Some(w.join(WORKSPACE_FILE)));
     }
 
@@ -340,7 +379,11 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         assert_eq!(loaded.ignored_untrusted, None);
         fs::write(w.join(WORKSPACE_FILE), format!("{ws}# changed\n")).unwrap();
         let loaded = load_merged(&g, &w, &trust).unwrap();
-        assert_eq!(loaded.config.tools.len(), 5, "a changed file needs re-trusting");
+        assert_eq!(
+            loaded.config.tools.len(),
+            5,
+            "a changed file needs re-trusting"
+        );
         assert!(loaded.ignored_untrusted.is_some());
     }
 

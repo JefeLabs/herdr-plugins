@@ -4,7 +4,6 @@
 //! closes the workspace's toolbar pane; `select <tool>` switches the running
 //! toolbar to a tool by id or 1-based index.
 
-
 use std::process::ExitCode;
 
 use herdr_toolbar::app::{self, ConfigPaths};
@@ -46,7 +45,11 @@ fn main() -> ExitCode {
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-toolbar ");
             println!("{text}");
-            return if is_version { ExitCode::SUCCESS } else { ExitCode::from(2) };
+            return if is_version {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            };
         }
     };
     match result {
@@ -70,8 +73,16 @@ fn run_tui() -> anyhow::Result<()> {
         std::fs::write(herdr::pane_file(&ctx), format!("{pane}\n"))?;
     }
     let control = Control::bind(&herdr::socket_path(&ctx))?;
-    let paths = ConfigPaths { global, workspace_root: ctx.workspace_cwd.clone(), trust: Trust::new(herdr::trust_file(&ctx)) };
-    let env = SpawnEnv { cwd: ctx.workspace_cwd.clone(), inherit: ctx.inherit.clone(), tool_id: String::new() };
+    let paths = ConfigPaths {
+        global,
+        workspace_root: ctx.workspace_cwd.clone(),
+        trust: Trust::new(herdr::trust_file(&ctx)),
+    };
+    let env = SpawnEnv {
+        cwd: ctx.workspace_cwd.clone(),
+        inherit: ctx.inherit.clone(),
+        tool_id: String::new(),
+    };
     let result = app::run(paths, env, Some(Box::new(move || control.poll())));
     // `control` was moved into the closure and dropped inside run; make sure
     // nothing is left even if Herdr tore the pane down abruptly.
@@ -91,7 +102,9 @@ fn run_select(tool: &str) -> anyhow::Result<()> {
 /// Allow this workspace's `.herdr-toolbar.toml` (current content) to be merged.
 fn run_trust() -> anyhow::Result<()> {
     let ctx = HerdrContext::from_env()?;
-    let file = ctx.workspace_cwd.join(herdr_toolbar::config::WORKSPACE_FILE);
+    let file = ctx
+        .workspace_cwd
+        .join(herdr_toolbar::config::WORKSPACE_FILE);
     Trust::new(herdr::trust_file(&ctx)).allow(&file)?;
     println!("trusted {}", file.display());
     Ok(())

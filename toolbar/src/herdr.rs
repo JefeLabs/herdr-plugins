@@ -14,7 +14,14 @@ pub const PLUGIN_ID: &str = "jefelabs.toolbar";
 pub const PANE_ENTRYPOINT: &str = "toolbar";
 
 /// Herdr variables passed through to hosted tools so they can drive Herdr themselves.
-const PASSTHROUGH: &[&str] = &["HERDR_SOCKET_PATH", "HERDR_BIN_PATH", "HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"];
+const PASSTHROUGH: &[&str] = &[
+    "HERDR_SOCKET_PATH",
+    "HERDR_BIN_PATH",
+    "HERDR_ENV",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_PANE_ID",
+];
 
 #[derive(Debug, Clone)]
 pub struct HerdrContext {
@@ -48,17 +55,23 @@ impl HerdrContext {
     /// Build from a variable lookup; `from_env` is this over the real environment.
     pub fn from_vars(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let bin = get("HERDR_BIN_PATH").context("HERDR_BIN_PATH is not set: herdr-toolbar must run inside a Herdr plugin pane or action")?;
-        let config_dir = get("HERDR_PLUGIN_CONFIG_DIR").context("HERDR_PLUGIN_CONFIG_DIR is not set")?;
-        let state_dir = get("HERDR_PLUGIN_STATE_DIR").context("HERDR_PLUGIN_STATE_DIR is not set")?;
+        let config_dir =
+            get("HERDR_PLUGIN_CONFIG_DIR").context("HERDR_PLUGIN_CONFIG_DIR is not set")?;
+        let state_dir =
+            get("HERDR_PLUGIN_STATE_DIR").context("HERDR_PLUGIN_STATE_DIR is not set")?;
         let ctx: ContextJson = match get("HERDR_PLUGIN_CONTEXT_JSON") {
-            Some(json) => serde_json::from_str(&json).context("HERDR_PLUGIN_CONTEXT_JSON is not valid JSON")?,
+            Some(json) => serde_json::from_str(&json)
+                .context("HERDR_PLUGIN_CONTEXT_JSON is not valid JSON")?,
             None => ContextJson::default(),
         };
         let workspace_cwd = ctx
             .workspace_cwd
             .or_else(|| std::env::current_dir().ok())
             .context("no workspace_cwd in HERDR_PLUGIN_CONTEXT_JSON and no current directory")?;
-        let inherit = PASSTHROUGH.iter().filter_map(|k| get(k).map(|v| (k.to_string(), v))).collect();
+        let inherit = PASSTHROUGH
+            .iter()
+            .filter_map(|k| get(k).map(|v| (k.to_string(), v)))
+            .collect();
         let pane_id = get("HERDR_PANE_ID");
         Ok(Self {
             bin: PathBuf::from(bin),
@@ -79,7 +92,8 @@ impl HerdrContext {
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
-        cmd.output().with_context(|| format!("running {} {}", self.bin.display(), args.join(" ")))
+        cmd.output()
+            .with_context(|| format!("running {} {}", self.bin.display(), args.join(" ")))
     }
 
     fn ws(&self) -> &str {
@@ -111,24 +125,48 @@ pub fn toggle(ctx: &HerdrContext) -> anyhow::Result<()> {
         if !id.is_empty() && ctx.herdr(&["pane", "get", id])?.status.success() {
             ctx.herdr(&["pane", "close", id])?;
             let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_file(socket_path(ctx));
             return Ok(());
         }
     }
     let cwd = ctx.workspace_cwd.display().to_string();
-    let target = ctx.target_pane_id.as_deref().context("no pane to split: the action context has no focused_pane_id and HERDR_PANE_ID is unset")?;
+    let target = ctx.target_pane_id.as_deref().context(
+        "no pane to split: the action context has no focused_pane_id and HERDR_PANE_ID is unset",
+    )?;
     // No `--workspace`: on Herdr 0.9.5 it makes the server ignore the target pane
     // and reject the split. The target pane already pins the workspace.
-    let args = ["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", PANE_ENTRYPOINT, "--placement", "split", "--direction", "right", "--target-pane", target, "--cwd", &cwd];
+    let args = [
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        PLUGIN_ID,
+        "--entrypoint",
+        PANE_ENTRYPOINT,
+        "--placement",
+        "split",
+        "--direction",
+        "right",
+        "--target-pane",
+        target,
+        "--cwd",
+        &cwd,
+    ];
     let out = ctx.herdr(&args)?;
     if !out.status.success() {
-        bail!("herdr plugin pane open failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "herdr plugin pane open failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let pane_id = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok().and_then(|v| {
-        ["/result/plugin_pane/pane/pane_id", "/result/pane/pane_id"]
-            .iter()
-            .find_map(|ptr| v.pointer(ptr).and_then(|p| p.as_str()).map(str::to_string))
-    });
+    let pane_id = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|v| {
+            ["/result/plugin_pane/pane/pane_id", "/result/pane/pane_id"]
+                .iter()
+                .find_map(|ptr| v.pointer(ptr).and_then(|p| p.as_str()).map(str::to_string))
+        });
     if let Some(id) = pane_id {
         std::fs::write(&file, format!("{id}\n"))?;
     }
@@ -138,8 +176,12 @@ pub fn toggle(ctx: &HerdrContext) -> anyhow::Result<()> {
 /// Tell the running toolbar to switch tools. `tool` is an id or a 1-based index.
 pub fn select(ctx: &HerdrContext, tool: &str) -> anyhow::Result<()> {
     let path = socket_path(ctx);
-    let mut stream = UnixStream::connect(&path)
-        .with_context(|| format!("toolbar is not open in this workspace (no socket at {})", path.display()))?;
+    let mut stream = UnixStream::connect(&path).with_context(|| {
+        format!(
+            "toolbar is not open in this workspace (no socket at {})",
+            path.display()
+        )
+    })?;
     stream.write_all(format!("select {tool}\n").as_bytes())?;
     Ok(())
 }
@@ -156,9 +198,13 @@ impl Control {
             std::fs::create_dir_all(dir)?;
         }
         let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+        let listener =
+            UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
         listener.set_nonblocking(true)?;
-        Ok(Self { listener, path: path.to_path_buf() })
+        Ok(Self {
+            listener,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn poll(&self) -> Vec<ControlCmd> {

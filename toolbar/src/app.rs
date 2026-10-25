@@ -6,9 +6,9 @@
 //! messages and control-socket commands.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
@@ -104,7 +104,10 @@ impl App {
     /// Replace the slot list from a fresh config, keeping running processes
     /// whose id still exists. Untrusted workspace files become a message.
     fn apply_loaded(&mut self, loaded: Loaded) {
-        let Loaded { config, ignored_untrusted } = loaded;
+        let Loaded {
+            config,
+            ignored_untrusted,
+        } = loaded;
         let mut old: Vec<Slot> = std::mem::take(&mut self.slots);
         let selected_id = old.get(self.selected).map(|s| s.cfg.id.clone());
         for cfg in config.tools {
@@ -117,7 +120,11 @@ impl App {
                     }
                     s
                 }
-                None => Slot { cfg, proc: None, last_error: None },
+                None => Slot {
+                    cfg,
+                    proc: None,
+                    last_error: None,
+                },
             };
             self.slots.push(slot);
         }
@@ -130,21 +137,28 @@ impl App {
             .and_then(|id| self.slots.iter().position(|s| s.cfg.id == id))
             .unwrap_or(0);
         self.message = ignored_untrusted.map(|p| {
-            format!("untrusted {} ignored; run `herdr-toolbar trust` in this workspace to allow it", p.display())
+            format!(
+                "untrusted {} ignored; run `herdr-toolbar trust` in this workspace to allow it",
+                p.display()
+            )
         });
         let _ = config.prefix; // prefix changes apply on next start; see reload()
     }
 
     fn content_size(&self) -> Size {
         let footer = self.footer().is_some();
-        let (rows, cols) = ui::content_size(Rect::new(0, 0, self.size.cols, self.size.rows), footer);
+        let (rows, cols) =
+            ui::content_size(Rect::new(0, 0, self.size.cols, self.size.rows), footer);
         Size { rows, cols }
     }
 
     fn spawn(&mut self, idx: usize) {
         let size = self.content_size();
         let slot = &mut self.slots[idx];
-        let env = SpawnEnv { tool_id: slot.cfg.id.clone(), ..self.env.clone() };
+        let env = SpawnEnv {
+            tool_id: slot.cfg.id.clone(),
+            ..self.env.clone()
+        };
         match ToolProcess::spawn(&slot.cfg, &env, size, self.wake_tx.clone()) {
             Ok(p) => {
                 slot.proc = Some(p);
@@ -204,7 +218,11 @@ impl App {
     }
 
     pub fn reload(&mut self) {
-        match load_merged(&self.paths.global, &self.paths.workspace_root, &self.paths.trust) {
+        match load_merged(
+            &self.paths.global,
+            &self.paths.workspace_root,
+            &self.paths.trust,
+        ) {
             Ok(loaded) => {
                 match Prefix::new(&loaded.config.prefix) {
                     Ok(p) => self.prefix = p,
@@ -226,14 +244,18 @@ impl App {
         match self.prefix.handle(key) {
             Action::Forward(bytes) => {
                 self.message = None;
-                let Some(slot) = self.slots.get(self.selected) else { return Flow::Continue };
+                let Some(slot) = self.slots.get(self.selected) else {
+                    return Flow::Continue;
+                };
                 match slot.state() {
                     ToolState::Running => {
                         if let Some(p) = slot.proc.as_ref() {
                             let _ = p.write(&bytes);
                         }
                     }
-                    ToolState::Exited { .. } | ToolState::Failed(_) if key.code == KeyCode::Enter => {
+                    ToolState::Exited { .. } | ToolState::Failed(_)
+                        if key.code == KeyCode::Enter =>
+                    {
                         self.restart_selected();
                     }
                     _ => {}
@@ -255,7 +277,9 @@ impl App {
 
     /// Forward pasted text to the selected running tool, sanitised (see `keys::paste_bytes`).
     pub fn paste(&mut self, text: &str) {
-        let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else { return };
+        let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else {
+            return;
+        };
         if p.state() != ToolState::Running {
             return;
         }
@@ -287,7 +311,9 @@ impl App {
     fn footer(&self) -> Option<String> {
         let slot = self.slots.get(self.selected)?;
         match slot.state() {
-            ToolState::Exited { code: Some(c) } => Some(format!("exited (code {c}), enter to restart")),
+            ToolState::Exited { code: Some(c) } => {
+                Some(format!("exited (code {c}), enter to restart"))
+            }
             ToolState::Exited { code: None } => Some("exited, enter to restart".to_string()),
             _ => None,
         }
@@ -297,7 +323,9 @@ impl App {
         if let Some(m) = &self.message {
             return Some(m.as_str());
         }
-        self.slots.get(self.selected).and_then(|s| s.last_error.as_deref())
+        self.slots
+            .get(self.selected)
+            .and_then(|s| s.last_error.as_deref())
     }
 
     /// A plain-data summary for tests and status: what `draw` would show.
@@ -321,10 +349,19 @@ impl App {
             .iter()
             .zip(states.iter())
             .enumerate()
-            .map(|(i, (s, state))| ui::BarItem { icon: &s.cfg.icon, name: &s.cfg.name, state, selected: i == self.selected })
+            .map(|(i, (s, state))| ui::BarItem {
+                icon: &s.cfg.icon,
+                name: &s.cfg.name,
+                state,
+                selected: i == self.selected,
+            })
             .collect();
         let footer = self.footer();
-        let guard = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()).map(|p| p.screen());
+        let guard = self
+            .slots
+            .get(self.selected)
+            .and_then(|s| s.proc.as_ref())
+            .map(|p| p.screen());
         let frame = ui::Frame {
             items,
             screen: guard.as_deref(),
@@ -347,9 +384,17 @@ impl App {
 
 /// Run the TUI until quit, SIGTERM/SIGHUP, or the controlling terminal goes away.
 /// `control` is polled every loop for commands from the `select` mode.
-pub fn run(paths: ConfigPaths, env: SpawnEnv, mut control: Option<Box<dyn FnMut() -> Vec<ControlCmd>>>) -> anyhow::Result<()> {
+pub fn run(
+    paths: ConfigPaths,
+    env: SpawnEnv,
+    mut control: Option<Box<dyn FnMut() -> Vec<ControlCmd>>>,
+) -> anyhow::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
-    for sig in [nix::sys::signal::Signal::SIGTERM, nix::sys::signal::Signal::SIGHUP, nix::sys::signal::Signal::SIGINT] {
+    for sig in [
+        nix::sys::signal::Signal::SIGTERM,
+        nix::sys::signal::Signal::SIGHUP,
+        nix::sys::signal::Signal::SIGINT,
+    ] {
         let flag = Arc::clone(&stop);
         // SAFETY: the handler only stores into an AtomicBool.
         unsafe {
@@ -373,7 +418,14 @@ pub fn run(paths: ConfigPaths, env: SpawnEnv, mut control: Option<Box<dyn FnMut(
 
     let mut terminal = ratatui::init();
     let area = terminal.size()?;
-    let mut app = App::new(paths, env, Size { rows: area.height, cols: area.width })?;
+    let mut app = App::new(
+        paths,
+        env,
+        Size {
+            rows: area.height,
+            cols: area.width,
+        },
+    )?;
 
     let result = (|| -> anyhow::Result<()> {
         loop {
@@ -432,7 +484,9 @@ mod tests {
     const SIZE: Size = Size { rows: 10, cols: 50 };
 
     fn tool(id: &str, cmd: &str) -> String {
-        format!("[[tool]]\nid = \"{id}\"\nname = \"{id}\"\nicon = \"x\"\ncommand = [\"sh\", \"-c\", \"{cmd}\"]\n")
+        format!(
+            "[[tool]]\nid = \"{id}\"\nname = \"{id}\"\nicon = \"x\"\ncommand = [\"sh\", \"-c\", \"{cmd}\"]\n"
+        )
     }
 
     struct Fixture {
@@ -447,19 +501,36 @@ mod tests {
         fs::write(&global_path, global).unwrap();
         let ws = tmp.path().join("ws");
         fs::create_dir(&ws).unwrap();
-        let paths = ConfigPaths { global: global_path, workspace_root: ws.clone(), trust: Trust::new(tmp.path().join("trusted.json")) };
-        let env = SpawnEnv { cwd: ws, inherit: vec![], tool_id: String::new() };
-        Fixture { _tmp: tmp, paths, env }
+        let paths = ConfigPaths {
+            global: global_path,
+            workspace_root: ws.clone(),
+            trust: Trust::new(tmp.path().join("trusted.json")),
+        };
+        let env = SpawnEnv {
+            cwd: ws,
+            inherit: vec![],
+            tool_id: String::new(),
+        };
+        Fixture {
+            _tmp: tmp,
+            paths,
+            env,
+        }
     }
 
     fn three() -> String {
-        tool("a", "echo A; sleep 30") + &tool("b", "echo B; sleep 30") + &tool("c", "echo C; sleep 30")
+        tool("a", "echo A; sleep 30")
+            + &tool("b", "echo B; sleep 30")
+            + &tool("c", "echo C; sleep 30")
     }
 
     fn wait_until(what: &str, f: impl Fn() -> bool) {
         let start = Instant::now();
         while !f() {
-            assert!(start.elapsed() < Duration::from_secs(3), "timed out: {what}");
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "timed out: {what}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -495,7 +566,10 @@ mod tests {
         app.select(0);
         app.select(1);
         assert_eq!(pid(&app, 1), p1, "re-selecting must not respawn");
-        assert_eq!(app.slots[1].proc.as_ref().unwrap().state(), ToolState::Running);
+        assert_eq!(
+            app.slots[1].proc.as_ref().unwrap().state(),
+            ToolState::Running
+        );
         assert_eq!(app.selected, 1);
         app.shutdown();
     }
@@ -507,7 +581,11 @@ mod tests {
         fs::write(&f.paths.global, "[[tool]\nid = 1").unwrap();
         app.reload();
         assert_eq!(app.slots.len(), 3);
-        assert!(app.message.as_deref().unwrap_or("").contains("line 1"), "got {:?}", app.message);
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("line 1"),
+            "got {:?}",
+            app.message
+        );
         app.shutdown();
     }
 
@@ -527,10 +605,18 @@ mod tests {
     #[test]
     fn reload_reports_untrusted_workspace_file() {
         let f = fixture(&three());
-        fs::write(f.paths.workspace_root.join(WORKSPACE_FILE), tool("evil", "true")).unwrap();
+        fs::write(
+            f.paths.workspace_root.join(WORKSPACE_FILE),
+            tool("evil", "true"),
+        )
+        .unwrap();
         let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
         assert_eq!(app.slots.len(), 3);
-        assert!(app.message.as_deref().unwrap_or("").contains("untrusted"), "got {:?}", app.message);
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("untrusted"),
+            "got {:?}",
+            app.message
+        );
         app.shutdown();
     }
 
@@ -539,7 +625,9 @@ mod tests {
         let f = fixture(&(tool("a", "sleep 30") + &tool("b", "exit 3")));
         let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
         app.select(1);
-        wait_until("exit", || app.slots[1].proc.as_ref().unwrap().state() != ToolState::Running);
+        wait_until("exit", || {
+            app.slots[1].proc.as_ref().unwrap().state() != ToolState::Running
+        });
         app.select(0);
         assert_eq!(app.view().states[1], ToolState::Exited { code: Some(3) });
         app.select(1);
@@ -569,7 +657,10 @@ mod tests {
         let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
         app.select(1);
         let (p0, p1) = (pid(&app, 0), pid(&app, 1));
-        assert_eq!(app.apply_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)), Flow::Continue);
+        assert_eq!(
+            app.apply_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            Flow::Continue
+        );
         assert_eq!(app.apply_key(key(KeyCode::Char('q'))), Flow::Quit);
         app.shutdown();
         wait_until("children gone", || !alive(p0) && !alive(p1));
@@ -577,7 +668,10 @@ mod tests {
 
     #[test]
     fn missing_binary_shows_message_and_other_tools_work() {
-        let f = fixture(&(tool("a", "sleep 30") + "[[tool]]\nid = \"nope\"\nname = \"Nope\"\nicon = \"!\"\ncommand = [\"definitely-not-installed-xyz\"]\n"));
+        let f = fixture(
+            &(tool("a", "sleep 30")
+                + "[[tool]]\nid = \"nope\"\nname = \"Nope\"\nicon = \"!\"\ncommand = [\"definitely-not-installed-xyz\"]\n"),
+        );
         let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
         app.select(1);
         let view = app.view();

@@ -23,7 +23,12 @@ pub struct Size {
 
 impl Size {
     fn pty(self) -> PtySize {
-        PtySize { rows: self.rows.max(1), cols: self.cols.max(1), pixel_width: 0, pixel_height: 0 }
+        PtySize {
+            rows: self.rows.max(1),
+            cols: self.cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        }
     }
 }
 
@@ -46,7 +51,20 @@ pub struct SpawnEnv {
 }
 
 /// Variables copied from the toolbar's own environment into every tool.
-const BASE_ENV: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "COLORTERM"];
+const BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "COLORTERM",
+];
 
 pub struct ToolProcess {
     parser: Arc<RwLock<vt100::Parser>>,
@@ -59,19 +77,41 @@ pub struct ToolProcess {
 
 impl ToolProcess {
     /// Start the tool. Errors are user-facing strings: "cannot start `<name>`: <os error>".
-    pub fn spawn(cfg: &ToolConfig, env: &SpawnEnv, size: Size, wake: Sender<()>) -> Result<Self, String> {
+    pub fn spawn(
+        cfg: &ToolConfig,
+        env: &SpawnEnv,
+        size: Size,
+        wake: Sender<()>,
+    ) -> Result<Self, String> {
         // portable-pty appends the whole PATH to a spawn failure; keep the first line.
         let fail = |e: &dyn std::fmt::Display| {
             let text = e.to_string();
-            let first = text.lines().next().unwrap_or("").trim_end_matches(':').trim();
-            format!("cannot start `{}`: {} ({})", cfg.name, first, cfg.command.join(" "))
+            let first = text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(':')
+                .trim();
+            format!(
+                "cannot start `{}`: {} ({})",
+                cfg.name,
+                first,
+                cfg.command.join(" ")
+            )
         };
 
-        let pair = native_pty_system().openpty(size.pty()).map_err(|e| fail(&e))?;
+        let pair = native_pty_system()
+            .openpty(size.pty())
+            .map_err(|e| fail(&e))?;
 
         let mut cmd = CommandBuilder::new(&cfg.command[0]);
         cmd.args(&cfg.command[1..]);
-        cmd.cwd(cfg.cwd.as_deref().map(PathBuf::from).unwrap_or_else(|| env.cwd.clone()));
+        cmd.cwd(
+            cfg.cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| env.cwd.clone()),
+        );
         cmd.env_clear();
         for name in BASE_ENV {
             if let Ok(v) = std::env::var(name) {
@@ -143,7 +183,14 @@ impl ToolProcess {
             });
         }
 
-        Ok(Self { parser, master: pair.master, writer: Mutex::new(writer), child, exit, pid })
+        Ok(Self {
+            parser,
+            master: pair.master,
+            writer: Mutex::new(writer),
+            child,
+            exit,
+            pid,
+        })
     }
 
     pub fn screen(&self) -> impl std::ops::Deref<Target = vt100::Screen> + '_ {
@@ -158,7 +205,11 @@ impl ToolProcess {
     }
 
     pub fn resize(&self, size: Size) {
-        self.parser.write().unwrap().screen_mut().set_size(size.rows, size.cols);
+        self.parser
+            .write()
+            .unwrap()
+            .screen_mut()
+            .set_size(size.rows, size.cols);
         let _ = self.master.resize(size.pty());
     }
 
@@ -195,7 +246,10 @@ impl ToolProcess {
 
 impl std::fmt::Debug for ToolProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolProcess").field("pid", &self.pid).field("state", &self.state()).finish()
+        f.debug_struct("ToolProcess")
+            .field("pid", &self.pid)
+            .field("state", &self.state())
+            .finish()
     }
 }
 

@@ -54,20 +54,33 @@ fn toggle_opens_when_no_pane_recorded() {
     );
     assert!(l.contains(&want), "log was:\n{l}");
     assert!(!l.contains("--focus"), "must not steal focus:\n{l}");
-    assert!(!l.contains("--workspace"), "--workspace makes Herdr 0.9.5 reject the target pane:\n{l}");
-    assert_eq!(fs::read_to_string(pane_file(&fx.ctx)).unwrap().trim(), "w1:p9");
+    assert!(
+        !l.contains("--workspace"),
+        "--workspace makes Herdr 0.9.5 reject the target pane:\n{l}"
+    );
+    assert_eq!(
+        fs::read_to_string(pane_file(&fx.ctx)).unwrap().trim(),
+        "w1:p9"
+    );
 }
 
 #[test]
 fn toggle_closes_when_pane_recorded_and_alive() {
     let mut fx = fx();
     fs::write(pane_file(&fx.ctx), "w1:p4\n").unwrap();
-    fx.ctx.extra_env.push(("FAKE_PANE_EXISTS".into(), "1".into()));
+    fs::write(socket_path(&fx.ctx), "").unwrap(); // stale socket left by a killed toolbar
+    fx.ctx
+        .extra_env
+        .push(("FAKE_PANE_EXISTS".into(), "1".into()));
     toggle(&fx.ctx).unwrap();
     let l = log(&fx);
     assert!(l.contains("pane close w1:p4"), "log was:\n{l}");
     assert!(!l.contains("plugin pane open"), "log was:\n{l}");
     assert!(!pane_file(&fx.ctx).exists());
+    assert!(
+        !socket_path(&fx.ctx).exists(),
+        "a stale socket must not survive a close"
+    );
 }
 
 #[test]
@@ -78,7 +91,10 @@ fn toggle_reopens_when_recorded_pane_is_gone() {
     let l = log(&fx);
     assert!(l.contains("pane get w1:p4"), "log was:\n{l}");
     assert!(l.contains("plugin pane open"), "log was:\n{l}");
-    assert_eq!(fs::read_to_string(pane_file(&fx.ctx)).unwrap().trim(), "w1:p9");
+    assert_eq!(
+        fs::read_to_string(pane_file(&fx.ctx)).unwrap().trim(),
+        "w1:p9"
+    );
 }
 
 #[test]
@@ -114,17 +130,41 @@ fn from_env_reads_context_json() {
         ("HERDR_ENV", "1".to_string()),
         ("HERDR_WORKSPACE_ID", "w7".to_string()),
         ("HERDR_PANE_ID", "w7:p2".to_string()),
-        ("HERDR_PLUGIN_CONFIG_DIR", tmp.path().join("c").display().to_string()),
-        ("HERDR_PLUGIN_STATE_DIR", tmp.path().join("s").display().to_string()),
-        ("HERDR_PLUGIN_CONTEXT_JSON", r#"{"workspace_cwd":"/w","focused_pane_cwd":"/w/tab","focused_pane_id":"w7:p5"}"#.to_string()),
+        (
+            "HERDR_PLUGIN_CONFIG_DIR",
+            tmp.path().join("c").display().to_string(),
+        ),
+        (
+            "HERDR_PLUGIN_STATE_DIR",
+            tmp.path().join("s").display().to_string(),
+        ),
+        (
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"workspace_cwd":"/w","focused_pane_cwd":"/w/tab","focused_pane_id":"w7:p5"}"#
+                .to_string(),
+        ),
     ];
-    let ctx = HerdrContext::from_vars(|k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone())).unwrap();
-    assert_eq!(ctx.workspace_cwd, Path::new("/w"), "workspace_cwd, never focused_pane_cwd");
+    let ctx =
+        HerdrContext::from_vars(|k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()))
+            .unwrap();
+    assert_eq!(
+        ctx.workspace_cwd,
+        Path::new("/w"),
+        "workspace_cwd, never focused_pane_cwd"
+    );
     assert_eq!(ctx.workspace_id.as_deref(), Some("w7"));
     assert_eq!(ctx.pane_id.as_deref(), Some("w7:p2"));
-    assert_eq!(ctx.target_pane_id.as_deref(), Some("w7:p5"), "focused pane from the action context");
+    assert_eq!(
+        ctx.target_pane_id.as_deref(),
+        Some("w7:p5"),
+        "focused pane from the action context"
+    );
     assert_eq!(ctx.bin, Path::new("/x/herdr"));
-    assert!(ctx.inherit.iter().any(|(k, v)| k == "HERDR_BIN_PATH" && v == "/x/herdr"));
+    assert!(
+        ctx.inherit
+            .iter()
+            .any(|(k, v)| k == "HERDR_BIN_PATH" && v == "/x/herdr")
+    );
     assert!(ctx.inherit.iter().any(|(k, _)| k == "HERDR_SOCKET_PATH"));
     assert!(ctx.inherit.iter().any(|(k, _)| k == "HERDR_ENV"));
     assert_eq!(pane_file(&ctx), tmp.path().join("s/w7.pane"));

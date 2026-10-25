@@ -71,7 +71,10 @@ pub struct Prefix {
 
 impl Prefix {
     pub fn new(prefix: &str) -> anyhow::Result<Self> {
-        Ok(Self { armed: false, chord: KeyChord::parse(prefix)? })
+        Ok(Self {
+            armed: false,
+            chord: KeyChord::parse(prefix)?,
+        })
     }
 
     pub fn armed(&self) -> bool {
@@ -84,11 +87,15 @@ impl Prefix {
                 self.armed = true;
                 return Action::Ignore;
             }
-            return key_to_bytes(&key).map(Action::Forward).unwrap_or(Action::Ignore);
+            return key_to_bytes(&key)
+                .map(Action::Forward)
+                .unwrap_or(Action::Ignore);
         }
         self.armed = false;
         if self.chord.matches(&key) {
-            return key_to_bytes(&key).map(Action::Forward).unwrap_or(Action::Ignore);
+            return key_to_bytes(&key)
+                .map(Action::Forward)
+                .unwrap_or(Action::Ignore);
         }
         match key.code {
             KeyCode::Char(c @ '1'..='9') if key.modifiers.is_empty() => {
@@ -239,7 +246,13 @@ mod tests {
     #[test]
     fn jk_r_x_q_map() {
         let mut p = p();
-        for (ch, want) in [('j', Action::Next), ('k', Action::Prev), ('r', Action::Reload), ('x', Action::Restart), ('q', Action::Quit)] {
+        for (ch, want) in [
+            ('j', Action::Next),
+            ('k', Action::Prev),
+            ('r', Action::Reload),
+            ('x', Action::Restart),
+            ('q', Action::Quit),
+        ] {
             arm(&mut p);
             assert_eq!(p.handle(k(Char(ch), NONE)), want, "key {ch}");
         }
@@ -253,7 +266,10 @@ mod tests {
         assert_eq!(key_to_bytes(&k(F(5), NONE)), Some(b"\x1b[15~".to_vec()));
         assert_eq!(key_to_bytes(&k(Enter, NONE)), Some(vec![b'\r']));
         assert_eq!(key_to_bytes(&k(Backspace, NONE)), Some(vec![0x7f]));
-        assert_eq!(key_to_bytes(&k(Char('é'), NONE)), Some("é".as_bytes().to_vec()));
+        assert_eq!(
+            key_to_bytes(&k(Char('é'), NONE)),
+            Some("é".as_bytes().to_vec())
+        );
         assert_eq!(key_to_bytes(&k(Char(' '), CONTROL)), Some(vec![0]));
     }
 
@@ -268,7 +284,10 @@ mod tests {
     fn paste_strips_escapes_and_wraps_only_when_bracketed() {
         // A paste must not be able to end the bracket early or inject control sequences.
         let hostile = "ls\x1b[201~\x1b]0;x\x07rm -rf ~\n\x01\ttab\r";
-        assert_eq!(paste_bytes(hostile, false), b"ls[201~]0;xrm -rf ~\n\ttab\r".to_vec());
+        assert_eq!(
+            paste_bytes(hostile, false),
+            b"ls[201~]0;xrm -rf ~\n\ttab\r".to_vec()
+        );
         let wrapped = paste_bytes("hi\x1b", true);
         assert_eq!(wrapped, b"\x1b[200~hi\x1b[201~".to_vec());
         assert_eq!(paste_bytes("plain", false), b"plain".to_vec());
