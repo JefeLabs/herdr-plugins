@@ -924,6 +924,8 @@ pub struct ListRow<'a> {
     /// The sent agent's live state (`working`, `idle`, `needs you`, `done`,
     /// `closed`); `None` before sending.
     pub agent: Option<String>,
+    /// How long the sent agent's session has been running, while it exists.
+    pub running: Option<String>,
     pub title: &'a str,
     /// Where it lives: group path, then the sent agent's workbrokr slot.
     pub location: String,
@@ -959,6 +961,7 @@ const STATUS_W: usize = 6;
 const BAR_W: usize = 10;
 const WHEN_W: usize = 12;
 const AGENT_W: usize = 11;
+const RUNNING_W: usize = 7;
 /// Description lines shown on a card at most.
 const DESC_LINES: usize = 2;
 
@@ -985,7 +988,7 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
 /// ```text
 /// ────────────────────────────────────────
 ///  Title
-///  TIMESTAMP │ STATUS │ AGENT │ PROGRESS
+///  TIMESTAMP │ STATUS │ AGENT │ RUNNING │ PROGRESS
 ///  group │ slot N
 ///
 ///  description, up to two wrapped lines
@@ -1090,6 +1093,11 @@ pub fn render_capability_list(
             )),
             Some(a) => fields.push(Span::raw(format!("{:<AGENT_W$}", fit(a, AGENT_W)))),
             None => fields.push(Span::styled(format!("{:<AGENT_W$}", "—"), dim)),
+        }
+        fields.push(sep());
+        match r.running.as_deref() {
+            Some(t) => fields.push(Span::raw(format!("{:<RUNNING_W$}", fit(t, RUNNING_W)))),
+            None => fields.push(Span::styled(format!("{:<RUNNING_W$}", "—"), dim)),
         }
         fields.push(sep());
         match &r.progress {

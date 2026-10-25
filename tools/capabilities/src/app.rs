@@ -335,6 +335,8 @@ pub struct App {
     poller: Option<crate::progress::Poller>,
     /// Ticks since the list started polling; 0 means "poll everything now".
     poll_ticks: u32,
+    /// Tests pin the clock here; `None` means the real time.
+    fixed_now: Option<chrono::DateTime<chrono::Local>>,
 }
 
 impl App {
@@ -377,6 +379,7 @@ impl App {
             agents_unavailable: false,
             poller: None,
             poll_ticks: 0,
+            fixed_now: None,
         };
         let last = crate::config::last_used(&app.dirs, &app.cfg);
         if let Some(l) = last.layout.as_deref().and_then(Layout::parse) {
@@ -2537,8 +2540,10 @@ impl App {
         struct Owned {
             description: String,
             agent: Option<String>,
+            running: Option<String>,
             location: String,
         }
+        let now = self.fixed_now.unwrap_or_else(chrono::Local::now);
         let owned: Vec<Owned> = self
             .list
             .iter()
@@ -2563,6 +2568,13 @@ impl App {
                     }),
                     _ => None,
                 };
+                // the sent agent's session time, while Herdr still lists it
+                let running = match (&i.fm.sent_to, &self.agents, i.fm.state) {
+                    (Some(sent), Some(agents), State::Sent) if agents.contains_key(&sent.agent) => {
+                        Some(crate::progress::running_for(sent.at, now))
+                    }
+                    _ => None,
+                };
                 // group path, then the sent agent's slot
                 let mut location = vec![
                     i.path
@@ -2581,6 +2593,7 @@ impl App {
                 Owned {
                     description,
                     agent,
+                    running,
                     location: location.join(" │ "),
                 }
             })
@@ -2599,6 +2612,7 @@ impl App {
                     progress: crate::progress::progress(i, &self.evidence_for(i))
                         .map(|p| (p.fill, p.label, p.complete)),
                     agent: o.agent.clone(),
+                    running: o.running.clone(),
                     title: &i.fm.title,
                     location: o.location.clone(),
                     when: when.format("%b %d %H:%M").to_string(),
@@ -3549,6 +3563,12 @@ mod tests {
         fs::create_dir_all(&prs).unwrap();
         fs::write(prs.join("42"), "OPEN").unwrap();
         let mut app = App::new(cfg, dirs).unwrap();
+        // a fixed clock keeps running times stable in snapshots
+        app.fixed_now = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-10-25T10:24:00-04:00")
+                .unwrap()
+                .with_timezone(&chrono::Local),
+        );
         app.herdr_env = vec![
             (
                 "HERDR_BIN_PATH".into(),
@@ -3733,6 +3753,30 @@ mod tests {
             lines[at + 2].starts_with(" The primary contact"),
             "{}",
             lines[at + 2]
+        );
+    }
+
+    #[test]
+    fn cards_show_how_long_the_agent_has_been_running() {
+        let mut fx = list_fixture(true);
+        // sent at 08:10 -04:00 in the fixture
+        fx.app.fixed_now = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-10-25T10:24:00-04:00")
+                .unwrap()
+                .with_timezone(&chrono::Local),
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 60);
+        assert!(shown.contains("! needs you │ 2h 14m"), "{shown}");
+        assert!(shown.contains("working     │ 2h 14m"), "{shown}");
+        assert!(
+            shown.contains("closed      │ —"),
+            "no clock once the pane is gone: {shown}"
+        );
+        assert!(
+            shown.contains("│ raw    │ —           │ —"),
+            "nothing before sending: {shown}"
         );
     }
 

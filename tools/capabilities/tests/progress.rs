@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use herdr_capabilities::progress::{
     Evidence, PlanTasks, Poller, PrState, Update, agent_statuses, bar, plan_evidence, plan_tasks,
-    pr_number, pr_state, progress,
+    pr_number, pr_state, progress, running_for,
 };
 use herdr_capabilities::store::{Intent, State, Store};
 
@@ -449,4 +449,19 @@ fn agent_worktree_and_slot_come_from_its_working_directory() {
     assert_eq!(map["a"].slot, Some(2));
     assert_eq!(map["b"].worktree, None, "no .slot above it");
     assert_eq!(map["b"].slot, None);
+}
+
+#[test]
+fn running_time_reads_compactly() {
+    let t0 = chrono::Local::now();
+    let at = |secs: i64| t0 + chrono::Duration::seconds(secs);
+    assert_eq!(running_for(t0, at(30)), "<1m");
+    assert_eq!(running_for(t0, at(45 * 60)), "45m");
+    assert_eq!(running_for(t0, at(2 * 3600 + 14 * 60)), "2h 14m");
+    assert_eq!(running_for(t0, at(3 * 86400 + 4 * 3600 + 59)), "3d 4h");
+    assert_eq!(
+        running_for(t0, at(-90)),
+        "<1m",
+        "a clock behind the send time"
+    );
 }

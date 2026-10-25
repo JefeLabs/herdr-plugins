@@ -194,6 +194,23 @@ fn leading_number(s: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// How long since `since`, compactly: `<1m`, `45m`, `2h 14m`, `3d 4h`.
+pub fn running_for(
+    since: chrono::DateTime<chrono::Local>,
+    now: chrono::DateTime<chrono::Local>,
+) -> String {
+    let mins = (now - since).num_minutes();
+    if mins < 1 {
+        return "<1m".to_string();
+    }
+    let (d, h, m) = (mins / 1440, (mins % 1440) / 60, mins % 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m"),
+        (0, _) => format!("{h}h {m}m"),
+        _ => format!("{d}d {h}h"),
+    }
+}
+
 /// `#5830`, `owner/repo#12`, or a GitHub pull request URL.
 pub fn pr_number(target: &str) -> Option<u64> {
     let t = target.trim();

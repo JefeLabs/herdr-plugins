@@ -137,20 +137,20 @@ Send runs `herdr workspace create` on the capability's repo (always the main che
 Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g agent
 ────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
- Oct 25 08:10 │ sent   │ ! needs you │ ███████░░░ PR #42 open
+ Oct 25 08:10 │ sent   │ ! needs you │ 2h 14m  │ ███████░░░ PR #42 open
  skoolscout/org │ slot 3
 
  The primary contact gets no prompt to book the intro meeting.
 ────────────────────────────────────────────────────────────────────────────────
  Families can skip a folder without seeing Pending
- Oct 24 18:02 │ ?2     │ —           │ —
+ Oct 24 18:02 │ ?2     │ —           │ —       │ —
  skoolscout/org
 
  When a parent uses Skip for now on the report-card folder, the folder still
  shows up labelled Pending.…
 ```
 
-Each capability is a card that opens with a horizontal rule: the title in bold on its own row; then the timestamp, the capability's status, the agent's status and the implementation progress; then where it lives (its group, and once sent the agent's workbrokr slot, read from the nearest `.slot` file above the agent's working directory); then, after a blank line, up to two wrapped lines of the description.
+Each capability is a card that opens with a horizontal rule: the title in bold on its own row; then the timestamp, the capability's status, the agent's status, how long the agent's session has been running (counted from the send, shown while Herdr still lists the agent) and the implementation progress; then where it lives (its group, and once sent the agent's workbrokr slot, read from the nearest `.slot` file above the agent's working directory); then, after a blank line, up to two wrapped lines of the description.
 
 Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a ten-cell bar shows how far the feature has got, from evidence that already exists:
 
