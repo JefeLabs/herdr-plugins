@@ -2504,20 +2504,13 @@ impl App {
             ..area
         };
         struct Owned {
-            group: String,
             description: String,
-            flag: Option<&'static str>,
+            agent: Option<String>,
         }
         let owned: Vec<Owned> = self
             .list
             .iter()
             .map(|i| {
-                let group = i
-                    .path
-                    .parent()
-                    .and_then(|d| d.strip_prefix(self.store.root()).ok())
-                    .map(|d| d.display().to_string())
-                    .unwrap_or_default();
                 // every non-empty line of the description; the card wraps it
                 let description = ui::description_text(&i.body)
                     .lines()
@@ -2525,19 +2518,19 @@ impl App {
                     .filter(|l| !l.is_empty() && !l.starts_with('#'))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let flag = match (&i.fm.sent_to, &self.agents, i.fm.state) {
-                    (Some(sent), Some(agents), State::Sent) => match agents.get(&sent.agent) {
-                        Some(st) if st == "blocked" => Some("! needs you"),
-                        Some(_) => None,
-                        None => Some("closed"),
-                    },
+                // the sent agent's live Herdr state; `…` until herdr answers
+                let agent = match (&i.fm.sent_to, i.fm.state) {
+                    (Some(sent), State::Sent) => Some(match &self.agents {
+                        Some(agents) => match agents.get(&sent.agent).map(String::as_str) {
+                            Some("blocked") => "needs you".to_string(),
+                            Some(st) => st.to_string(),
+                            None => "closed".to_string(),
+                        },
+                        None => "…".to_string(),
+                    }),
                     _ => None,
                 };
-                Owned {
-                    group,
-                    description,
-                    flag,
-                }
+                Owned { description, agent }
             })
             .collect();
         let rows: Vec<ui::ListRow> = self
@@ -2553,9 +2546,8 @@ impl App {
                     status: crate::store::readiness(i).label(),
                     progress: crate::progress::progress(i, &self.evidence_for(i))
                         .map(|p| (p.fill, p.label, p.complete)),
-                    flag: o.flag,
+                    agent: o.agent.clone(),
                     title: &i.fm.title,
-                    group: &o.group,
                     when: when.format("%b %d %H:%M").to_string(),
                     description: &o.description,
                 }
@@ -3552,16 +3544,10 @@ mod tests {
         assert!(wide.contains("building 1/3"), "{wide}");
         assert!(wide.contains("✓ complete"), "{wide}");
         assert!(wide.contains("?2"), "{wide}");
-        assert!(
-            wide.contains("skoolscout/org"),
-            "group label when wide: {wide}"
-        );
+        assert!(wide.contains("working"), "live agent state: {wide}");
+        assert!(wide.contains("closed"), "agent pane gone: {wide}");
         insta::assert_snapshot!("list_120", wide);
         let narrow = render(&fx.app, 80, 40);
-        assert!(
-            !narrow.contains("skoolscout/org"),
-            "no group label below 100: {narrow}"
-        );
         assert!(
             narrow.contains('…'),
             "long titles cut with an ellipsis: {narrow}"

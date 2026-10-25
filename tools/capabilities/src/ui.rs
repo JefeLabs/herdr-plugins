@@ -921,11 +921,10 @@ pub struct ListRow<'a> {
     pub status: String,
     /// `(fill 0..=10, label, complete)` once sent.
     pub progress: Option<(f32, String, bool)>,
-    /// `! needs you` or `closed`.
-    pub flag: Option<&'a str>,
+    /// The sent agent's live state (`working`, `idle`, `needs you`, `done`,
+    /// `closed`); `None` before sending.
+    pub agent: Option<String>,
     pub title: &'a str,
-    /// Group path relative to the root, e.g. `skoolscout/org`.
-    pub group: &'a str,
     pub when: String,
     pub description: &'a str,
 }
@@ -957,6 +956,7 @@ const LIST_HINTS: &str = "v tree · S sort · s send · g agent";
 const STATUS_W: usize = 6;
 const BAR_W: usize = 10;
 const WHEN_W: usize = 12;
+const AGENT_W: usize = 11;
 /// Description lines shown on a card at most.
 const DESC_LINES: usize = 2;
 
@@ -977,10 +977,15 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// The list layout: a header, then one card per capability. Row one is the
-/// title (bold), the group when the pane is wide, and the time; row two is the
-/// status, the delivery bar with its label and flag once sent; then up to two
-/// wrapped lines of description. A blank line separates cards.
+/// The list layout: a header, then one card per capability:
+///
+/// ```text
+///  Title
+///  TIMESTAMP │ STATUS │ AGENT │ PROGRESS
+///  description, up to two wrapped lines
+/// ```
+///
+/// A blank line separates cards.
 pub fn render_capability_list(
     rows: &[ListRow],
     selected: usize,
@@ -1029,7 +1034,7 @@ pub fn render_capability_list(
         .iter()
         .map(|r| card_description(r.description, inner_w))
         .collect();
-    // title + status rows + description, then a spacer
+    // title + fields rows + description, then a spacer
     let height = |i: usize| 2 + descs[i].len() + 1;
     // first card shown: the selected card must fit completely
     let room = body.height as usize + 1; // the last card needs no spacer
@@ -1038,6 +1043,7 @@ pub fn render_capability_list(
         first += 1;
     }
     let bottom = body.y + body.height;
+    let sep = || Span::styled(" │ ", Style::default().add_modifier(Modifier::DIM));
     let mut y = body.y;
     for (i, r) in rows.iter().enumerate().skip(first) {
         if y >= bottom {
@@ -1057,56 +1063,41 @@ pub fn render_capability_list(
             }
             *y += 1;
         };
-        // row one: title, group, time
-        let group = if w >= 100 && !r.group.is_empty() {
-            fit(r.group, 24)
-        } else {
-            String::new()
-        };
-        let group_w = if group.is_empty() {
-            0
-        } else {
-            Span::raw(group.as_str()).width() + 2
-        };
-        let title_w = inner_w.saturating_sub(WHEN_W + 1 + group_w);
-        let title = fit(r.title, title_w);
-        let pad = title_w.saturating_sub(Span::raw(title.as_str()).width());
-        let mut top = vec![
-            Span::raw(" "),
-            Span::styled(title, bold),
-            Span::raw(" ".repeat(pad)),
-        ];
-        if !group.is_empty() {
-            top.push(Span::styled(format!("  {group}"), dim));
-        }
-        top.push(Span::styled(
-            format!(" {:>WHEN_W$}", fit(&r.when, WHEN_W)),
-            dim,
-        ));
-        put(Line::from(top), &mut y);
+        // row one: the title alone
+        put(
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(fit(r.title, inner_w), bold),
+            ]),
+            &mut y,
+        );
 
-        // row two: status, progress, flag
-        let mut second = vec![Span::raw(format!(
-            " {:<STATUS_W$} ",
-            fit(&r.status, STATUS_W)
-        ))];
+        // row two: timestamp │ status │ agent │ progress
+        let mut fields = vec![
+            Span::raw(" "),
+            Span::styled(format!("{:<WHEN_W$}", fit(&r.when, WHEN_W)), dim),
+            sep(),
+            Span::raw(format!("{:<STATUS_W$}", fit(&r.status, STATUS_W))),
+            sep(),
+        ];
+        match r.agent.as_deref() {
+            Some("needs you") => fields.push(Span::styled(
+                format!("{:<AGENT_W$}", "! needs you"),
+                bold.fg(ratatui::style::Color::Yellow),
+            )),
+            Some(a) => fields.push(Span::raw(format!("{:<AGENT_W$}", fit(a, AGENT_W)))),
+            None => fields.push(Span::styled(format!("{:<AGENT_W$}", "—"), dim)),
+        }
+        fields.push(sep());
         match &r.progress {
-            Some((_, _, true)) => second.push(Span::raw("✓ complete  ")),
+            Some((_, _, true)) => fields.push(Span::raw("✓ complete")),
             Some((fill, label, false)) => {
-                second.push(Span::raw(crate::progress::bar(*fill, BAR_W)));
-                second.push(Span::raw(format!(" {}  ", fit(label, 24))));
+                fields.push(Span::raw(crate::progress::bar(*fill, BAR_W)));
+                fields.push(Span::raw(format!(" {}", fit(label, 24))));
             }
-            None => {}
+            None => fields.push(Span::styled("—", dim)),
         }
-        if let Some(flag) = r.flag {
-            let style = if flag.starts_with('!') {
-                bold.fg(ratatui::style::Color::Yellow)
-            } else {
-                dim
-            };
-            second.push(Span::styled(flag.to_string(), style));
-        }
-        put(Line::from(second), &mut y);
+        put(Line::from(fields), &mut y);
 
         // description
         for d in &descs[i] {

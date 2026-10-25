@@ -136,21 +136,21 @@ Send runs `herdr workspace create` on the capability's repo (always the main che
 ```
 Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g agent
 ────────────────────────────────────────────────────────────────────────────────
- Notify primary contact to schedule a meeting                      Oct 25 08:10
- sent   ███████░░░ PR #42 open  ! needs you
+ Notify primary contact to schedule a meeting
+ Oct 25 08:10 │ sent   │ ! needs you │ ███████░░░ PR #42 open
  The primary contact gets no prompt to book the intro meeting.
 
- Families can skip a folder without seeing Pending                 Oct 24 18:02
- ?2
+ Families can skip a folder without seeing Pending
+ Oct 24 18:02 │ ?2     │ —           │ —
  When a parent uses Skip for now on the report-card folder, the folder still
  shows up labelled Pending.…
 
- Invitees skip the join request                                    Oct 20 10:30
- sent   ✓ complete  closed
+ Invitees skip the join request
+ Oct 20 10:30 │ sent   │ closed      │ ✓ complete
  Invited parents no longer file a join request.
 ```
 
-Each capability is a card: the title on its own row (with its group when the pane is at least 100 columns wide) and the time, then the status and, once sent, the delivery bar, then up to two wrapped lines of the description.
+Each capability is a card: the title on its own row; then the timestamp, the capability's status, the agent's status and the implementation progress; then up to two wrapped lines of the description.
 
 Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a ten-cell bar shows how far the feature has got, from evidence that already exists:
 
@@ -163,7 +163,7 @@ Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`
 | Merged | `verifying j/M` | every remaining PR merged (closed ones are ignored) |
 | Complete | `✓ complete` | every acceptance criterion ticked, by you |
 
-Ticked criteria fill only their own share of the bar; they never stand in for building or merging. Beside the bar, `! needs you` means the agent the capability was sent to is waiting on you in Herdr, and `closed` means its pane is gone.
+Ticked criteria fill only their own share of the bar; they never stand in for building or merging. The agent field shows the live Herdr state of the agent the capability was sent to: `working`, `idle`, `done`, `! needs you` when it is waiting on you, `closed` when its pane is gone, `…` until Herdr has answered, and `—` before sending.
 
 Keys in the list: `j`/`k` (and `PgUp`/`PgDn`) move, `Enter` opens the capability in the tree, `v` back to the tree, `S` cycles the sort order (Updated, Progress with the least advanced first, Captured, Title), `s` send (same gate), `g` focus the sent agent, `r` rescan, `q` quit. Agent states refresh every few seconds while the list shows; plans and PR states on entry, on `r` and about once a minute. `herdr`, `gh` and git run on background threads, and any of them failing only blanks its column. `gh` is found through `GH_BIN_PATH`, else on `PATH`.
 
