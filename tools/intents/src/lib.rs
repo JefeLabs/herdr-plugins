@@ -2,5 +2,6 @@
 
 pub mod config;
 pub mod conversation;
+pub mod editor;
 pub mod provider;
 pub mod store;
