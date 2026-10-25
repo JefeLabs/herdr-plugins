@@ -624,6 +624,9 @@ impl App {
             if !d.starts_with(self.store.root()) {
                 break;
             }
+            // mark it seen too: a group never drawn before would otherwise be
+            // collapsed again by rebuild_rows' first-sight rule
+            self.seen_groups.insert(d.to_path_buf());
             self.collapsed.remove(d);
             dir = d.parent();
         }
@@ -3486,6 +3489,34 @@ mod tests {
             "{:?}",
             v.rows
         );
+    }
+
+    #[test]
+    fn enter_in_the_list_reveals_a_deeply_nested_capability() {
+        let mut fx = setup("agy.jsonl");
+        // skoolscout/discover-schools/org/office-hours: never drawn in the tree yet
+        let mut parent = PathBuf::from("skoolscout");
+        for name in ["discover-schools", "org", "office-hours"] {
+            fx.app.store.create_group(&parent, name).unwrap();
+            parent = parent.join(name);
+        }
+        fx.app
+            .store
+            .create(&parent, "Deep one", "idea", "x\n", None)
+            .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Deep one");
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree");
+        assert!(
+            v.rows[v.selected].label.contains("Deep one"),
+            "Enter lands on the capability: {:?}",
+            v.rows
+        );
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Deep one");
     }
 
     #[test]
