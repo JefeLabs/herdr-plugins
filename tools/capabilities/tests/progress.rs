@@ -286,7 +286,7 @@ fn agents_without_names_are_skipped() {
     let env = herdr_env(tmp.path(), true);
     let map = agent_statuses(&fixtures().join("fake-herdr.sh"), &env).unwrap();
     assert_eq!(map.len(), 1, "{map:?}");
-    assert_eq!(map["intent-notify-547e"], "blocked");
+    assert_eq!(map["intent-notify-547e"].status, "blocked");
 }
 
 #[test]
@@ -422,4 +422,31 @@ fn pr_state_asks_gh_about_the_pr_as_linked() {
         "owner/repo#n names its repo: {calls}"
     );
     assert_eq!(pr_number("o/other#9"), Some(9));
+}
+
+#[test]
+fn agent_worktree_and_slot_come_from_its_working_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let area = tmp.path().join("repo/.claude/worktrees/org/team");
+    fs::create_dir_all(area.join("app-ui")).unwrap();
+    fs::write(area.join(".slot"), "2\n").unwrap();
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let list = tmp.path().join("agents.json");
+    fs::write(
+        &list,
+        format!(
+            r#"{{"result":{{"agents":[{{"name":"a","agent_status":"working","foreground_cwd":"{}"}},{{"name":"b","agent_status":"idle","cwd":"{}"}}]}}}}"#,
+            area.join("app-ui").display(),
+            elsewhere.display()
+        ),
+    )
+    .unwrap();
+    let mut env = herdr_env(tmp.path(), false);
+    env.push(("FAKE_AGENT_LIST".to_string(), list.display().to_string()));
+    let map = agent_statuses(&fixtures().join("fake-herdr.sh"), &env).unwrap();
+    assert_eq!(map["a"].worktree.as_deref(), Some("org/team"));
+    assert_eq!(map["a"].slot, Some(2));
+    assert_eq!(map["b"].worktree, None, "no .slot above it");
+    assert_eq!(map["b"].slot, None);
 }

@@ -925,6 +925,8 @@ pub struct ListRow<'a> {
     /// `closed`); `None` before sending.
     pub agent: Option<String>,
     pub title: &'a str,
+    /// Where it lives: group path, then the sent agent's worktree and slot.
+    pub location: String,
     pub when: String,
     pub description: &'a str,
 }
@@ -984,6 +986,8 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
 /// ────────────────────────────────────────
 ///  Title
 ///  TIMESTAMP │ STATUS │ AGENT │ PROGRESS
+///  group │ worktree area │ slot N
+///
 ///  description, up to two wrapped lines
 /// ```
 pub fn render_capability_list(
@@ -1032,8 +1036,8 @@ pub fn render_capability_list(
         .iter()
         .map(|r| card_description(r.description, inner_w))
         .collect();
-    // rule + title + fields rows + description
-    let height = |i: usize| 1 + 2 + descs[i].len();
+    // rule + title + fields + location + blank + description
+    let height = |i: usize| 1 + 3 + 1 + descs[i].len();
     // first card shown: the selected card must fit completely
     let room = body.height as usize;
     let mut first = 0;
@@ -1097,6 +1101,16 @@ pub fn render_capability_list(
             None => fields.push(Span::styled("—", dim)),
         }
         put(Line::from(fields), &mut y);
+
+        // row three: where it lives; then a blank line before the description
+        put(
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(fit(&r.location, inner_w), dim),
+            ]),
+            &mut y,
+        );
+        put(Line::raw(""), &mut y);
 
         // description
         for d in &descs[i] {

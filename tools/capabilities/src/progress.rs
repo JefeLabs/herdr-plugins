@@ -343,9 +343,47 @@ pub fn pr_state(gh: &Path, repo: &Path, target: &str, env: &[(String, String)]) 
     }
 }
 
-/// `herdr agent list` as `name → agent_status`. Agents without a name (not
+/// One agent as `herdr agent list` reports it, plus where it is working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentInfo {
+    /// `working`, `idle`, `blocked`, `done`, `unknown`.
+    pub status: String,
+    /// The worktree it is in: the area under `.claude/worktrees/` (e.g.
+    /// `org/team`), else the worktree folder's name.
+    pub worktree: Option<String>,
+    /// The workbrokr slot from that worktree's `.slot` file.
+    pub slot: Option<u32>,
+}
+
+/// The nearest folder at or above `cwd` holding a `.slot` file: its area name
+/// and slot number. `(None, None)` when there is none.
+pub fn worktree_of(cwd: &Path) -> (Option<String>, Option<u32>) {
+    for dir in cwd.ancestors().take(16) {
+        let Ok(text) = std::fs::read_to_string(dir.join(".slot")) else {
+            continue;
+        };
+        let slot = text.trim().parse().ok();
+        let parts: Vec<String> = dir
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        let area = parts
+            .windows(2)
+            .position(|w| w[0] == ".claude" && w[1] == "worktrees")
+            .map(|i| parts[i + 2..].join("/"))
+            .filter(|a| !a.is_empty())
+            .or_else(|| dir.file_name().map(|n| n.to_string_lossy().to_string()));
+        return (area, slot);
+    }
+    (None, None)
+}
+
+/// `herdr agent list` as `name → AgentInfo`. Agents without a name (not
 /// started by this tool) are skipped. `None` when herdr cannot answer.
-pub fn agent_statuses(herdr: &Path, env: &[(String, String)]) -> Option<HashMap<String, String>> {
+pub fn agent_statuses(
+    herdr: &Path,
+    env: &[(String, String)],
+) -> Option<HashMap<String, AgentInfo>> {
     let out = Command::new(herdr)
         .args(["agent", "list"])
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -364,7 +402,19 @@ pub fn agent_statuses(herdr: &Path, env: &[(String, String)]) -> Option<HashMap<
             .filter_map(|a| {
                 let name = a.get("name")?.as_str()?;
                 let status = a.get("agent_status")?.as_str()?;
-                Some((name.to_string(), status.to_string()))
+                let cwd = a
+                    .get("foreground_cwd")
+                    .or_else(|| a.get("cwd"))
+                    .and_then(|c| c.as_str());
+                let (worktree, slot) = cwd.map(|c| worktree_of(Path::new(c))).unwrap_or_default();
+                Some((
+                    name.to_string(),
+                    AgentInfo {
+                        status: status.to_string(),
+                        worktree,
+                        slot,
+                    },
+                ))
             })
             .collect(),
     )
@@ -385,7 +435,7 @@ pub fn tool_bin(env: &[(String, String)], key: &str, default: Option<&str>) -> O
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update {
-    Agents(Option<HashMap<String, String>>),
+    Agents(Option<HashMap<String, AgentInfo>>),
     Pr {
         repo: PathBuf,
         /// The `pr:` target as linked.

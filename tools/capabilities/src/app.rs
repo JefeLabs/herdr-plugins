@@ -326,7 +326,7 @@ pub struct App {
     pr_states: HashMap<(PathBuf, String), crate::progress::PrState>,
     /// Latest `herdr agent list` (`name → agent_status`); `None` until known
     /// or when herdr cannot answer.
-    agents: Option<HashMap<String, String>>,
+    agents: Option<HashMap<String, crate::progress::AgentInfo>>,
     /// herdr was asked and could not answer: the agent field stays blank
     /// rather than looking like it is still loading.
     agents_unavailable: bool,
@@ -2537,6 +2537,7 @@ impl App {
         struct Owned {
             description: String,
             agent: Option<String>,
+            location: String,
         }
         let owned: Vec<Owned> = self
             .list
@@ -2552,7 +2553,7 @@ impl App {
                 // the sent agent's live Herdr state; `…` until herdr answers
                 let agent = match (&i.fm.sent_to, i.fm.state) {
                     (Some(sent), State::Sent) => Some(match &self.agents {
-                        Some(agents) => match agents.get(&sent.agent).map(String::as_str) {
+                        Some(agents) => match agents.get(&sent.agent).map(|a| a.status.as_str()) {
                             Some("blocked") => "needs you".to_string(),
                             Some(st) => st.to_string(),
                             None => "closed".to_string(),
@@ -2562,7 +2563,30 @@ impl App {
                     }),
                     _ => None,
                 };
-                Owned { description, agent }
+                // group path, then the sent agent's worktree and slot
+                let mut location = vec![
+                    i.path
+                        .parent()
+                        .and_then(|d| d.strip_prefix(self.store.root()).ok())
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default(),
+                ];
+                if i.fm.state == State::Sent
+                    && let (Some(sent), Some(agents)) = (&i.fm.sent_to, &self.agents)
+                    && let Some(info) = agents.get(&sent.agent)
+                {
+                    if let Some(w) = &info.worktree {
+                        location.push(format!("worktree {w}"));
+                    }
+                    if let Some(n) = info.slot {
+                        location.push(format!("slot {n}"));
+                    }
+                }
+                Owned {
+                    description,
+                    agent,
+                    location: location.join(" │ "),
+                }
             })
             .collect();
         let rows: Vec<ui::ListRow> = self
@@ -2580,6 +2604,7 @@ impl App {
                         .map(|p| (p.fill, p.label, p.complete)),
                     agent: o.agent.clone(),
                     title: &i.fm.title,
+                    location: o.location.clone(),
                     when: when.format("%b %d %H:%M").to_string(),
                     description: &o.description,
                 }
@@ -3512,8 +3537,18 @@ mod tests {
             "## Description\nshort\n",
         );
 
+        let notify_wt = repo.join(".claude/worktrees/org/notify");
+        fs::create_dir_all(notify_wt.join("app-ui")).unwrap();
+        fs::write(notify_wt.join(".slot"), "3\n").unwrap();
         let agents = tmp.path().join("agents.json");
-        fs::write(&agents, r#"{"result":{"agents":[{"agent":"claude","agent_status":"blocked","name":"intent-notify-547e"},{"agent":"claude","agent_status":"working","name":"intent-reassign-0001"}]}}"#).unwrap();
+        fs::write(
+            &agents,
+            format!(
+                r#"{{"result":{{"agents":[{{"agent":"claude","agent_status":"blocked","name":"intent-notify-547e","foreground_cwd":"{}"}},{{"agent":"claude","agent_status":"working","name":"intent-reassign-0001"}}]}}}}"#,
+                notify_wt.join("app-ui").display()
+            ),
+        )
+        .unwrap();
         let prs = tmp.path().join("prs");
         fs::create_dir_all(&prs).unwrap();
         fs::write(prs.join("42"), "OPEN").unwrap();
@@ -3570,7 +3605,7 @@ mod tests {
         let mut fx = list_fixture(true);
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
-        let wide = render(&fx.app, 120, 40);
+        let wide = render(&fx.app, 120, 60);
         assert!(wide.contains("! needs you"), "{wide}");
         assert!(wide.contains("PR #42 open"), "{wide}");
         assert!(wide.contains("building 1/3"), "{wide}");
@@ -3579,7 +3614,7 @@ mod tests {
         assert!(wide.contains("working"), "live agent state: {wide}");
         assert!(wide.contains("closed"), "agent pane gone: {wide}");
         insta::assert_snapshot!("list_120", wide);
-        let narrow = render(&fx.app, 80, 40);
+        let narrow = render(&fx.app, 80, 60);
         assert!(
             narrow.contains('…'),
             "long titles cut with an ellipsis: {narrow}"
@@ -3597,7 +3632,7 @@ mod tests {
         let mut fx = list_fixture(true);
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
-        let (w, h) = (100u16, 30u16);
+        let (w, h) = (100u16, 60u16);
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| fx.app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
             .unwrap();
@@ -3660,7 +3695,7 @@ mod tests {
         fs::write(&path, text).unwrap();
         fx.app.poll_ticks = 1800; // the minute timer is due
         settle(&mut fx.app);
-        let shown = render(&fx.app, 120, 40);
+        let shown = render(&fx.app, 120, 60);
         assert!(shown.contains("PR #43 open"), "{shown}");
     }
 
@@ -3670,10 +3705,37 @@ mod tests {
         fx.app.herdr_env.retain(|(k, _)| k != "FAKE_AGENT_LIST"); // fake herdr now fails
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
-        let shown = render(&fx.app, 120, 40);
+        let shown = render(&fx.app, 120, 60);
         assert!(
             shown.contains("Oct 25 08:10 │ sent   │ —"),
             "no endless loading mark: {shown}"
+        );
+    }
+
+    #[test]
+    fn cards_show_where_the_capability_lives() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 60);
+        assert!(
+            shown.contains(" skoolscout/org │ worktree org/notify │ slot 3"),
+            "group, then the sent agent's worktree and slot: {shown}"
+        );
+        assert!(
+            shown.lines().any(|l| l == " Inbox"),
+            "an unsent card shows its group alone: {shown}"
+        );
+        let lines: Vec<&str> = shown.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("worktree org/notify"))
+            .unwrap();
+        assert_eq!(lines[at + 1], "", "a blank line before the description");
+        assert!(
+            lines[at + 2].starts_with(" The primary contact"),
+            "{}",
+            lines[at + 2]
         );
     }
 
@@ -3746,7 +3808,7 @@ mod tests {
         let mut fx = list_fixture(false);
         key(&mut fx.app, KeyCode::Char('v'));
         settle(&mut fx.app);
-        let text = render(&fx.app, 120, 40);
+        let text = render(&fx.app, 120, 60);
         assert!(text.contains("✓ complete"), "{text}");
         assert!(
             text.contains("building ?"),
