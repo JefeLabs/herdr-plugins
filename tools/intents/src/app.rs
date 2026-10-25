@@ -123,7 +123,9 @@ pub struct App {
     pub tree: Group,
     rows: Vec<Row>,
     pub selected: usize,
-    tree_scroll: usize,
+    /// Groups seen at least once; a sub-group (depth >= 1) starts collapsed the
+    /// first time it appears, so a deep tree discloses itself one level at a time.
+    seen_groups: HashSet<PathBuf>,
     collapsed: HashSet<PathBuf>,
     pub screen: Screen,
     pub editor: TextArea,
@@ -149,7 +151,7 @@ impl App {
             tree,
             rows: Vec::new(),
             selected: 0,
-            tree_scroll: 0,
+            seen_groups: HashSet::new(),
             collapsed: HashSet::new(),
             screen: Screen::Browse,
             editor: TextArea::default(),
@@ -167,8 +169,18 @@ impl App {
 
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
-        fn walk(g: &Group, depth: usize, collapsed: &HashSet<PathBuf>, rows: &mut Vec<Row>) {
+        fn walk(
+            g: &Group,
+            depth: usize,
+            collapsed: &mut HashSet<PathBuf>,
+            seen: &mut HashSet<PathBuf>,
+            rows: &mut Vec<Row>,
+        ) {
             for sub in &g.groups {
+                // a sub-group starts collapsed the first time it is seen
+                if seen.insert(sub.path.clone()) && depth >= 1 {
+                    collapsed.insert(sub.path.clone());
+                }
                 let count = count_intents(sub);
                 rows.push(Row::Group {
                     path: sub.path.clone(),
@@ -177,7 +189,7 @@ impl App {
                     count,
                 });
                 if !collapsed.contains(&sub.path) {
-                    walk(sub, depth + 1, collapsed, rows);
+                    walk(sub, depth + 1, collapsed, seen, rows);
                 }
             }
             for it in &g.intents {
@@ -190,7 +202,13 @@ impl App {
         fn count_intents(g: &Group) -> usize {
             g.intents.len() + g.groups.iter().map(count_intents).sum::<usize>()
         }
-        walk(&self.tree, 0, &self.collapsed, &mut rows);
+        walk(
+            &self.tree,
+            0,
+            &mut self.collapsed,
+            &mut self.seen_groups,
+            &mut rows,
+        );
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -1087,7 +1105,14 @@ impl App {
                 },
             })
             .collect();
-        ui::render_tree(&tree_rows, self.selected, self.tree_scroll, left, buf);
+        // scroll the tree just enough to keep the selection on screen
+        let visible = left.height as usize;
+        let tree_scroll = if visible > 0 && self.selected >= visible {
+            self.selected + 1 - visible
+        } else {
+            0
+        };
+        ui::render_tree(&tree_rows, self.selected, tree_scroll, left, buf);
 
         match &self.screen {
             Screen::Edit => self.editor.render(right, buf, true),
@@ -1885,6 +1910,59 @@ mod tests {
                 .contains("herdr"),
             "{:?}",
             fx.app.view().message
+        );
+    }
+
+    #[test]
+    fn subgroups_start_collapsed_and_expand_progressively() {
+        let fx = setup("agy.jsonl");
+        let root = fx.app.store.root().to_path_buf();
+        for sub in ["a/one", "a/two", "a/one/deep"] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let mut app = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        let labels: Vec<String> = app.view().rows.iter().map(|r| r.label.clone()).collect();
+        assert!(labels.contains(&"a".to_string()));
+        assert!(
+            labels.contains(&"one".to_string()),
+            "sub-groups show as collapsed rows: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"deep".to_string()),
+            "a sub-group's contents stay hidden until expanded: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"In the inbox".to_string()),
+            "top-level groups show their intents"
+        );
+        select(&mut app, "one");
+        key(&mut app, KeyCode::Char('l'));
+        let labels: Vec<String> = app.view().rows.iter().map(|r| r.label.clone()).collect();
+        assert!(
+            labels.contains(&"deep".to_string()),
+            "expanding discloses one more level: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn tree_scrolls_to_keep_the_selection_visible() {
+        let fx = setup("agy.jsonl");
+        let root = fx.app.store.root().to_path_buf();
+        for i in 0..40 {
+            fs::create_dir_all(root.join(format!("g{i:02}"))).unwrap();
+        }
+        let mut app = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        for _ in 0..30 {
+            key(&mut app, KeyCode::Char('j'));
+        }
+        let selected_label = app.view().rows[app.view().selected].label.clone();
+        let mut t = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        t.draw(|f| app.draw(Rect::new(0, 0, 60, 10), f.buffer_mut()))
+            .unwrap();
+        let text = format!("{:?}", t.backend().buffer());
+        assert!(
+            text.contains(&selected_label),
+            "selected row {selected_label} must be drawn; buffer:\n{text}"
         );
     }
 }
