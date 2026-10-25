@@ -1,10 +1,19 @@
-//! Send an intent to a new Herdr agent. Filled in by Task 7; stubs for now.
+//! Send an intent to a new Herdr agent: resolve the repo, render the handoff
+//! prompt (with the workbrokr preamble where it applies), and drive the Herdr
+//! CLI: workspace create → agent start → agent prompt.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::config::{Config, Handoff};
 use crate::store::Intent;
 
+/// Handoffs that build code; planning handoffs never get the work-start preamble.
+const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec"];
+
+const WORKBROKR_PREAMBLE: &str = "This repo uses workbrokr. Before touching code, run `work start --area <area> --type <fix|feature> --mode <fullstack|frontend>`; take the area from the intent's tags or group, and ask me if it is unclear.\n\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendOutcome {
     pub workspace_id: String,
     pub pane_id: String,
@@ -17,8 +26,16 @@ pub struct SendError {
     pub detail: String,
 }
 
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.step, self.detail)
+    }
+}
+
+/// The main checkout: parent of `git rev-parse --git-common-dir`, canonical.
+/// A worktree resolves to the checkout it belongs to.
 pub fn main_checkout(from: &Path) -> anyhow::Result<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(from)
         .output()?;
@@ -31,24 +48,209 @@ pub fn main_checkout(from: &Path) -> anyhow::Result<PathBuf> {
     } else {
         from.join(common)
     };
+    let common = std::fs::canonicalize(&common).unwrap_or(common);
     let top = common.parent().map(Path::to_path_buf).unwrap_or(common);
     Ok(std::fs::canonicalize(&top).unwrap_or(top))
 }
 
-pub fn prepare(_cfg: &Config, h: &Handoff, it: &Intent) -> (PathBuf, String) {
-    let repo = it.fm.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    (repo, h.prompt.replace("{intent}", &it.body))
+pub fn uses_workbrokr(repo: &Path, override_: Option<bool>) -> bool {
+    match override_ {
+        Some(v) => v,
+        None => repo.join("helmsmith.config.ts").is_file(),
+    }
 }
 
-pub fn send_intent(
-    _env: &[(String, String)],
-    _repo: &Path,
-    _it: &Intent,
-    _kind: &str,
-    _prompt: &str,
+pub fn render_prompt(
+    h: &Handoff,
+    intent: &Intent,
+    attachments: &[(String, u64)],
+    workbrokr: bool,
+) -> String {
+    let atts = if attachments.is_empty() {
+        "(none)".to_string()
+    } else {
+        attachments
+            .iter()
+            .map(|(n, _)| format!("- {}", intent.assets_dir().join(n).display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let intent_text = format!("# {}\n\n{}", intent.fm.title, intent.body.trim_end());
+    let mut p = h
+        .prompt
+        .replace("\\n", "\n")
+        .replace("{intent}", &intent_text)
+        .replace("{attachments}", &atts);
+    if workbrokr && BUILDING_HANDOFFS.contains(&h.name.as_str()) {
+        p = format!("{WORKBROKR_PREAMBLE}{p}");
+    }
+    p
+}
+
+/// Repo and rendered prompt for the confirm screen.
+pub fn prepare(
+    cfg: &Config,
+    h: &Handoff,
+    it: &Intent,
+    attachments: &[(String, u64)],
+) -> (PathBuf, String) {
+    let repo = it
+        .fm
+        .repo
+        .clone()
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|d| main_checkout(&d).ok())
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    let prompt = render_prompt(h, it, attachments, uses_workbrokr(&repo, cfg.workbrokr));
+    (repo, prompt)
+}
+
+/// `intent-<slug prefix>`, valid for Herdr agent names (`[a-z][a-z0-9_-]{0,31}`).
+pub fn agent_name(slug: &str) -> String {
+    let cleaned: String = slug
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let mut name = format!("intent-{}", &cleaned[..cleaned.len().min(25)]);
+    name = name.trim_end_matches('-').to_string();
+    if name == "intent" {
+        name.push_str("-x");
+    }
+    name
+}
+
+fn herdr(
+    bin: &Path,
+    env: &[(String, String)],
+    args: &[&str],
+    step: &'static str,
+) -> Result<serde_json::Value, SendError> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().map_err(|e| SendError {
+        step,
+        detail: format!("cannot run {}: {e}", bin.display()),
+    })?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let detail = serde_json::from_str::<serde_json::Value>(err.trim())
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| err.trim().to_string());
+        return Err(SendError {
+            step,
+            detail: if detail.is_empty() {
+                format!("exit {}", out.status)
+            } else {
+                detail
+            },
+        });
+    }
+    Ok(
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// workspace create → agent start → agent prompt. Any failure names its step;
+/// the caller leaves the intent untouched on `Err`.
+pub fn send(
+    herdr_bin: &Path,
+    env: &[(String, String)],
+    repo: &Path,
+    title: &str,
+    provider_kind: &str,
+    prompt: &str,
 ) -> Result<SendOutcome, SendError> {
-    Err(SendError {
-        step: "send",
-        detail: "not implemented".into(),
+    let cwd = repo.display().to_string();
+    let created = herdr(
+        herdr_bin,
+        env,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            &cwd,
+            "--label",
+            title,
+            "--no-focus",
+        ],
+        "workspace create",
+    )?;
+    let workspace_id = created
+        .pointer("/result/workspace/workspace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let pane_id = created
+        .pointer("/result/root_pane/pane_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SendError {
+            step: "workspace create",
+            detail: "no root pane in reply".into(),
+        })?
+        .to_string();
+    let agent = agent_name(&crate::store::slugify(title));
+    herdr(
+        herdr_bin,
+        env,
+        &[
+            "agent",
+            "start",
+            &agent,
+            "--kind",
+            provider_kind,
+            "--pane",
+            &pane_id,
+        ],
+        "agent start",
+    )?;
+    herdr(
+        herdr_bin,
+        env,
+        &["agent", "prompt", &agent, prompt],
+        "agent prompt",
+    )?;
+    Ok(SendOutcome {
+        workspace_id,
+        pane_id,
+        agent,
     })
+}
+
+/// App entry point: finds the `herdr` binary from `HERDR_BIN_PATH` (the env
+/// list first, then the process environment), else fails before any call.
+pub fn send_intent(
+    env: &[(String, String)],
+    repo: &Path,
+    it: &Intent,
+    provider_kind: &str,
+    prompt: &str,
+) -> Result<SendOutcome, SendError> {
+    let bin = env
+        .iter()
+        .find(|(k, _)| k == "HERDR_BIN_PATH")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("HERDR_BIN_PATH").ok())
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| SendError { step: "herdr", detail: "Herdr is required to send: HERDR_BIN_PATH is not set (run inside a Herdr pane or the toolbar)".into() })?;
+    send(
+        Path::new(&bin),
+        env,
+        repo,
+        &it.fm.title,
+        provider_kind,
+        prompt,
+    )
 }

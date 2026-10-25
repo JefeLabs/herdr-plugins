@@ -696,7 +696,12 @@ impl App {
                 };
                 match self.selected_intent().cloned() {
                     Some(it) => {
-                        let (repo, prompt) = crate::send::prepare(&self.cfg, &handoff, &it);
+                        let (repo, prompt) = crate::send::prepare(
+                            &self.cfg,
+                            &handoff,
+                            &it,
+                            &Store::attachments(&it),
+                        );
                         self.screen = Screen::SendConfirm {
                             handoff,
                             provider,
@@ -1806,5 +1811,79 @@ mod tests {
         assert_eq!(fx.app.selected_intent().unwrap().fm.kind, "issue");
         let path = fx.app.selected_intent().unwrap().path.clone();
         assert_eq!(Store::load(&path).unwrap().fm.kind, "issue", "persisted");
+    }
+
+    #[test]
+    fn send_marks_intent_sent_with_record_only_on_success() {
+        let mut fx = setup("agy.jsonl");
+        let log = fx._tmp.path().join("herdr.log");
+        fx.app.herdr_env = vec![
+            (
+                "HERDR_BIN_PATH".into(),
+                fixtures().join("fake-herdr.sh").display().to_string(),
+            ),
+            ("FAKE_HERDR_LOG".into(), log.display().to_string()),
+        ];
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "send-pick");
+        key(&mut fx.app, KeyCode::Enter); // first applicable handoff for an idea: grill
+        assert_eq!(fx.app.view().screen, "send-confirm");
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert_eq!(it.fm.state, State::Sent);
+        let sent = it.fm.sent_to.unwrap();
+        assert_eq!(sent.handoff, "grill");
+        assert_eq!(sent.workspace_id, "w9");
+        assert!(fs::read_to_string(&log).unwrap().contains("agent prompt"));
+
+        // a failing herdr call leaves the intent as it was
+        let mut fx2 = setup("agy.jsonl");
+        fx2.app.herdr_env = vec![
+            (
+                "HERDR_BIN_PATH".into(),
+                fixtures().join("fake-herdr.sh").display().to_string(),
+            ),
+            (
+                "FAKE_HERDR_LOG".into(),
+                fx2._tmp.path().join("h.log").display().to_string(),
+            ),
+            ("FAKE_AGENT_START_FAILS".into(), "1".into()),
+        ];
+        select(&mut fx2.app, "Beta");
+        key(&mut fx2.app, KeyCode::Char('R'));
+        key(&mut fx2.app, KeyCode::Char('s'));
+        key(&mut fx2.app, KeyCode::Enter);
+        key(&mut fx2.app, KeyCode::Enter);
+        let it = Store::load(&fx2.app.selected_intent().unwrap().path).unwrap();
+        assert_eq!(it.fm.state, State::Ready, "unchanged on failure");
+        assert!(it.fm.sent_to.is_none());
+        assert!(
+            fx2.app.view().message.unwrap().contains("agent start"),
+            "{:?}",
+            fx2.app.view().message
+        );
+    }
+
+    #[test]
+    fn send_without_herdr_shows_message_and_keeps_state() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.herdr_env = vec![("HERDR_BIN_PATH".into(), String::new())];
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('s'));
+        key(&mut fx.app, KeyCode::Enter);
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert_eq!(it.fm.state, State::Raw);
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap()
+                .to_lowercase()
+                .contains("herdr"),
+            "{:?}",
+            fx.app.view().message
+        );
     }
 }
