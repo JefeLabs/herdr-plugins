@@ -1,6 +1,6 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 4169
+assertion_line: 4343
 expression: narrow
 ---
 Capabilities · 7 · sorted by Updated

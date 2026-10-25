@@ -585,7 +585,11 @@ fn affected_areas_round_trip_and_stay_out_of_the_file_when_empty() {
     let it = s
         .create(Path::new("Inbox"), "Spans areas", "idea", "x\n", None)
         .unwrap();
-    assert!(!std::fs::read_to_string(&it.path).unwrap().contains("areas:"));
+    assert!(
+        !std::fs::read_to_string(&it.path)
+            .unwrap()
+            .contains("areas:")
+    );
     Store::update_fields(&it.path, |fm| {
         fm.areas = vec!["skoolscout/org".into(), "skoolscout/family".into()]
     })

@@ -1,6 +1,6 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 4158
+assertion_line: 4332
 expression: wide
 ---
 Capabilities · 7 · sorted by Updated                                       v tree · S sort · f filter · s send · g agent
