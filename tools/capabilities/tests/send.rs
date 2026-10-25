@@ -228,3 +228,41 @@ fn failed_start_reports_the_orphaned_workspace() {
         e.detail
     );
 }
+
+#[test]
+fn prompts_ask_the_agent_to_verify_preconditions_first_when_there_are_any() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        config: tmp.path().join("cfg"),
+        root: tmp.path().join("root"),
+    };
+    let cfg = load_or_init(&dirs).unwrap();
+    let store = Store::open(&dirs.root).unwrap();
+    let with = store
+        .create(
+            Path::new("Inbox"),
+            "With",
+            "idea",
+            "## Description\nx\n\n## Preconditions\n- [ ] report cards optional\n",
+            None,
+        )
+        .unwrap();
+    let without = store
+        .create(
+            Path::new("Inbox"),
+            "Without",
+            "idea",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    let grill = cfg.handoffs.iter().find(|h| h.name == "grill").unwrap();
+    let p = render_prompt(grill, &with, &[], false);
+    assert!(p.to_lowercase().contains("precondition"), "{p}");
+    assert!(
+        p.find("precondition").unwrap() < p.find("/grill-me").unwrap(),
+        "the instruction comes first: {p}"
+    );
+    let p = render_prompt(grill, &without, &[], false);
+    assert!(!p.to_lowercase().contains("precondition"), "{p}");
+}

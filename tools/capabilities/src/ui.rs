@@ -415,6 +415,7 @@ mod tests {
             attachments: &[],
             focus: Pane::Questions,
             description_scroll: 0,
+            preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
             answering: None,
@@ -466,6 +467,7 @@ mod tests {
 pub enum Pane {
     Tree,
     Description,
+    Preconditions,
     Criteria,
     Questions,
 }
@@ -514,6 +516,7 @@ pub struct DetailView<'a> {
     pub attachments: &'a [(String, u64)],
     pub focus: Pane,
     pub description_scroll: u16,
+    pub preconditions_selected: usize,
     pub criteria_selected: usize,
     pub question_selected: usize,
     /// `(question index, text so far)` while an answer is being typed.
@@ -550,18 +553,24 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         })
         .sum::<usize>() as u16
         + if v.answering.is_some() { 2 } else { 0 };
-    let c_rows: u16 = cs
-        .iter()
-        .map(|c| wrap_text(&c.text, text_width.saturating_sub(2)).len())
-        .sum::<usize>() as u16;
-    let half = (area.height / 2).max(3);
+    let ps = crate::store::preconditions(&it.body);
+    let rows_of = |items: &[crate::store::Criterion]| {
+        items
+            .iter()
+            .map(|c| wrap_text(&c.text, text_width.saturating_sub(2)).len())
+            .sum::<usize>() as u16
+    };
+    let c_rows = rows_of(&cs);
+    let p_rows = rows_of(&ps);
+    let third = (area.height / 3).max(3);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(4),
-            Constraint::Length((c_rows + 1).clamp(2, half.min(10))),
-            Constraint::Length((q_rows + 1).clamp(2, half)),
+            Constraint::Length((p_rows + 1).clamp(2, third.min(8))),
+            Constraint::Length((c_rows + 1).clamp(2, third.min(8))),
+            Constraint::Length((q_rows + 1).clamp(2, third + 2)),
         ])
         .split(area);
 
@@ -599,6 +608,17 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     Paragraph::new(header).render(layout[0], buf);
 
     // description: everything outside the two list sections
+    // preconditions
+    render_checklist(
+        &ps,
+        "Preconditions",
+        "none — what must already be true for this to be worth building?",
+        v.focus == Pane::Preconditions,
+        v.preconditions_selected,
+        layout[2],
+        buf,
+    );
+
     let block = pane_block("Description", v.focus == Pane::Description);
     let inner = block.inner(layout[1]);
     block.render(layout[1], buf);
@@ -617,8 +637,8 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         ),
         v.focus == Pane::Criteria,
     );
-    let inner = block.inner(layout[2]);
-    block.render(layout[2], buf);
+    let inner = block.inner(layout[3]);
+    block.render(layout[3], buf);
     if cs.is_empty() {
         Paragraph::new(Span::styled(
             "none yet — add `- [ ]` items in the editor or let polish propose them",
@@ -654,8 +674,8 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         &format!("Open questions ({} open)", open),
         v.focus == Pane::Questions,
     );
-    let inner = block.inner(layout[3]);
-    block.render(layout[3], buf);
+    let inner = block.inner(layout[4]);
+    block.render(layout[4], buf);
     if qs.is_empty() {
         Paragraph::new(Span::styled(
             "none",
@@ -737,7 +757,59 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     }
 }
 
-/// The body without the two list sections.
+/// A titled checklist pane with wrapped items; the selected one is highlighted when focused.
+fn render_checklist(
+    items: &[crate::store::Criterion],
+    title: &str,
+    empty: &str,
+    focused: bool,
+    selected: usize,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let block = pane_block(
+        &format!(
+            "{title} ({}/{})",
+            items.iter().filter(|c| c.done).count(),
+            items.len()
+        ),
+        focused,
+    );
+    let inner = block.inner(area);
+    block.render(area, buf);
+    if items.is_empty() {
+        Paragraph::new(Span::styled(
+            empty,
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .render(inner, buf);
+        return;
+    }
+    let mut y = inner.y;
+    'items: for (i, c) in items.iter().enumerate() {
+        let box_ = if c.done { "[x] " } else { "[ ] " };
+        for (j, piece) in wrap_text(&sanitize(&c.text), (inner.width as usize).saturating_sub(4))
+            .into_iter()
+            .enumerate()
+        {
+            if y >= inner.y + inner.height {
+                break 'items;
+            }
+            let rect = Rect {
+                y,
+                height: 1,
+                ..inner
+            };
+            if focused && i == selected {
+                buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+            }
+            Line::from(format!("{}{piece}", if j == 0 { box_ } else { "    " })).render(rect, buf);
+            y += 1;
+        }
+    }
+}
+
+/// The body without the list sections.
 pub fn description_text(body: &str) -> String {
     let mut out = String::new();
     let mut skipping = false;
@@ -745,7 +817,8 @@ pub fn description_text(body: &str) -> String {
         if line.starts_with("## ") {
             let h = line.trim();
             skipping = h.eq_ignore_ascii_case("## Acceptance criteria")
-                || h.eq_ignore_ascii_case("## Open questions");
+                || h.eq_ignore_ascii_case("## Open questions")
+                || h.eq_ignore_ascii_case("## Preconditions");
             if skipping {
                 continue;
             }

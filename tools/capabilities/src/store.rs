@@ -597,9 +597,9 @@ pub fn answer_question(body: &str, index: usize, answer: &str) -> Option<String>
     Some(text)
 }
 
-/// Checklist items under `## Acceptance criteria`.
-pub fn criteria(body: &str) -> Vec<Criterion> {
-    section_lines(body, "## Acceptance criteria")
+/// Checklist items (`- [ ]` / `- [x]`) under a `## Heading`.
+pub fn checklist(body: &str, heading: &str) -> Vec<Criterion> {
+    section_lines(body, heading)
         .into_iter()
         .filter_map(|(_, line)| {
             let t = line.trim_start();
@@ -620,11 +620,11 @@ pub fn criteria(body: &str) -> Vec<Criterion> {
         .collect()
 }
 
-/// Flip the checkbox of criterion `index`. `None` if out of range.
-pub fn toggle_criterion(body: &str, index: usize) -> Option<String> {
+/// Flip the checkbox of item `index` under `heading`. `None` if out of range.
+pub fn toggle_checklist(body: &str, heading: &str, index: usize) -> Option<String> {
     let mut seen = 0usize;
     let mut target: Option<usize> = None;
-    for (i, line) in section_lines(body, "## Acceptance criteria") {
+    for (i, line) in section_lines(body, heading) {
         let t = line.trim_start();
         if t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ") {
             if seen == index {
@@ -653,6 +653,28 @@ pub fn toggle_criterion(body: &str, index: usize) -> Option<String> {
         text.push('\n');
     }
     Some(text)
+}
+
+pub const CRITERIA_HEADING: &str = "## Acceptance criteria";
+pub const PRECONDITIONS_HEADING: &str = "## Preconditions";
+
+/// Checks that prove the capability is done.
+pub fn criteria(body: &str) -> Vec<Criterion> {
+    checklist(body, CRITERIA_HEADING)
+}
+
+pub fn toggle_criterion(body: &str, index: usize) -> Option<String> {
+    toggle_checklist(body, CRITERIA_HEADING, index)
+}
+
+/// Assumptions that must hold for the capability to be worth building;
+/// ticked once confirmed (by the owner or by the receiving agent).
+pub fn preconditions(body: &str) -> Vec<Criterion> {
+    checklist(body, PRECONDITIONS_HEADING)
+}
+
+pub fn toggle_precondition(body: &str, index: usize) -> Option<String> {
+    toggle_checklist(body, PRECONDITIONS_HEADING, index)
 }
 
 /// Convenience for callers that want the raw mapping (e.g. tests).

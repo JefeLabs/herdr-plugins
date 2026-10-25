@@ -2,6 +2,10 @@
 
 
 
+## Preconditions
+
+- [ ] 
+
 ## Acceptance criteria
 
 - [ ] 

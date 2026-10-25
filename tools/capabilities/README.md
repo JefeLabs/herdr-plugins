@@ -44,11 +44,15 @@ command = "jefelabs.capabilities.add"
 
 ## Shape of an capability
 
-Every capability body has three sections, seeded by the kind's template and kept by the agent's proposals:
+Every capability body has four sections, seeded by the kind's template and kept by the agent's proposals:
 
 ```markdown
 ## Description
 What this is, in the author's words (for an issue: observed, expected, steps).
+
+## Preconditions
+- [ ] what must already be true for this to be worth building
+- [x] one already confirmed
 
 ## Acceptance criteria
 - [ ] a check a reviewer could verify
@@ -60,7 +64,7 @@ What this is, in the author's words (for an issue: observed, expected, steps).
 - Since when?
 ```
 
-The right-hand side shows the three parts as separate panes under a header. The Description pane and the agent's replies in the chat render Markdown: headings bold, bullets as dots, bold, italic and code spans styled, code blocks dimmed; the editor shows the raw text. `Tab` and `Shift-Tab` move focus between the tree, Description, Acceptance criteria and Open questions; `Esc` returns to the tree. In Description, `j`/`k` scroll and `Enter` edits. In Acceptance criteria, `j`/`k` choose and `Enter` or space toggles the checkbox, staying in the pane so several can be ticked. In Open questions, `j`/`k` choose and `Enter` opens an answer box right under the question; type (or paste), `Enter` saves, `Esc` cancels. Answers are stored as an indented `→` line under the question, answered questions no longer count as open (the `?N` mark counts only unanswered ones), and the agent is told to keep them with their answers rather than re-ask. `Q` and `C` jump straight to the questions and criteria panes.
+The right-hand side shows the three parts as separate panes under a header. The Description pane and the agent's replies in the chat render Markdown: headings bold, bullets as dots, bold, italic and code spans styled, code blocks dimmed; the editor shows the raw text. `Tab` and `Shift-Tab` move focus between the tree, Description, Preconditions, Acceptance criteria and Open questions; `Esc` returns to the tree. In Description, `j`/`k` scroll and `Enter` edits. In Acceptance criteria, `j`/`k` choose and `Enter` or space toggles the checkbox, staying in the pane so several can be ticked. In Open questions, `j`/`k` choose and `Enter` opens an answer box right under the question; type (or paste), `Enter` saves, `Esc` cancels. Answers are stored as an indented `→` line under the question, answered questions no longer count as open (the `?N` mark counts only unanswered ones), and the agent is told to keep them with their answers rather than re-ask. `Q` jumps to the questions; `C` jumps to the criteria and, pressed again, to the preconditions. Preconditions are assumptions, not checks: when a capability is sent, the receiving agent is told to verify each one against the code before building anything and to ask about those it cannot settle.
 
 ## Keys
 

@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use herdr_capabilities::store::{
-    SaveError, State, Store, answer_question, criteria, open_questions, questions, slugify,
-    toggle_criterion,
+    SaveError, State, Store, answer_question, criteria, open_questions, preconditions, questions,
+    slugify, toggle_criterion, toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -391,5 +391,20 @@ fn criteria_parse_and_toggle() {
     assert!(
         body.contains("- [ ] Nothing changes for uploaded folders"),
         "{body}"
+    );
+}
+
+#[test]
+fn preconditions_are_their_own_checklist() {
+    let body = "## Description\nx\n\n## Preconditions\n- [ ] Report cards are optional at that point\n- [x] Pending is shared across folders\n\n## Acceptance criteria\n- [ ] Skipped folders read Skipped\n";
+    let pre = preconditions(body);
+    assert_eq!(pre.len(), 2);
+    assert!(!pre[0].done && pre[1].done);
+    assert_eq!(criteria(body).len(), 1, "criteria unaffected");
+    let body = toggle_precondition(body, 0).unwrap();
+    assert!(body.contains("- [x] Report cards are optional"), "{body}");
+    assert!(
+        body.contains("- [ ] Skipped folders read Skipped"),
+        "criteria untouched: {body}"
     );
 }

@@ -11,6 +11,8 @@ use crate::store::Intent;
 /// Handoffs that build code; planning handoffs never get the work-start preamble.
 const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec"];
 
+const PRECONDITIONS_PREAMBLE: &str = "Before anything else, verify each item under Preconditions against the code and the data: tell me which hold, which do not, and ask about any you cannot settle. Do not build on a precondition you have not confirmed.\n\n";
+
 const WORKBROKR_PREAMBLE: &str = "This repo uses workbrokr. Before touching code, run `work start --area <area> --type <fix|feature> --mode <fullstack|frontend>`; take the area from the intent's tags or group, and ask me if it is unclear.\n\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,9 @@ pub fn render_prompt(
         .replace("\\n", "\n")
         .replace("{intent}", &intent_text)
         .replace("{attachments}", &atts);
+    if !crate::store::preconditions(&intent.body).is_empty() {
+        p = format!("{PRECONDITIONS_PREAMBLE}{p}");
+    }
     if workbrokr && BUILDING_HANDOFFS.contains(&h.name.as_str()) {
         p = format!("{WORKBROKR_PREAMBLE}{p}");
     }

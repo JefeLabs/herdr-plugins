@@ -212,6 +212,7 @@ pub struct App {
     parked_chat: Option<ChatState>,
     pub focus: Pane,
     description_scroll: u16,
+    preconditions_selected: usize,
     criteria_selected: usize,
     question_selected: usize,
 }
@@ -238,6 +239,7 @@ impl App {
             parked_chat: None,
             focus: Pane::Tree,
             description_scroll: 0,
+            preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
         };
@@ -349,6 +351,7 @@ impl App {
 
     fn reset_pane_cursors(&mut self) {
         self.description_scroll = 0;
+        self.preconditions_selected = 0;
         self.criteria_selected = 0;
         self.question_selected = 0;
     }
@@ -422,7 +425,8 @@ impl App {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Description,
-                    Pane::Description => Pane::Criteria,
+                    Pane::Description => Pane::Preconditions,
+                    Pane::Preconditions => Pane::Criteria,
                     Pane::Criteria => Pane::Questions,
                     Pane::Questions => Pane::Tree,
                 };
@@ -432,7 +436,8 @@ impl App {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Questions,
                     Pane::Description => Pane::Tree,
-                    Pane::Criteria => Pane::Description,
+                    Pane::Preconditions => Pane::Description,
+                    Pane::Criteria => Pane::Preconditions,
                     Pane::Questions => Pane::Criteria,
                 };
                 return Flow::Continue;
@@ -446,8 +451,14 @@ impl App {
             }
             KeyCode::Char('C') => {
                 if self.selected_intent().is_some() {
-                    self.focus = Pane::Criteria;
+                    // C goes to the criteria; C again flips to the preconditions, and back
+                    self.focus = if self.focus == Pane::Criteria {
+                        Pane::Preconditions
+                    } else {
+                        Pane::Criteria
+                    };
                     self.criteria_selected = 0;
+                    self.preconditions_selected = 0;
                 }
                 return Flow::Continue;
             }
@@ -633,6 +644,24 @@ impl App {
                 }
                 _ => {}
             },
+            Pane::Preconditions => {
+                let n = crate::store::preconditions(&it.body).len();
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.preconditions_selected =
+                            (self.preconditions_selected + 1).min(n.saturating_sub(1))
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.preconditions_selected = self.preconditions_selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_checklist(
+                        crate::store::PRECONDITIONS_HEADING,
+                        self.preconditions_selected,
+                    ),
+                    _ => {}
+                }
+            }
             Pane::Criteria => {
                 let n = crate::store::criteria(&it.body).len();
                 match k.code {
@@ -644,7 +673,10 @@ impl App {
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.criteria_selected = self.criteria_selected.saturating_sub(1)
                     }
-                    KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_criterion(),
+                    KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_checklist(
+                        crate::store::CRITERIA_HEADING,
+                        self.criteria_selected,
+                    ),
                     _ => {}
                 }
             }
@@ -675,14 +707,13 @@ impl App {
         Flow::Continue
     }
 
-    fn toggle_selected_criterion(&mut self) {
+    fn toggle_selected_checklist(&mut self, heading: &str, index: usize) {
         let Some(path) = self.selected_intent().map(|i| i.path.clone()) else {
             return;
         };
         match Store::load(&path) {
             Ok(mut it) => {
-                if let Some(body) = crate::store::toggle_criterion(&it.body, self.criteria_selected)
-                {
+                if let Some(body) = crate::store::toggle_checklist(&it.body, heading, index) {
                     it.body = body;
                     if let Err(e) = Store::save(&mut it) {
                         self.message = Some(format!("save failed: {e}"));
@@ -1620,6 +1651,7 @@ impl App {
             focus: match self.focus {
                 Pane::Tree => "tree",
                 Pane::Description => "description",
+                Pane::Preconditions => "preconditions",
                 Pane::Criteria => "criteria",
                 Pane::Questions => "questions",
             },
@@ -1824,6 +1856,7 @@ impl App {
                             attachments: &attachments,
                             focus: self.focus,
                             description_scroll: self.description_scroll,
+                            preconditions_selected: self.preconditions_selected,
                             criteria_selected: self.criteria_selected,
                             question_selected: self.question_selected,
                             answering,
@@ -1858,6 +1891,7 @@ impl App {
                 (Some(m), _) => m.clone(),
                 (None, Pane::Tree) => "Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · Tab next pane · Esc tree".to_string(),
             },
@@ -2964,6 +2998,8 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "description");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "preconditions");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "criteria");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "questions");
@@ -3053,7 +3089,12 @@ mod tests {
         t.draw(|f| fx.app.draw(Rect::new(0, 0, 100, 24), f.buffer_mut()))
             .unwrap();
         let text = format!("{:?}", t.backend().buffer());
-        for title in ["Description", "Acceptance criteria", "Open questions"] {
+        for title in [
+            "Description",
+            "Preconditions",
+            "Acceptance criteria",
+            "Open questions",
+        ] {
             assert!(text.contains(title), "pane {title} missing");
         }
         assert!(
@@ -3119,5 +3160,30 @@ mod tests {
             "Parents can skip a folder without a Pending label"
         );
         assert!(it.body.starts_with("## Description\nnew body"));
+    }
+
+    #[test]
+    fn c_cycles_between_criteria_and_preconditions_and_toggles_each() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = "## Description\nx\n\n## Preconditions\n- [ ] pre one\n\n## Acceptance criteria\n- [ ] crit one\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('C'));
+        assert_eq!(fx.app.view().focus, "criteria");
+        key(&mut fx.app, KeyCode::Char('C'));
+        assert_eq!(fx.app.view().focus, "preconditions");
+        key(&mut fx.app, KeyCode::Enter);
+        let body = Store::load(&path).unwrap().body;
+        assert!(
+            body.contains("- [x] pre one") && body.contains("- [ ] crit one"),
+            "{body}"
+        );
+        key(&mut fx.app, KeyCode::Char('C'));
+        assert_eq!(fx.app.view().focus, "criteria");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(Store::load(&path).unwrap().body.contains("- [x] crit one"));
     }
 }
