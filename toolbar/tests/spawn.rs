@@ -60,6 +60,7 @@ fn missing_binary_is_failed_with_os_error() {
     let e = ToolProcess::spawn(&cfg(&["definitely-not-installed-xyz"]), &env(), Size { rows: 5, cols: 40 }, tx).unwrap_err();
     assert!(e.contains("cannot start `T`"), "got: {e}");
     assert!(e.contains("definitely-not-installed-xyz"), "got: {e}");
+    assert_eq!(e.lines().count(), 1, "one line only, portable-pty's PATH dump is dropped: {e}");
 }
 
 #[test]

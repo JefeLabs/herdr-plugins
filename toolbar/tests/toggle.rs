@@ -29,6 +29,7 @@ fn fx() -> Fx {
         bin: fake_herdr(),
         workspace_id: Some("w1".into()),
         pane_id: None,
+        target_pane_id: Some("w1:p3".into()),
         workspace_cwd: ws,
         config_dir: config,
         state_dir: state,
@@ -48,11 +49,12 @@ fn toggle_opens_when_no_pane_recorded() {
     toggle(&fx.ctx).unwrap();
     let l = log(&fx);
     let want = format!(
-        "plugin pane open --plugin jefelabs.toolbar --entrypoint toolbar --placement split --direction right --cwd {}",
+        "plugin pane open --plugin jefelabs.toolbar --entrypoint toolbar --placement split --direction right --target-pane w1:p3 --cwd {}",
         fx.ctx.workspace_cwd.display()
     );
     assert!(l.contains(&want), "log was:\n{l}");
     assert!(!l.contains("--focus"), "must not steal focus:\n{l}");
+    assert!(!l.contains("--workspace"), "--workspace makes Herdr 0.9.5 reject the target pane:\n{l}");
     assert_eq!(fs::read_to_string(pane_file(&fx.ctx)).unwrap().trim(), "w1:p9");
 }
 
@@ -114,18 +116,27 @@ fn from_env_reads_context_json() {
         ("HERDR_PANE_ID", "w7:p2".to_string()),
         ("HERDR_PLUGIN_CONFIG_DIR", tmp.path().join("c").display().to_string()),
         ("HERDR_PLUGIN_STATE_DIR", tmp.path().join("s").display().to_string()),
-        ("HERDR_PLUGIN_CONTEXT_JSON", r#"{"workspace_cwd":"/w","focused_pane_cwd":"/w/tab"}"#.to_string()),
+        ("HERDR_PLUGIN_CONTEXT_JSON", r#"{"workspace_cwd":"/w","focused_pane_cwd":"/w/tab","focused_pane_id":"w7:p5"}"#.to_string()),
     ];
     let ctx = HerdrContext::from_vars(|k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone())).unwrap();
     assert_eq!(ctx.workspace_cwd, Path::new("/w"), "workspace_cwd, never focused_pane_cwd");
     assert_eq!(ctx.workspace_id.as_deref(), Some("w7"));
     assert_eq!(ctx.pane_id.as_deref(), Some("w7:p2"));
+    assert_eq!(ctx.target_pane_id.as_deref(), Some("w7:p5"), "focused pane from the action context");
     assert_eq!(ctx.bin, Path::new("/x/herdr"));
     assert!(ctx.inherit.iter().any(|(k, v)| k == "HERDR_BIN_PATH" && v == "/x/herdr"));
     assert!(ctx.inherit.iter().any(|(k, _)| k == "HERDR_SOCKET_PATH"));
     assert!(ctx.inherit.iter().any(|(k, _)| k == "HERDR_ENV"));
     assert_eq!(pane_file(&ctx), tmp.path().join("s/w7.pane"));
     assert_eq!(socket_path(&ctx), tmp.path().join("s/w7.sock"));
+}
+
+#[test]
+fn toggle_without_a_target_pane_is_a_clear_error() {
+    let mut fx = fx();
+    fx.ctx.target_pane_id = None;
+    let e = toggle(&fx.ctx).unwrap_err().to_string();
+    assert!(e.contains("no pane to split"), "got: {e}");
 }
 
 #[test]

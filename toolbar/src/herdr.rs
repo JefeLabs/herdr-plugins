@@ -21,6 +21,9 @@ pub struct HerdrContext {
     pub bin: PathBuf,
     pub workspace_id: Option<String>,
     pub pane_id: Option<String>,
+    /// The pane a split should be cut from: `focused_pane_id` from the action
+    /// context, else `HERDR_PANE_ID`.
+    pub target_pane_id: Option<String>,
     /// The workspace's directory from `HERDR_PLUGIN_CONTEXT_JSON.workspace_cwd`.
     pub workspace_cwd: PathBuf,
     pub config_dir: PathBuf,
@@ -34,6 +37,7 @@ pub struct HerdrContext {
 #[derive(serde::Deserialize, Default)]
 struct ContextJson {
     workspace_cwd: Option<PathBuf>,
+    focused_pane_id: Option<String>,
 }
 
 impl HerdrContext {
@@ -55,10 +59,12 @@ impl HerdrContext {
             .or_else(|| std::env::current_dir().ok())
             .context("no workspace_cwd in HERDR_PLUGIN_CONTEXT_JSON and no current directory")?;
         let inherit = PASSTHROUGH.iter().filter_map(|k| get(k).map(|v| (k.to_string(), v))).collect();
+        let pane_id = get("HERDR_PANE_ID");
         Ok(Self {
             bin: PathBuf::from(bin),
             workspace_id: get("HERDR_WORKSPACE_ID"),
-            pane_id: get("HERDR_PANE_ID"),
+            target_pane_id: ctx.focused_pane_id.or_else(|| pane_id.clone()),
+            pane_id,
             workspace_cwd,
             config_dir: PathBuf::from(config_dir),
             state_dir: PathBuf::from(state_dir),
@@ -109,18 +115,20 @@ pub fn toggle(ctx: &HerdrContext) -> anyhow::Result<()> {
         }
     }
     let cwd = ctx.workspace_cwd.display().to_string();
-    let mut args = vec!["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", PANE_ENTRYPOINT, "--placement", "split", "--direction", "right", "--cwd", &cwd];
-    if let Some(ws) = &ctx.workspace_id {
-        args.extend(["--workspace", ws.as_str()]);
-    }
+    let target = ctx.target_pane_id.as_deref().context("no pane to split: the action context has no focused_pane_id and HERDR_PANE_ID is unset")?;
+    // No `--workspace`: on Herdr 0.9.5 it makes the server ignore the target pane
+    // and reject the split. The target pane already pins the workspace.
+    let args = ["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", PANE_ENTRYPOINT, "--placement", "split", "--direction", "right", "--target-pane", target, "--cwd", &cwd];
     let out = ctx.herdr(&args)?;
     if !out.status.success() {
         bail!("herdr plugin pane open failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let pane_id = serde_json::from_str::<serde_json::Value>(stdout.trim())
-        .ok()
-        .and_then(|v| v.pointer("/result/pane/pane_id").and_then(|p| p.as_str()).map(str::to_string));
+    let pane_id = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok().and_then(|v| {
+        ["/result/plugin_pane/pane/pane_id", "/result/pane/pane_id"]
+            .iter()
+            .find_map(|ptr| v.pointer(ptr).and_then(|p| p.as_str()).map(str::to_string))
+    });
     if let Some(id) = pane_id {
         std::fs::write(&file, format!("{id}\n"))?;
     }

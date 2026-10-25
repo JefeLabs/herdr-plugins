@@ -60,7 +60,12 @@ pub struct ToolProcess {
 impl ToolProcess {
     /// Start the tool. Errors are user-facing strings: "cannot start `<name>`: <os error>".
     pub fn spawn(cfg: &ToolConfig, env: &SpawnEnv, size: Size, wake: Sender<()>) -> Result<Self, String> {
-        let fail = |e: &dyn std::fmt::Display| format!("cannot start `{}`: {} ({})", cfg.name, e, cfg.command.join(" "));
+        // portable-pty appends the whole PATH to a spawn failure; keep the first line.
+        let fail = |e: &dyn std::fmt::Display| {
+            let text = e.to_string();
+            let first = text.lines().next().unwrap_or("").trim_end_matches(':').trim();
+            format!("cannot start `{}`: {} ({})", cfg.name, first, cfg.command.join(" "))
+        };
 
         let pair = native_pty_system().openpty(size.pty()).map_err(|e| fail(&e))?;
 

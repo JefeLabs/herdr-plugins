@@ -73,7 +73,10 @@ fn run_tui() -> anyhow::Result<()> {
     let paths = ConfigPaths { global, workspace_root: ctx.workspace_cwd.clone(), trust: Trust::new(herdr::trust_file(&ctx)) };
     let env = SpawnEnv { cwd: ctx.workspace_cwd.clone(), inherit: ctx.inherit.clone(), tool_id: String::new() };
     let result = app::run(paths, env, Some(Box::new(move || control.poll())));
+    // `control` was moved into the closure and dropped inside run; make sure
+    // nothing is left even if Herdr tore the pane down abruptly.
     let _ = std::fs::remove_file(herdr::pane_file(&ctx));
+    let _ = std::fs::remove_file(herdr::socket_path(&ctx));
     result
 }
 
