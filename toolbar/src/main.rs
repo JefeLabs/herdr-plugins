@@ -7,20 +7,27 @@
 
 use std::process::ExitCode;
 
+use herdr_toolbar::app::{self, ConfigPaths};
+use herdr_toolbar::config::Trust;
+use herdr_toolbar::herdr::{self, Control, HerdrContext};
+use herdr_toolbar::pty::SpawnEnv;
+
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     Tui,
     Toggle,
     Select(String),
+    Trust,
     Usage(String),
 }
 
-const USAGE: &str = "usage: herdr-toolbar [toggle | select <tool-id|index> | --version]";
+const USAGE: &str = "usage: herdr-toolbar [toggle | select <tool-id|index> | trust | --version]";
 
 fn parse_mode(args: &[String]) -> Mode {
     match args {
         [] => Mode::Tui,
         [a] if a == "toggle" => Mode::Toggle,
+        [a] if a == "trust" => Mode::Trust,
         [a, tool] if a == "select" => Mode::Select(tool.clone()),
         [a] if a == "--version" || a == "-V" => {
             Mode::Usage(format!("herdr-toolbar {}", env!("CARGO_PKG_VERSION")))
@@ -35,6 +42,7 @@ fn main() -> ExitCode {
         Mode::Tui => run_tui(),
         Mode::Toggle => run_toggle(),
         Mode::Select(tool) => run_select(&tool),
+        Mode::Trust => run_trust(),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-toolbar ");
             println!("{text}");
@@ -51,14 +59,38 @@ fn main() -> ExitCode {
 }
 
 fn run_tui() -> anyhow::Result<()> {
-    Ok(())
+    let ctx = HerdrContext::from_env()?;
+    std::fs::create_dir_all(&ctx.state_dir)?;
+    std::fs::create_dir_all(&ctx.config_dir)?;
+    let global = ctx.config_dir.join("tools.toml");
+    if !global.exists() {
+        std::fs::write(&global, include_str!("../tools.example.toml"))?;
+    }
+    if let Some(pane) = &ctx.pane_id {
+        std::fs::write(herdr::pane_file(&ctx), format!("{pane}\n"))?;
+    }
+    let control = Control::bind(&herdr::socket_path(&ctx))?;
+    let paths = ConfigPaths { global, workspace_root: ctx.workspace_cwd.clone(), trust: Trust::new(herdr::trust_file(&ctx)) };
+    let env = SpawnEnv { cwd: ctx.workspace_cwd.clone(), inherit: ctx.inherit.clone(), tool_id: String::new() };
+    let result = app::run(paths, env, Some(Box::new(move || control.poll())));
+    let _ = std::fs::remove_file(herdr::pane_file(&ctx));
+    result
 }
 
 fn run_toggle() -> anyhow::Result<()> {
-    Ok(())
+    herdr::toggle(&HerdrContext::from_env()?)
 }
 
-fn run_select(_tool: &str) -> anyhow::Result<()> {
+fn run_select(tool: &str) -> anyhow::Result<()> {
+    herdr::select(&HerdrContext::from_env()?, tool)
+}
+
+/// Allow this workspace's `.herdr-toolbar.toml` (current content) to be merged.
+fn run_trust() -> anyhow::Result<()> {
+    let ctx = HerdrContext::from_env()?;
+    let file = ctx.workspace_cwd.join(herdr_toolbar::config::WORKSPACE_FILE);
+    Trust::new(herdr::trust_file(&ctx)).allow(&file)?;
+    println!("trusted {}", file.display());
     Ok(())
 }
 
@@ -74,6 +106,7 @@ mod tests {
             parse_mode(&["select".into(), "db".into()]),
             Mode::Select("db".into())
         );
+        assert_eq!(parse_mode(&["trust".into()]), Mode::Trust);
         assert!(matches!(parse_mode(&["bogus".into()]), Mode::Usage(_)));
     }
 }

@@ -6,3 +6,4 @@ pub mod keys;
 pub mod pty;
 pub mod ui;
 pub mod app;
+pub mod herdr;

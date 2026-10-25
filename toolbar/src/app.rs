@@ -14,7 +14,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
 
-use crate::config::{Config, Loaded, ToolConfig, Trust, load_merged};
+use crate::config::{Loaded, ToolConfig, Trust, load_merged};
 use crate::keys::{Action, Prefix};
 use crate::pty::{Size, SpawnEnv, ToolProcess, ToolState};
 use crate::ui;
@@ -169,10 +169,10 @@ impl App {
         }
         // The footer may have appeared or vanished; keep the shown tool sized right.
         let size = self.content_size();
-        if let Some(p) = self.slots[idx].proc.as_ref() {
-            if p.screen().size() != (size.rows, size.cols) {
-                p.resize(size);
-            }
+        if let Some(p) = self.slots[idx].proc.as_ref()
+            && p.screen().size() != (size.rows, size.cols)
+        {
+            p.resize(size);
         }
     }
 
@@ -251,6 +251,16 @@ impl App {
             Action::Ignore => {}
         }
         Flow::Continue
+    }
+
+    /// Forward pasted text to the selected running tool, sanitised (see `keys::paste_bytes`).
+    pub fn paste(&mut self, text: &str) {
+        let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else { return };
+        if p.state() != ToolState::Running {
+            return;
+        }
+        let bracketed = p.screen().bracketed_paste();
+        let _ = p.write(&crate::keys::paste_bytes(text, bracketed));
     }
 
     pub fn apply_control(&mut self, cmd: ControlCmd) {
@@ -384,11 +394,7 @@ pub fn run(paths: ConfigPaths, env: SpawnEnv, mut control: Option<Box<dyn FnMut(
                         }
                     }
                     Event::Resize(cols, rows) => app.resize(Size { rows, cols }),
-                    Event::Paste(text) => {
-                        if let Some(p) = app.slots.get(app.selected).and_then(|s| s.proc.as_ref()) {
-                            let _ = p.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
-                        }
-                    }
+                    Event::Paste(text) => app.paste(&text),
                     _ => {}
                 }
             }
