@@ -138,6 +138,22 @@ pub fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Bytes to send for pasted text. ESC and every C0 control except tab, newline and
+/// carriage return are removed, so a paste can neither close the bracket early nor
+/// smuggle a control sequence. Markers are added only when the tool asked for
+/// bracketed paste (DECSET 2004).
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let clean: String = text
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if bracketed {
+        format!("\x1b[200~{clean}\x1b[201~").into_bytes()
+    } else {
+        clean.into_bytes()
+    }
+}
+
 fn control_byte(ch: char) -> Option<u8> {
     let upper = ch.to_ascii_uppercase();
     Some(match upper {
@@ -246,5 +262,15 @@ mod tests {
         assert!(Prefix::new("super-]").is_err());
         assert!(Prefix::new("ctrl-").is_err());
         assert!(Prefix::new("alt-t").is_ok());
+    }
+
+    #[test]
+    fn paste_strips_escapes_and_wraps_only_when_bracketed() {
+        // A paste must not be able to end the bracket early or inject control sequences.
+        let hostile = "ls\x1b[201~\x1b]0;x\x07rm -rf ~\n\x01\ttab\r";
+        assert_eq!(paste_bytes(hostile, false), b"ls[201~]0;xrm -rf ~\n\ttab\r".to_vec());
+        let wrapped = paste_bytes("hi\x1b", true);
+        assert_eq!(wrapped, b"\x1b[200~hi\x1b[201~".to_vec());
+        assert_eq!(paste_bytes("plain", false), b"plain".to_vec());
     }
 }
