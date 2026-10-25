@@ -219,6 +219,11 @@ pub struct App {
     parked_chat: Option<ChatState>,
     pub focus: Pane,
     description_scroll: u16,
+    /// mtime of our own binary at startup; a newer one on disk means a rebuild
+    /// is waiting for a restart of the slot.
+    pub binary_stamp: Option<std::time::SystemTime>,
+    newer_build: bool,
+    ticks: u32,
     preconditions_selected: usize,
     criteria_selected: usize,
     question_selected: usize,
@@ -246,6 +251,9 @@ impl App {
             parked_chat: None,
             focus: Pane::Tree,
             description_scroll: 0,
+            binary_stamp: binary_mtime(),
+            newer_build: false,
+            ticks: 0,
             preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
@@ -387,7 +395,11 @@ impl App {
         if k.kind == KeyEventKind::Release {
             return Flow::Continue;
         }
-        self.message = None;
+        self.message = if self.newer_build {
+            Some("a newer build is installed: Ctrl-] x in the toolbar restarts this slot".into())
+        } else {
+            None
+        };
         match std::mem::replace(&mut self.screen, Screen::Browse) {
             Screen::Browse => self.key_browse(k),
             Screen::Edit => {
@@ -1620,8 +1632,26 @@ impl App {
 
     // ---- ticking ------------------------------------------------------------
 
+    /// Compare the binary's current mtime with the one we started with.
+    pub fn check_for_newer_build(&mut self, now: Option<std::time::SystemTime>) {
+        if let (Some(start), Some(now)) = (self.binary_stamp, now)
+            && now > start
+            && !self.newer_build
+        {
+            self.newer_build = true;
+            self.message = Some(
+                "a newer build is installed: Ctrl-] x in the toolbar restarts this slot".into(),
+            );
+        }
+    }
+
     /// Drain messages from a running turn.
     pub fn tick(&mut self) {
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks.is_multiple_of(150) {
+            // about every 5 s at the loop's 33 ms cadence
+            self.check_for_newer_build(binary_mtime());
+        }
         let Screen::Chat(st) = &mut self.screen else {
             return;
         };
@@ -1979,6 +2009,13 @@ impl App {
         };
         ui::render_status(&status_text, status, buf);
     }
+}
+
+fn binary_mtime() -> Option<std::time::SystemTime> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
 }
 
 fn row_path(r: &Row) -> PathBuf {
@@ -3350,5 +3387,27 @@ mod tests {
             it.body
         );
         assert_eq!(it.open_questions(), 1);
+    }
+
+    #[test]
+    fn a_newer_binary_on_disk_is_announced_in_the_status_line() {
+        let mut fx = setup("agy.jsonl");
+        let started = std::time::SystemTime::now();
+        fx.app.binary_stamp = Some(started);
+        fx.app.check_for_newer_build(Some(started));
+        assert!(fx.app.view().message.is_none(), "same build: quiet");
+        fx.app
+            .check_for_newer_build(Some(started + Duration::from_secs(60)));
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("newer build") && m.contains("Ctrl-] x"), "{m}");
+        key(&mut fx.app, KeyCode::Char('j'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("newer build"),
+            "the notice survives key presses"
+        );
     }
 }
