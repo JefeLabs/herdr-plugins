@@ -1,0 +1,30 @@
+id = "jefelabs.toolbar"
+name = "Toolbar"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Right-hand activity bar of tools, each hosted in its own terminal"
+platforms = ["macos", "linux"]
+
+# Runs on `herdr plugin install` only; a linked checkout is built by hand:
+#   cargo build --release -p herdr-toolbar
+# The workspace puts the binary in <repo>/target, one level above this plugin.
+[[build]]
+command = ["cargo", "build", "--release", "-p", "herdr-toolbar"]
+
+[[panes]]
+id = "toolbar"
+title = "Toolbar"
+placement = "split"
+command = ["../target/release/herdr-toolbar"]
+
+[[actions]]
+id = "toggle"
+title = "Toolbar: toggle"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "toggle"]
+
+[[actions]]
+id = "select"
+title = "Toolbar: select tool"
+contexts = ["workspace"]
+command = ["../target/release/herdr-toolbar", "select"]

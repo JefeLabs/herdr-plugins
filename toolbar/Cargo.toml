@@ -1,0 +1,23 @@
+[package]
+name = "herdr-toolbar"
+version = "0.1.0"
+description = "Herdr plugin: a right-hand activity bar of tools, each hosted in its own terminal"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+tui-term = "0.3.4"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+serde_json = "1"
+anyhow = "1"
+shellexpand = "3"
+nix = { version = "0.31", features = ["signal"] }
+
+[dev-dependencies]
+insta = "1"
+tempfile = "3"
