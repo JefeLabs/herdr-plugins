@@ -2563,7 +2563,7 @@ impl App {
                     }),
                     _ => None,
                 };
-                // group path, then the sent agent's worktree and slot
+                // group path, then the sent agent's slot
                 let mut location = vec![
                     i.path
                         .parent()
@@ -2574,13 +2574,9 @@ impl App {
                 if i.fm.state == State::Sent
                     && let (Some(sent), Some(agents)) = (&i.fm.sent_to, &self.agents)
                     && let Some(info) = agents.get(&sent.agent)
+                    && let Some(n) = info.slot
                 {
-                    if let Some(w) = &info.worktree {
-                        location.push(format!("worktree {w}"));
-                    }
-                    if let Some(n) = info.slot {
-                        location.push(format!("slot {n}"));
-                    }
+                    location.push(format!("slot {n}"));
                 }
                 Owned {
                     description,
@@ -3719,18 +3715,19 @@ mod tests {
         settle(&mut fx.app);
         let shown = render(&fx.app, 120, 60);
         assert!(
-            shown.contains(" skoolscout/org │ worktree org/notify │ slot 3"),
-            "group, then the sent agent's worktree and slot: {shown}"
+            shown.contains(" skoolscout/org │ slot 3"),
+            "group, then the sent agent's slot: {shown}"
+        );
+        assert!(
+            !shown.contains("worktree"),
+            "no worktree name on cards: {shown}"
         );
         assert!(
             shown.lines().any(|l| l == " Inbox"),
             "an unsent card shows its group alone: {shown}"
         );
         let lines: Vec<&str> = shown.lines().collect();
-        let at = lines
-            .iter()
-            .position(|l| l.contains("worktree org/notify"))
-            .unwrap();
+        let at = lines.iter().position(|l| l.contains("│ slot 3")).unwrap();
         assert_eq!(lines[at + 1], "", "a blank line before the description");
         assert!(
             lines[at + 2].starts_with(" The primary contact"),

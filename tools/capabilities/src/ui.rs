@@ -925,7 +925,7 @@ pub struct ListRow<'a> {
     /// `closed`); `None` before sending.
     pub agent: Option<String>,
     pub title: &'a str,
-    /// Where it lives: group path, then the sent agent's worktree and slot.
+    /// Where it lives: group path, then the sent agent's workbrokr slot.
     pub location: String,
     pub when: String,
     pub description: &'a str,
@@ -986,7 +986,7 @@ fn card_description(text: &str, width: usize) -> Vec<String> {
 /// ────────────────────────────────────────
 ///  Title
 ///  TIMESTAMP │ STATUS │ AGENT │ PROGRESS
-///  group │ worktree area │ slot N
+///  group │ slot N
 ///
 ///  description, up to two wrapped lines
 /// ```

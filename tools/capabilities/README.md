@@ -138,7 +138,7 @@ Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g 
 ────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
  Oct 25 08:10 │ sent   │ ! needs you │ ███████░░░ PR #42 open
- skoolscout/org │ worktree org/notify │ slot 3
+ skoolscout/org │ slot 3
 
  The primary contact gets no prompt to book the intro meeting.
 ────────────────────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g 
  shows up labelled Pending.…
 ```
 
-Each capability is a card that opens with a horizontal rule: the title in bold on its own row; then the timestamp, the capability's status, the agent's status and the implementation progress; then where it lives (its group, and once sent the agent's worktree and workbrokr slot, read from the agent's working directory and the nearest `.slot` file above it); then, after a blank line, up to two wrapped lines of the description.
+Each capability is a card that opens with a horizontal rule: the title in bold on its own row; then the timestamp, the capability's status, the agent's status and the implementation progress; then where it lives (its group, and once sent the agent's workbrokr slot, read from the nearest `.slot` file above the agent's working directory); then, after a blank line, up to two wrapped lines of the description.
 
 Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a ten-cell bar shows how far the feature has got, from evidence that already exists:
 

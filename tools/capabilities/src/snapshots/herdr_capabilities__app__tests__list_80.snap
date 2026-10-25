@@ -1,13 +1,13 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 3627
+assertion_line: 3623
 expression: narrow
 ---
 Capabilities · 7 · sorted by Updated          v tree · S sort · s send · g agent
 ────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
  Oct 25 08:10 │ sent   │ ! needs you │ ███████░░░ PR #42 open
- skoolscout/org │ worktree org/notify │ slot 3
+ skoolscout/org │ slot 3
 
  The primary contact gets no prompt to book the intro meeting.
 ────────────────────────────────────────────────────────────────────────────────
