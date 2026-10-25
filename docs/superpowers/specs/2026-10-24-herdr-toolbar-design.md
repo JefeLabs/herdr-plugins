@@ -376,7 +376,9 @@ make possible, and they set the priority of the follow-ups.
 | Before/after code change view | Show a change as C4 diagrams of the system before and after, generated from the worktree (e.g. Structurizr or D2 rendered to images, with an ASCII fallback) | Worktree as cwd (decision 4). Diagrams as pictures need image passthrough; until then an ASCII/box-drawing rendering. |
 | Spec / plan viewer | Show the spec and plan the agent in this workspace is working on, from `docs/superpowers/specs` and `plans`, with the current task highlighted | Worktree as cwd. Markdown rendering; images in specs need image passthrough. |
 
-Two of the three want pictures, which is why image passthrough is the first
+| terminal-browser (zenbu-labs) | A real browser in the terminal, as a slot | Paints pages as Kitty graphics, so it is blank in the bar until image passthrough; run it in a plain Herdr pane meanwhile. (Owner asked 2026-10-24.) |
+
+Three of the four want pictures, which is why image passthrough is the first
 follow-up after v1 rather than a someday item.
 
 ## Left to the builder

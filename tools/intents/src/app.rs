@@ -27,6 +27,7 @@ pub enum Flow {
     ExternalEdit(usize),
 }
 
+#[allow(clippy::large_enum_variant)] // one Intent per row is the point of the row
 enum Row {
     Group {
         path: PathBuf,

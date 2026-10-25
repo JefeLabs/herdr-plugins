@@ -26,7 +26,7 @@ fn with_config(
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result: anyhow::Result<()> = match parse_mode(&args) {
-        Mode::Tui => with_config(|cfg, dirs| app::run(cfg, dirs)),
+        Mode::Tui => with_config(app::run),
         Mode::Add { title, popup } => with_config(|cfg, dirs| app::add(cfg, dirs, title, popup)),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-intents ");
