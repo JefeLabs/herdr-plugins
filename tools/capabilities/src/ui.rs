@@ -398,6 +398,67 @@ mod tests {
             .unwrap();
         assert!(!text_of(&t).contains('\u{1b}'), "raw ESC in status");
     }
+    #[test]
+    fn long_questions_wrap_so_they_can_be_read_in_full() {
+        let long = "Is `Pending` a generic status shared across all folders, and would we want a distinct Skipped state instead of reusing it everywhere?";
+        let body = format!(
+            "## Description\nx\n\n## Open questions\n- {long}\n  → a long answer that also needs to wrap across the narrow pane width to be legible\n- short?\n"
+        );
+        let it = crate::store::Intent {
+            path: std::path::PathBuf::from("/x/a.md"),
+            fm: serde_yaml_ng::from_str("title: T\nkind: idea\n").unwrap(),
+            body,
+            loaded_updated: chrono::Local::now(),
+        };
+        let view = DetailView {
+            intent: &it,
+            attachments: &[],
+            focus: Pane::Questions,
+            description_scroll: 0,
+            criteria_selected: 0,
+            question_selected: 0,
+            answering: None,
+        };
+        let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
+        t.draw(|f| render_capability(&view, f.area(), f.buffer_mut()))
+            .unwrap();
+        let rows: Vec<String> = (0..30)
+            .map(|y| {
+                (0..50)
+                    .map(|x| t.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("reusing it"),
+            "tail of the long question must be visible:\n{joined}"
+        );
+        assert!(
+            joined.contains("legible"),
+            "tail of the answer must be visible:\n{joined}"
+        );
+        assert!(
+            joined.contains("? short?"),
+            "the next question still shows:\n{joined}"
+        );
+        assert!(rows.iter().all(|r| r.chars().count() <= 50));
+        // the whole selected question is highlighted, not just its first line
+        let first = rows
+            .iter()
+            .position(|r| r.contains("✓ Is `Pending`"))
+            .unwrap_or_else(|| panic!("selected question row not found:\n{joined}"));
+        for y in first..first + 2 {
+            assert!(
+                t.backend().buffer()[(2, y as u16)]
+                    .modifier
+                    .contains(Modifier::REVERSED),
+                "row {y} of the selected question is highlighted"
+            );
+        }
+    }
 }
 
 /// Which of the three detail panes has keyboard focus (or the tree).
@@ -407,6 +468,44 @@ pub enum Pane {
     Description,
     Criteria,
     Questions,
+}
+
+/// Greedy word wrap to `width` columns; a word longer than the width is split.
+pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let w = width.max(1);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        let mut len = 0usize;
+        for word in para.split_whitespace() {
+            let mut rest = word;
+            while rest.chars().count() > w {
+                if len > 0 {
+                    out.push(std::mem::take(&mut line));
+                    len = 0;
+                }
+                let cut: String = rest.chars().take(w).collect();
+                out.push(cut.clone());
+                rest = &rest[cut.len()..];
+            }
+            let wl = rest.chars().count();
+            if len > 0 && len + 1 + wl > w {
+                out.push(std::mem::take(&mut line));
+                len = 0;
+            }
+            if len > 0 {
+                line.push(' ');
+                len += 1;
+            }
+            line.push_str(rest);
+            len += wl;
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Everything the three-pane detail view needs from the app.
@@ -439,18 +538,30 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     let it = v.intent;
     let qs = questions(&it.body);
     let cs = criteria(&it.body);
-    let q_rows = qs
+    let text_width = (area.width as usize).saturating_sub(2); // after the "? " prefix
+    let q_rows: u16 = qs
         .iter()
-        .map(|q| 1 + usize::from(q.answer.is_some()))
+        .map(|q| {
+            wrap_text(&q.text, text_width).len()
+                + q.answer
+                    .as_ref()
+                    .map(|a| wrap_text(a, text_width.saturating_sub(2)).len())
+                    .unwrap_or(0)
+        })
         .sum::<usize>() as u16
         + if v.answering.is_some() { 2 } else { 0 };
+    let c_rows: u16 = cs
+        .iter()
+        .map(|c| wrap_text(&c.text, text_width.saturating_sub(2)).len())
+        .sum::<usize>() as u16;
+    let half = (area.height / 2).max(3);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(4),
-            Constraint::Length((cs.len() as u16 + 1).clamp(2, 8)),
-            Constraint::Length((q_rows + 1).clamp(2, 12)),
+            Constraint::Length((c_rows + 1).clamp(2, half.min(10))),
+            Constraint::Length((q_rows + 1).clamp(2, half)),
         ])
         .split(area);
 
@@ -515,21 +626,27 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         ))
         .render(inner, buf);
     }
-    for (i, c) in cs.iter().enumerate().take(inner.height as usize) {
-        let rect = Rect {
-            y: inner.y + i as u16,
-            height: 1,
-            ..inner
-        };
-        if v.focus == Pane::Criteria && i == v.criteria_selected {
-            buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+    let mut y = inner.y;
+    'crit: for (i, c) in cs.iter().enumerate() {
+        let box_ = if c.done { "[x] " } else { "[ ] " };
+        for (j, piece) in wrap_text(&sanitize(&c.text), (inner.width as usize).saturating_sub(4))
+            .into_iter()
+            .enumerate()
+        {
+            if y >= inner.y + inner.height {
+                break 'crit;
+            }
+            let rect = Rect {
+                y,
+                height: 1,
+                ..inner
+            };
+            if v.focus == Pane::Criteria && i == v.criteria_selected {
+                buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+            }
+            Line::from(format!("{}{piece}", if j == 0 { box_ } else { "    " })).render(rect, buf);
+            y += 1;
         }
-        Line::from(format!(
-            "{} {}",
-            if c.done { "[x]" } else { "[ ]" },
-            sanitize(&c.text)
-        ))
-        .render(rect, buf);
     }
 
     // questions
@@ -546,12 +663,19 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         ))
         .render(inner, buf);
     }
-    let mut y = inner.y;
-    // keep the selected question visible: skip rows above it when needed
+    // one entry per wrapped line, tagged with its question index
     let mut rows: Vec<(usize, Line)> = Vec::new();
+    let qw = (inner.width as usize).saturating_sub(2);
     for (i, q) in qs.iter().enumerate() {
         let mark = if q.answer.is_some() { "✓" } else { "?" };
-        rows.push((i, Line::from(format!("{mark} {}", sanitize(&q.text)))));
+        for (j, piece) in wrap_text(&sanitize(&q.text), qw).into_iter().enumerate() {
+            let prefix = if j == 0 {
+                format!("{mark} ")
+            } else {
+                "  ".to_string()
+            };
+            rows.push((i, Line::from(format!("{prefix}{piece}"))));
+        }
         if let Some((idx, text)) = v.answering
             && idx == i
         {
@@ -570,15 +694,22 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 )),
             ));
         } else if let Some(a) = &q.answer {
-            rows.push((
-                i,
-                Line::from(Span::styled(
-                    format!("  → {}", sanitize(a)),
-                    Style::default().add_modifier(Modifier::DIM),
-                )),
-            ));
+            for (j, piece) in wrap_text(&sanitize(a), qw.saturating_sub(2))
+                .into_iter()
+                .enumerate()
+            {
+                let prefix = if j == 0 { "  → " } else { "    " };
+                rows.push((
+                    i,
+                    Line::from(Span::styled(
+                        format!("{prefix}{piece}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )),
+                ));
+            }
         }
     }
+    // keep the selected question's first row visible
     let first_sel = rows
         .iter()
         .position(|(i, _)| *i == v.question_selected)
@@ -589,7 +720,8 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     } else {
         0
     };
-    for (i, line) in rows.into_iter().skip(skip) {
+    for (k, (i, line)) in rows.into_iter().skip(skip).enumerate() {
+        let y = inner.y + k as u16;
         if y >= inner.y + inner.height {
             break;
         }
@@ -602,7 +734,6 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
             buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
         }
         line.render(rect, buf);
-        y += 1;
     }
 }
 
