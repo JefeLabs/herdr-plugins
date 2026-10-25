@@ -165,7 +165,7 @@ Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`
 
 Ticked criteria fill only their own share of the bar; they never stand in for building or merging. The agent field shows the live Herdr state of the agent the capability was sent to: `working`, `idle`, `done`, `! needs you` when it is waiting on you, `closed` when its pane is gone, `…` until Herdr has answered, and `—` before sending.
 
-Keys in the list: `j`/`k` (and `PgUp`/`PgDn`) move, `Enter` opens the capability in the tree, `v` back to the tree, `S` cycles the sort order (Updated, Progress with the least advanced first, Captured, Title), `s` send (same gate), `g` focus the sent agent, `r` rescan, `q` quit. Agent states refresh every few seconds while the list shows; plans and PR states on entry, on `r` and about once a minute. `herdr`, `gh` and git run on background threads, and any of them failing only blanks its column. `gh` is found through `GH_BIN_PATH`, else on `PATH`.
+Keys in the list: `j`/`k` (and `PgUp`/`PgDn`) move, `Enter` opens the capability in the tree, `v` back to the tree, `S` cycles the sort order (Updated, Progress with the least advanced first, Longest running with running agents sent longest ago first, Captured with the newest first, Created Asc with the oldest first, Title), `s` send (same gate), `g` focus the sent agent, `r` rescan, `q` quit. Agent states refresh every few seconds while the list shows; plans and PR states on entry, on `r` and about once a minute. `herdr`, `gh` and git run on background threads, and any of them failing only blanks its column. `gh` is found through `GH_BIN_PATH`, else on `PATH`.
 
 ## Files
 

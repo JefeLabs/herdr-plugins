@@ -200,8 +200,12 @@ pub enum SortOrder {
     Updated,
     /// Least advanced first: raw, ?N, ready, sent by bar fill, complete.
     Progress,
+    /// Agents Herdr still lists, sent longest ago first; then the rest by Updated.
+    LongestRunning,
     /// Newest created first.
     Captured,
+    /// Oldest created first.
+    CreatedAsc,
     /// A to Z.
     Title,
 }
@@ -210,8 +214,10 @@ impl SortOrder {
     pub fn next(self) -> Self {
         match self {
             SortOrder::Updated => SortOrder::Progress,
-            SortOrder::Progress => SortOrder::Captured,
-            SortOrder::Captured => SortOrder::Title,
+            SortOrder::Progress => SortOrder::LongestRunning,
+            SortOrder::LongestRunning => SortOrder::Captured,
+            SortOrder::Captured => SortOrder::CreatedAsc,
+            SortOrder::CreatedAsc => SortOrder::Title,
             SortOrder::Title => SortOrder::Updated,
         }
     }
@@ -219,7 +225,9 @@ impl SortOrder {
         match self {
             SortOrder::Updated => "Updated",
             SortOrder::Progress => "Progress",
+            SortOrder::LongestRunning => "Longest running",
             SortOrder::Captured => "Captured",
+            SortOrder::CreatedAsc => "Created Asc",
             SortOrder::Title => "Title",
         }
     }
@@ -227,7 +235,9 @@ impl SortOrder {
         [
             SortOrder::Updated,
             SortOrder::Progress,
+            SortOrder::LongestRunning,
             SortOrder::Captured,
+            SortOrder::CreatedAsc,
             SortOrder::Title,
         ]
         .into_iter()
@@ -466,6 +476,25 @@ impl App {
         match self.sort {
             SortOrder::Updated => list.sort_by_key(|i| std::cmp::Reverse(crate::store::stamp(i))),
             SortOrder::Captured => list.sort_by_key(|i| std::cmp::Reverse(i.fm.created)),
+            SortOrder::CreatedAsc => list.sort_by_key(|i| i.fm.created),
+            SortOrder::LongestRunning => {
+                // running = sent, and Herdr still lists its agent
+                let started = |i: &Intent| {
+                    let sent = i.fm.sent_to.as_ref()?;
+                    let listed = i.fm.state == State::Sent
+                        && self
+                            .agents
+                            .as_ref()
+                            .is_some_and(|a| a.contains_key(&sent.agent));
+                    listed.then_some(sent.at)
+                };
+                list.sort_by(|a, b| match (started(a), started(b)) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => crate::store::stamp(b).cmp(&crate::store::stamp(a)),
+                });
+            }
             SortOrder::Title => list.sort_by_key(|i| i.fm.title.to_lowercase()),
             SortOrder::Progress => {
                 let key = |i: &Intent| {
@@ -645,7 +674,7 @@ impl App {
                 }
             }
         }
-        if self.sort == SortOrder::Progress {
+        if matches!(self.sort, SortOrder::Progress | SortOrder::LongestRunning) {
             self.rebuild_list();
         }
     }
@@ -2604,7 +2633,7 @@ impl App {
             .zip(&owned)
             .map(|(i, o)| {
                 let when = match self.sort {
-                    SortOrder::Captured => i.fm.created,
+                    SortOrder::Captured | SortOrder::CreatedAsc => i.fm.created,
                     _ => crate::store::stamp(i),
                 };
                 ui::ListRow {
@@ -3274,7 +3303,7 @@ mod tests {
 
     /// Press `S` until the list is sorted by `order`.
     fn sort_by(app: &mut App, order: &str) {
-        for _ in 0..4 {
+        for _ in 0..8 {
             if app.view().sort == order {
                 return;
             }
@@ -3482,9 +3511,9 @@ mod tests {
         } else {
             String::new()
         };
-        let sent = |agent: &str| {
+        let sent = |agent: &str, at: &str| {
             format!(
-                "state: sent\n{repo_line}sent_to:\n  handoff: grill\n  workspace_id: w9\n  agent: {agent}\n  at: 2026-10-25T08:10:00-04:00\n"
+                "state: sent\n{repo_line}sent_to:\n  handoff: grill\n  workspace_id: w9\n  agent: {agent}\n  at: 2026-10-25T{at}:00-04:00\n"
             )
         };
         let root = &dirs.root;
@@ -3515,7 +3544,7 @@ mod tests {
             "pr",
             &format!(
                 "title: Notify primary contact to schedule a meeting\nkind: idea\ncreated: 2026-10-25 00:34:00\nupdated: 2026-10-25 08:10:00\n{}",
-                sent("intent-notify-547e")
+                sent("intent-notify-547e", "08:10")
             ),
             "## Description\nThe primary contact gets no prompt to book the intro meeting.\n\n## Acceptance criteria\n- [ ] gets an email\n\n## Artifacts\n- spec: docs/superpowers/specs/notify.md\n- pr: #42\n",
         );
@@ -3525,7 +3554,7 @@ mod tests {
             "building",
             &format!(
                 "title: Counselors can reassign a student between orgs\nkind: idea\ncreated: 2026-10-21 09:00:00\nupdated: 2026-10-22 16:15:00\n{}",
-                sent("intent-reassign-0001")
+                sent("intent-reassign-0001", "07:00")
             ),
             "## Description\nReassignment needs a support ticket today.\n\n## Acceptance criteria\n- [ ] moves\n- [ ] keeps history\n\n## Artifacts\n- plan: docs/superpowers/plans/reassign.md\n",
         );
@@ -3535,7 +3564,7 @@ mod tests {
             "done",
             &format!(
                 "title: Invitees skip the join request\nkind: idea\ncreated: 2026-10-19 09:00:00\nupdated: 2026-10-20 10:30:00\n{}",
-                sent("intent-invitees-0002")
+                sent("intent-invitees-0002", "06:00")
             ),
             "## Description\nInvited parents no longer file a join request.\n\n## Acceptance criteria\n- [x] no request\n",
         );
@@ -3769,7 +3798,7 @@ mod tests {
         settle(&mut fx.app);
         let shown = render(&fx.app, 120, 60);
         assert!(shown.contains("! needs you │ 2h 14m"), "{shown}");
-        assert!(shown.contains("working     │ 2h 14m"), "{shown}");
+        assert!(shown.contains("working     │ 3h 24m"), "{shown}");
         assert!(
             shown.contains("closed      │ —"),
             "no clock once the pane is gone: {shown}"
@@ -3778,6 +3807,35 @@ mod tests {
             shown.contains("│ raw    │ —           │ —"),
             "nothing before sending: {shown}"
         );
+    }
+
+    #[test]
+    fn longest_running_and_created_asc_orders() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        sort_by(&mut fx.app, "Longest running");
+        let titles = fx.app.view().list_titles;
+        assert_eq!(
+            &titles[..2],
+            &[
+                "Counselors can reassign a student between orgs".to_string(),
+                "Notify primary contact to schedule a meeting".to_string(),
+            ],
+            "running agents first, longest first: {titles:?}"
+        );
+        assert_eq!(
+            titles[2], "a",
+            "then the rest by most recently changed: {titles:?}"
+        );
+        sort_by(&mut fx.app, "Created Asc");
+        let titles = fx.app.view().list_titles;
+        assert!(titles[0].starts_with("A very long title"), "{titles:?}");
+        assert_eq!(titles[1], "Invitees skip the join request");
+        assert_eq!(titles.last().unwrap(), "a", "newest last: {titles:?}");
+        // the choice is remembered like the others
+        let again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        assert_eq!(again.view().sort, "Created Asc");
     }
 
     #[test]
