@@ -117,6 +117,8 @@ pub struct Reply {
     pub prose: String,
     pub proposal: Option<String>,
     pub questions: Vec<String>,
+    /// A proposed title, phrased as a capability ("<who> can <what>"), from a `capability:` line.
+    pub title: Option<String>,
 }
 
 /// Find the fenced proposal block and the `questions:` list. Fences follow
@@ -157,6 +159,17 @@ pub fn parse_reply(text: &str) -> Reply {
             .trim_matches(|c| c == '*' || c == '_')
             .trim()
             .to_ascii_lowercase();
+        if header.starts_with("capability:") {
+            let original = trimmed.trim_matches(|c| c == '*' || c == '_').trim();
+            let phrase = original["capability:".len()..]
+                .trim()
+                .trim_matches('"')
+                .trim();
+            if !phrase.is_empty() {
+                reply.title = Some(phrase.to_string());
+            }
+            continue;
+        }
         if let Some(after) = header.strip_prefix("questions:") {
             in_questions = true;
             let rest = after.trim().to_string();

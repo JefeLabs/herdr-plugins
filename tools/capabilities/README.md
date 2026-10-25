@@ -64,7 +64,7 @@ The right-hand side shows the three parts as separate panes under a header. The 
 
 ## Keys
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an capability in the selected group, `n` new group, `m` move the selected capability or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `Tab` move between panes, `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an capability in the selected group, `n` new group, `m` move the selected capability or group (type the target group path), `K` cycle kind, `R` ready, `U` back to refining, `p` refine with the agent, `Tab` move between panes, `t` rename (the title is meant to be a capability phrase: who can do what), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
 
 Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` refine (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 
@@ -76,7 +76,7 @@ Send: pick a handoff, then on the confirm screen `Tab` cycles the provider, `j`/
 
 ## Refining with an agent
 
-Refinement is a conversation, not a one-shot rewrite. The first turn is seeded by the kind's polish template (`templates/<kind>.polish.md`), the capability text and, when opened on a selection, a focus line. Replies stream in as they are written. Every reply is asked to end with a fenced ```` ```proposal ```` block holding the complete rewritten capability and a `questions:` list; `a` applies the latest proposal after a diff and merges the questions into `## Open questions`. A reply without a proposal cannot be applied, so chat text never lands in an capability. Your text changes only when you apply.
+Refinement is a conversation, not a one-shot rewrite. The first turn is seeded by the kind's polish template (`templates/<kind>.polish.md`), the capability text and, when opened on a selection, a focus line. Replies stream in as they are written. Every reply is asked to start with a `capability:` line, a phrase naming who can do what, which becomes the title when you apply, and to end with a fenced ```` ```proposal ```` block holding the complete rewritten capability and a `questions:` list; `a` applies the latest proposal after a diff and merges the questions into `## Open questions`. A reply without a proposal cannot be applied, so chat text never lands in an capability. Your text changes only when you apply.
 
 The conversation id is stored per provider in the capability's front matter and resumed on later turns, and a transcript is appended to `<capability>.chat.md`.
 

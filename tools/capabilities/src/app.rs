@@ -91,15 +91,23 @@ pub struct PendingChat {
 pub enum Pending {
     OverwriteSave,
     DiscardEdits,
-    OverwriteApply { body: String },
+    OverwriteApply { body: String, title: Option<String> },
 }
 
 pub enum InputAction {
-    AddIntent { group: PathBuf },
-    NewGroup { parent: PathBuf },
+    AddIntent {
+        group: PathBuf,
+    },
+    NewGroup {
+        parent: PathBuf,
+    },
     Attach,
     MoveTo,
-    MoveGroup { group: PathBuf },
+    MoveGroup {
+        group: PathBuf,
+    },
+    /// Set the capability's title (the file name is kept).
+    Rename,
 }
 
 #[allow(clippy::large_enum_variant)] // Chat carries the live turn; boxing buys nothing here
@@ -122,6 +130,7 @@ pub enum Screen {
     Diff {
         proposal: String,
         questions: Vec<String>,
+        title: Option<String>,
         scroll: u16,
     },
     SendPick {
@@ -386,8 +395,9 @@ impl App {
             Screen::Diff {
                 proposal,
                 questions,
+                title,
                 scroll,
-            } => self.key_diff(proposal, questions, scroll, k),
+            } => self.key_diff(proposal, questions, title, scroll, k),
             Screen::SendPick { handoffs, selected } => self.key_send_pick(handoffs, selected, k),
             Screen::SendConfirm {
                 handoff,
@@ -580,6 +590,15 @@ impl App {
                             selected: 0,
                         };
                     }
+                }
+            }
+            KeyCode::Char('t') => {
+                if let Some(it) = self.selected_intent() {
+                    self.screen = Screen::Input {
+                        label: "title (a capability phrase: who can what)".into(),
+                        text: it.fm.title.clone(),
+                        action: InputAction::Rename,
+                    };
                 }
             }
             KeyCode::Char('r') => self.rescan(),
@@ -1021,10 +1040,12 @@ impl App {
                             .as_ref()
                             .map(|r| r.questions.clone())
                             .unwrap_or_default();
+                        let title = st.latest.as_ref().and_then(|r| r.title.clone());
                         self.parked_chat = Some(st);
                         self.screen = Screen::Diff {
                             proposal,
                             questions,
+                            title,
                             scroll: 0,
                         };
                     }
@@ -1064,11 +1085,16 @@ impl App {
         &mut self,
         proposal: String,
         questions: Vec<String>,
+        title: Option<String>,
         scroll: u16,
         k: KeyEvent,
     ) -> Flow {
         match k.code {
-            KeyCode::Enter => self.apply_proposal(&merge_questions(&proposal, &questions), false),
+            KeyCode::Enter => self.apply_proposal(
+                &merge_questions(&proposal, &questions),
+                title.as_deref(),
+                false,
+            ),
             KeyCode::Esc => {
                 self.screen = match self.parked_chat.take() {
                     Some(st) => Screen::Chat(st),
@@ -1079,6 +1105,7 @@ impl App {
                 self.screen = Screen::Diff {
                     proposal,
                     questions,
+                    title,
                     scroll: scroll.saturating_add(5),
                 }
             }
@@ -1086,6 +1113,7 @@ impl App {
                 self.screen = Screen::Diff {
                     proposal,
                     questions,
+                    title,
                     scroll: scroll.saturating_sub(5),
                 }
             }
@@ -1094,6 +1122,7 @@ impl App {
                 self.screen = Screen::Diff {
                     proposal,
                     questions,
+                    title,
                     scroll,
                 }
             }
@@ -1103,7 +1132,7 @@ impl App {
 
     /// Write `body` into the chat's intent. Unless forced, refuse when the file
     /// changed since the chat opened (another toolbar, another editor) and ask.
-    fn apply_proposal(&mut self, body: &str, force: bool) {
+    fn apply_proposal(&mut self, body: &str, new_title: Option<&str>, force: bool) {
         let Some(st) = self.parked_chat.as_ref() else {
             self.screen = Screen::Browse;
             return;
@@ -1121,10 +1150,13 @@ impl App {
             }
         };
         if !force && it.loaded_updated.timestamp() != opened.timestamp() {
-            self.screen = Screen::Prompt { question: "File changed on disk since this chat opened. Overwrite with the proposal? (y/n)".into(), pending: Pending::OverwriteApply { body: body.to_string() } };
+            self.screen = Screen::Prompt { question: "File changed on disk since this chat opened. Overwrite with the proposal? (y/n)".into(), pending: Pending::OverwriteApply { body: body.to_string(), title: new_title.map(str::to_string) } };
             return;
         }
         it.body = body.to_string();
+        if let Some(t) = new_title.map(str::trim).filter(|t| !t.is_empty()) {
+            it.fm.title = t.to_string();
+        }
         it.fm.polished_at = Some(chrono::Local::now());
         if it.fm.state == State::Raw {
             it.fm.state = State::Refining;
@@ -1325,7 +1357,9 @@ impl App {
                     self.editing = None;
                     self.screen = Screen::Browse;
                 }
-                Pending::OverwriteApply { body } => self.apply_proposal(&body, true),
+                Pending::OverwriteApply { body, title } => {
+                    self.apply_proposal(&body, title.as_deref(), true)
+                }
             },
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.screen = match pending {
@@ -1432,6 +1466,10 @@ impl App {
                         Err(e) => self.message = Some(format!("move failed: {e:#}")),
                     }
                 }
+            }
+            InputAction::Rename => {
+                let v = value.to_string();
+                self.update_selected_fields(|fm| fm.title = v);
             }
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
@@ -1731,6 +1769,7 @@ impl App {
                 proposal,
                 questions,
                 scroll,
+                ..
             } => {
                 let old = self
                     .parked_chat
@@ -1808,13 +1847,16 @@ impl App {
             Screen::Prompt { question, .. } => question.clone(),
             Screen::Edit => "Ctrl-s save · Ctrl-p polish · Ctrl-e $EDITOR · Esc back".to_string(),
             Screen::Chat(_) => "Enter send · Ctrl-a apply · Ctrl-d dismiss · PgUp/PgDn scroll · Esc cancel/back".to_string(),
-            Screen::Diff { .. } => "Enter apply · Esc back · PgUp/PgDn scroll".to_string(),
+            Screen::Diff { title, .. } => match title {
+                Some(t) => format!("Enter apply (title → {t}) · Esc back · PgUp/PgDn scroll"),
+                None => "Enter apply · Esc back · PgUp/PgDn scroll".to_string(),
+            },
             Screen::SendPick { .. } | Screen::AgentPick { .. } => "j/k choose · Enter select · Esc back".to_string(),
             Screen::Answer { .. } => "type the answer · Enter saves · Esc cancels".to_string(),
             Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
             Screen::Browse => match (&self.message, self.focus) {
                 (Some(m), _) => m.clone(),
-                (None, Pane::Tree) => "Tab panes  a add  n group  e edit  p polish  Q answer  C criteria  s send  R ready  K kind  m move  A attach  r rescan  q quit".to_string(),
+                (None, Pane::Tree) => "Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · Tab next pane · Esc tree".to_string(),
@@ -3018,5 +3060,64 @@ mod tests {
             text.contains("? a?") && text.contains("? b?"),
             "questions listed with their open mark: {text}"
         );
+    }
+
+    #[test]
+    fn t_renames_the_capability_with_the_current_title_prefilled() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('t'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "input");
+        assert_eq!(v.input_text, "Alpha", "prefilled");
+        for _ in 0..5 {
+            key(&mut fx.app, KeyCode::Backspace);
+        }
+        type_str(
+            &mut fx.app,
+            "Advisors can request a meeting from Office Hours",
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        assert_eq!(
+            Store::load(&path).unwrap().fm.title,
+            "Advisors can request a meeting from Office Hours"
+        );
+        assert!(
+            path.ends_with("alpha.md") || path.to_string_lossy().contains("alpha"),
+            "file name is kept: {}",
+            path.display()
+        );
+        assert!(
+            fx.app
+                .view()
+                .rows
+                .iter()
+                .any(|r| r.label == "Advisors can request a meeting from Office Hours")
+        );
+    }
+
+    #[test]
+    fn applying_a_proposal_with_a_capability_phrase_renames_too() {
+        let mut fx = setup("agy.jsonl");
+        let titled = fx._tmp.path().join("titled.jsonl");
+        fs::write(&titled, r#"{"event":"init","conversation_id":"c2"}
+{"event":"step_update","step_update":{"conversation_id":"c2","step_type":"agent_response","text_delta":"capability: Parents can skip a folder without a Pending label\n\n```proposal\n## Description\nnew body\n```\nquestions: none\n"}}
+{"event":"result","result":{"conversation_id":"c2","status":"SUCCESS"}}
+"#).unwrap();
+        fx.app.provider_env[0].1 = titled.display().to_string();
+        select(&mut fx.app, "Alpha");
+        polish(&mut fx.app);
+        wait_until(&mut fx.app, "turn", |a| {
+            !a.view().turn_running && a.view().can_apply
+        });
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert_eq!(
+            it.fm.title,
+            "Parents can skip a folder without a Pending label"
+        );
+        assert!(it.body.starts_with("## Description\nnew body"));
     }
 }

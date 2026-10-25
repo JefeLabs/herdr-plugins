@@ -199,3 +199,21 @@ fn extra_options_are_inserted_after_the_program() {
         "prompt stays after `--`: {argv:?}"
     );
 }
+
+#[test]
+fn reply_may_carry_a_capability_phrase_as_the_new_title() {
+    let r = parse_reply(
+        "capability: Families can skip a folder without seeing Pending\n\n```proposal\n## Description\nx\n```\nquestions: none\n",
+    );
+    assert_eq!(
+        r.title.as_deref(),
+        Some("Families can skip a folder without seeing Pending")
+    );
+    assert!(
+        !r.prose.contains("capability:"),
+        "the title line is not prose: {:?}",
+        r.prose
+    );
+    let r = parse_reply("```proposal\nx\n```\n");
+    assert!(r.title.is_none());
+}
