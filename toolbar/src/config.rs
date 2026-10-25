@@ -107,16 +107,25 @@ impl Trust {
         format!("{:x}", Sha256::digest(text.as_bytes()))
     }
 
+    /// The key is the path exactly as the workspace root names it, never
+    /// canonicalised: a symlink must not borrow another file's trust.
     fn key(file: &Path) -> String {
-        std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf()).display().to_string()
+        file.display().to_string()
+    }
+
+    fn is_regular_file(file: &Path) -> bool {
+        std::fs::symlink_metadata(file).map(|m| m.file_type().is_file()).unwrap_or(false)
     }
 
     pub fn is_trusted(&self, file: &Path, text: &str) -> bool {
-        self.read().get(&Self::key(file)) == Some(&Self::hash(text))
+        Self::is_regular_file(file) && self.read().get(&Self::key(file)) == Some(&Self::hash(text))
     }
 
-    /// Record the file's current content as trusted.
+    /// Record the file's current content as trusted. Refuses symlinks.
     pub fn allow(&self, file: &Path) -> anyhow::Result<()> {
+        if !Self::is_regular_file(file) {
+            bail!("{} is not a regular file (symlinks are never trusted)", file.display());
+        }
         let text = std::fs::read_to_string(file)
             .with_context(|| format!("reading {}", file.display()))?;
         let mut map = self.read();
@@ -347,5 +356,23 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         assert!(!env.contains_key("DYLD_INSERT_LIBRARIES"));
         assert!(!env.contains_key("LD_PRELOAD"));
         assert!(!env.contains_key("PATH"));
+    }
+
+    #[test]
+    fn symlinked_workspace_file_is_never_trusted() {
+        // A repo could ship `.herdr-toolbar.toml -> /some/already-trusted/file`
+        // so its key canonicalises to a trusted path. Refuse symlinks outright.
+        let ws = "[[tool]]\nid = \"extra\"\nname = \"X\"\nicon = \"x\"\ncommand = [\"true\"]\n";
+        let (t, g, w) = dirs(GLOBAL, None);
+        let real = t.path().join("elsewhere.toml");
+        fs::write(&real, ws).unwrap();
+        let trust = Trust::new(t.path().join("trusted.json"));
+        trust.allow(&real).unwrap();
+        std::os::unix::fs::symlink(&real, w.join(WORKSPACE_FILE)).unwrap();
+        let loaded = load_merged(&g, &w, &trust).unwrap();
+        assert_eq!(loaded.config.tools.len(), 5);
+        assert!(loaded.ignored_untrusted.is_some());
+        // and `allow` on the symlink itself must refuse
+        assert!(trust.allow(&w.join(WORKSPACE_FILE)).is_err());
     }
 }
