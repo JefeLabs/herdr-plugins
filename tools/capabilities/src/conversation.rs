@@ -207,6 +207,10 @@ fn lossy_lines<R: Read + Send + 'static>(r: R) -> impl Iterator<Item = String> {
 /// remembers context, so only the new message goes. Without one (text
 /// providers, a cancelled first turn) the seed and the transcript so far are
 /// re-sent, as the spec's degraded mode requires.
+/// Restated on every turn, so a conversation that began under an older
+/// template still answers in the current structure.
+pub const FORMAT_REMINDER: &str = "(Reply format: first line `capability: <who> can <what>`; then a fenced ```proposal block with the complete body as `## Description`, `## Preconditions` (`- [ ]` items, keep `[x]` on confirmed ones), `## Acceptance criteria` (`- [ ]` checks), `## Open questions` (`- ` items, keep answered ones with their `→` answer); then `questions:` with `- ` items or `questions: none`.)";
+
 pub fn follow_up_prompt(
     seed: &str,
     transcript: &[(String, String)],
@@ -214,7 +218,7 @@ pub fn follow_up_prompt(
     resumable: bool,
 ) -> String {
     if resumable {
-        return message.to_string();
+        return format!("{}\n\n{FORMAT_REMINDER}\n", message.trim_end());
     }
     let mut p = String::new();
     p.push_str(seed.trim_end());
@@ -224,6 +228,8 @@ pub fn follow_up_prompt(
     }
     p.push_str("\n[user]\n");
     p.push_str(message.trim_end());
+    p.push_str("\n\n");
+    p.push_str(FORMAT_REMINDER);
     p.push('\n');
     p
 }

@@ -248,7 +248,12 @@ fn follow_up_prompt_without_id_carries_seed_and_transcript() {
         false,
     );
     assert!(
-        p.contains("SEED") && p.contains("reply one") && p.ends_with("shorter please\n"),
+        p.contains("SEED")
+            && p.contains("reply one")
+            && p.contains(
+                "shorter please
+"
+            ),
         "{p}"
     );
     let p = follow_up_prompt(
@@ -257,9 +262,9 @@ fn follow_up_prompt_without_id_carries_seed_and_transcript() {
         "shorter please",
         true,
     );
-    assert_eq!(
-        p, "shorter please",
-        "with a resumable conversation only the new message is sent"
+    assert!(
+        p.starts_with("shorter please") && !p.contains("SEED"),
+        "with a resumable conversation the seed and transcript are not re-sent: {p}"
     );
 }
 
@@ -273,4 +278,26 @@ fn provider_killed_by_signal_is_reported_as_such_not_as_cancelled() {
         Some(TurnMsg::Failed(m)) => assert!(m.contains("signal") && !m.contains("cancel"), "{m}"),
         other => panic!("{other:?}"),
     }
+}
+
+// every turn restates the reply format, so a conversation that began under an
+// older template still comes back with Preconditions and Acceptance criteria
+#[test]
+fn follow_up_prompts_always_carry_the_format_reminder() {
+    let resumed = follow_up_prompt("SEED", &[], "shorter please", true);
+    assert!(resumed.starts_with("shorter please"), "{resumed}");
+    for h in [
+        "capability:",
+        "## Preconditions",
+        "## Acceptance criteria",
+        "## Open questions",
+        "```proposal",
+    ] {
+        assert!(resumed.contains(h), "resumed turn lacks {h}: {resumed}");
+    }
+    let fresh = follow_up_prompt("SEED", &[("user".into(), "polish".into())], "again", false);
+    assert!(
+        fresh.contains("SEED") && fresh.contains("## Preconditions"),
+        "{fresh}"
+    );
 }
