@@ -3085,16 +3085,27 @@ impl App {
         let hits =
             ui::render_capability_list(&rows, self.list_selected, &header, empty, list_area, buf);
         *self.card_hits.borrow_mut() = hits;
-        let text = self.message.clone().unwrap_or_else(|| {
-            "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
-                .to_string()
-        });
+        let text = match &self.screen {
+            Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
+            Screen::Prompt { question, .. } => question.clone(),
+            _ => self.message.clone().unwrap_or_else(|| {
+                "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
+                    .to_string()
+            }),
+        };
         ui::render_status(&text, status, buf);
     }
 
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
         self.last_area.set(area);
-        if matches!(self.screen, Screen::Browse) && self.layout == Layout::List {
+        // the card view stays on screen for the browser and for one-line
+        // prompts (title, areas, confirmations), which use the status line
+        if self.layout == Layout::List
+            && matches!(
+                self.screen,
+                Screen::Browse | Screen::Input { .. } | Screen::Prompt { .. }
+            )
+        {
             self.draw_list(area, buf);
             return;
         }
@@ -4128,6 +4139,36 @@ mod tests {
             it.path.parent().unwrap(),
             fx.app.store.root().join("skoolscout"),
             "added to the selected card's group"
+        );
+    }
+
+    #[test]
+    fn typing_a_title_in_the_card_view_keeps_the_cards_on_screen() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_text(&mut fx.app, "Gam");
+        let shown = render(&fx.app, 100, 20);
+        assert!(
+            shown.starts_with("Capabilities ·"),
+            "still the card view: {shown}"
+        );
+        let status = shown.lines().last().unwrap_or_default();
+        assert!(
+            status.contains("new capability in") && status.contains("Gam"),
+            "the prompt is on the status line: {status}"
+        );
+        // the areas prompt too
+        key(&mut fx.app, KeyCode::Esc);
+        key(&mut fx.app, KeyCode::Char('+'));
+        let shown = render(&fx.app, 100, 20);
+        assert!(shown.starts_with("Capabilities ·"), "{shown}");
+        assert!(
+            shown
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .contains("affected areas")
         );
     }
 
