@@ -702,7 +702,7 @@ mod tests {
         let titles = [
             "▸ Preconditions (1/1)",
             "▾ Acceptance criteria (1/2)",
-            "▸ Demos (1 linked, 1 found)",
+            "▸ Demo Videos (1 linked, 1 found)",
             "▸ Open questions (1 open)",
             "▸ Pull requests (1/2 merged, 1 found)",
             "▸ Artifacts (3 linked, 1 found)",
@@ -776,7 +776,7 @@ mod tests {
         let (_t, rows) = detail(&it, Pane::Tree, Pane::PullRequests, 80, 24);
         let all = rows.join("\n");
         assert!(all.contains("▾ Pull requests (0)"), "{all}");
-        assert!(all.contains("▸ Demos (0)"), "{all}");
+        assert!(all.contains("▸ Demo Videos (0)"), "{all}");
         assert!(all.contains("none yet"), "{all}");
     }
 
@@ -806,7 +806,7 @@ mod tests {
         let desc = row_of(&rows, "The description.");
         assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 1, "{all}");
         assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 1);
-        assert_eq!(row_of(&rows, "▸ Demos"), 20, "{all}");
+        assert_eq!(row_of(&rows, "▸ Demo Videos"), 20, "{all}");
         assert_eq!(row_of(&rows, "▸ Open questions"), 21, "{all}");
         assert_eq!(row_of(&rows, "▸ Pull requests"), 22, "{all}");
         assert_eq!(row_of(&rows, "▸ Artifacts"), 23, "{all}");
@@ -1180,7 +1180,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         format!(
             "{} {}",
             marker(Pane::Demos),
-            count_title("Demos", &demo_rows)
+            count_title("Demo Videos", &demo_rows)
         ),
         format!(
             "{} Open questions ({} open)",

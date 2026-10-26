@@ -3821,7 +3821,7 @@ impl App {
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
-                (None, Pane::Demos) => "Demos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
+                (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::PullRequests) => "Pull requests: j/k choose · Enter/o open in the browser · L link a found one · a add · Esc tree".to_string(),
             },
         };
@@ -6647,6 +6647,15 @@ mod tests {
         let body = Store::load(&path).unwrap().body;
         assert!(body.contains("- pr: #77"), "{body}");
         assert!(body.contains("- demo: story-x (criteria: 2)"), "{body}");
+    }
+
+    #[test]
+    fn the_demo_videos_help_line_names_the_section() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        tab_to(&mut fx.app, "demos");
+        let shown = render(&fx.app, 140, 30);
+        assert!(shown.contains("Demo Videos: j/k choose"), "{shown}");
     }
 
     #[test]
