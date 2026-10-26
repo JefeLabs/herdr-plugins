@@ -99,6 +99,10 @@ fn the_prompt_carries_the_capability_the_spec_the_prs_and_the_follow_ups() {
     ] {
         assert!(p.contains(needle), "missing {needle:?} in:\n{p}");
     }
+    assert!(
+        !p.contains(herdr_capabilities::conversation::POLISH_RULE),
+        "a reconcile never polishes the owner's wording"
+    );
 }
 
 #[test]

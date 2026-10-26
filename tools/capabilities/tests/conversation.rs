@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use herdr_capabilities::config::{Output, ProviderSpec, When};
 use herdr_capabilities::conversation::{
-    FORMAT_REMINDER, HAPPY_PATH_RULE, Turn, TurnMsg, follow_up_prompt, seed_prompt,
+    FORMAT_REMINDER, HAPPY_PATH_RULE, POLISH_RULE, Turn, TurnMsg, follow_up_prompt, seed_prompt,
 };
 
 fn fixtures() -> PathBuf {
@@ -372,9 +372,43 @@ fn a_follow_up_carries_the_format_reminder_once() {
     let p = follow_up_prompt(&seed, &transcript, "again", false);
     assert_eq!(p.matches(FORMAT_REMINDER).count(), 1, "{p}");
     assert!(
-        p.trim_end().ends_with(FORMAT_REMINDER),
-        "the reminder comes last, after the new message"
+        p.find(FORMAT_REMINDER) > p.rfind("again"),
+        "the reminder comes after the new message"
+    );
+    assert!(
+        p.trim_end().ends_with(POLISH_RULE),
+        "then the polish rule, last"
     );
     let resumed = follow_up_prompt(&seed, &transcript, "again", true);
     assert_eq!(resumed.matches(FORMAT_REMINDER).count(), 1);
+}
+
+#[test]
+fn every_turn_asks_to_polish_what_the_author_wrote_answers_included() {
+    assert_eq!(
+        POLISH_RULE,
+        "Polish everything the author wrote, answers included: fix spelling, grammar and unclear wording in the description, preconditions, acceptance criteria, each open question and each `→ answer`, keeping its meaning and every decision in it. Keep every answered question with its polished `→ answer`, and do not re-ask it."
+    );
+    // polish turns carry it; the shared format reminder does not, so a
+    // reconcile (which must copy criteria word for word) never polishes
+    assert!(!FORMAT_REMINDER.contains(POLISH_RULE));
+    let seed = seed_prompt("template", "body", None, "idea");
+    assert_eq!(seed.matches(POLISH_RULE).count(), 1);
+    let transcript = [("user".to_string(), "polish".to_string())];
+    for resumable in [true, false] {
+        let p = follow_up_prompt(&seed, &transcript, "again", resumable);
+        assert_eq!(p.matches(POLISH_RULE).count(), 1, "{p}");
+        assert_eq!(p.matches(FORMAT_REMINDER).count(), 1, "{p}");
+    }
+    for t in [
+        include_str!("../defaults/idea.polish.md"),
+        include_str!("../defaults/issue.polish.md"),
+        include_str!("../defaults/enhancement.polish.md"),
+    ] {
+        assert!(t.contains(POLISH_RULE), "bundled polish template: {t}");
+        assert!(
+            !t.contains("with its answer, and do not re-ask it"),
+            "the old keep-as-is rule is gone: {t}"
+        );
+    }
 }

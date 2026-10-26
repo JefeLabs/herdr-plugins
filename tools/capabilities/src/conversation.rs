@@ -248,7 +248,10 @@ fn lossy_lines<R: Read + Send + 'static>(r: R) -> impl Iterator<Item = String> {
 /// What the refinement conversation may ask about: the happy path only.
 pub const HAPPY_PATH_RULE: &str = "Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off.";
 
-pub const FORMAT_REMINDER: &str = "(Reply format: first line `capability: <who> can <what>`; then a fenced ```proposal block with the complete body as `## Description`, `## Preconditions` (`- [ ]` items, keep `[x]` on confirmed ones), `## Acceptance criteria` (`- [ ]` checks), `## Open questions` (`- ` items, keep answered ones with their `→` answer); then `questions:` with `- ` items or `questions: none`. Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off. When the capability lists areas it affects, group `## Acceptance criteria` under `### <area path>` sub-headings, one per area (its own group first), keeping every criterion's wording and checkbox.)";
+/// Polishing covers everything the author typed, answers included.
+pub const POLISH_RULE: &str = "Polish everything the author wrote, answers included: fix spelling, grammar and unclear wording in the description, preconditions, acceptance criteria, each open question and each `→ answer`, keeping its meaning and every decision in it. Keep every answered question with its polished `→ answer`, and do not re-ask it.";
+
+pub const FORMAT_REMINDER: &str = "(Reply format: first line `capability: <who> can <what>`; then a fenced ```proposal block with the complete body as `## Description`, `## Preconditions` (`- [ ]` items, keep `[x]` on confirmed ones), `## Acceptance criteria` (`- [ ]` checks), `## Open questions` (`- ` items, answered ones each with its `→` answer); then `questions:` with `- ` items or `questions: none`. Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off. When the capability lists areas it affects, group `## Acceptance criteria` under `### <area path>` sub-headings, one per area (its own group first), keeping every criterion's wording and checkbox.)";
 
 pub fn follow_up_prompt(
     seed: &str,
@@ -256,13 +259,14 @@ pub fn follow_up_prompt(
     message: &str,
     resumable: bool,
 ) -> String {
+    let tail = polish_tail();
     if resumable {
-        return format!("{}\n\n{FORMAT_REMINDER}\n", message.trim_end());
+        return format!("{}\n\n{tail}\n", message.trim_end());
     }
-    // the seed ends with the reminder too; keep only the last one, after the
+    // the seed ends with the same tail; keep only the last one, after the
     // new message
     let seed = seed.trim_end();
-    let seed = seed.strip_suffix(FORMAT_REMINDER).unwrap_or(seed);
+    let seed = seed.strip_suffix(tail.as_str()).unwrap_or(seed);
     let mut p = String::new();
     p.push_str(seed.trim_end());
     p.push_str("\n\nConversation so far:\n");
@@ -272,9 +276,15 @@ pub fn follow_up_prompt(
     p.push_str("\n[user]\n");
     p.push_str(message.trim_end());
     p.push_str("\n\n");
-    p.push_str(FORMAT_REMINDER);
+    p.push_str(&tail);
     p.push('\n');
     p
+}
+
+/// What ends every polish turn: the reply format, then the polish rule (a
+/// reconcile uses the format alone, since it must keep the owner's wording).
+fn polish_tail() -> String {
+    format!("{FORMAT_REMINDER}\n{POLISH_RULE}")
 }
 
 /// First message of a conversation: the kind's polish template, the intent,
@@ -302,7 +312,7 @@ pub fn seed_prompt(
         }
     }
     p.push('\n');
-    p.push_str(FORMAT_REMINDER);
+    p.push_str(&polish_tail());
     p.push('\n');
     p
 }
