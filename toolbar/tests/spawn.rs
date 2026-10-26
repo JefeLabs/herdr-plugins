@@ -15,6 +15,7 @@ fn cfg(cmd: &[&str]) -> ToolConfig {
         command: cmd.iter().map(|s| s.to_string()).collect(),
         cwd: None,
         env: BTreeMap::new(),
+        open: Default::default(),
     }
 }
 

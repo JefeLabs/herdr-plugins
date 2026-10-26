@@ -95,6 +95,7 @@ fn run_tui() -> anyhow::Result<()> {
     app::run(
         paths,
         env,
+        Some(ctx),
         Some(Box::new(move || control.poll())),
         Some(Box::new(move || {
             let _ = std::fs::remove_file(pane_file);

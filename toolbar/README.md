@@ -78,9 +78,18 @@ icon    = "▤"
 command = ["lazysql"]
 cwd     = "~"                                 # optional, default is the workspace directory
 env     = { PGHOST = "localhost" }            # optional
+
+[[tool]]
+id      = "browser"
+name    = "Browser"
+icon    = "◎"
+command = ["terminal-browser", "open"]
+open    = "pane"                              # optional: a Herdr pane, not the slot
 ```
 
-Tools start the first time you select them. A tool that is not installed shows a one-line "cannot start" message in its slot and the other tools keep working.
+Tools start the first time you select them.
+
+A tool with `open = "pane"` runs in a Herdr pane instead of the toolbar's slot: selecting it opens a right split of the work pane (the toolbar's left neighbour, else the focused pane), runs its `command` there with its `cwd` and `env`, and focuses it. Selecting it again focuses that pane, on whichever tab it is; once the pane is closed, the next selection opens a new one. The pane id is kept under the plugin's state folder, so this survives a toolbar restart. Use it for tools that need the room or draw with graphics, such as `terminal-browser`, which shows pages as images the slot cannot pass through yet. A tool that is not installed shows a one-line "cannot start" message in its slot and the other tools keep working.
 
 ### Per-worktree overrides
 

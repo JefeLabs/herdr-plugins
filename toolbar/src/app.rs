@@ -13,7 +13,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
 
-use crate::config::{Loaded, ToolConfig, Trust, load_merged};
+use crate::config::{Loaded, Open, ToolConfig, Trust, load_merged};
 use crate::keys::{Action, Prefix};
 use crate::pty::{Size, SpawnEnv, ToolProcess, ToolState};
 use crate::ui;
@@ -76,6 +76,11 @@ pub struct App {
     paths: ConfigPaths,
     wake_tx: Sender<()>,
     wake_rx: Receiver<()>,
+    /// Set when running inside Herdr: pane tools need it.
+    herdr: Option<crate::herdr::HerdrContext>,
+    /// What background launches have to say (a failure), for the footer.
+    notes_tx: Sender<String>,
+    notes_rx: Receiver<String>,
 }
 
 impl App {
@@ -84,9 +89,13 @@ impl App {
     /// reserved for things no reload can fix (none today).
     pub fn new(paths: ConfigPaths, env: SpawnEnv, size: Size) -> anyhow::Result<Self> {
         let (wake_tx, wake_rx) = channel();
+        let (notes_tx, notes_rx) = channel();
         let mut app = Self {
             slots: Vec::new(),
             selected: 0,
+            herdr: None,
+            notes_tx,
+            notes_rx,
             prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
             size,
@@ -169,12 +178,22 @@ impl App {
         }
     }
 
+    /// The Herdr context, for tools that open in a Herdr pane.
+    pub fn set_herdr(&mut self, ctx: crate::herdr::HerdrContext) {
+        self.herdr = Some(ctx);
+    }
+
     /// Show tool `idx`, starting it on first selection. Out-of-range is clamped.
     pub fn select(&mut self, idx: usize) {
         if self.slots.is_empty() {
             return;
         }
         let idx = idx.min(self.slots.len() - 1);
+        // a pane tool opens beside the work pane and leaves the slot alone
+        if self.slots[idx].cfg.open == Open::Pane {
+            self.open_in_pane(idx);
+            return;
+        }
         self.selected = idx;
         if self.slots[idx].proc.is_none() && self.slots[idx].last_error.is_none() {
             self.spawn(idx);
@@ -185,6 +204,34 @@ impl App {
             && p.screen().size() != (size.rows, size.cols)
         {
             p.resize(size);
+        }
+    }
+
+    /// Open (or focus) a pane tool off the UI thread; Herdr answers in tens
+    /// of milliseconds but the toolbar must never wait on it.
+    fn open_in_pane(&mut self, idx: usize) {
+        let cfg = self.slots[idx].cfg.clone();
+        let Some(ctx) = self.herdr.clone() else {
+            self.message = Some(format!(
+                "{} opens in a Herdr pane: run the toolbar inside Herdr",
+                cfg.name
+            ));
+            return;
+        };
+        self.message = None;
+        let (tx, wake) = (self.notes_tx.clone(), self.wake_tx.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = crate::herdr::open_in_pane(&ctx, &cfg) {
+                let _ = tx.send(format!("{} did not open: {e:#}", cfg.name));
+                let _ = wake.send(());
+            }
+        });
+    }
+
+    /// Show what background launches reported.
+    pub fn drain_notes(&mut self) {
+        while let Ok(note) = self.notes_rx.try_recv() {
+            self.message = Some(note);
         }
     }
 
@@ -441,6 +488,7 @@ impl App {
 pub fn run(
     paths: ConfigPaths,
     env: SpawnEnv,
+    herdr: Option<crate::herdr::HerdrContext>,
     mut control: Option<Box<dyn FnMut() -> Vec<ControlCmd>>>,
     on_exit: Option<Box<dyn FnOnce()>>,
 ) -> anyhow::Result<()> {
@@ -476,6 +524,9 @@ pub fn run(
             return Err(e);
         }
     };
+    if let Some(ctx) = herdr {
+        app.set_herdr(ctx);
+    }
 
     let (events_tx, events_rx) = channel::<Event>();
     std::thread::spawn(move || {
@@ -517,6 +568,7 @@ pub fn run(
         }
         // Drain pty wakes so one redraw covers a burst of output.
         while app.wake_rx.try_recv().is_ok() {}
+        app.drain_notes();
     })();
 
     app.shutdown();
@@ -739,6 +791,52 @@ mod tests {
         assert!(app.slots[1].proc.is_none());
         assert!(app.slots[2].proc.is_none());
         app.shutdown();
+    }
+
+    #[test]
+    fn a_pane_tool_never_takes_the_slot() {
+        let cfg = tool("a", "echo A; sleep 30")
+            + "[[tool]]\nid = \"browser\"\nname = \"Browser\"\nicon = \"o\"\ncommand = [\"terminal-browser\", \"open\"]\nopen = \"pane\"\n";
+        let fx = fixture(&cfg);
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.select(0);
+        app.select(1);
+        assert_eq!(app.selected, 0, "the slot keeps showing a");
+        assert!(app.slots[1].proc.is_none(), "nothing runs in the slot");
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("Herdr"),
+            "outside Herdr it says why: {:?}",
+            app.message
+        );
+
+        // inside Herdr it opens the pane in the background
+        let log = fx._tmp.path().join("herdr.log");
+        let state = fx._tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        app.set_herdr(crate::herdr::HerdrContext {
+            bin: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-herdr.sh"),
+            workspace_id: Some("w1".into()),
+            pane_id: Some("w1:p9".into()),
+            tab_id: Some("w1:t1".into()),
+            target_pane_id: Some("w1:p9".into()),
+            workspace_cwd: fx.env.cwd.clone(),
+            config_dir: fx._tmp.path().join("config"),
+            state_dir: state,
+            socket: fx._tmp.path().join("herdr.sock"),
+            inherit: vec![],
+            extra_env: vec![
+                ("FAKE_HERDR_LOG".into(), log.display().to_string()),
+                ("FAKE_NEIGHBOR".into(), "w1:p3".into()),
+            ],
+        });
+        app.select(1);
+        assert_eq!(app.selected, 0);
+        wait_until("the pane is opened", || {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("pane run w1:p12 'terminal-browser' 'open'")
+        });
     }
 
     #[test]
