@@ -13,7 +13,7 @@ const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec"];
 
 fn artifacts_preamble(intent: &Intent) -> String {
     format!(
-        "Whenever you create something for this capability — a spec, a plan, an ADR or decision record, a wayfinder decision ticket, or a GitHub issue — append one line under `## Artifacts` in {} (create the section if missing): `- spec: <path>`, `- plan: <path>`, `- adr: <path>`, `- decision: #<n>`, `- issue: <url or #n>`, and `- pr: #<n>` when you open a pull request. Paths are relative to the repo root.\n\n",
+        "Whenever you create something for this capability — a spec, a plan, an ADR or decision record, a wayfinder decision ticket, or a GitHub issue — append one line under `## Artifacts` in {} (create the section if missing): `- spec: <path>`, `- plan: <path>`, `- adr: <path>`, `- decision: #<n>`, `- issue: <url or #n>`, `- pr: #<n>` when you open a pull request, and `- demo: <story-id> (criteria: <numbers>)` for each app-demos story you add, naming the acceptance criteria it shows. Paths are relative to the repo root.\n\n",
         intent.path.display()
     )
 }

@@ -1,0 +1,205 @@
+//! App-demo stories (skoolscout's `app-demos/stories/*.yaml`) linked to a
+//! capability as `- demo: <story-id> (criteria: 1, 4)`: recorded, captioned
+//! videos that show its acceptance criteria working.
+
+use std::path::{Path, PathBuf};
+
+use crate::store::{Artifact, significant_words, word_matches};
+
+/// One story, as much of it as the reader shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Story {
+    pub id: String,
+    pub title: String,
+    pub actor: String,
+    pub host: String,
+    pub depends_on: Vec<String>,
+    pub tags: Vec<String>,
+    /// Each step as `action` or `action: value`, then ` — caption` when it has one.
+    pub steps: Vec<String>,
+    pub file: PathBuf,
+}
+
+/// `story-id (criteria: 1, 4)` → the story id and the (1-based) criteria it shows.
+pub fn demo_target(target: &str) -> (String, Vec<usize>) {
+    let t = target.trim();
+    let (id, rest) = match t.split_once(char::is_whitespace) {
+        Some((id, rest)) => (id, rest),
+        None => (t, ""),
+    };
+    let criteria = rest
+        .split_once("criteria:")
+        .map(|(_, list)| {
+            list.trim_end_matches(')')
+                .split(',')
+                .filter_map(|n| n.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    (id.to_string(), criteria)
+}
+
+fn text(v: &serde_yaml_ng::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn list(v: &serde_yaml_ng::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|l| l.as_sequence())
+        .map(|l| {
+            l.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn step_text(step: &serde_yaml_ng::Value) -> Option<String> {
+    let map = step.as_mapping()?;
+    let (action, value) = map.iter().next()?;
+    let action = action.as_str()?;
+    let mut out = match value.as_str() {
+        Some(s) => format!("{action}: {s}"),
+        None => action.to_string(),
+    };
+    if let Some(caption) = value.get("caption").and_then(|c| c.as_str()) {
+        out.push_str(" — ");
+        out.push_str(caption);
+    }
+    Some(out)
+}
+
+/// Every story in `<root>/app-demos/stories/*.yaml`, over the given roots
+/// (the main checkout and its worktrees); unreadable files are skipped.
+pub fn all_stories(roots: &[PathBuf]) -> Vec<Story> {
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(dir) = std::fs::read_dir(root.join("app-demos/stories")) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")))
+            .collect();
+        files.sort();
+        for file in files {
+            let Some(doc) = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|t| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&t).ok())
+            else {
+                continue;
+            };
+            let Some(stories) = doc.get("stories").and_then(|s| s.as_sequence()) else {
+                continue;
+            };
+            for s in stories {
+                let id = text(s, "id");
+                if id.is_empty() || out.iter().any(|o: &Story| o.id == id) {
+                    continue;
+                }
+                out.push(Story {
+                    title: text(s, "title"),
+                    actor: text(s, "actor"),
+                    host: text(s, "host"),
+                    depends_on: list(s, "dependsOn"),
+                    tags: list(s, "tags"),
+                    steps: s
+                        .get("steps")
+                        .and_then(|l| l.as_sequence())
+                        .map(|l| l.iter().filter_map(step_text).collect())
+                        .unwrap_or_default(),
+                    file: file.clone(),
+                    id,
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn find_story(roots: &[PathBuf], id: &str) -> Option<Story> {
+    all_stories(roots).into_iter().find(|s| s.id == id)
+}
+
+/// The story for the in-tool reader, with the criteria it demonstrates.
+pub fn story_markdown(story: &Story, criteria: &[(usize, String)]) -> String {
+    let mut md = format!("# {}\n\n", story.title);
+    md.push_str(&format!("story `{}`", story.id));
+    if !story.actor.is_empty() {
+        md.push_str(&format!(" · actor **{}**", story.actor));
+    }
+    if !story.host.is_empty() {
+        md.push_str(&format!(" · host `{}`", story.host));
+    }
+    md.push_str("\n\n");
+    if !criteria.is_empty() {
+        md.push_str("## Shows these acceptance criteria\n\n");
+        for (n, c) in criteria {
+            md.push_str(&format!("{n}. {c}\n"));
+        }
+        md.push('\n');
+    }
+    if !story.depends_on.is_empty() {
+        md.push_str(&format!("Runs after: {}\n\n", story.depends_on.join(", ")));
+    }
+    if !story.tags.is_empty() {
+        md.push_str(&format!("Tags: {}\n\n", story.tags.join(", ")));
+    }
+    if !story.steps.is_empty() {
+        md.push_str("## Steps\n\n");
+        for s in &story.steps {
+            md.push_str(&format!("- {s}\n"));
+        }
+        md.push('\n');
+    }
+    md.push_str("`o` plays the recorded video, or opens the demos site at this story (`make demos-open` in app-demos).\n");
+    md
+}
+
+/// The newest recorded take (`.webm` / `.mp4`) under `app-demos/videos/<id>/`.
+pub fn video_for(roots: &[PathBuf], id: &str) -> Option<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|r| std::fs::read_dir(r.join("app-demos/videos").join(id)).ok())
+        .flat_map(|d| d.flatten())
+        .map(|e| e.path())
+        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("webm" | "mp4")))
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
+/// The demos site, opened at one story.
+pub fn site_url(id: &str) -> String {
+    format!("http://localhost:4400/#{id}")
+}
+
+/// Stories in `repo` whose title shares at least two significant words with
+/// the capability's title, minus those already linked (`already` holds the
+/// targets of the capability's `demo:` lines).
+pub fn discover_demos(repo: &Path, title: &str, already: &[String]) -> Vec<Artifact> {
+    let wanted = significant_words(title);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let needed = wanted.len().min(2);
+    let linked: Vec<String> = already.iter().map(|a| demo_target(a).0).collect();
+    all_stories(&[repo.to_path_buf()])
+        .into_iter()
+        .filter(|s| !linked.contains(&s.id))
+        .filter(|s| {
+            let words = significant_words(&format!("{} {}", s.title, s.id.replace('-', " ")));
+            wanted
+                .iter()
+                .filter(|w| words.iter().any(|h| word_matches(w, h)))
+                .count()
+                >= needed
+        })
+        .map(|s| Artifact {
+            kind: "demo".into(),
+            target: s.id,
+        })
+        .collect()
+}

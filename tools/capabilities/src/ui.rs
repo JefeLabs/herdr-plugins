@@ -370,6 +370,7 @@ mod tests {
                 "none",
                 true,
                 selected,
+                &[],
                 f.area(),
                 f.buffer_mut(),
             )
@@ -713,6 +714,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         "none — what must already be true for this to be worth building?",
         v.focus == Pane::Preconditions,
         v.preconditions_selected,
+        &[],
         layout[2],
         buf,
     );
@@ -726,46 +728,23 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         .scroll((v.description_scroll, 0))
         .render(inner, buf);
 
-    // criteria
-    let block = pane_block(
-        &format!(
-            "Acceptance criteria ({}/{})",
-            cs.iter().filter(|c| c.done).count(),
-            cs.len()
-        ),
+    // criteria: the same scrolling checklist, with ▶ on those an app-demo shows
+    let demoed: Vec<usize> = crate::store::artifacts(&it.body)
+        .iter()
+        .filter(|a| a.kind.eq_ignore_ascii_case("demo"))
+        .flat_map(|a| crate::demos::demo_target(&a.target).1)
+        .filter_map(|n| n.checked_sub(1))
+        .collect();
+    render_checklist(
+        &cs,
+        "Acceptance criteria",
+        "none yet — add `- [ ]` items in the editor or let polish propose them",
         v.focus == Pane::Criteria,
+        v.criteria_selected,
+        &demoed,
+        layout[3],
+        buf,
     );
-    let inner = block.inner(layout[3]);
-    block.render(layout[3], buf);
-    if cs.is_empty() {
-        Paragraph::new(Span::styled(
-            "none yet — add `- [ ]` items in the editor or let polish propose them",
-            Style::default().add_modifier(Modifier::DIM),
-        ))
-        .render(inner, buf);
-    }
-    let mut y = inner.y;
-    'crit: for (i, c) in cs.iter().enumerate() {
-        let box_ = if c.done { "[x] " } else { "[ ] " };
-        for (j, piece) in wrap_text(&sanitize(&c.text), (inner.width as usize).saturating_sub(4))
-            .into_iter()
-            .enumerate()
-        {
-            if y >= inner.y + inner.height {
-                break 'crit;
-            }
-            let rect = Rect {
-                y,
-                height: 1,
-                ..inner
-            };
-            if v.focus == Pane::Criteria && i == v.criteria_selected {
-                buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
-            }
-            Line::from(format!("{}{piece}", if j == 0 { box_ } else { "    " })).render(rect, buf);
-            y += 1;
-        }
-    }
 
     // questions
     let block = pane_block(
@@ -928,12 +907,16 @@ pub fn render_reader(
 }
 
 /// A titled checklist pane with wrapped items; the selected one is highlighted when focused.
+/// A checklist pane (Preconditions, Acceptance criteria). `marked` holds the
+/// (0-based) items an app-demo shows; they get `▶` after the checkbox.
+#[allow(clippy::too_many_arguments)]
 fn render_checklist(
     items: &[crate::store::Criterion],
     title: &str,
     empty: &str,
     focused: bool,
     selected: usize,
+    marked: &[usize],
     area: Rect,
     buf: &mut Buffer,
 ) {
@@ -960,7 +943,15 @@ fn render_checklist(
     let width = (inner.width as usize).saturating_sub(4);
     let wrapped: Vec<Vec<String>> = items
         .iter()
-        .map(|c| wrap_text(&sanitize(&c.text), width))
+        .enumerate()
+        .map(|(i, c)| {
+            let w = if marked.contains(&i) {
+                width.saturating_sub(2)
+            } else {
+                width
+            };
+            wrap_text(&sanitize(&c.text), w)
+        })
         .collect();
     let height = inner.height as usize;
     let total: usize = wrapped.iter().map(Vec::len).sum();
@@ -996,7 +987,13 @@ fn render_checklist(
             if focused && i == selected {
                 buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
             }
-            Line::from(format!("{}{piece}", if j == 0 { box_ } else { "    " })).render(rect, buf);
+            let lead = match (j, marked.contains(&i)) {
+                (0, true) => format!("{box_}▶ "),
+                (0, false) => box_.to_string(),
+                (_, true) => "      ".to_string(),
+                (_, false) => "    ".to_string(),
+            };
+            Line::from(format!("{lead}{piece}")).render(rect, buf);
             y += 1;
             used += 1;
         }

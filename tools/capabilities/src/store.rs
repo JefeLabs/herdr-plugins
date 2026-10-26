@@ -874,7 +874,7 @@ const ARTIFACT_DIRS: &[(&str, &str)] = &[
     ("docs/adr", "adr"),
 ];
 
-fn significant_words(text: &str) -> Vec<String> {
+pub(crate) fn significant_words(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| {
@@ -901,7 +901,7 @@ fn significant_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn word_matches(a: &str, b: &str) -> bool {
+pub(crate) fn word_matches(a: &str, b: &str) -> bool {
     a == b || (a.len() >= 4 && b.starts_with(a)) || (b.len() >= 4 && a.starts_with(b))
 }
 

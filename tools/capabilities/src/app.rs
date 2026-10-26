@@ -1344,7 +1344,9 @@ impl App {
                     .into_iter()
                     .map(|a| a.target)
                     .collect();
-                crate::store::discover_artifacts(repo, &it.fm.title, &already)
+                let mut found = crate::store::discover_artifacts(repo, &it.fm.title, &already);
+                found.extend(crate::demos::discover_demos(repo, &it.fm.title, &already));
+                found
             }
             _ => Vec::new(),
         };
@@ -1810,6 +1812,10 @@ impl App {
 
     /// Enter reads a Markdown file in the tool; tickets, URLs and `o` open externally.
     fn open_artifact(&mut self, it: &Intent, a: &crate::store::Artifact, external: bool) {
+        if a.kind.eq_ignore_ascii_case("demo") {
+            self.open_demo(it, &a.target, external);
+            return;
+        }
         let target = a.target.trim();
         let is_ref = target.starts_with('#')
             || target.starts_with("http://")
@@ -1868,6 +1874,57 @@ impl App {
             }
             Err(e) => self.message = Some(format!("cannot read {}: {e}", path.display())),
         }
+    }
+
+    /// A demo line: Enter shows its app-demos story in the reader; `o` plays
+    /// the newest recorded video, else opens the demos site at the story.
+    fn open_demo(&mut self, it: &Intent, target: &str, external: bool) {
+        let (id, criteria) = crate::demos::demo_target(target);
+        let roots: Vec<PathBuf> = it
+            .fm
+            .repo
+            .as_deref()
+            .filter(|r| r.is_dir())
+            .map(crate::send::worktrees)
+            .unwrap_or_default();
+        if external {
+            let arg = crate::demos::video_for(&roots, &id)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| crate::demos::site_url(&id));
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            self.message = Some(
+                match std::process::Command::new(opener)
+                    .arg(&arg)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(_) => format!("opened {arg}"),
+                    Err(e) => format!("cannot open {arg}: {e}"),
+                },
+            );
+            return;
+        }
+        let Some(story) = crate::demos::find_story(&roots, &id) else {
+            self.message = Some(format!(
+                "no app-demos story `{id}` in the capability's repo (o opens the demos site)"
+            ));
+            return;
+        };
+        let cs = crate::store::criteria(&it.body);
+        let shows: Vec<(usize, String)> = criteria
+            .iter()
+            .filter_map(|n| cs.get(n.checked_sub(1)?).map(|c| (*n, c.text.clone())))
+            .collect();
+        self.screen = Screen::Reader {
+            title: story.title.clone(),
+            lines: crate::markdown::render_markdown(&crate::demos::story_markdown(&story, &shows)),
+            scroll: 0,
+        };
     }
 
     /// Relative targets resolve against the capability's repo, else its own folder.
@@ -4344,6 +4401,58 @@ mod tests {
             app.selected_intent().unwrap().path.parent().unwrap(),
             dirs.root.as_path()
         );
+    }
+
+    #[test]
+    fn the_criteria_pane_scrolls_to_the_selected_criterion() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut body = String::from("## Description\nx\n\n## Acceptance criteria\n");
+        for i in 0..10 {
+            body.push_str(&format!("- [ ] criterion number {i}\n"));
+        }
+        let mut it = Store::load(&path).unwrap();
+        it.body = body;
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('C'));
+        for _ in 0..8 {
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        let shown = render(&fx.app, 100, 24);
+        assert!(
+            shown.contains("criterion number 8"),
+            "the selection is in view: {shown}"
+        );
+        assert!(shown.contains("more (j/k)"), "says what is hidden: {shown}");
+    }
+
+    #[test]
+    fn a_demo_line_opens_its_story_and_marks_the_criteria_it_shows() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx._tmp.path().join("repo");
+        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
+        fs::write(
+            repo.join("app-demos/stories/a.yaml"),
+            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
+        )
+        .unwrap();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(repo);
+        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n- [ ] second thing\n\n## Artifacts\n- demo: alex-shows-alpha (criteria: 2)\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        let shown = render(&fx.app, 100, 24);
+        assert!(shown.contains("[ ] ▶ second thing"), "{shown}");
+        assert!(shown.contains("[ ] first thing"), "{shown}");
+        key(&mut fx.app, KeyCode::Char('V'));
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.screen, "reader", "{v:?}");
+        assert_eq!(v.reader_title, "Alex shows Alpha working");
     }
 
     #[test]

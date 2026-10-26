@@ -3,6 +3,7 @@
 pub mod app;
 pub mod config;
 pub mod conversation;
+pub mod demos;
 pub mod editor;
 pub mod markdown;
 pub mod progress;

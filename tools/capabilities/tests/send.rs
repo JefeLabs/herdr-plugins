@@ -328,6 +328,11 @@ fn every_handoff_says_edge_cases_are_the_agents_and_asks_for_pr_lines() {
             "{}: {p}",
             h.name
         );
+        assert!(
+            p.contains("`- demo: <story-id> (criteria: <numbers>)`"),
+            "{}: {p}",
+            h.name
+        );
     }
 }
 
