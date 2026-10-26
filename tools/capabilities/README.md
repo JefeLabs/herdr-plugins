@@ -194,12 +194,13 @@ Keys in the list: `j`/`k` (and `PgUp`/`PgDn`) move, `Enter` opens the capability
 
 ```
 ~/capabilities/
-  Inbox/
-    2026-10-24-pending-label.md
-    2026-10-24-pending-label.assets/screen.png
-    2026-10-24-pending-label.chat.md
+  2026-10-24-pending-label.md            ← a quick capture, at the top until you move it (m)
+  2026-10-24-pending-label.assets/screen.png
+  2026-10-24-pending-label.chat.md
   skoolscout/applications/…
 ```
+
+There is no default group: quick captures (the `add` mode behind the toolbar's capture key) land at the top of the tree, and `a` in the tree adds to the selected group.
 
 Front matter: `title, kind, state (raw|refining|ready|sent), created, updated, repo, tags, polished_at, sent_to, conversations`. Hand edits are read leniently: unknown fields are preserved, a missing title falls back to the file name, dates may be `YYYY-MM-DD`, tags may be a scalar, states are case-insensitive, CRLF is fine. Every field change (state, kind, sent) reloads the file first, so two toolbars never clobber each other's text; a save or an apply over a file that changed since you opened it asks before overwriting.
 

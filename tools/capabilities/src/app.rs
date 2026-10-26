@@ -1143,7 +1143,7 @@ impl App {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.store.root().to_path_buf()),
-            None => self.store.root().join(crate::store::INBOX),
+            None => self.store.root().to_path_buf(),
         }
     }
 
@@ -3511,7 +3511,7 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
             terminal.draw(|f| {
                 let area = f.area();
                 let p = ratatui::widgets::Paragraph::new(format!(
-                    "New capability (Inbox)\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
+                    "New capability\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
                 ));
                 p.render(area, f.buffer_mut());
             })?;
@@ -3535,7 +3535,8 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
         if let Some(t) = result? {
             let t = t.trim();
             if !t.is_empty() {
-                store.create(Path::new(crate::store::INBOX), t, "idea", &body, repo)?;
+                // quick captures go to the top of the tree; there is no default group
+                store.create(Path::new(""), t, "idea", &body, repo)?;
             }
         }
         return Ok(());
@@ -3564,13 +3565,7 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
             (t, if rest.trim().is_empty() { body } else { rest })
         }
     };
-    let it = store.create(
-        Path::new(crate::store::INBOX),
-        t.trim(),
-        "idea",
-        &body_text,
-        repo,
-    )?;
+    let it = store.create(Path::new(""), t.trim(), "idea", &body_text, repo)?;
     println!("{}", it.path.display());
     Ok(())
 }
@@ -4049,6 +4044,38 @@ mod tests {
             .areas
             .clone();
         assert_eq!(beta, vec!["Inbox"]);
+    }
+
+    #[test]
+    fn quick_capture_lands_at_the_top_of_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        add(cfg.clone(), dirs.clone(), Some("Quick one".into()), false).unwrap();
+        let names: Vec<String> = fs::read_dir(&dirs.root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("-quick-one.md")),
+            "{names:?}"
+        );
+        assert!(
+            !dirs.root.join("Inbox").exists(),
+            "no Inbox group: {names:?}"
+        );
+        let app = App::new(cfg, dirs).unwrap();
+        assert!(
+            app.view()
+                .rows
+                .iter()
+                .any(|r| r.label == "Quick one" && r.depth == 0),
+            "{:?}",
+            app.view().rows
+        );
     }
 
     #[test]

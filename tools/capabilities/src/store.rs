@@ -11,7 +11,6 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
 
-pub const INBOX: &str = "Inbox";
 const SLUG_MAX: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -213,8 +212,7 @@ pub struct Store {
 impl Store {
     /// Open (creating) the root and its `Inbox`.
     pub fn open(root: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(root.join(INBOX))
-            .with_context(|| format!("creating {}", root.display()))?;
+        std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
         Ok(Self {
             root: root.to_path_buf(),
         })

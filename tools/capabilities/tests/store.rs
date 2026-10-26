@@ -14,9 +14,10 @@ fn store() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
-fn open_creates_root_and_inbox() {
+fn open_creates_the_root_and_no_inbox() {
     let (tmp, _s) = store();
-    assert!(tmp.path().join("root/Inbox").is_dir());
+    assert!(tmp.path().join("root").is_dir());
+    assert!(!tmp.path().join("root/Inbox").exists(), "no default group");
 }
 
 #[test]
@@ -60,6 +61,7 @@ fn create_writes_front_matter_and_body() {
 #[test]
 fn round_trip_preserves_unknown_fields_and_defaults_missing() {
     let (tmp, _s) = store();
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     let p = tmp.path().join("root/Inbox/hand.md");
     fs::write(
         &p,
@@ -240,6 +242,7 @@ fn lenient_front_matter_loads_hand_edits() {
             "---\ntitle: T\nkind: idea\ncreated: 2026-10-24 18:02:11\n---\nb\n",
         ),
     ];
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     for (name, text) in cases {
         let p = tmp.path().join("root/Inbox").join(format!("{name}.md"));
         fs::write(&p, text).unwrap();
@@ -270,6 +273,7 @@ fn lenient_front_matter_loads_hand_edits() {
 #[test]
 fn unparseable_file_shows_up_as_a_broken_entry_not_silently_dropped() {
     let (tmp, s) = store();
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     fs::write(
         tmp.path().join("root/Inbox/bad.md"),
         "---\ntitle: [unclosed\n---\nb\n",
@@ -285,6 +289,7 @@ fn unparseable_file_shows_up_as_a_broken_entry_not_silently_dropped() {
 #[test]
 fn missing_updated_does_not_cause_a_false_conflict() {
     let (tmp, _s) = store();
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     let p = tmp.path().join("root/Inbox/old.md");
     fs::write(&p, "---\ntitle: Old\nkind: idea\n---\nb\n").unwrap();
     let mut it = Store::load(&p).unwrap();
