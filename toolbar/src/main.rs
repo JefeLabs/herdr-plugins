@@ -88,6 +88,7 @@ fn run_tui() -> anyhow::Result<()> {
         cwd: ctx.workspace_cwd.clone(),
         inherit: ctx.inherit.clone(),
         tool_id: String::new(),
+        cell: None,
     };
     let pane_file = herdr::pane_file(&ctx);
     let socket = herdr::socket_path(&ctx);

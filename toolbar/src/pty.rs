@@ -22,15 +22,22 @@ pub struct Size {
 }
 
 impl Size {
-    fn pty(self) -> PtySize {
+    /// The pty size; in pixels too when the cell size is known, which is how
+    /// a graphics tool learns how big to draw.
+    fn pty(self, cell: Option<(u16, u16)>) -> PtySize {
+        let (rows, cols) = (self.rows.max(1), self.cols.max(1));
+        let (w, h) = cell.unwrap_or((0, 0));
         PtySize {
-            rows: self.rows.max(1),
-            cols: self.cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
+            rows,
+            cols,
+            pixel_width: cols.saturating_mul(w),
+            pixel_height: rows.saturating_mul(h),
         }
     }
 }
+
+/// Image commands a graphics tool printed, each with its cursor (row, col).
+type GraphicsQueue = Arc<Mutex<Vec<(Vec<u8>, u16, u16)>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolState {
@@ -48,6 +55,9 @@ pub struct SpawnEnv {
     /// Herdr variables to pass through, e.g. `HERDR_BIN_PATH`.
     pub inherit: Vec<(String, String)>,
     pub tool_id: String,
+    /// The toolbar's cell size in pixels (width, height), when its terminal
+    /// reports one: graphics tools are told their size in pixels from it.
+    pub cell: Option<(u16, u16)>,
 }
 
 /// Variables removed from the inherited environment: they tell a tool it sits
@@ -70,7 +80,9 @@ fn env_is_denied(name: &str) -> bool {
 pub struct ToolProcess {
     parser: Arc<RwLock<vt100::Parser>>,
     master: Box<dyn MasterPty + Send>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    graphics: GraphicsQueue,
+    cell: Option<(u16, u16)>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     exit: Arc<Mutex<Option<Option<i32>>>>,
     pid: Option<u32>,
@@ -107,7 +119,7 @@ impl ToolProcess {
         let pair = {
             let _guard = OPENPTY.lock().unwrap_or_else(|e| e.into_inner());
             native_pty_system()
-                .openpty(size.pty())
+                .openpty(size.pty(env.cell))
                 .map_err(|e| fail(&e))?
         };
 
@@ -143,21 +155,32 @@ impl ToolProcess {
 
         let parser = Arc::new(RwLock::new(vt100::Parser::new(size.rows, size.cols, 0)));
         let mut reader = pair.master.try_clone_reader().map_err(|e| fail(&e))?;
-        let writer = pair.master.take_writer().map_err(|e| fail(&e))?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| fail(&e))?));
+        let graphics: GraphicsQueue = Arc::new(Mutex::new(Vec::new()));
 
         {
             let parser = Arc::clone(&parser);
+            let writer = Arc::clone(&writer);
+            let graphics = Arc::clone(&graphics);
+            let (with_graphics, cell) = (cfg.graphics, env.cell);
             std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
+                let mut buf = [0u8; 65536];
+                let mut splitter = crate::graphics::Splitter::default();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => {
+                        Ok(n) if !with_graphics => {
                             parser.write().unwrap().process(&buf[..n]);
-                            if wake.send(()).is_err() {
-                                break;
+                        }
+                        Ok(n) => {
+                            for piece in splitter.split(&buf[..n]) {
+                                take_piece(piece, &parser, &writer, &graphics, cell);
                             }
                         }
+                    }
+                    if wake.send(()).is_err() {
+                        break;
                     }
                 }
             });
@@ -190,11 +213,19 @@ impl ToolProcess {
         Ok(Self {
             parser,
             master: pair.master,
-            writer: Mutex::new(writer),
+            writer,
+            graphics,
+            cell: env.cell,
             child,
             exit,
             pid,
         })
+    }
+
+    /// The image commands printed since the last call, each with the tool's
+    /// cursor (row, column) where it was printed.
+    pub fn take_graphics(&self) -> Vec<(Vec<u8>, u16, u16)> {
+        std::mem::take(&mut *self.graphics.lock().unwrap())
     }
 
     pub fn screen(&self) -> impl std::ops::Deref<Target = vt100::Screen> + '_ {
@@ -214,7 +245,7 @@ impl ToolProcess {
             .unwrap()
             .screen_mut()
             .set_size(size.rows, size.cols);
-        let _ = self.master.resize(size.pty());
+        let _ = self.master.resize(size.pty(self.cell));
     }
 
     pub fn state(&self) -> ToolState {
@@ -247,6 +278,44 @@ impl ToolProcess {
             let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
             let _ = self.child.lock().unwrap().wait();
             *self.exit.lock().unwrap() = Some(None);
+        }
+    }
+}
+
+/// One piece of a graphics tool's output: text to the screen model (and
+/// answers to the reports it asks for), queries answered, image commands
+/// kept with the cursor where they were printed.
+fn take_piece(
+    piece: crate::graphics::Piece,
+    parser: &RwLock<vt100::Parser>,
+    writer: &Mutex<Box<dyn Write + Send>>,
+    graphics: &GraphicsQueue,
+    cell: Option<(u16, u16)>,
+) {
+    use crate::graphics::{Piece, is_query, query_reply, report_replies};
+    let answer = |bytes: &[u8]| {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut w = writer.lock().unwrap();
+        let _ = w.write_all(bytes);
+        let _ = w.flush();
+    };
+    match piece {
+        Piece::Text(text) => {
+            let (rows, cols) = {
+                let mut p = parser.write().unwrap();
+                p.process(&text);
+                p.screen().size()
+            };
+            answer(&report_replies(&text, cell, rows, cols));
+        }
+        Piece::Graphics(cmd) if is_query(&cmd) => {
+            answer(&query_reply(&cmd).unwrap_or_default());
+        }
+        Piece::Graphics(cmd) => {
+            let (row, col) = parser.read().unwrap().screen().cursor_position();
+            graphics.lock().unwrap().push((cmd, row, col));
         }
     }
 }

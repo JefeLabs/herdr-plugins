@@ -28,6 +28,10 @@ pub struct ToolConfig {
     /// Herdr pane opened beside the work pane (`open = "pane"`).
     #[serde(default)]
     pub open: Open,
+    /// Experimental: pass the tool's Kitty graphics through to Herdr, so a
+    /// slot can show images (terminal-browser pages). Off by default.
+    #[serde(default)]
+    pub graphics: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]

@@ -85,11 +85,20 @@ name    = "Browser"
 icon    = "◎"
 command = ["terminal-browser", "open"]
 open    = "pane"                              # optional: a Herdr pane, not the slot
+
+[[tool]]
+id       = "web"
+name     = "Browser (in the toolbar)"
+icon     = "◍"
+command  = ["terminal-browser", "open"]
+graphics = true                               # experimental: show its images in the slot
 ```
 
 Tools start the first time you select them.
 
-A tool with `open = "pane"` runs in a Herdr pane instead of the toolbar's slot: selecting it opens a right split of the work pane (the toolbar's left neighbour, else the focused pane), runs its `command` there with its `cwd` and `env`, and focuses it. Selecting it again focuses that pane, on whichever tab it is; once the pane is closed, the next selection opens a new one. The pane id is kept under the plugin's state folder, so this survives a toolbar restart. Use it for tools that need the room or draw with graphics, such as `terminal-browser`, which shows pages as images the slot cannot pass through yet. A tool that is not installed shows a one-line "cannot start" message in its slot and the other tools keep working.
+A tool with `open = "pane"` runs in a Herdr pane instead of the toolbar's slot: selecting it opens a right split of the work pane (the toolbar's left neighbour, else the focused pane), runs its `command` there with its `cwd` and `env`, and focuses it. Selecting it again focuses that pane, on whichever tab it is; once the pane is closed, the next selection opens a new one. The pane id is kept under the plugin's state folder, so this survives a toolbar restart. Use it for tools that need the room or draw with graphics, such as `terminal-browser`, which shows pages as images.
+
+`graphics = true` (experimental) lets a slot tool draw Kitty images. The slot's screen model drops them, so the toolbar cuts each image command out of the tool's output, keeps the cursor where it was printed, and after each frame writes it to Herdr placed at that cell of the slot, with replies turned off (`q=2`) so nothing comes back into the toolbar's input. It also answers what a graphics tool asks before drawing: whether images work, the device attributes (`CSI c`), and, when the toolbar's terminal reports its pixel size, the cell and text-area size (`CSI 16 t`, `CSI 14 t`, and the pty's pixel size). Switching to another tool clears the images; switching back makes the tool redraw. Every frame passes through the toolbar, so a busy page is slower than in its own pane, and the slot is only as big as the toolbar: `open = "pane"` is the faster choice for real browsing. A tool that is not installed shows a one-line "cannot start" message in its slot and the other tools keep working.
 
 ### Per-worktree overrides
 
@@ -113,7 +122,7 @@ Trust is recorded as the file's path plus a hash of its content, so it has to be
 
 ## Known limits (v1)
 
-- **Text only.** The embedded terminal advertises `TERM=xterm-256color` without graphics, so tools fall back to text: `yazi` lists files without thumbnails, `mdcat` prints markdown without pictures. Passing Kitty graphics through is the first planned follow-up.
+- **Text by default.** The embedded terminal advertises `TERM=xterm-256color` without graphics, so tools fall back to text: `yazi` lists files without thumbnails, `mdcat` prints markdown without pictures. A tool with `graphics = true` gets its Kitty images passed through (experimental, see above); the others stay text.
 - **Mouse.** Clicking an icon selects that tool. Clicks, drags and the wheel inside a tool reach it only when the tool has turned mouse reporting on (as `yazi`, `lazysql` and the capabilities tool do), in the mode and encoding it asked for. Because the toolbar captures the mouse, a plain drag no longer selects text in its pane; most terminals still select with Shift held.
 - One toolbar per workspace, in the tab where it was opened. Closing it stops its tools.
 

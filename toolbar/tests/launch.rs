@@ -70,6 +70,7 @@ fn browser() -> ToolConfig {
         cwd: None,
         env: BTreeMap::from([("TB_X".to_string(), "1".to_string())]),
         open: Open::Pane,
+        graphics: false,
     }
 }
 

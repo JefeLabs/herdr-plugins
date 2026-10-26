@@ -81,6 +81,9 @@ pub struct App {
     /// What background launches have to say (a failure), for the footer.
     notes_tx: Sender<String>,
     notes_rx: Receiver<String>,
+    /// Bytes for the terminal after the next frame (clearing a hidden
+    /// graphics tool's images).
+    pending_out: Vec<u8>,
 }
 
 impl App {
@@ -96,6 +99,7 @@ impl App {
             herdr: None,
             notes_tx,
             notes_rx,
+            pending_out: Vec::new(),
             prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
             size,
@@ -194,6 +198,25 @@ impl App {
             self.open_in_pane(idx);
             return;
         }
+        let previous = self.selected;
+        if previous != idx {
+            // a hidden graphics tool's images would stay on screen
+            if self.slots.get(previous).is_some_and(|s| s.cfg.graphics) {
+                self.pending_out
+                    .extend_from_slice(crate::graphics::DELETE_ALL);
+            }
+            // a graphics tool shown again redraws: its images were cleared
+            if self.slots[idx].cfg.graphics
+                && let Some(p) = self.slots[idx].proc.as_ref()
+            {
+                let size = self.content_size();
+                p.resize(Size {
+                    rows: size.rows,
+                    cols: size.cols.saturating_sub(1).max(1),
+                });
+                p.resize(size);
+            }
+        }
         self.selected = idx;
         if self.slots[idx].proc.is_none() && self.slots[idx].last_error.is_none() {
             self.spawn(idx);
@@ -226,6 +249,29 @@ impl App {
                 let _ = wake.send(());
             }
         });
+    }
+
+    /// Bytes to write after a frame: what is pending, then the image
+    /// commands of the shown graphics tool placed in the slot. Hidden graphics
+    /// tools' commands are dropped; the tool redraws when shown again.
+    pub fn graphics_out(&mut self) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.pending_out);
+        for (i, slot) in self.slots.iter().enumerate() {
+            if !slot.cfg.graphics {
+                continue;
+            }
+            let Some(p) = slot.proc.as_ref() else {
+                continue;
+            };
+            let cmds = p.take_graphics();
+            if i == self.selected {
+                // the slot's screen starts at the pane's top-left cell
+                for (cmd, row, col) in cmds {
+                    out.extend(crate::graphics::placed(&cmd, 0, 0, row, col));
+                }
+            }
+        }
+        out
     }
 
     /// Show what background launches reported.
@@ -510,6 +556,12 @@ pub fn run(
         width: 80,
         height: 24,
     });
+    // the cell size in pixels, when the terminal reports its pixel size
+    let cell = crossterm::terminal::window_size().ok().and_then(|w| {
+        (w.width > 0 && w.height > 0 && w.columns > 0 && w.rows > 0)
+            .then(|| (w.width / w.columns, w.height / w.rows))
+    });
+    let env = SpawnEnv { cell, ..env };
     let mut app = match App::new(
         paths,
         env,
@@ -544,6 +596,14 @@ pub fn run(
             .is_err()
         {
             return Ok(()); // the terminal is gone
+        }
+        // graphics tools' images go after the frame, placed in the slot
+        let images = app.graphics_out();
+        if !images.is_empty() {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&images);
+            let _ = out.flush();
         }
         if STOP.load(Ordering::Relaxed) {
             return Ok(());
@@ -674,6 +734,7 @@ mod tests {
             cwd: ws,
             inherit: vec![],
             tool_id: String::new(),
+            cell: None,
         };
         Fixture {
             _tmp: tmp,
@@ -791,6 +852,44 @@ mod tests {
         assert!(app.slots[1].proc.is_none());
         assert!(app.slots[2].proc.is_none());
         app.shutdown();
+    }
+
+    #[test]
+    fn a_graphics_tool_draws_its_images_in_the_slot_and_clears_them_when_hidden() {
+        let fx = fixture("");
+        let script = fx._tmp.path().join("draw.sh");
+        fs::write(
+            &script,
+            "stty raw -echo; printf 'ab\\033_Ga=T,f=100;AAAA\\033\\\\'; sleep 30\n",
+        )
+        .unwrap();
+        let cfg = format!(
+            "[[tool]]\nid = \"browser\"\nname = \"Browser\"\nicon = \"o\"\ncommand = [\"sh\", \"{}\"]\ngraphics = true\n\n{}",
+            script.display(),
+            tool("b", "echo B; sleep 30")
+        );
+        fs::write(&fx.paths.global, cfg).unwrap();
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.select(0);
+        let mut out = Vec::new();
+        let start = Instant::now();
+        while out.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no image");
+            out = app.graphics_out();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            out,
+            crate::graphics::placed(b"\x1b_Ga=T,f=100;AAAA\x1b\\", 0, 0, 0, 2),
+            "placed at the tool's cursor, the slot's top-left being the pane's"
+        );
+        app.select(1);
+        assert_eq!(
+            app.graphics_out(),
+            crate::graphics::DELETE_ALL,
+            "switching away clears its images"
+        );
+        assert!(app.graphics_out().is_empty());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod config;
+pub mod graphics;
 pub mod herdr;
 pub mod keys;
 pub mod pty;
