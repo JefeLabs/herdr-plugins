@@ -94,12 +94,12 @@ The conversation id is stored per provider in the capability's front matter and 
 
 | Provider | Polish | Resume | Status |
 |---|---|---|---|
-| `agy` (default) | `agy -p=… --output-format stream-json --sandbox` | `--conversation <id>` | verified; models include `gemini-4-argon-high/medium/low` |
+| `agy` (default) | `agy -p=… --output-format stream-json --sandbox --print-timeout 0s` | `--conversation <id>` | verified; models include `gemini-4-argon-high/medium/low` |
 | `claude` | `claude -p … --output-format stream-json --include-partial-messages --session-id <uuid>` | `--resume <id>` | verified |
 | `codex` | `codex exec --json …` | `codex exec resume <id> …` | unverified (account returned 402) |
 | `copilot` | `copilot -p … --output-format json` | `--session-id <id>` | unverified (policy denied) |
 
-Any other CLI goes in `capabilities.toml` as a custom provider. Polish runs with no tools and no repository in reach: the built-in argv use `--permission-mode plan --tools "" --strict-mcp-config` (claude), `--sandbox` (agy; its `--mode plan` is ignored while slash expansion is off), `--sandbox read-only` (codex) and `--deny-tool '*'` (copilot), and every turn runs in a neutral directory under the root (`<root>/.polish/<capability>`), never in your checkout. The tool never passes `--allow-all*` or `--dangerously-skip-permissions`.
+agy gets `--print-timeout 0s` so it waits for a long turn to finish: with a print timeout it gives up mid-turn and then never exits. Any other CLI goes in `capabilities.toml` as a custom provider. Polish runs with no tools and no repository in reach: the built-in argv use `--permission-mode plan --tools "" --strict-mcp-config` (claude), `--sandbox` (agy; its `--mode plan` is ignored while slash expansion is off), `--sandbox read-only` (codex) and `--deny-tool '*'` (copilot), and every turn runs in a neutral directory under the root (`<root>/.polish/<capability>`), never in your checkout. The tool never passes `--allow-all*` or `--dangerously-skip-permissions`.
 
 ```toml
 polish_provider = "agy"
@@ -155,7 +155,7 @@ Criteria someone else adds or rewords (an agent editing the file, a reconcile) a
 
 When every pull request of a sent capability has merged (one closed without merging is ignored), the tool reconciles it with what shipped: in the background it reads the spec, the plan names, the merged pull requests' titles and descriptions and the `issue:` follow-ups, and asks your refinement agent (the last one used) for a rewrite. The rewrite corrects the acceptance criteria to match the shipped behaviour (grouped under `### <area path>` when the work spans areas), names any dropped criterion under Open questions, keeps Description, Preconditions and Artifacts, and leaves follow-ups out of the criteria.
 
-The rewrite is applied straight away; the previous version is kept beside the file as `<name>.before-reconcile.bak`, and `u` puts it back. The capability is marked unread: its card and tree row show `*` before the title until you open it (select it in the tree, or `Enter` on its card). Each merged set is reconciled once (`reconciled_for` in the front matter), so a later merge reconciles again but a restart does not. If a reconcile fails (the agent returns no proposal, say), the reason stays on the status line while that capability is selected, and `r` retries it. `R` and `U` leave a sent capability sent, since its progress tracks the work from then on. Pull request states are checked about once a minute in either view (tree or list), so a merge reconciles wherever you are; a capability whose merge happened while the tool was closed is reconciled shortly after it starts.
+The rewrite is applied straight away; the previous version is kept beside the file as `<name>.before-reconcile.bak`, and `u` puts it back. The capability is marked unread: its card and tree row show `*` before the title until you open it (select it in the tree, or `Enter` on its card). Each merged set is reconciled once (`reconciled_for` in the front matter), so a later merge reconciles again but a restart does not. If a reconcile fails (the agent returns no proposal, say), the reason stays on the status line while that capability is selected, and `r` retries it. A reconcile that runs longer than 10 minutes is stopped and reported the same way, and quitting the tool stops any reconcile still running. `R` and `U` leave a sent capability sent, since its progress tracks the work from then on. Pull request states are checked about once a minute in either view (tree or list), so a merge reconciles wherever you are; a capability whose merge happened while the tool was closed is reconciled shortly after it starts.
 
 ## List view
 

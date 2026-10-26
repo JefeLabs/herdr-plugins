@@ -401,8 +401,11 @@ pub struct App {
     poll_ticks: u32,
     /// Tests pin the clock here; `None` means the real time.
     fixed_now: Option<chrono::DateTime<chrono::Local>>,
-    /// Reconciles running: the agent turn per capability and the merged set it covers.
-    reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn)>,
+    /// Reconciles running: per capability, the merged set it covers, the
+    /// agent turn, and when it started.
+    reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant)>,
+    /// How long a reconcile may run before it is stopped and reported.
+    reconcile_limit: std::time::Duration,
     /// Merged sets already started this session, so a failure is not retried in a loop.
     reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
     /// Why the last reconcile of a capability failed; shown while it is
@@ -459,6 +462,7 @@ impl App {
             poll_ticks: 0,
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
+            reconcile_limit: std::time::Duration::from_secs(600),
             reconcile_tried: HashSet::new(),
             reconcile_failed: HashMap::new(),
             last_area: std::cell::Cell::new(Rect::default()),
@@ -852,7 +856,8 @@ impl App {
         }
         match Turn::start(&spec, &prompt, None, &cwd, &self.provider_env) {
             Ok(turn) => {
-                self.reconcile_jobs.insert(path, (merged, turn));
+                self.reconcile_jobs
+                    .insert(path, (merged, turn, std::time::Instant::now()));
             }
             Err(e) => self.message = Some(format!("reconcile could not start: {e:#}")),
         }
@@ -862,7 +867,21 @@ impl App {
     /// old version is kept for undo, and it is marked unread.
     fn poll_reconciles(&mut self) {
         let mut done: Vec<(PathBuf, Vec<u64>, Result<Reply, String>)> = Vec::new();
-        for (path, (merged, turn)) in &self.reconcile_jobs {
+        let limit = self.reconcile_limit;
+        for (path, (merged, turn, started)) in &mut self.reconcile_jobs {
+            if started.elapsed() > limit {
+                // the agent is stuck: stop its process group and say so
+                turn.cancel();
+                done.push((
+                    path.clone(),
+                    merged.clone(),
+                    Err(format!(
+                        "the agent did not finish within {} minutes",
+                        limit.as_secs().div_ceil(60)
+                    )),
+                ));
+                continue;
+            }
             while let Some(msg) = turn.try_recv() {
                 match msg {
                     TurnMsg::Finished(reply) => {
@@ -3859,6 +3878,11 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
     {
         t.cancel();
     }
+    // stop running reconciles: process::exit below skips destructors, and an
+    // agent left running outlives this slot
+    for (_, turn, _) in app.reconcile_jobs.values_mut() {
+        turn.cancel();
+    }
     restore_terminal();
     match outcome {
         Ok(()) => std::process::exit(0),
@@ -5509,6 +5533,32 @@ mod tests {
             vec![42],
             "retried"
         );
+    }
+
+    #[test]
+    fn a_reconcile_that_runs_too_long_is_stopped_and_reported() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        let empty = fx.tmp.path().join("empty.jsonl");
+        fs::write(&empty, "").unwrap();
+        fx.app.provider_env[0].1 = empty.display().to_string();
+        fx.app
+            .provider_env
+            .push(("FAKE_MODE".into(), "hang".into())); // never answers
+        fx.app.reconcile_limit = Duration::from_millis(300);
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        assert!(Store::load(&path).unwrap().fm.reconciled_for.is_empty());
+        assert!(
+            fx.app
+                .reconcile_failed
+                .get(&path)
+                .is_some_and(|m| m.contains("did not finish")),
+            "{:?}",
+            fx.app.reconcile_failed
+        );
+        assert_eq!(fx.app.polls_in_flight(), 0, "the stuck agent is gone");
     }
 
     #[test]

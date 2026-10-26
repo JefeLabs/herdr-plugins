@@ -460,7 +460,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--output-format",
                 "stream-json",
                 "--print-timeout",
-                "90s",
+                "0s",
                 "--disable-slash-commands",
                 "--sandbox",
             ]),
@@ -472,7 +472,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--output-format",
                 "stream-json",
                 "--print-timeout",
-                "90s",
+                "0s",
                 "--disable-slash-commands",
                 "--sandbox",
             ]),
@@ -753,6 +753,16 @@ mod tests {
                 .unwrap()
                 .contains("```proposal")
         );
+    }
+
+    #[test]
+    fn agy_waits_for_the_turn_to_finish() {
+        // agy hangs instead of exiting when its print timeout fires mid-turn
+        let p = builtin_providers();
+        for argv in [&p["agy"].polish, &p["agy"].resume] {
+            let i = argv.iter().position(|a| a == "--print-timeout").unwrap();
+            assert_eq!(argv[i + 1], "0s", "{argv:?}");
+        }
     }
 
     #[test]
