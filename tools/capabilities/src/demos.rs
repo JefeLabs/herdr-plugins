@@ -160,15 +160,51 @@ pub fn story_markdown(story: &Story, criteria: &[(usize, String)]) -> String {
     md
 }
 
+/// A story id that can safely name a folder and a URL fragment: letters,
+/// digits, `.`, `_` and `-`, not starting with `.` or `-`.
+pub fn safe_story_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && !id.starts_with('-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 /// The newest recorded take (`.webm` / `.mp4`) under `app-demos/videos/<id>/`.
+/// Only plain files count: a symlink is never returned (the result is handed
+/// to the system opener), and the file must sit inside the story's folder.
 pub fn video_for(roots: &[PathBuf], id: &str) -> Option<PathBuf> {
-    roots
-        .iter()
-        .filter_map(|r| std::fs::read_dir(r.join("app-demos/videos").join(id)).ok())
-        .flat_map(|d| d.flatten())
-        .map(|e| e.path())
-        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("webm" | "mp4")))
-        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    if !safe_story_id(id) {
+        return None;
+    }
+    let mut takes: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for root in roots {
+        let dir = root.join("app-demos/videos").join(id);
+        let Ok(canon_dir) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !matches!(p.extension().and_then(|x| x.to_str()), Some("webm" | "mp4")) {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            let inside = std::fs::canonicalize(&p).is_ok_and(|c| c.starts_with(&canon_dir));
+            if let (true, Ok(modified)) = (inside, meta.modified()) {
+                takes.push((modified, p));
+            }
+        }
+    }
+    takes.into_iter().max_by_key(|(t, _)| *t).map(|(_, p)| p)
 }
 
 /// The demos site, opened at one story.

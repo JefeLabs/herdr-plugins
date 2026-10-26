@@ -1880,6 +1880,10 @@ impl App {
     /// the newest recorded video, else opens the demos site at the story.
     fn open_demo(&mut self, it: &Intent, target: &str, external: bool) {
         let (id, criteria) = crate::demos::demo_target(target);
+        if !crate::demos::safe_story_id(&id) {
+            self.message = Some(format!("`{id}` is not a story id (letters, digits, . _ -)"));
+            return;
+        }
         let roots: Vec<PathBuf> = it
             .fm
             .repo

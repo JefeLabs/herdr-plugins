@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herdr_capabilities::demos::{
-    demo_target, discover_demos, find_story, story_markdown, video_for,
+    demo_target, discover_demos, find_story, safe_story_id, story_markdown, video_for,
 };
 
 const STORIES: &str = r#"
@@ -146,4 +146,40 @@ fn stories_matching_the_title_are_found_unless_linked() {
         "already linked: {linked:?}"
     );
     assert!(discover_demos(Path::new("/nonexistent"), "anything at all", &[]).is_empty());
+}
+
+#[test]
+fn only_plain_video_files_inside_the_story_folder_are_played() {
+    let (t, repo) = repo_with_stories();
+    let dir = repo.join("app-demos/videos/alex-requests-a-meeting-from-candidates");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("take-1.webm"), b"real").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // a newer "video" that is really a link to something else must never be opened
+    let outside = t.path().join("payload.command");
+    fs::write(&outside, b"#!/bin/sh\necho pwned\n").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("take-2.mp4")).unwrap();
+    assert_eq!(
+        video_for(
+            std::slice::from_ref(&repo),
+            "alex-requests-a-meeting-from-candidates"
+        )
+        .unwrap(),
+        dir.join("take-1.webm"),
+        "the symlink is skipped"
+    );
+    // a story id that climbs out of the videos folder is refused
+    let escape = repo.join("app-demos/videos/../x");
+    fs::create_dir_all(&escape).unwrap();
+    fs::write(escape.join("a.mp4"), b"x").unwrap();
+    assert!(video_for(std::slice::from_ref(&repo), "../x").is_none());
+}
+
+#[test]
+fn story_ids_are_plain_names() {
+    assert!(safe_story_id("alex-requests-a-meeting-from-candidates"));
+    assert!(safe_story_id("story_2.v1"));
+    for bad in ["", "../x", "a/b", ".hidden", "-flag", "a b", "a\\b"] {
+        assert!(!safe_story_id(bad), "{bad:?}");
+    }
 }
