@@ -594,6 +594,9 @@ mod tests {
             found: &[],
             answering: None,
             open,
+            prs: &[],
+            prs_selected: 0,
+            demos_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render_capability(&view, f.area(), f.buffer_mut()))
@@ -614,6 +617,167 @@ mod tests {
         rows.iter()
             .position(|r| r.contains(needle))
             .unwrap_or_else(|| panic!("{needle:?} not found:\n{}", rows.join("\n")))
+    }
+
+    const LISTS_BODY: &str = "## Description\nThe description.\n\n## Preconditions\n- [x] pre one\n\n## Acceptance criteria\n- [x] crit one\n- [ ] crit two\n\n## Open questions\n- q one?\n\n## Artifacts\n- spec: docs/spec.md\n- plan: docs/plan.md\n- pr: #5828\n- pr: #5829\n- demo: story-a (criteria: 1)\n- issue: #5833\n";
+
+    fn lists_prs() -> Vec<PrRow> {
+        use crate::progress::PrState;
+        vec![
+            PrRow {
+                target: "#5828".into(),
+                state: PrState::Merged,
+                title: Some("Notify the family".into()),
+                found: false,
+            },
+            PrRow {
+                target: "#5829".into(),
+                state: PrState::Open,
+                title: None,
+                found: false,
+            },
+            PrRow {
+                target: "#5840".into(),
+                state: PrState::Merged,
+                title: Some("Fix the sign-in".into()),
+                found: true,
+            },
+        ]
+    }
+
+    /// The detail view with linked and found pull requests, demos and artifacts.
+    fn lists_detail(
+        focus: Pane,
+        open: Pane,
+        selected: usize,
+    ) -> (Terminal<TestBackend>, Vec<String>) {
+        let it = intent_with(LISTS_BODY);
+        let prs = lists_prs();
+        let found = [
+            crate::store::Artifact {
+                kind: "demo".into(),
+                target: "story-b".into(),
+            },
+            crate::store::Artifact {
+                kind: "adr".into(),
+                target: "docs/adr/1.md".into(),
+            },
+        ];
+        let view = DetailView {
+            intent: &it,
+            attachments: &[],
+            focus,
+            description_scroll: 0,
+            preconditions_selected: 0,
+            criteria_selected: 0,
+            question_selected: 0,
+            artifacts_selected: selected,
+            found: &found,
+            answering: None,
+            open,
+            prs: &prs,
+            prs_selected: selected,
+            demos_selected: selected,
+        };
+        let (w, h) = (80u16, 30u16);
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render_capability(&view, f.area(), f.buffer_mut()))
+            .unwrap();
+        let rows = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| t.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        (t, rows)
+    }
+
+    #[test]
+    fn pull_requests_and_demos_have_their_own_sections() {
+        let (_t, rows) = lists_detail(Pane::Tree, Pane::Criteria, 0);
+        let all = rows.join("\n");
+        let titles = [
+            "▸ Preconditions (1/1)",
+            "▾ Acceptance criteria (1/2)",
+            "▸ Demos (1 linked, 1 found)",
+            "▸ Open questions (1 open)",
+            "▸ Pull requests (1/2 merged, 1 found)",
+            "▸ Artifacts (3 linked, 1 found)",
+        ];
+        let at: Vec<usize> = titles.iter().map(|t| row_of(&rows, t)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "in this order:\n{all}");
+    }
+
+    #[test]
+    fn the_pull_requests_section_shows_each_ones_state_and_title() {
+        let (t, rows) = lists_detail(Pane::PullRequests, Pane::PullRequests, 1);
+        let all = rows.join("\n");
+        for line in [
+            "merged  #5828  Notify the family",
+            "open    #5829",
+            "merged? #5840  Fix the sign-in   (found · L links)",
+        ] {
+            assert!(rows.iter().any(|r| r == line), "missing {line:?}:\n{all}");
+        }
+        for elsewhere in ["docs/spec.md", "story-a", "#5833"] {
+            assert!(
+                !all.contains(elsewhere),
+                "{elsewhere:?} is not a PR:\n{all}"
+            );
+        }
+        // the selection is the section's own
+        let y = row_of(&rows, "open    #5829") as u16;
+        assert!(
+            t.backend().buffer()[(0, y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn the_demos_section_lists_linked_then_found_stories() {
+        let (_t, rows) = lists_detail(Pane::Demos, Pane::Demos, 0);
+        let all = rows.join("\n");
+        let linked = row_of(&rows, "▶ story-a (criteria: 1)");
+        let found = row_of(&rows, "▶ story-b   (found · L links)");
+        assert!(linked < found, "{all}");
+        assert!(
+            !all.contains("#5828") && !all.contains("docs/spec.md"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn artifacts_keep_the_rest() {
+        let (_t, rows) = lists_detail(Pane::Artifacts, Pane::Artifacts, 0);
+        let all = rows.join("\n");
+        for line in [
+            "spec     docs/spec.md",
+            "plan     docs/plan.md",
+            "issue    #5833",
+            "adr?     docs/adr/1.md   (found · L links)",
+        ] {
+            assert!(rows.iter().any(|r| r == line), "missing {line:?}:\n{all}");
+        }
+        for moved in ["#5828", "story-a", "story-b"] {
+            assert!(
+                !all.contains(moved),
+                "{moved:?} has its own section:\n{all}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_pull_request_and_demo_sections_say_so() {
+        let it = intent_with(SECTIONS_BODY.replace("- spec: docs/spec.md\n", "").as_str());
+        let (_t, rows) = detail(&it, Pane::Tree, Pane::PullRequests, 80, 24);
+        let all = rows.join("\n");
+        assert!(all.contains("▾ Pull requests (0)"), "{all}");
+        assert!(all.contains("▸ Demos (0)"), "{all}");
+        assert!(all.contains("none yet"), "{all}");
     }
 
     #[test]
@@ -642,7 +806,9 @@ mod tests {
         let desc = row_of(&rows, "The description.");
         assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 1, "{all}");
         assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 1);
-        assert_eq!(row_of(&rows, "▸ Open questions"), 22, "{all}");
+        assert_eq!(row_of(&rows, "▸ Demos"), 20, "{all}");
+        assert_eq!(row_of(&rows, "▸ Open questions"), 21, "{all}");
+        assert_eq!(row_of(&rows, "▸ Pull requests"), 22, "{all}");
         assert_eq!(row_of(&rows, "▸ Artifacts"), 23, "{all}");
 
         let (_t, rows) = detail(&it, Pane::Tree, Pane::Artifacts, 80, 24);
@@ -709,6 +875,9 @@ mod tests {
             found: &[],
             answering: None,
             open: Pane::Questions,
+            prs: &[],
+            prs_selected: 0,
+            demos_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
         t.draw(|f| render_capability(&view, f.area(), f.buffer_mut()))
@@ -759,7 +928,9 @@ pub enum Pane {
     Description,
     Preconditions,
     Criteria,
+    Demos,
     Questions,
+    PullRequests,
     Artifacts,
 }
 
@@ -818,6 +989,20 @@ pub struct DetailView<'a> {
     /// The section open under the description (an accordion): the others
     /// show only their title line.
     pub open: Pane,
+    /// Pull requests, linked first then found by the repo search.
+    pub prs: &'a [PrRow],
+    pub prs_selected: usize,
+    pub demos_selected: usize,
+}
+
+/// A pull request in the detail view: linked by a `pr:` line or found by the
+/// repo search, with the state and title `gh` gave.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrRow {
+    pub target: String,
+    pub state: crate::progress::PrState,
+    pub title: Option<String>,
+    pub found: bool,
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'static> {
@@ -850,7 +1035,9 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     let sections = [
         Pane::Preconditions,
         Pane::Criteria,
+        Pane::Demos,
         Pane::Questions,
+        Pane::PullRequests,
         Pane::Artifacts,
     ];
     let mut constraints = vec![Constraint::Length(2), Constraint::Length(desc_h)];
@@ -912,22 +1099,99 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         format!("{} Preconditions", marker(Pane::Preconditions)),
         format!("{} Acceptance criteria", marker(Pane::Criteria)),
     ];
+    // the list sections' rows: pull requests and demos have their own,
+    // everything else stays in Artifacts
+    let in_section = |pane: Pane, found: bool| -> Vec<&crate::store::Artifact> {
+        let from: &[crate::store::Artifact] = if found { v.found } else { &arts };
+        from.iter()
+            .filter(|a| list_section(&a.kind) == pane)
+            .collect()
+    };
+    let demo_rows: Vec<ItemRow> = [false, true]
+        .into_iter()
+        .flat_map(|found| {
+            in_section(Pane::Demos, found)
+                .into_iter()
+                .map(move |a| ItemRow {
+                    tag: "▶".into(),
+                    text: a.target.clone(),
+                    found,
+                })
+        })
+        .collect();
+    let artifact_rows: Vec<ItemRow> = [false, true]
+        .into_iter()
+        .flat_map(|found| {
+            in_section(Pane::Artifacts, found)
+                .into_iter()
+                .map(move |a| ItemRow {
+                    tag: if found {
+                        format!("{}?", a.kind)
+                    } else {
+                        a.kind.clone()
+                    },
+                    text: a.target.clone(),
+                    found,
+                })
+        })
+        .collect();
+    let pr_rows: Vec<ItemRow> = v
+        .prs
+        .iter()
+        .map(|p| ItemRow {
+            tag: format!(
+                "{}{}",
+                pr_state_label(p.state),
+                if p.found { "?" } else { "" }
+            ),
+            text: match &p.title {
+                Some(t) => format!("{}  {t}", p.target),
+                None => p.target.clone(),
+            },
+            found: p.found,
+        })
+        .collect();
+    let count_title = |name: &str, rows: &[ItemRow]| {
+        let found = rows.iter().filter(|r| r.found).count();
+        let linked = rows.len() - found;
+        if found == 0 {
+            format!("{name} ({linked})")
+        } else {
+            format!("{name} ({linked} linked, {found} found)")
+        }
+    };
+    let pr_title = {
+        let linked: Vec<&PrRow> = v.prs.iter().filter(|p| !p.found).collect();
+        let found = v.prs.len() - linked.len();
+        let merged = linked
+            .iter()
+            .filter(|p| p.state == crate::progress::PrState::Merged)
+            .count();
+        match (linked.len(), found) {
+            (0, 0) => "Pull requests (0)".to_string(),
+            (0, f) => format!("Pull requests (0 linked, {f} found)"),
+            (n, 0) => format!("Pull requests ({merged}/{n} merged)"),
+            (n, f) => format!("Pull requests ({merged}/{n} merged, {f} found)"),
+        }
+    };
     let titles = [
         checklist_title(&names[0], &ps, &[]),
         checklist_title(&names[1], &cs, &fresh),
+        format!(
+            "{} {}",
+            marker(Pane::Demos),
+            count_title("Demos", &demo_rows)
+        ),
         format!(
             "{} Open questions ({} open)",
             marker(Pane::Questions),
             it.open_questions()
         ),
+        format!("{} {pr_title}", marker(Pane::PullRequests)),
         format!(
             "{} {}",
             marker(Pane::Artifacts),
-            if v.found.is_empty() {
-                format!("Artifacts ({})", arts.len())
-            } else {
-                format!("Artifacts ({} linked, {} found)", arts.len(), v.found.len())
-            }
+            count_title("Artifacts", &artifact_rows)
         ),
     ];
     for (i, section) in sections.into_iter().enumerate() {
@@ -970,9 +1234,124 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
                     buf,
                 )
             }
+            Pane::Demos => render_items(
+                &titles[i],
+                v.focus == Pane::Demos,
+                v.demos_selected,
+                &demo_rows,
+                2,
+                "none yet — app-demos stories that show the criteria working (a adds one: story-id (criteria: 1, 4))",
+                rect,
+                buf,
+            ),
             Pane::Questions => render_questions(v, &qs, &titles[i], rect, buf),
-            _ => render_artifacts(v, &arts, &titles[i], rect, buf),
+            Pane::PullRequests => render_items(
+                &titles[i],
+                v.focus == Pane::PullRequests,
+                v.prs_selected,
+                &pr_rows,
+                8,
+                "none yet — agents add a `pr:` line for each pull request they open (a adds one by hand)",
+                rect,
+                buf,
+            ),
+            _ => render_items(
+                &titles[i],
+                v.focus == Pane::Artifacts,
+                v.artifacts_selected,
+                &artifact_rows,
+                9,
+                "none yet — specs, plans, ADRs and tickets the agents produce land here (a adds one by hand)",
+                rect,
+                buf,
+            ),
         }
+    }
+}
+
+/// Which list section an artifact line belongs to: pull requests and demos
+/// have their own, everything else stays in Artifacts.
+pub fn list_section(kind: &str) -> Pane {
+    if kind.eq_ignore_ascii_case("pr") {
+        Pane::PullRequests
+    } else if kind.eq_ignore_ascii_case("demo") {
+        Pane::Demos
+    } else {
+        Pane::Artifacts
+    }
+}
+
+fn pr_state_label(state: crate::progress::PrState) -> &'static str {
+    use crate::progress::PrState;
+    match state {
+        PrState::Merged => "merged",
+        PrState::Open => "open",
+        PrState::Closed => "closed",
+        PrState::Unknown => "…",
+    }
+}
+
+/// One row of a list section: a short tag column, its text, and whether it
+/// was found rather than linked.
+struct ItemRow {
+    tag: String,
+    text: String,
+    found: bool,
+}
+
+/// A list section (Demos, Pull requests, Artifacts): its rows under the
+/// title, scrolled to the selection; found rows are dim and say `L` links
+/// them.
+#[allow(clippy::too_many_arguments)]
+fn render_items(
+    title: &str,
+    focused: bool,
+    selected: usize,
+    rows: &[ItemRow],
+    tag_width: usize,
+    empty: &str,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let block = pane_block(title, focused);
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    if rows.is_empty() {
+        Paragraph::new(Span::styled(empty, dim))
+            .wrap(Wrap { trim: false })
+            .render(inner, buf);
+        return;
+    }
+    let skip = if selected >= inner.height as usize {
+        selected + 1 - inner.height as usize
+    } else {
+        0
+    };
+    for (k, (i, row)) in rows.iter().enumerate().skip(skip).enumerate() {
+        let y = inner.y + k as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let rect = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        if focused && i == selected {
+            buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
+        }
+        let (text_style, hint) = if row.found {
+            (dim, "   (found · L links)")
+        } else {
+            (Style::default(), "")
+        };
+        Line::from(vec![
+            Span::styled(format!("{:<tag_width$}", sanitize(&row.tag)), dim),
+            Span::styled(sanitize(&row.text), text_style),
+            Span::styled(hint, dim),
+        ])
+        .render(rect, buf);
     }
 }
 
@@ -1065,61 +1444,6 @@ fn render_questions(
             buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
         }
         line.render(rect, buf);
-    }
-}
-
-/// The Artifacts section: linked first, then those found in the repo (dim, "found").
-fn render_artifacts(
-    v: &DetailView,
-    arts: &[crate::store::Artifact],
-    title: &str,
-    area: Rect,
-    buf: &mut Buffer,
-) {
-    let block = pane_block(title, v.focus == Pane::Artifacts);
-    let inner = block.inner(area);
-    block.render(area, buf);
-    let all: Vec<(&crate::store::Artifact, bool)> = arts
-        .iter()
-        .map(|a| (a, false))
-        .chain(v.found.iter().map(|a| (a, true)))
-        .collect();
-    if all.is_empty() {
-        Paragraph::new(Span::styled("none yet — specs, plans, ADRs and tickets the agents produce land here (a adds one by hand)", Style::default().add_modifier(Modifier::DIM))).wrap(Wrap { trim: false }).render(inner, buf);
-    }
-    let skip = if v.artifacts_selected >= inner.height as usize {
-        v.artifacts_selected + 1 - inner.height as usize
-    } else {
-        0
-    };
-    for (k, (i, (a, is_found))) in all.iter().enumerate().skip(skip).enumerate() {
-        let y = inner.y + k as u16;
-        if y >= inner.y + inner.height {
-            break;
-        }
-        let rect = Rect {
-            y,
-            height: 1,
-            ..inner
-        };
-        if v.focus == Pane::Artifacts && i == v.artifacts_selected {
-            buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
-        }
-        let (tag, target_style, hint) = if *is_found {
-            (
-                format!("{:<9}", format!("{}?", sanitize(&a.kind))),
-                Style::default().add_modifier(Modifier::DIM),
-                "   (found · L links)",
-            )
-        } else {
-            (format!("{:<9}", sanitize(&a.kind)), Style::default(), "")
-        };
-        Line::from(vec![
-            Span::styled(tag, Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(sanitize(&a.target), target_style),
-            Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
-        ])
-        .render(rect, buf);
     }
 }
 

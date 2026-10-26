@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use herdr_capabilities::progress::{
     CellKind, Evidence, FoundPr, PlanTasks, Poller, PrState, Progress, Size, Update,
-    agent_statuses, ago, bar, branch_area, plan_evidence, plan_size, plan_tasks, pr_number,
-    pr_state, progress, prs_mentioning, stage_cells,
+    agent_statuses, ago, bar, branch_area, plan_evidence, plan_size, plan_tasks, pr_info,
+    pr_number, pr_state, progress, prs_mentioning, stage_cells,
 };
 
 /// The bar as `(glyphs, kinds)`: D done (`█`), T to do (`░`), R in review (`▓`).
@@ -349,6 +349,27 @@ fn pr_state_reads_gh_and_degrades() {
     );
 }
 
+#[test]
+fn pr_info_reads_the_title_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("prs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("7"), "MERGED").unwrap();
+    fs::write(dir.join("7.title"), "Notify the family").unwrap();
+    fs::write(dir.join("9"), "OPEN").unwrap();
+    let env = vec![("FAKE_GH_DIR".to_string(), dir.display().to_string())];
+    let gh = fixtures().join("fake-gh.sh");
+    assert_eq!(
+        pr_info(&gh, tmp.path(), "#7", &env),
+        (PrState::Merged, Some("Notify the family".to_string()))
+    );
+    assert_eq!(pr_info(&gh, tmp.path(), "#9", &env), (PrState::Open, None));
+    assert_eq!(
+        pr_info(&gh, tmp.path(), "#8", &env),
+        (PrState::Unknown, None)
+    );
+}
+
 fn sent_with(body: &str) -> (tempfile::TempDir, herdr_capabilities::store::Intent) {
     intent(State::Sent, body)
 }
@@ -430,6 +451,38 @@ fn poller_reports_on_a_channel_without_duplicates() {
     assert!(matches!(&updates[0], Update::Agents(Some(m)) if m.len() == 1));
     let calls = fs::read_to_string(tmp.path().join("herdr.log")).unwrap();
     assert_eq!(calls.matches("agent list").count(), 1);
+}
+
+#[test]
+fn poller_reports_a_prs_state_and_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("prs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("7"), "MERGED").unwrap();
+    fs::write(dir.join("7.title"), "Notify the family").unwrap();
+    let mut poller = Poller::new(vec![
+        (
+            "GH_BIN_PATH".to_string(),
+            fixtures().join("fake-gh.sh").display().to_string(),
+        ),
+        ("FAKE_GH_DIR".to_string(), dir.display().to_string()),
+    ]);
+    poller.request_pr(tmp.path().to_path_buf(), "#7".into());
+    let start = Instant::now();
+    let mut updates = Vec::new();
+    while updates.is_empty() && start.elapsed() < Duration::from_secs(5) {
+        updates.extend(poller.drain());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        updates,
+        vec![Update::Pr {
+            repo: tmp.path().to_path_buf(),
+            target: "#7".into(),
+            state: PrState::Merged,
+            title: Some("Notify the family".into()),
+        }]
+    );
 }
 
 #[test]
@@ -561,7 +614,7 @@ fn prs_are_found_by_the_file_names_they_mention() {
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("search-p.md.json"),
-        r#"[{"number":5828,"state":"MERGED","headRefName":"feature/org/office-hours--meeting-request-backend"},{"number":5832,"state":"OPEN"}]"#,
+        r#"[{"number":5828,"state":"MERGED","headRefName":"feature/org/office-hours--meeting-request-backend","title":"Advisor meeting requests (backend)"},{"number":5832,"state":"OPEN"}]"#,
     )
     .unwrap();
     let log = tmp.path().join("gh.log");
@@ -576,12 +629,14 @@ fn prs_are_found_by_the_file_names_they_mention() {
             FoundPr {
                 number: 5828,
                 state: PrState::Merged,
-                branch: "feature/org/office-hours--meeting-request-backend".into()
+                branch: "feature/org/office-hours--meeting-request-backend".into(),
+                title: "Advisor meeting requests (backend)".into()
             },
             FoundPr {
                 number: 5832,
                 state: PrState::Open,
-                branch: String::new()
+                branch: String::new(),
+                title: String::new()
             }
         ]
     );
@@ -589,7 +644,9 @@ fn prs_are_found_by_the_file_names_they_mention() {
     assert!(prs_mentioning(&tmp.path().join("no-gh"), tmp.path(), "p.md", &env).is_empty());
     let calls = fs::read_to_string(&log).unwrap();
     assert!(
-        calls.contains("pr list --state all --search \"p.md\""),
+        calls.contains(
+            "pr list --state all --search \"p.md\" --json number,state,headRefName,title"
+        ),
         "{calls}"
     );
 }

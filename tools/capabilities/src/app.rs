@@ -121,7 +121,10 @@ pub enum InputAction {
     /// Append an open question.
     AddQuestion,
     /// Append `- kind: target` under Artifacts (input is "kind: target").
-    AddArtifact,
+    /// `kind` is used when the text does not start with `kind:`.
+    AddArtifact {
+        kind: &'static str,
+    },
     /// Replace the capability's affected areas (comma-separated group paths;
     /// empty clears them).
     EditAreas,
@@ -375,6 +378,10 @@ pub struct App {
     criteria_selected: usize,
     question_selected: usize,
     artifacts_selected: usize,
+    prs_selected: usize,
+    demos_selected: usize,
+    /// PR titles from `gh`, keyed like `pr_states`.
+    pr_titles: HashMap<(PathBuf, String), String>,
     /// Artifacts found in the selected capability's repo, cached per path.
     found_cache: Option<(PathBuf, Vec<crate::store::Artifact>)>,
     pub layout: Layout,
@@ -430,6 +437,8 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Criteria => "criteria",
         Pane::Questions => "questions",
         Pane::Artifacts => "artifacts",
+        Pane::Demos => "demos",
+        Pane::PullRequests => "pull requests",
     }
 }
 
@@ -463,6 +472,9 @@ impl App {
             criteria_selected: 0,
             question_selected: 0,
             artifacts_selected: 0,
+            prs_selected: 0,
+            demos_selected: 0,
+            pr_titles: HashMap::new(),
             found_cache: None,
             layout: Layout::Tree,
             sort: SortOrder::Updated,
@@ -1066,7 +1078,11 @@ impl App {
                     repo,
                     target,
                     state,
+                    title,
                 } => {
+                    if let Some(t) = title {
+                        self.pr_titles.insert((repo.clone(), target.clone()), t);
+                    }
                     self.pr_states.insert((repo, target), state);
                 }
                 crate::progress::Update::Plans { path, plans } => {
@@ -1408,6 +1424,8 @@ impl App {
         self.criteria_selected = 0;
         self.question_selected = 0;
         self.artifacts_selected = 0;
+        self.prs_selected = 0;
+        self.demos_selected = 0;
     }
 
     fn select_path(&mut self, p: &Path) {
@@ -1442,6 +1460,109 @@ impl App {
         self.found_cache = Some((it.path, found));
     }
 
+    /// Pull requests for the detail view: the linked ones with what `gh`
+    /// said about them, then those the repo search found that no `pr:`
+    /// line names.
+    fn pr_rows(&self, it: &Intent) -> Vec<ui::PrRow> {
+        use crate::progress::{PrState, pr_number};
+        let key = |t: &str| {
+            it.fm
+                .repo
+                .as_ref()
+                .map(|r| (r.clone(), t.trim().to_string()))
+        };
+        let found: Vec<&crate::progress::FoundPr> = self
+            .found_prs
+            .get(&it.path)
+            .into_iter()
+            .flatten()
+            .flat_map(|(_, prs)| prs)
+            .collect();
+        // until `gh` answers for a linked PR, the search's answer stands in
+        // (a found PR just linked keeps its state and title)
+        let searched = |target: &str| {
+            let n = pr_number(target)?;
+            found.iter().find(|f| f.number == n).copied()
+        };
+        let mut rows: Vec<ui::PrRow> = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| ui::list_section(&a.kind) == Pane::PullRequests)
+            .map(|a| {
+                let k = key(&a.target);
+                let s = searched(&a.target);
+                ui::PrRow {
+                    state: k
+                        .as_ref()
+                        .and_then(|k| self.pr_states.get(k))
+                        .copied()
+                        .filter(|st| *st != PrState::Unknown)
+                        .or(s.map(|f| f.state))
+                        .unwrap_or(PrState::Unknown),
+                    title: k
+                        .as_ref()
+                        .and_then(|k| self.pr_titles.get(k))
+                        .cloned()
+                        .or_else(|| s.map(|f| f.title.clone()).filter(|t| !t.trim().is_empty())),
+                    target: a.target.trim().to_string(),
+                    found: false,
+                }
+            })
+            .collect();
+        let mut seen: Vec<u64> = rows.iter().filter_map(|r| pr_number(&r.target)).collect();
+        for f in found {
+            if seen.contains(&f.number) {
+                continue;
+            }
+            seen.push(f.number);
+            rows.push(ui::PrRow {
+                target: format!("#{}", f.number),
+                state: f.state,
+                title: (!f.title.trim().is_empty()).then(|| f.title.clone()),
+                found: true,
+            });
+        }
+        rows
+    }
+
+    /// A list section's rows: (linked, found), in the order the section
+    /// draws them.
+    fn section_lists(
+        &self,
+        it: &Intent,
+        pane: Pane,
+    ) -> (Vec<crate::store::Artifact>, Vec<crate::store::Artifact>) {
+        let linked = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| ui::list_section(&a.kind) == pane)
+            .collect();
+        let found = if pane == Pane::PullRequests {
+            self.pr_rows(it)
+                .into_iter()
+                .filter(|r| r.found)
+                .map(|r| crate::store::Artifact {
+                    kind: "pr".into(),
+                    target: r.target,
+                })
+                .collect()
+        } else {
+            self.found_artifacts()
+                .iter()
+                .filter(|a| ui::list_section(&a.kind) == pane)
+                .cloned()
+                .collect()
+        };
+        (linked, found)
+    }
+
+    /// The selection of a list section (Artifacts, Demos, Pull requests).
+    fn list_selected(&mut self, pane: Pane) -> &mut usize {
+        match pane {
+            Pane::PullRequests => &mut self.prs_selected,
+            Pane::Demos => &mut self.demos_selected,
+            _ => &mut self.artifacts_selected,
+        }
+    }
+
     /// The cached found artifacts for the selected capability.
     fn found_artifacts(&self) -> &[crate::store::Artifact] {
         match (&self.found_cache, self.selected_intent()) {
@@ -1470,7 +1591,12 @@ impl App {
         // while focus is on the tree or the description
         if matches!(
             self.focus,
-            Pane::Preconditions | Pane::Criteria | Pane::Questions | Pane::Artifacts
+            Pane::Preconditions
+                | Pane::Criteria
+                | Pane::Demos
+                | Pane::Questions
+                | Pane::PullRequests
+                | Pane::Artifacts
         ) {
             self.open = self.focus;
         }
@@ -1546,8 +1672,10 @@ impl App {
                     Pane::Tree => Pane::Description,
                     Pane::Description => Pane::Preconditions,
                     Pane::Preconditions => Pane::Criteria,
-                    Pane::Criteria => Pane::Questions,
-                    Pane::Questions => Pane::Artifacts,
+                    Pane::Criteria => Pane::Demos,
+                    Pane::Demos => Pane::Questions,
+                    Pane::Questions => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Artifacts,
                     Pane::Artifacts => Pane::Tree,
                 };
                 return Flow::Continue;
@@ -1555,11 +1683,13 @@ impl App {
             KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Questions,
-                    Pane::Description => Pane::Tree,
-                    Pane::Preconditions => Pane::Description,
+                    Pane::Artifacts => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Questions,
+                    Pane::Questions => Pane::Demos,
+                    Pane::Demos => Pane::Criteria,
                     Pane::Criteria => Pane::Preconditions,
-                    Pane::Questions => Pane::Criteria,
+                    Pane::Preconditions => Pane::Description,
+                    Pane::Description => Pane::Tree,
                 };
                 return Flow::Continue;
             }
@@ -1783,7 +1913,15 @@ impl App {
                 Pane::Questions => ("new open question", InputAction::AddQuestion),
                 Pane::Artifacts => (
                     "new artifact as kind: path-or-url (spec, plan, adr, decision, issue)",
-                    InputAction::AddArtifact,
+                    InputAction::AddArtifact { kind: "link" },
+                ),
+                Pane::PullRequests => (
+                    "new pull request: #number or URL",
+                    InputAction::AddArtifact { kind: "pr" },
+                ),
+                Pane::Demos => (
+                    "new demo: story-id (criteria: 1, 4)",
+                    InputAction::AddArtifact { kind: "demo" },
                 ),
                 _ => return Flow::Continue,
             };
@@ -1884,10 +2022,11 @@ impl App {
                     _ => {}
                 }
             }
-            Pane::Artifacts => {
-                let linked = crate::store::artifacts(&it.body);
-                let found = self.found_artifacts().to_vec();
+            Pane::Artifacts | Pane::Demos | Pane::PullRequests => {
+                let pane = self.focus;
+                let (linked, found) = self.section_lists(&it, pane);
                 let total = linked.len() + found.len();
+                let selected = *self.list_selected(pane);
                 // (artifact, is_found) at a row of the combined list
                 let pick = |i: usize| {
                     if i < linked.len() {
@@ -1899,24 +2038,23 @@ impl App {
                 match k.code {
                     KeyCode::Esc => self.focus = Pane::Tree,
                     KeyCode::Char('j') | KeyCode::Down => {
-                        self.artifacts_selected =
-                            (self.artifacts_selected + 1).min(total.saturating_sub(1))
+                        *self.list_selected(pane) = (selected + 1).min(total.saturating_sub(1))
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        self.artifacts_selected = self.artifacts_selected.saturating_sub(1)
+                        *self.list_selected(pane) = selected.saturating_sub(1)
                     }
                     KeyCode::Enter | KeyCode::Char('o') => {
-                        if let Some((a, _)) = pick(self.artifacts_selected) {
+                        if let Some((a, _)) = pick(selected) {
                             self.open_artifact(&it, &a, k.code == KeyCode::Char('o'));
                         }
                     }
-                    KeyCode::Char('L') => match pick(self.artifacts_selected) {
+                    KeyCode::Char('L') => match pick(selected) {
                         Some((a, true)) => {
                             self.edit_selected_body(|body| {
                                 crate::store::add_artifact(body, &a.kind, &a.target)
                             });
                             self.found_cache = None;
-                            self.artifacts_selected = linked.len();
+                            *self.list_selected(pane) = linked.len();
                             self.message = Some(format!("linked {}", a.target));
                         }
                         Some((_, false)) => {
@@ -2083,7 +2221,7 @@ impl App {
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.screen = Screen::Browse;
-                self.focus = Pane::Artifacts;
+                self.focus = self.open;
                 return Flow::Continue;
             }
             KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
@@ -3002,7 +3140,7 @@ impl App {
                     .unwrap_or(1)
                     .saturating_sub(1);
             }
-            InputAction::AddArtifact => {
+            InputAction::AddArtifact { kind: default_kind } => {
                 let (kind, target) = match value.split_once(':') {
                     Some((k, t))
                         if !k.trim().contains(' ')
@@ -3011,15 +3149,18 @@ impl App {
                     {
                         (k.trim().to_string(), t.trim().to_string())
                     }
-                    _ => ("link".to_string(), value.to_string()),
+                    _ => (default_kind.to_string(), value.to_string()),
                 };
                 self.edit_selected_body(|body| crate::store::add_artifact(body, &kind, &target));
-                self.focus = Pane::Artifacts;
-                self.artifacts_selected = self
+                // the new line is the last one linked in its section
+                let pane = ui::list_section(&kind);
+                self.focus = pane;
+                let linked = self
                     .selected_intent()
-                    .map(|it| crate::store::artifacts(&it.body).len())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
+                    .cloned()
+                    .map(|it| self.section_lists(&it, pane).0.len())
+                    .unwrap_or(1);
+                *self.list_selected(pane) = linked.saturating_sub(1);
             }
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
@@ -3624,6 +3765,7 @@ impl App {
                         _ => None,
                     };
                     let attachments = Store::attachments(intent);
+                    let prs = self.pr_rows(intent);
                     ui::render_capability(
                         &ui::DetailView {
                             intent,
@@ -3637,6 +3779,9 @@ impl App {
                             found: self.found_artifacts(),
                             answering,
                             open: self.open,
+                            prs: &prs,
+                            prs_selected: self.prs_selected,
+                            demos_selected: self.demos_selected,
                         },
                         right,
                         buf,
@@ -3676,6 +3821,8 @@ impl App {
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
+                (None, Pane::Demos) => "Demos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
+                (None, Pane::PullRequests) => "Pull requests: j/k choose · Enter/o open in the browser · L link a found one · a add · Esc tree".to_string(),
             },
         };
         ui::render_status(&status_text, status, buf);
@@ -4611,7 +4758,8 @@ mod tests {
         let shown = render(&fx.app, 100, 24);
         assert!(shown.contains("[ ] ▶ second thing"), "{shown}");
         assert!(shown.contains("[ ] first thing"), "{shown}");
-        key(&mut fx.app, KeyCode::Char('V'));
+        // demos have their own section
+        tab_to(&mut fx.app, "demos");
         key(&mut fx.app, KeyCode::Enter);
         let v = fx.app.view();
         assert_eq!(v.screen, "reader", "{v:?}");
@@ -6406,7 +6554,14 @@ mod tests {
             "criteria",
             "the description leaves it open"
         );
-        for pane in ["preconditions", "criteria", "questions", "artifacts"] {
+        for pane in [
+            "preconditions",
+            "criteria",
+            "demos",
+            "questions",
+            "pull requests",
+            "artifacts",
+        ] {
             key(&mut fx.app, KeyCode::Tab);
             assert_eq!(fx.app.view().focus, pane);
             assert_eq!(fx.app.view().open, pane, "the focused section opens");
@@ -6423,7 +6578,103 @@ mod tests {
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().open, "artifacts");
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "questions");
+        assert_eq!(fx.app.view().open, "pull requests");
+    }
+
+    /// Tab from the tree to the named section.
+    fn tab_to(app: &mut App, pane: &str) {
+        for _ in 0..8 {
+            if app.view().focus == pane {
+                return;
+            }
+            key(app, KeyCode::Tab);
+        }
+        panic!("never reached {pane}");
+    }
+
+    #[test]
+    fn pull_requests_show_their_titles_and_l_links_a_found_one() {
+        let mut fx = list_fixture(true);
+        let prs = fx.tmp.path().join("prs");
+        fs::write(prs.join("42.title"), "Notify the family by email").unwrap();
+        fs::write(
+            prs.join("search-notify.md.json"),
+            r#"[{"number":43,"state":"MERGED","headRefName":"fix/org/notify--copy","title":"Fix the email copy"}]"#,
+        )
+        .unwrap();
+        select(&mut fx.app, "Notify primary contact");
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        tab_to(&mut fx.app, "pull requests");
+        let shown = render(&fx.app, 120, 40);
+        assert!(
+            shown.contains("Pull requests (0/1 merged, 1 found)"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("open    #42  Notify the family by email"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("merged? #43  Fix the email copy   (found · L links)"),
+            "{shown}"
+        );
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('L'));
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let body = Store::load(&path).unwrap().body;
+        assert!(body.contains("- pr: #43"), "{body}");
+        let shown = render(&fx.app, 120, 40);
+        assert!(shown.contains("Pull requests (1/2 merged)"), "{shown}");
+        assert_eq!(fx.app.view().focus, "pull requests");
+    }
+
+    #[test]
+    fn a_in_pull_requests_and_demos_adds_a_line_of_that_kind() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        tab_to(&mut fx.app, "pull requests");
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "#77");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().focus, "pull requests");
+        tab_to(&mut fx.app, "demos");
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "story-x (criteria: 2)");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().focus, "demos");
+        let body = Store::load(&path).unwrap().body;
+        assert!(body.contains("- pr: #77"), "{body}");
+        assert!(body.contains("- demo: story-x (criteria: 2)"), "{body}");
+    }
+
+    #[test]
+    fn reading_a_demo_returns_to_the_demos_section() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx._tmp.path().join("repo");
+        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
+        fs::write(
+            repo.join("app-demos/stories/a.yaml"),
+            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
+        )
+        .unwrap();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(repo);
+        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n\n## Artifacts\n- spec: docs/x.md\n- demo: alex-shows-alpha (criteria: 1)\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        tab_to(&mut fx.app, "demos");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(
+            fx.app.view().screen,
+            "reader",
+            "the section's first row is the demo"
+        );
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().focus, "demos");
     }
 
     #[test]
@@ -6438,13 +6689,20 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "criteria");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "demos");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "questions");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "pull requests");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "artifacts");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "pull requests");
+        key(&mut fx.app, KeyCode::Tab);
         // j/k in the tree still move the selection only while the tree has focus
         key(&mut fx.app, KeyCode::Char('j'));
         assert_eq!(
@@ -6534,8 +6792,8 @@ mod tests {
             assert!(text.contains(title), "pane {title} missing: {text}");
         }
         assert!(!text.contains("? a?"), "questions start collapsed: {text}");
-        // tree → description → preconditions → criteria → questions
-        for _ in 0..4 {
+        // tree → description → preconditions → criteria → demos → questions
+        for _ in 0..5 {
             key(&mut fx.app, KeyCode::Tab);
         }
         let text = render(&fx.app, 100, 24);

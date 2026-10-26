@@ -93,6 +93,8 @@ pub struct FoundPr {
     pub state: PrState,
     /// Its head branch, e.g. `feature/org/candidates--meeting-request-org`.
     pub branch: String,
+    /// Its title; empty when `gh` gave none.
+    pub title: String,
 }
 
 /// Pull requests found per spec or plan file name.
@@ -566,6 +568,17 @@ fn ledgers_for(roots: &[PathBuf], plan: &str) -> Vec<String> {
 /// repo), and `owner/repo#n` adds `-R owner/repo`. Anything but a clear
 /// answer is `Unknown`.
 pub fn pr_state(gh: &Path, repo: &Path, target: &str, env: &[(String, String)]) -> PrState {
+    pr_info(gh, repo, target, env).0
+}
+
+/// A pull request's state and title from `gh pr view`; `Unknown` and no
+/// title when `gh` cannot say.
+pub fn pr_info(
+    gh: &Path,
+    repo: &Path,
+    target: &str,
+    env: &[(String, String)],
+) -> (PrState, Option<String>) {
     let t = target.trim();
     let args: Vec<String> = if let Some(n) = t.strip_prefix('#') {
         vec![n.trim().to_string()]
@@ -574,10 +587,10 @@ pub fn pr_state(gh: &Path, repo: &Path, target: &str, env: &[(String, String)]) 
     } else if let Some((slug, n)) = t.split_once('#') {
         vec![n.trim().to_string(), "-R".into(), slug.trim().to_string()]
     } else {
-        return PrState::Unknown;
+        return (PrState::Unknown, None);
     };
     let view = ["pr".to_string(), "view".to_string(), args[0].clone()];
-    let rest: Vec<String> = ["--json".to_string(), "state".to_string()]
+    let rest: Vec<String> = ["--json".to_string(), "state,title".to_string()]
         .into_iter()
         .chain(args[1..].iter().cloned())
         .collect();
@@ -589,20 +602,25 @@ pub fn pr_state(gh: &Path, repo: &Path, target: &str, env: &[(String, String)]) 
         .stderr(Stdio::null())
         .output();
     let Ok(out) = out else {
-        return PrState::Unknown;
+        return (PrState::Unknown, None);
     };
     if !out.status.success() {
-        return PrState::Unknown;
+        return (PrState::Unknown, None);
     }
-    let state = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .ok()
-        .and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_string));
-    match state.as_deref() {
+    let v = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok();
+    let field = |k: &str| {
+        v.as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+    };
+    let state = match field("state").as_deref() {
         Some("OPEN") => PrState::Open,
         Some("MERGED") => PrState::Merged,
         Some("CLOSED") => PrState::Closed,
         _ => PrState::Unknown,
-    }
+    };
+    (state, field("title").filter(|t| !t.trim().is_empty()))
 }
 
 /// One agent as `herdr agent list` reports it, plus where it is working.
@@ -660,7 +678,7 @@ pub fn prs_mentioning(
             "--search",
             &format!("\"{query}\""),
             "--json",
-            "number,state,headRefName",
+            "number,state,headRefName,title",
             "--limit",
             "30",
         ])
@@ -694,10 +712,16 @@ pub fn prs_mentioning(
                         .and_then(|b| b.as_str())
                         .unwrap_or_default()
                         .to_string();
+                    let title = p
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     Some(FoundPr {
                         number,
                         state,
                         branch,
+                        title,
                     })
                 })
                 .collect()
@@ -770,6 +794,7 @@ pub enum Update {
         /// The `pr:` target as linked.
         target: String,
         state: PrState,
+        title: Option<String>,
     },
     /// Plan tasks for the capability at `path` (reading plans runs git).
     Plans {
@@ -833,15 +858,16 @@ impl Poller {
         let env = self.env.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let state = tool_bin(&env, "GH_BIN_PATH", Some("gh"))
-                .map(|gh| pr_state(&gh, &repo, &target, &env))
-                .unwrap_or(PrState::Unknown);
+            let (state, title) = tool_bin(&env, "GH_BIN_PATH", Some("gh"))
+                .map(|gh| pr_info(&gh, &repo, &target, &env))
+                .unwrap_or((PrState::Unknown, None));
             let _ = tx.send((
                 key,
                 Update::Pr {
                     repo,
                     target,
                     state,
+                    title,
                 },
             ));
         });
