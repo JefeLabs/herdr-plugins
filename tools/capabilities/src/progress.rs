@@ -535,7 +535,9 @@ pub fn plan_evidence(repo: Option<&Path>, it: &Intent) -> Vec<PlanTasks> {
 }
 
 /// Ledger texts under `<root>/.superpowers/sdd/*/progress.md` whose first line
-/// `# SDD ledger — plan: <path>` names `plan` (either path a suffix of the other).
+/// is a ledger header `# SDD ledger — plan: <path>` naming `plan` (either path
+/// a suffix of the other, compared by whole components). A header that names
+/// no file matches nothing.
 fn ledgers_for(roots: &[PathBuf], plan: &str) -> Vec<String> {
     let mut out = Vec::new();
     for root in roots {
@@ -549,12 +551,16 @@ fn ledgers_for(roots: &[PathBuf], plan: &str) -> Vec<String> {
             let Some(named) = text
                 .lines()
                 .next()
+                .filter(|l| l.starts_with("# SDD ledger"))
                 .and_then(|l| l.split_once("plan:"))
                 .map(|(_, p)| p.trim().to_string())
             else {
                 continue;
             };
             let (named, plan) = (Path::new(&named), Path::new(plan));
+            if named.file_name().is_none() {
+                continue;
+            }
             if named.ends_with(plan) || plan.ends_with(named) {
                 out.push(text);
             }

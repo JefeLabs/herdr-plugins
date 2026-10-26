@@ -360,3 +360,21 @@ fn every_turn_asks_for_criteria_grouped_by_area() {
         follow_up_prompt("SEED", &[("user".into(), "polish".into())], "again", true).contains(rule)
     );
 }
+
+#[test]
+fn a_follow_up_carries_the_format_reminder_once() {
+    let seed = seed_prompt("template", "## Description\nbody\n", None, "idea");
+    assert_eq!(seed.matches(FORMAT_REMINDER).count(), 1);
+    let transcript = [
+        ("user".to_string(), "polish".to_string()),
+        ("agent".to_string(), "a reply".to_string()),
+    ];
+    let p = follow_up_prompt(&seed, &transcript, "again", false);
+    assert_eq!(p.matches(FORMAT_REMINDER).count(), 1, "{p}");
+    assert!(
+        p.trim_end().ends_with(FORMAT_REMINDER),
+        "the reminder comes last, after the new message"
+    );
+    let resumed = follow_up_prompt(&seed, &transcript, "again", true);
+    assert_eq!(resumed.matches(FORMAT_REMINDER).count(), 1);
+}

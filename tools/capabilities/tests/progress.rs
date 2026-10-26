@@ -419,6 +419,41 @@ fn plan_evidence_finds_the_ledger_in_a_worktree() {
 }
 
 #[test]
+fn only_a_ledger_header_naming_the_plan_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("main");
+    fs::create_dir_all(repo.join("docs/superpowers/plans")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    fs::write(
+        repo.join("docs/superpowers/plans/p.md"),
+        "### Task 1: a\n### Task 2: b\n### Task 3: c\n",
+    )
+    .unwrap();
+    let ledger = |dir: &str, text: &str| {
+        let d = repo.join(".superpowers/sdd").join(dir);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("progress.md"), text).unwrap();
+    };
+    ledger(
+        "p",
+        "# SDD ledger — plan: docs/superpowers/plans/p.md\nTask 1: complete (x)\n",
+    );
+    // malformed: names no plan, so it must not match every plan
+    ledger(
+        "broken",
+        "# SDD ledger — plan:\nTask 1: complete\nTask 2: complete\nTask 3: complete\n",
+    );
+    // not a ledger header at all, though it mentions the plan
+    ledger(
+        "notes",
+        "# Notes on the plan: docs/superpowers/plans/p.md\nTask 1: complete\nTask 2: complete\n",
+    );
+    let (_t, it) = sent_with("## Artifacts\n- plan: docs/superpowers/plans/p.md\n");
+    assert_eq!(plan_evidence(Some(&repo), &it), vec![tasks(1, 3)]);
+}
+
+#[test]
 fn plan_evidence_without_repo_marks_unreadable() {
     let (_t, it) = sent_with("## Artifacts\n- plan: docs/superpowers/plans/p.md\n");
     assert_eq!(

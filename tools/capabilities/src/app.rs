@@ -1105,6 +1105,13 @@ impl App {
     }
 
     /// `s`: refuse with the reason, or open the hand-off picker.
+    /// A page of the list: the cards on screen at the last draw, less one so
+    /// the last card seen stays on screen (and a card cut off at the bottom
+    /// is not skipped); one before anything has been drawn.
+    fn list_page(&self) -> usize {
+        self.card_hits.borrow().len().saturating_sub(1).max(1)
+    }
+
     fn start_send(&mut self) {
         // the picker is drawn beside the tree: point the tree at this capability
         if self.layout == Layout::List
@@ -1300,8 +1307,12 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.list_selected = self.list_selected.saturating_sub(1)
             }
-            KeyCode::PageDown => self.list_selected = (self.list_selected + 10).min(last),
-            KeyCode::PageUp => self.list_selected = self.list_selected.saturating_sub(10),
+            KeyCode::PageDown => {
+                self.list_selected = (self.list_selected + self.list_page()).min(last)
+            }
+            KeyCode::PageUp => {
+                self.list_selected = self.list_selected.saturating_sub(self.list_page())
+            }
             KeyCode::Char('v') => self.set_layout(Layout::Tree),
             KeyCode::Enter => self.set_layout(Layout::Tree),
             KeyCode::Char('S') => {
@@ -1438,6 +1449,10 @@ impl App {
     /// repo's `docs/superpowers/{specs,plans}` and `docs/adr`). Cached per path,
     /// dropped on rescan, so a key press costs nothing once computed.
     fn refresh_found(&mut self) {
+        // only the detail view (tree layout) shows found artifacts
+        if self.layout == Layout::List {
+            return;
+        }
         let Some(it) = self.selected_intent().cloned() else {
             self.found_cache = None;
             return;
@@ -2821,6 +2836,12 @@ impl App {
                 let fresh = self
                     .selected_intent()
                     .and_then(|i| Store::load(&i.path).ok());
+                // the file may have changed since `s`: check the gate again
+                if let Some(refusal) = fresh.as_ref().and_then(crate::store::send_refusal) {
+                    self.message = Some(refusal);
+                    self.screen = Screen::Browse;
+                    return Flow::Continue;
+                }
                 match fresh {
                     Some(it) => match crate::send::prepare(
                         &self.cfg,
@@ -2916,6 +2937,11 @@ impl App {
             return;
         };
         let Ok(it) = Store::load(&path) else { return };
+        // and once more right before sending: the confirm screen can stay open
+        if let Some(refusal) = crate::store::send_refusal(&it) {
+            self.message = Some(refusal);
+            return;
+        }
         let kind = self
             .cfg
             .providers
@@ -5594,6 +5620,34 @@ mod tests {
     }
 
     #[test]
+    fn moving_between_cards_does_not_scan_the_repo_for_found_artifacts() {
+        let mut fx = list_fixture(true);
+        let specs = fx.tmp.path().join("repo/docs/superpowers/specs");
+        fs::create_dir_all(&specs).unwrap();
+        fs::write(
+            specs.join("reassign-design.md"),
+            "# Counselors reassign a student between orgs\n",
+        )
+        .unwrap();
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(fx.app.view().layout, "list");
+        fx.app.found_cache = None;
+        for _ in 0..6 {
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        assert!(
+            fx.app.found_cache.is_none(),
+            "the list never shows found artifacts, so it does not look for them"
+        );
+        // the tree still finds them for the capability it shows
+        key(&mut fx.app, KeyCode::Char('v'));
+        select(&mut fx.app, "org");
+        key(&mut fx.app, KeyCode::Char('l'));
+        select(&mut fx.app, "Counselors can reassign");
+        assert_eq!(fx.app.view().found_count, 1);
+    }
+
+    #[test]
     fn a_reconcile_hands_the_agent_the_suggested_areas_too() {
         let mut fx = list_fixture(true);
         fs::create_dir_all(fx.app.store.root().join("skoolscout/family")).unwrap();
@@ -5766,6 +5820,77 @@ mod tests {
             "list",
             "back in the list after the picker"
         );
+    }
+
+    #[test]
+    fn page_keys_move_the_list_by_a_screen() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        let total = fx.app.view().list_titles.len();
+        let _ = render(&fx.app, 120, 20);
+        let shown = fx.app.card_hits.borrow().len();
+        assert!(
+            shown >= 2 && shown < total,
+            "{shown} of {total} cards on screen"
+        );
+        // the list opens on the tree's capability, not necessarily the first
+        let start = fx.app.view().list_selected;
+        key(&mut fx.app, KeyCode::PageDown);
+        assert_eq!(
+            fx.app.view().list_selected,
+            start + shown - 1,
+            "a screen less one: the last card seen stays on screen"
+        );
+        key(&mut fx.app, KeyCode::PageUp);
+        assert_eq!(fx.app.view().list_selected, start);
+    }
+
+    #[test]
+    fn a_question_added_after_s_stops_the_send() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        for _ in 0..10 {
+            if list_title(&fx.app).starts_with("Org admins") {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx.tmp.path().join("repo");
+        Store::update_fields(&path, |fm| fm.repo = Some(repo)).unwrap();
+        fx.app.rescan();
+        let original = Store::load(&path).unwrap().body;
+        let ask = |body: &str| {
+            let mut it = Store::load(&path).unwrap();
+            it.body = body.to_string();
+            Store::save_force(&mut it).unwrap();
+        };
+        let refused = |app: &App| {
+            app.view().screen == "browse"
+                && app
+                    .view()
+                    .message
+                    .unwrap_or_default()
+                    .contains("1 open question")
+        };
+        // a question appears while the handoff picker is open
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "send-pick");
+        ask(&format!("{original}- And which format?\n"));
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(refused(&fx.app), "{:?}", fx.app.view().message);
+        // and while the confirm screen is showing
+        ask(&original);
+        key(&mut fx.app, KeyCode::Char('s'));
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "send-confirm");
+        ask(&format!("{original}- And which format?\n"));
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(refused(&fx.app), "{:?}", fx.app.view().message);
+        let calls = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(!calls.contains("workspace create"), "nothing sent: {calls}");
+        assert_ne!(Store::load(&path).unwrap().fm.state, State::Sent);
     }
 
     #[test]

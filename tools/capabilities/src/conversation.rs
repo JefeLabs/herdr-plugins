@@ -259,6 +259,10 @@ pub fn follow_up_prompt(
     if resumable {
         return format!("{}\n\n{FORMAT_REMINDER}\n", message.trim_end());
     }
+    // the seed ends with the reminder too; keep only the last one, after the
+    // new message
+    let seed = seed.trim_end();
+    let seed = seed.strip_suffix(FORMAT_REMINDER).unwrap_or(seed);
     let mut p = String::new();
     p.push_str(seed.trim_end());
     p.push_str("\n\nConversation so far:\n");
