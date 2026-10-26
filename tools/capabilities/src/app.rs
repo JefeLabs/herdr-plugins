@@ -702,9 +702,10 @@ impl App {
                 };
                 self.layout = Layout::List;
                 self.poll_ticks = 0;
-                if let Some(i) = target.and_then(|p| self.list.iter().position(|i| i.path == p)) {
-                    self.list_selected = i;
-                }
+                // no card for the tree's selection (an empty group): the first
+                self.list_selected = target
+                    .and_then(|p| self.list.iter().position(|i| i.path == p))
+                    .unwrap_or(0);
             }
             Layout::Tree => {
                 let target = self.list.get(self.list_selected).map(|i| i.path.clone());
@@ -5181,6 +5182,41 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_card_cuts_the_progress_label_with_an_ellipsis_and_never_the_bar() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let is_bar = |c: char| matches!(c, '█' | '▉' | '▓' | '░');
+        // the Counselors card: agent working, building 1/3
+        let fields_row = |screen: &str| -> Option<String> {
+            screen
+                .lines()
+                .find(|l| l.contains("working"))
+                .map(|l| l.trim_end().to_string())
+        };
+        let wide = fields_row(&render(&fx.app, 120, 60)).unwrap();
+        assert!(wide.contains("building 1/3"), "{wide}");
+        let bar_len = wide.chars().filter(|c| is_bar(*c)).count();
+        assert!(bar_len > 0, "{wide}");
+        for w in 52..=120u16 {
+            let Some(row) = fields_row(&render(&fx.app, w, 60)) else {
+                continue;
+            };
+            let cells = row.chars().filter(|c| is_bar(*c)).count();
+            assert!(
+                cells == 0 || cells == bar_len,
+                "at {w} columns the bar is whole or absent: {row:?}"
+            );
+            if row.contains("buil") && !row.contains("building 1/3") {
+                assert!(
+                    row.ends_with('…'),
+                    "at {w} columns a cut label ends in …: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn card_titles_are_bold_and_cards_open_with_a_rule() {
         let mut fx = list_fixture(true);
         key(&mut fx.app, KeyCode::Char('v'));
@@ -5820,6 +5856,77 @@ mod tests {
             "list",
             "back in the list after the picker"
         );
+    }
+
+    #[test]
+    fn the_list_opens_on_its_first_card_from_an_empty_group() {
+        let mut fx = list_fixture(true);
+        fs::create_dir_all(fx.app.store.root().join("zz-empty")).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('j'));
+        let moved = fx.app.view().list_selected;
+        assert!(moved > 0);
+        key(&mut fx.app, KeyCode::Char('v'));
+        select(&mut fx.app, "zz-empty");
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(
+            fx.app.view().list_selected,
+            0,
+            "no card under the group: start at the first, not where the list was"
+        );
+    }
+
+    #[test]
+    fn a_poll_that_reorders_the_progress_sort_keeps_the_selection() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        sort_by(&mut fx.app, "Progress");
+        for _ in 0..10 {
+            if list_title(&fx.app).starts_with("Counselors") {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        let before = fx.app.view().list_titles;
+        let at = fx.app.view().list_selected;
+        // the Notify card's PR closes: its progress drops below Counselors'
+        fs::write(fx.tmp.path().join("prs/42"), "CLOSED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let after = fx.app.view().list_titles;
+        assert_ne!(before, after, "the poll re-sorted the list");
+        assert_ne!(
+            after[at], before[at],
+            "another card now sits where the selection was"
+        );
+        assert!(
+            list_title(&fx.app).starts_with("Counselors"),
+            "the selection follows its card: {}",
+            list_title(&fx.app)
+        );
+    }
+
+    #[test]
+    fn a_repo_that_is_a_file_still_renders_in_the_list() {
+        let mut fx = list_fixture(true);
+        let file = fx.tmp.path().join("not-a-folder");
+        fs::write(&file, "x").unwrap();
+        let path = fx.app.store.root().join("skoolscout/org/building.md");
+        Store::update_fields(&path, |fm| fm.repo = Some(file.clone())).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 60);
+        assert!(shown.contains("Counselors can reassign"), "{shown}");
+        let row = shown
+            .lines()
+            .find(|l| l.contains("working"))
+            .unwrap_or_else(|| panic!("its fields row: {shown}"));
+        assert!(!row.contains("building 1/3"), "no plans can be read: {row}");
     }
 
     #[test]

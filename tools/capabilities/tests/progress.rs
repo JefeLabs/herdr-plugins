@@ -454,6 +454,14 @@ fn only_a_ledger_header_naming_the_plan_counts() {
 }
 
 #[test]
+fn without_a_repo_a_relative_plan_is_read_beside_the_capability() {
+    let (_t, it) = sent_with("## Artifacts\n- plan: p.md\n");
+    let plan = "### Task 1: a\n### Task 2: b\n";
+    fs::write(it.path.parent().unwrap().join("p.md"), plan).unwrap();
+    assert_eq!(plan_evidence(None, &it), vec![plan_tasks(plan, None)]);
+}
+
+#[test]
 fn plan_evidence_without_repo_marks_unreadable() {
     let (_t, it) = sent_with("## Artifacts\n- plan: docs/superpowers/plans/p.md\n");
     assert_eq!(

@@ -501,7 +501,8 @@ pub fn bar(fill: f32, cells: usize) -> String {
 // ---- gathering evidence -------------------------------------------------------
 
 /// Tasks for every `plan:` line of `it`, in order. A plan is read from the
-/// repo's main checkout or any of its worktrees; its ledger is the
+/// capability's repo, the repo's main checkout or any of its worktrees (with
+/// no repo, beside the capability); its ledger is the
 /// `.superpowers/sdd/*/progress.md` (in any worktree) whose first line names it.
 pub fn plan_evidence(repo: Option<&Path>, it: &Intent) -> Vec<PlanTasks> {
     let roots = repo.map(crate::send::worktrees).unwrap_or_default();
@@ -513,8 +514,15 @@ pub fn plan_evidence(repo: Option<&Path>, it: &Intent) -> Vec<PlanTasks> {
             let path = match repo {
                 Some(r) => crate::send::resolve_in_repo(r, &a.target),
                 None => {
+                    // as the Artifacts reader does: a relative path is read
+                    // beside the capability
                     let p = PathBuf::from(shellexpand::tilde(a.target.trim()).into_owned());
-                    (p.is_absolute() && p.exists()).then_some(p)
+                    let p = if p.is_absolute() {
+                        p
+                    } else {
+                        it.path.parent().map(|d| d.join(&p)).unwrap_or(p)
+                    };
+                    p.exists().then_some(p)
                 }
             };
             let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {

@@ -2031,13 +2031,24 @@ pub fn render_capability_list(
             None => fields.push(Span::styled(format!("{:<RUNNING_W$}", "—"), dim)),
         }
         fields.push(sep());
+        // progress gets what is left: bar and label (cut with …), else the
+        // bar alone, else the label cut to fit; never part of the bar
+        let room = w.saturating_sub(fields.iter().map(Span::width).sum());
         match &r.progress {
-            Some(p) if p.complete => fields.push(Span::raw("✓ complete")),
+            Some(p) if p.complete => fields.push(Span::raw(fit("✓ complete", room))),
             Some(p) => {
-                fields.extend(bar_spans(p));
-                fields.push(Span::raw(format!(" {}", fit(&p.label, 24))));
+                let bar_w = Span::raw(crate::progress::stage_bar(p)).width();
+                if room >= bar_w + 2 {
+                    fields.extend(bar_spans(p));
+                    let label_w = (room - bar_w - 1).min(24);
+                    fields.push(Span::raw(format!(" {}", fit(&p.label, label_w))));
+                } else if room >= bar_w {
+                    fields.extend(bar_spans(p));
+                } else {
+                    fields.push(Span::raw(fit(&p.label, room)));
+                }
             }
-            None => fields.push(Span::styled("—", dim)),
+            None => fields.push(Span::styled(fit("—", room), dim)),
         }
         put(Line::from(fields), &mut y);
 

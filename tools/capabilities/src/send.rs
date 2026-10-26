@@ -94,8 +94,10 @@ pub fn worktrees(repo: &Path) -> Vec<PathBuf> {
 }
 
 /// A linked target as a file on disk: `~` and absolute paths as written (if
-/// they exist), otherwise the first `<worktree>/<target>` that exists, main
-/// checkout first. Specs and plans usually live in a worktree until merged.
+/// they exist), otherwise `<repo>/<target>` (the capability's own repo, which
+/// may be a worktree or a subfolder), then the first `<worktree>/<target>`
+/// that exists, main checkout first. Specs and plans usually live in a
+/// worktree until merged.
 pub fn resolve_in_repo(repo: &Path, target: &str) -> Option<PathBuf> {
     let p = PathBuf::from(shellexpand::tilde(target.trim()).into_owned());
     if p.is_absolute() {
@@ -104,8 +106,8 @@ pub fn resolve_in_repo(repo: &Path, target: &str) -> Option<PathBuf> {
     if !repo.is_dir() {
         return None;
     }
-    worktrees(repo)
-        .into_iter()
+    std::iter::once(repo.to_path_buf())
+        .chain(worktrees(repo))
         .map(|root| root.join(&p))
         .find(|candidate| candidate.exists())
 }

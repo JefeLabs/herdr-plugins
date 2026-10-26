@@ -427,3 +427,37 @@ fn a_handoff_names_the_other_areas_a_capability_affects() {
         "{p}"
     );
 }
+
+#[test]
+fn the_capabilitys_own_repo_is_searched_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    fs::create_dir_all(main.join("docs")).unwrap();
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let wt = tmp.path().join("wt");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+    // the main checkout holds an older copy than the worktree the repo names
+    fs::write(main.join("docs/p.md"), "old").unwrap();
+    fs::create_dir_all(wt.join("docs")).unwrap();
+    fs::write(wt.join("docs/p.md"), "new").unwrap();
+    let found = resolve_in_repo(&wt, "docs/p.md").unwrap();
+    assert_eq!(fs::read_to_string(&found).unwrap(), "new", "{found:?}");
+    // a subfolder as the repo: a path relative to it
+    fs::create_dir_all(main.join("sub")).unwrap();
+    fs::write(main.join("sub/q.md"), "q").unwrap();
+    assert_eq!(
+        resolve_in_repo(&main.join("sub"), "q.md"),
+        Some(main.join("sub/q.md"))
+    );
+}
