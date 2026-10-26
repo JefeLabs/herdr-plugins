@@ -77,6 +77,7 @@ pub fn reconcile_prompt(it: &Intent, ctx: &Context) -> String {
     let mut p = String::new();
     p.push_str("Reconcile this capability with the work that shipped. Every pull request below is merged. Rewrite the capability so it describes what was actually built and decided:\n");
     p.push_str("- Rewrite `## Acceptance criteria` to match the shipped behaviour: keep criteria that still hold (keep `[x]` on ticked ones), correct those the work changed, add ones the spec or the pull requests settled, and drop ones that were not built, naming each dropped one under `## Open questions` so nothing disappears silently.\n");
+    p.push_str("- Copy a criterion that still holds word for word, checkbox included; put any detail the work settled about it in an indented sub-bullet under it (`  - detail`), never in its text. Do not tick or untick criteria: ticks are the owner's sign-off, and new or changed criteria start unticked.\n");
     p.push_str("- When the work spans more than one of the capability's areas, group the criteria under `### <area path>` sub-headings, one per area.\n");
     p.push_str("- Keep `## Description` (update it if the scope changed), `## Preconditions` and every line under `## Artifacts`.\n");
     p.push_str("- Do not turn follow-up issues into criteria: they are separate work.\n");

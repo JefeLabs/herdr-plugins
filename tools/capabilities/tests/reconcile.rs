@@ -93,6 +93,9 @@ fn the_prompt_carries_the_capability_the_spec_the_prs_and_the_follow_ups() {
         "### <area path>",
         "follow-up",
         "```proposal",
+        "word for word",
+        "indented sub-bullet",
+        "Do not tick or untick",
     ] {
         assert!(p.contains(needle), "missing {needle:?} in:\n{p}");
     }
