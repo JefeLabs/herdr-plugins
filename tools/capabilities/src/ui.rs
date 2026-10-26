@@ -361,6 +361,57 @@ mod tests {
         format!("{:?}", t.backend().buffer())
     }
 
+    fn checklist_text(items: &[crate::store::Criterion], selected: usize, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(40, h)).unwrap();
+        t.draw(|f| {
+            render_checklist(
+                items,
+                "Acceptance criteria",
+                "none",
+                true,
+                selected,
+                f.area(),
+                f.buffer_mut(),
+            )
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..40)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_long_checklist_scrolls_to_the_selection_and_says_what_is_hidden() {
+        let items: Vec<crate::store::Criterion> = (0..10)
+            .map(|i| crate::store::Criterion {
+                text: format!("item {i}"),
+                done: i < 2,
+            })
+            .collect();
+        // a top border and five lines inside: four items and the hint
+        let top = checklist_text(&items, 0, 6);
+        assert!(
+            top.contains("[x] item 0") && top.contains("[ ] item 3"),
+            "{top}"
+        );
+        assert!(!top.contains("item 4"), "{top}");
+        assert!(top.contains("↓ 6 more"), "{top}");
+        let low = checklist_text(&items, 8, 6);
+        assert!(low.contains("item 8"), "the selection stays in view: {low}");
+        assert!(low.contains("↑ 5") && low.contains("↓ 1 more"), "{low}");
+        // nothing hidden, no hint
+        let all = checklist_text(&items[..3], 0, 6);
+        assert!(!all.contains("more"), "{all}");
+    }
+
     #[test]
     fn titles_and_broken_rows_are_sanitised() {
         let rows = vec![
@@ -904,14 +955,37 @@ fn render_checklist(
         .render(inner, buf);
         return;
     }
+    // each item's wrapped lines; scroll so the selection is in view and say
+    // how many items are hidden above and below
+    let width = (inner.width as usize).saturating_sub(4);
+    let wrapped: Vec<Vec<String>> = items
+        .iter()
+        .map(|c| wrap_text(&sanitize(&c.text), width))
+        .collect();
+    let height = inner.height as usize;
+    let total: usize = wrapped.iter().map(Vec::len).sum();
+    let overflow = total > height;
+    let room = if overflow {
+        height.saturating_sub(1).max(1)
+    } else {
+        height
+    };
+    let sel = if focused {
+        selected.min(items.len() - 1)
+    } else {
+        0
+    };
+    let mut first = 0;
+    while first < sel && wrapped[first..=sel].iter().map(Vec::len).sum::<usize>() > room {
+        first += 1;
+    }
     let mut y = inner.y;
-    'items: for (i, c) in items.iter().enumerate() {
+    let mut used = 0usize;
+    let mut last_shown = first;
+    'items: for (i, c) in items.iter().enumerate().skip(first) {
         let box_ = if c.done { "[x] " } else { "[ ] " };
-        for (j, piece) in wrap_text(&sanitize(&c.text), (inner.width as usize).saturating_sub(4))
-            .into_iter()
-            .enumerate()
-        {
-            if y >= inner.y + inner.height {
+        for (j, piece) in wrapped[i].iter().enumerate() {
+            if used >= room {
                 break 'items;
             }
             let rect = Rect {
@@ -924,6 +998,31 @@ fn render_checklist(
             }
             Line::from(format!("{}{piece}", if j == 0 { box_ } else { "    " })).render(rect, buf);
             y += 1;
+            used += 1;
+        }
+        last_shown = i;
+    }
+    if overflow {
+        let above = first;
+        let below = items.len() - 1 - last_shown;
+        let mut parts = Vec::new();
+        if above > 0 {
+            parts.push(format!("↑ {above}"));
+        }
+        if below > 0 {
+            parts.push(format!("↓ {below}"));
+        }
+        if !parts.is_empty() {
+            let rect = Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            };
+            Line::styled(
+                format!("{} more (j/k)", parts.join(" · ")),
+                Style::default().add_modifier(Modifier::DIM),
+            )
+            .render(rect, buf);
         }
     }
 }
