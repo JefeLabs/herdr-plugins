@@ -1057,6 +1057,32 @@ pub fn criteria(body: &str) -> Vec<Criterion> {
     checklist(body, CRITERIA_HEADING)
 }
 
+/// Set each acceptance criterion's checkbox from `ticked(text)`, keeping
+/// everything else (indentation, sub-headings, sub-bullets) as it is.
+pub fn set_criteria_ticks(body: &str, ticked: impl Fn(&str) -> bool) -> String {
+    let lines: Vec<usize> = section_lines(body, CRITERIA_HEADING)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        let t = line.trim_start();
+        match checkbox_text(t) {
+            Some(rest) if lines.contains(&i) && !rest.trim().is_empty() => {
+                let indent = &line[..line.len() - t.len()];
+                let mark = if ticked(rest.trim()) { "x" } else { " " };
+                out.push(format!("{indent}- [{mark}] {rest}"));
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if body.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
 pub fn toggle_criterion(body: &str, index: usize) -> Option<String> {
     toggle_checklist(body, CRITERIA_HEADING, index)
 }

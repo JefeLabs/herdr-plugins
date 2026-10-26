@@ -928,7 +928,7 @@ impl App {
                 Ok(reply) => match reply.proposal {
                     Some(prop) => {
                         let body = merge_questions(&prop, &reply.questions);
-                        crate::reconcile::apply(&path, &body, &merged)
+                        crate::reconcile::apply(&path, &body, &merged, self.store.root())
                             .map(|it| it.fm.title)
                             .map_err(|e| format!("reconcile not saved: {e:#}"))
                     }

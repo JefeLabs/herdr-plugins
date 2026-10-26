@@ -228,14 +228,61 @@ pub fn backup_path(path: &Path) -> PathBuf {
 
 /// Replace the body with the reconciled one: keep the current file as the
 /// backup, record the merged set, and mark the capability unread.
-pub fn apply(path: &Path, body: &str, merged: &[u64]) -> anyhow::Result<Intent> {
-    std::fs::copy(path, backup_path(path))?;
+///
+/// Ticks stay the owner's: a criterion is ticked only if one with the same
+/// wording was ticked before, whatever the agent marked. The `### <area>`
+/// headings the criteria are grouped under that name an existing group under
+/// `root` (other than the capability's own) are added to `areas:`.
+pub fn apply(path: &Path, body: &str, merged: &[u64], root: &Path) -> anyhow::Result<Intent> {
     let mut it = Store::load(path)?;
-    it.body = body.to_string();
+    std::fs::copy(path, backup_path(path))?;
+    it.body = owner_ticks(&it.body, body);
+    let own = path
+        .parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    for area in heading_areas(&it.body, root) {
+        if area != own && !it.fm.areas.contains(&area) {
+            it.fm.areas.push(area);
+        }
+    }
     it.fm.reconciled_for = merged.to_vec();
     it.fm.unread = true;
     Store::save_force(&mut it)?;
     Ok(it)
+}
+
+/// `after` with each criterion ticked only if `before` had the same wording
+/// ticked.
+pub fn owner_ticks(before: &str, after: &str) -> String {
+    let ticked: Vec<String> = crate::store::criteria(before)
+        .into_iter()
+        .filter(|c| c.done)
+        .map(|c| crate::store::criterion_key(&c.text))
+        .collect();
+    crate::store::set_criteria_ticks(after, |text| {
+        ticked.contains(&crate::store::criterion_key(text))
+    })
+}
+
+/// The groups the criteria are grouped under: `### <path>` headings inside
+/// Acceptance criteria that name an existing folder under `root`. Paths that
+/// would leave `root` are ignored.
+pub fn heading_areas(body: &str, root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, name) in crate::store::criteria_groups(body) {
+        let area = name.trim().trim_matches('/').to_string();
+        let rel = Path::new(&area);
+        let plain = !area.is_empty()
+            && rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if plain && root.join(rel).is_dir() && !out.contains(&area) {
+            out.push(area);
+        }
+    }
+    out
 }
 
 /// Put the version before the last reconcile back. `false` when there is none.
