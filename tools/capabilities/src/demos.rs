@@ -226,12 +226,14 @@ pub fn discover_demos(repo: &Path, title: &str, already: &[String]) -> Vec<Artif
         .into_iter()
         .filter(|s| !linked.contains(&s.id))
         .filter(|s| {
+            let id = significant_words(&s.id.replace('-', " "));
             let words = significant_words(&format!("{} {}", s.title, s.id.replace('-', " ")));
-            wanted
+            let hits: Vec<&String> = wanted
                 .iter()
                 .filter(|w| words.iter().any(|h| word_matches(w, h)))
-                .count()
-                >= needed
+                .collect();
+            // the id must share a word too, as a file name must
+            hits.len() >= needed && hits.iter().any(|w| id.iter().any(|i| word_matches(w, i)))
         })
         .map(|s| Artifact {
             kind: "demo".into(),

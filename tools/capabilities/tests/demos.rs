@@ -183,3 +183,24 @@ fn story_ids_are_plain_names() {
         assert!(!safe_story_id(bad), "{bad:?}");
     }
 }
+
+#[test]
+fn a_story_must_share_a_word_with_its_id_not_only_its_title() {
+    let (_t, repo) = repo_with_stories();
+    fs::write(
+        repo.join("app-demos/stories/more.yaml"),
+        "stories:\n  - id: walkthrough-one\n    title: \"Advisors request a meeting from Candidates\"\n    actor: alex\n    steps:\n      - signIn: alex\n",
+    )
+    .unwrap();
+    let found = discover_demos(&repo, "Advisors request a meeting from Candidates", &[]);
+    assert!(
+        !found.iter().any(|a| a.target == "walkthrough-one"),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|a| a.target == "alex-requests-a-meeting-from-candidates"),
+        "{found:?}"
+    );
+}

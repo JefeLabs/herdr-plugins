@@ -902,17 +902,58 @@ pub(crate) fn significant_words(text: &str) -> Vec<String> {
                         | "implementation"
                 )
         })
-        .map(str::to_string)
-        .collect()
+        .fold(Vec::new(), |mut out: Vec<String>, w| {
+            // a word the text repeats counts once
+            if !out.iter().any(|o| o == w) {
+                out.push(w.to_string());
+            }
+            out
+        })
 }
 
+/// Two words match when they share a stem: plurals (contacts, families,
+/// boxes), -ing and -ed (meeting, skipped) and a final e (schedule,
+/// scheduling) fold away. A word is not matched by every word that merely
+/// starts with it ("specific" is not "specification").
 pub(crate) fn word_matches(a: &str, b: &str) -> bool {
-    a == b || (a.len() >= 4 && b.starts_with(a)) || (b.len() >= 4 && a.starts_with(b))
+    stem(a) == stem(b)
 }
 
-/// Files under the known artifact folders of `repo` whose name or first
-/// heading shares at least two significant words with `title`, minus the
-/// targets already linked. Paths are relative to the repo.
+fn stem(word: &str) -> String {
+    let mut w = word.to_string();
+    if w.len() > 4 && w.ends_with("ies") {
+        w.truncate(w.len() - 3);
+        w.push('y');
+    } else if ["sses", "xes", "zes", "ches", "shes"]
+        .iter()
+        .any(|s| w.ends_with(s))
+    {
+        w.truncate(w.len() - 2);
+    } else if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+        w.pop();
+    }
+    for suffix in ["ing", "ed"] {
+        if w.ends_with(suffix) && w.len() - suffix.len() >= 3 {
+            w.truncate(w.len() - suffix.len());
+            // skipped -> skip, but install, pass, buzz keep their double
+            let b = w.as_bytes();
+            if b.len() >= 2 && b[b.len() - 1] == b[b.len() - 2] && !b"lsz".contains(&b[b.len() - 1])
+            {
+                w.pop();
+            }
+            break;
+        }
+    }
+    if w.len() > 3 && w.ends_with('e') {
+        w.pop();
+    }
+    w
+}
+
+/// Files under the known artifact folders of `repo` whose name and first
+/// heading share at least two significant words with `title`, one of them in
+/// the file name, minus the targets already linked. Paths are relative to
+/// the repo.
 pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<Artifact> {
     let wanted = significant_words(title);
     if wanted.is_empty() {
@@ -942,13 +983,16 @@ pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<A
                         .map(|l| l.trim_start_matches('#').trim().to_string())
                 })
                 .unwrap_or_default();
+            let name = significant_words(&e.file_name().to_string_lossy());
             let haystack: Vec<String> =
                 significant_words(&format!("{} {heading}", e.file_name().to_string_lossy()));
-            let hits = wanted
+            let hits: Vec<&String> = wanted
                 .iter()
                 .filter(|w| haystack.iter().any(|h| word_matches(w, h)))
-                .count();
-            if hits >= needed {
+                .collect();
+            // the name must share a word too: a heading alone matches too much
+            let in_name = hits.iter().any(|w| name.iter().any(|n| word_matches(w, n)));
+            if hits.len() >= needed && in_name {
                 out.push(Artifact {
                     kind: kind.to_string(),
                     target: rel,

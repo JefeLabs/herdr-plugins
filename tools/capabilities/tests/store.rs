@@ -665,3 +665,55 @@ fn criteria_groups_are_the_sub_headings_and_where_they_start() {
     );
     assert!(criteria_groups("## Acceptance criteria\n- [ ] a\n").is_empty());
 }
+
+#[test]
+fn found_artifacts_need_whole_words_a_name_match_and_each_word_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    let specs = repo.join("docs/superpowers/specs");
+    fs::create_dir_all(&specs).unwrap();
+    let doc = |name: &str, heading: &str| {
+        fs::write(specs.join(name), format!("# {heading}\n")).unwrap();
+    };
+    doc(
+        "2026-10-26-reminders-2-meeting-request-chases.md",
+        "Meeting request reminders",
+    );
+    // "specific" is not the start of "specification": one shared word, not two
+    doc(
+        "2026-09-20-contacts-import-wizard-design.md",
+        "Contacts import wizard: specification",
+    );
+    // two shared words, but only in the heading: the name shares none
+    doc(
+        "2026-08-07-wizard-topic-badge-design.md",
+        "Schedule a Meeting: topic badge",
+    );
+    let found: Vec<String> = discover_artifacts(
+        repo,
+        "Advisor can request a primary contact to schedule a specific type of meeting",
+        &[],
+    )
+    .into_iter()
+    .map(|a| a.target)
+    .collect();
+    assert_eq!(
+        found,
+        vec!["docs/superpowers/specs/2026-10-26-reminders-2-meeting-request-chases.md"]
+    );
+
+    // a word the title repeats counts once
+    doc(
+        "2026-09-17-school-recruitment-profile-design.md",
+        "School recruitment profile",
+    );
+    doc("2026-10-01-school-search-design.md", "School search");
+    let found: Vec<String> = discover_artifacts(repo, "School search for every school", &[])
+        .into_iter()
+        .map(|a| a.target)
+        .collect();
+    assert_eq!(
+        found,
+        vec!["docs/superpowers/specs/2026-10-01-school-search-design.md"]
+    );
+}
