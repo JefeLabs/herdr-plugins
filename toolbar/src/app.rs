@@ -719,7 +719,12 @@ mod tests {
     }
 
     fn pid(app: &App, i: usize) -> u32 {
-        app.slots[i].proc.as_ref().unwrap().pid().unwrap()
+        app.slots[i]
+            .proc
+            .as_ref()
+            .unwrap_or_else(|| panic!("slot {i} did not start: {:?}", app.slots[i].last_error))
+            .pid()
+            .unwrap()
     }
 
     fn alive(pid: u32) -> bool {
