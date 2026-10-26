@@ -25,6 +25,8 @@ pub struct TreeRow<'a> {
     pub refs: usize,
     /// Updated by a reconcile and not yet read: drawn with a leading `*`.
     pub unread: bool,
+    /// Every acceptance criterion ticked: the only case drawn with `✓`.
+    pub complete: bool,
 }
 
 /// Control characters other than tab/newline become a visible placeholder so
@@ -104,9 +106,11 @@ pub fn render_tree(rows: &[TreeRow], selected: usize, scroll: usize, area: Rect,
                 Style::default().add_modifier(Modifier::DIM),
             ));
         } else {
+            // ✓ is kept for complete; a sent capability reads as an arrow
             let mark = match row.state {
+                _ if row.complete => "✓ ",
+                Some(State::Sent) => "→ ",
                 Some(State::Ready) => "● ",
-                Some(State::Sent) => "✓ ",
                 Some(State::Refining) => "◐ ",
                 _ => "○ ",
             };
@@ -372,6 +376,7 @@ mod tests {
                 reference: false,
                 refs: 0,
                 unread: false,
+                complete: false,
             },
             TreeRow {
                 depth: 0,
@@ -385,6 +390,7 @@ mod tests {
                 reference: false,
                 refs: 0,
                 unread: false,
+                complete: false,
             },
             TreeRow {
                 depth: 0,
@@ -398,6 +404,7 @@ mod tests {
                 reference: false,
                 refs: 0,
                 unread: false,
+                complete: false,
             },
         ];
         let mut t = Terminal::new(TestBackend::new(40, 5)).unwrap();

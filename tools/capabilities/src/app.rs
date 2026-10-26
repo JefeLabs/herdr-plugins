@@ -3194,7 +3194,10 @@ impl App {
                     _ => crate::store::stamp(i),
                 };
                 ui::ListRow {
-                    status: crate::store::readiness(i).label(),
+                    status: match crate::store::readiness(i) {
+                        crate::store::Readiness::Sent => "→ sent".to_string(),
+                        r => r.label(),
+                    },
                     progress: crate::progress::progress(i, &self.evidence_for(i)),
                     agent: o.agent.clone(),
                     running: o.running.clone(),
@@ -3276,6 +3279,7 @@ impl App {
                     reference: false,
                     refs: *refs,
                     unread: false,
+                    complete: false,
                 },
                 Row::Intent {
                     intent,
@@ -3293,6 +3297,8 @@ impl App {
                     reference: reference.is_some(),
                     refs: 0,
                     unread: intent.fm.unread,
+                    complete: crate::progress::progress(intent, &self.evidence_for(intent))
+                        .is_some_and(|p| p.complete),
                 },
                 Row::Broken { path, depth, .. } => ui::TreeRow {
                     depth: *depth,
@@ -3306,6 +3312,7 @@ impl App {
                     reference: false,
                     refs: 0,
                     unread: false,
+                    complete: false,
                 },
             })
             .collect();
@@ -4727,7 +4734,7 @@ mod tests {
         settle(&mut fx.app);
         let shown = render(&fx.app, 120, 60);
         assert!(
-            shown.contains("Oct 25 08:10 │ sent   │ —"),
+            shown.contains("Oct 25 08:10 │ → sent │ —"),
             "no endless loading mark: {shown}"
         );
     }
@@ -4753,7 +4760,7 @@ mod tests {
             "its home, then the other areas it affects"
         );
         assert!(
-            lines[t + 2].starts_with(" Oct 25 08:10 │ sent"),
+            lines[t + 2].starts_with(" Oct 25 08:10 │ → sent"),
             "{}",
             lines[t + 2]
         );
@@ -5048,6 +5055,42 @@ mod tests {
             back.body
         );
         assert!(!crate::reconcile::backup_path(&path).exists());
+    }
+
+    #[test]
+    fn sent_reads_as_an_arrow_and_only_complete_gets_a_check() {
+        let mut fx = list_fixture(true);
+        settle(&mut fx.app);
+        // open every group so all capabilities show in the tree
+        let groups: Vec<PathBuf> = fx.app.collapsed.iter().cloned().collect();
+        for g in groups {
+            fx.app.collapsed.remove(&g);
+        }
+        fx.app.rebuild_rows();
+        let tree = render(&fx.app, 120, 30);
+        let line = |title: &str| {
+            tree.lines()
+                .find(|l| l.contains(title) && !l.contains('↳'))
+                .unwrap_or_else(|| panic!("no {title} in {tree}"))
+                .to_string()
+        };
+        assert!(
+            line("Notify primary contact").contains("→ Notify"),
+            "sent: {tree}"
+        );
+        assert!(
+            line("Invitees skip").contains("✓ Invitees"),
+            "complete: {tree}"
+        );
+        assert!(
+            !line("Counselors").contains('✓'),
+            "sent, not complete: {tree}"
+        );
+        // the card's status field
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let cards = render(&fx.app, 120, 70);
+        assert!(cards.contains("│ → sent │"), "{cards}");
     }
 
     #[test]

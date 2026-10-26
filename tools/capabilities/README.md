@@ -158,7 +158,7 @@ Capabilities · 7 · sorted by Updated
 ────────────────────────────────────────────────────────────────────────────────
  Notify primary contact to schedule a meeting
  skoolscout/org
- Oct 25 08:10 │ sent   │ ! needs you │ 2h ago  │ ▉▉▉██▉▉░░░ PR #42 open
+ Oct 25 08:10 │ → sent │ ! needs you │ 2h ago  │ ▉▉▉██▉▉░░░ PR #42 open
  .claude/worktrees/org/notify │ slot 3
 
  The primary contact gets no prompt to book the intro meeting.
@@ -173,7 +173,7 @@ Capabilities · 7 · sorted by Updated
 
 Each capability is a card that opens with a horizontal rule: the title in bold, with its path in the tree under it; then the timestamp, the capability's status, the agent's status, how long ago it was sent and the implementation progress; then, once the agent is working in a worktree, that worktree's path (relative to the repo) and its workbrokr slot, read from the nearest `.slot` file above the agent's working directory; then, after a blank line, up to two wrapped lines of the description.
 
-Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`. Once sent, a bar with one block per stage (sent, specced, planned, building, PR open, merged, verified) shows how far the feature has got, from evidence that already exists. A filled block means that stage is done; the verified block fills by its share of ticked criteria. Done cells are solid (`█`), cells in review dark shade (`▓`), cells still to do light shade (`░`); the kinds are carried by the glyphs because Herdr draws block characters in the default colour. Blocks touch with no gap cells: a done block ends in a slightly narrower cell (`▉`) whose thin sliver marks where it meets the next, and elsewhere the change of shade divides blocks (two to-do blocks side by side read as one light run). The label names the stage you are in.
+Before sending, the status reads `raw`, `?N` (N questions unanswered) or `ready`; once sent it reads `→ sent`. The same marks run through the tree: `○` raw, `◐` refining, `●` ready, `→` sent, `✓` only when every acceptance criterion is ticked (complete), and `*` before the title when a reconcile updated the capability and you have not read it yet. Once sent, a bar with one block per stage (sent, specced, planned, building, PR open, merged, verified) shows how far the feature has got, from evidence that already exists. A filled block means that stage is done; the verified block fills by its share of ticked criteria. Done cells are solid (`█`), cells in review dark shade (`▓`), cells still to do light shade (`░`); the kinds are carried by the glyphs because Herdr draws block characters in the default colour. Blocks touch with no gap cells: a done block ends in a slightly narrower cell (`▉`) whose thin sliver marks where it meets the next, and elsewhere the change of shade divides blocks (two to-do blocks side by side read as one light run). The label names the stage you are in.
 
 The building stage holds one block per linked plan, sized from the plan itself: S (up to 3 tasks or 8 files named), M (up to 6 or 20), L (up to 10 or 40), XL beyond, taking the larger of the two; S is one cell wide, M two, L three, XL four, so the bar's length shows how big the effort is. A plan naming no tasks and no files gets no block. Each plan block fills from its own ledger while one exists, is full once a pull request mentioning the plan's file name is merged, and shows `▓` while that pull request is open. For example, two L plans merged and an M plan in review:
 
