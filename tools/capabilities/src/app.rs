@@ -6066,7 +6066,7 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         fx.app
             .provider_env
-            .push(("FAKE_MODE".into(), "hang".into()));
+            .push(("FAKE_MODE".into(), "midturn".into()));
         select(&mut fx.app, "Alpha");
         polish(&mut fx.app);
         wait_until(&mut fx.app, "deltas", |a| {

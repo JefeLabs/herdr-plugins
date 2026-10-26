@@ -150,9 +150,10 @@ fn resume_uses_the_resume_argv() {
 }
 
 #[test]
-fn cancel_kills_a_hanging_provider_within_a_second() {
+fn a_provider_that_lingers_after_its_result_still_finishes_the_turn() {
+    // agy can print its result and then never exit; the result ends the turn
     let tmp = tempfile::tempdir().unwrap();
-    let mut turn = Turn::start(
+    let turn = Turn::start(
         &spec(),
         "x",
         None,
@@ -160,7 +161,36 @@ fn cancel_kills_a_hanging_provider_within_a_second() {
         &env(Some("agy.jsonl"), Some("hang")),
     )
     .unwrap();
-    let _ = collect(&turn, Duration::from_millis(400)); // deltas arrive, no Finished (process hangs)
+    let pid = turn.pid().unwrap();
+    let msgs = collect(&turn, Duration::from_secs(3));
+    assert!(
+        matches!(msgs.last(), Some(TurnMsg::Finished(r)) if r.proposal.is_some()),
+        "{:?}",
+        msgs.last()
+    );
+    // and the lingering process is ended
+    let start = Instant::now();
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "provider still alive"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn cancel_kills_a_hanging_provider_within_a_second() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut turn = Turn::start(
+        &spec(),
+        "x",
+        None,
+        tmp.path(),
+        &env(Some("agy.jsonl"), Some("midturn")),
+    )
+    .unwrap();
+    let _ = collect(&turn, Duration::from_millis(400)); // deltas arrive, no Finished (mid-turn)
     let pid = turn.pid().unwrap();
     let t0 = Instant::now();
     turn.cancel();

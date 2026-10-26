@@ -33,6 +33,28 @@ pub struct Turn {
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// End a provider that is done but still running: SIGTERM to its process
+/// group, SIGKILL after half a second (agy ignores SIGTERM), then reap it.
+fn end_group(child: &Arc<Mutex<Child>>) {
+    let Ok(mut c) = child.lock() else {
+        return;
+    };
+    let pgid = nix::unistd::Pid::from_raw(c.id() as i32);
+    if let Ok(Some(_)) = c.try_wait() {
+        return;
+    }
+    let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = c.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+    let _ = c.wait();
+}
+
 impl Turn {
     /// Start one turn. `extra_env` is added to the provider's environment
     /// (tests use it for the fake provider). Output is read on threads.
@@ -87,6 +109,7 @@ impl Turn {
                 let mut text = String::new();
                 let mut sent_id: Option<String> = None;
                 let mut error: Option<String> = None;
+                let mut result_seen = false;
                 for line in lossy_lines(stdout) {
                     match parse_line(&spec, &line) {
                         Event::Text(t) => {
@@ -102,8 +125,21 @@ impl Turn {
                             }
                         }
                         Event::Error(e) => error = Some(e),
-                        Event::Done | Event::Other => {}
+                        Event::Done => {
+                            // the provider says the turn is over: its reply is
+                            // complete, so stop reading. agy can stay running
+                            // after its result (and keep stdout open), which
+                            // would otherwise hold the turn forever.
+                            result_seen = true;
+                            break;
+                        }
+                        Event::Other => {}
                     }
+                }
+                if result_seen {
+                    end_group(&child);
+                    let _ = tx.send(TurnMsg::Finished(parse_reply(&text)));
+                    return;
                 }
                 // stdout closed: the process is finishing. Reap it.
                 let status = child.lock().ok().and_then(|mut c| c.wait().ok());
