@@ -1081,6 +1081,18 @@ impl App {
             KeyCode::Char('s') => self.start_send(),
             KeyCode::Char('g') => self.go_to_agent(),
             KeyCode::Char('+') => self.open_areas_input(),
+            KeyCode::Char('a') => {
+                let group = self.selected_group_dir();
+                let place = match group.strip_prefix(self.store.root()) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+                    _ => "the top level".to_string(),
+                };
+                self.screen = Screen::Input {
+                    label: format!("new capability in {place}: title"),
+                    text: String::new(),
+                    action: InputAction::AddIntent { group },
+                };
+            }
             _ => {}
         }
         Flow::Continue
@@ -1132,6 +1144,14 @@ impl App {
 
     /// Group directory the selection belongs to (the group itself, or the intent's parent).
     fn selected_group_dir(&self) -> PathBuf {
+        if self.layout == Layout::List {
+            // the card view adds next to the selected card, else at the top
+            return self
+                .selected_intent()
+                .and_then(|it| it.path.parent())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.store.root().to_path_buf());
+        }
         match self.rows.get(self.selected) {
             Some(Row::Group { path, .. }) => path.clone(),
             Some(Row::Intent { intent, .. }) => intent
@@ -2540,6 +2560,17 @@ impl App {
                         self.collapsed.remove(&group);
                         self.rescan();
                         self.select_path(&it.path);
+                        match self.list.iter().position(|i| i.path == it.path) {
+                            Some(i) => self.list_selected = i,
+                            None if self.layout == Layout::List => {
+                                self.message = Some(format!(
+                                    "added `{}`; the {} filter hides it (f changes it)",
+                                    it.fm.title,
+                                    self.filter.label()
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                     Err(e) => self.message = Some(format!("create failed: {e:#}")),
                 }
@@ -3055,7 +3086,7 @@ impl App {
             ui::render_capability_list(&rows, self.list_selected, &header, empty, list_area, buf);
         *self.card_hits.borrow_mut() = hits;
         let text = self.message.clone().unwrap_or_else(|| {
-            "j/k move  Enter open in tree  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
+            "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
                 .to_string()
         });
         ui::render_status(&text, status, buf);
@@ -4075,6 +4106,48 @@ mod tests {
                 .any(|r| r.label == "Quick one" && r.depth == 0),
             "{:?}",
             app.view().rows
+        );
+    }
+
+    #[test]
+    fn a_in_the_card_view_adds_to_the_selected_cards_group() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('a'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "input");
+        type_text(&mut fx.app, "Gamma");
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.layout, "list", "stays in the card view");
+        assert_eq!(list_title(&fx.app), "Gamma", "the new card is selected");
+        let it = fx.app.selected_intent().unwrap();
+        assert_eq!(
+            it.path.parent().unwrap(),
+            fx.app.store.root().join("skoolscout"),
+            "added to the selected card's group"
+        );
+    }
+
+    #[test]
+    fn a_in_an_empty_card_view_adds_at_the_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        let mut app = App::new(cfg, dirs.clone()).unwrap();
+        key(&mut app, KeyCode::Char('v'));
+        key(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "First one");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(list_title(&app), "First one");
+        assert_eq!(
+            app.selected_intent().unwrap().path.parent().unwrap(),
+            dirs.root.as_path()
         );
     }
 

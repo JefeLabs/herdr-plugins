@@ -1,6 +1,6 @@
 ---
 source: tools/capabilities/src/app.rs
-assertion_line: 4343
+assertion_line: 4443
 expression: narrow
 ---
 Capabilities · 7 · sorted by Updated
@@ -62,4 +62,4 @@ Capabilities · 7 · sorted by Updated
 
 
 
-j/k move  Enter open in tree  v tree  S sort  f filter  s send  g agent  r resca
+j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent
