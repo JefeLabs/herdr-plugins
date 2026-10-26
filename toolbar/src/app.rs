@@ -639,8 +639,9 @@ mod tests {
     fn wait_until(what: &str, f: impl Fn() -> bool) {
         let start = Instant::now();
         while !f() {
+            // generous: under a full parallel test run a shell can take seconds to start
             assert!(
-                start.elapsed() < Duration::from_secs(3),
+                start.elapsed() < Duration::from_secs(10),
                 "timed out: {what}"
             );
             std::thread::sleep(Duration::from_millis(10));
