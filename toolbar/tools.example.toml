@@ -37,8 +37,8 @@ icon    = "◆"
 command = ["jira", "issue", "list"]
 env     = { JIRA_PROJECT = "SKOOL" }
 
-# Opens in a Herdr pane beside the work pane (pages are images, which the
-# slot cannot show yet); selecting it again focuses that pane.
+# Opens in a Herdr pane beside the work pane, at full size and speed;
+# selecting it again focuses that pane.
 [[tool]]
 id      = "browser"
 name    = "Browser"
