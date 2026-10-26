@@ -101,9 +101,15 @@ impl ToolProcess {
             )
         };
 
-        let pair = native_pty_system()
-            .openpty(size.pty())
-            .map_err(|e| fail(&e))?;
+        // openpty is not safe to call from several threads at once on macOS
+        // (it fails with "Unknown error: -6"); serialise pty creation
+        static OPENPTY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let pair = {
+            let _guard = OPENPTY.lock().unwrap_or_else(|e| e.into_inner());
+            native_pty_system()
+                .openpty(size.pty())
+                .map_err(|e| fail(&e))?
+        };
 
         let mut cmd = CommandBuilder::new(&cfg.command[0]);
         cmd.args(&cfg.command[1..]);
