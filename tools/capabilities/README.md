@@ -143,6 +143,12 @@ The tree then shows the capability as a dim `↳` row under each affected group;
 
 Areas are also suggested from the work itself: a pull request found for the capability whose branch follows workbrokr's `<type>/<area>--<task>` shape names an area (`feature/org/candidates--…` gives `org/candidates`), and when exactly one group's path ends with it, the card shows `suggested: …`. `+` opens with suggestions already added, so Enter confirms them; nothing is added without that.
 
+## Reconcile after merge
+
+When every pull request of a sent capability has merged (one closed without merging is ignored), the tool reconciles it with what shipped: in the background it reads the spec, the plan names, the merged pull requests' titles and descriptions and the `issue:` follow-ups, and asks your refinement agent (the last one used) for a rewrite. The rewrite corrects the acceptance criteria to match the shipped behaviour (grouped under `### <area path>` when the work spans areas), names any dropped criterion under Open questions, keeps Description, Preconditions and Artifacts, and leaves follow-ups out of the criteria.
+
+The rewrite is applied straight away; the previous version is kept beside the file as `<name>.before-reconcile.bak`, and `u` puts it back. The capability is marked unread: its card and tree row show `*` before the title until you open it (select it in the tree, or `Enter` on its card). Each merged set is reconciled once (`reconciled_for` in the front matter), so a later merge reconciles again but a restart does not. It runs while the list is open, since that is when pull request states are checked; a capability whose merge happened while the tool was closed is reconciled the next time the list checks.
+
 ## List view
 
 `v` flips the browser between the group tree and one full-screen list of every capability, across all groups (collapsed or not). The selection carries across both ways, and the layout, sort order and filter are remembered.

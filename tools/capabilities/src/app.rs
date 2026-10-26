@@ -401,6 +401,10 @@ pub struct App {
     poll_ticks: u32,
     /// Tests pin the clock here; `None` means the real time.
     fixed_now: Option<chrono::DateTime<chrono::Local>>,
+    /// Reconciles running: the agent turn per capability and the merged set it covers.
+    reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn)>,
+    /// Merged sets already started this session, so a failure is not retried in a loop.
+    reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
     /// The area last drawn, so mouse clicks can be mapped to what is there.
     last_area: std::cell::Cell<Rect>,
     /// Where each list card was last drawn: `(list index, first line, end line)`.
@@ -451,6 +455,8 @@ impl App {
             poller: None,
             poll_ticks: 0,
             fixed_now: None,
+            reconcile_jobs: HashMap::new(),
+            reconcile_tried: HashSet::new(),
             last_area: std::cell::Cell::new(Rect::default()),
             card_hits: std::cell::RefCell::new(Vec::new()),
         };
@@ -764,9 +770,135 @@ impl App {
             .get_or_insert_with(|| crate::progress::Poller::new(env))
     }
 
-    /// Background requests started and not yet reported.
+    /// Background requests started and not yet reported, reconciles included.
     pub fn polls_in_flight(&self) -> usize {
-        self.poller.as_ref().map_or(0, |p| p.in_flight())
+        self.poller.as_ref().map_or(0, |p| p.in_flight()) + self.reconcile_jobs.len()
+    }
+
+    /// Start a reconcile for every sent capability whose pull requests have all
+    /// merged since its last reconcile.
+    fn check_reconciles(&mut self) {
+        fn all(g: &Group, out: &mut Vec<Intent>) {
+            out.extend(g.intents.iter().cloned());
+            for sub in &g.groups {
+                all(sub, out);
+            }
+        }
+        let mut intents = Vec::new();
+        all(&self.tree, &mut intents);
+        for it in intents {
+            if it.fm.repo.is_none() || self.reconcile_jobs.contains_key(&it.path) {
+                continue;
+            }
+            let Some(merged) = crate::reconcile::needs_reconcile(&it, &self.evidence_for(&it))
+            else {
+                continue;
+            };
+            if self
+                .reconcile_tried
+                .insert((it.path.clone(), merged.clone()))
+            {
+                self.poller().request_reconcile(it, merged);
+            }
+        }
+    }
+
+    /// Ask the refinement agent (the last one used, else the configured one)
+    /// for the reconciled text.
+    fn start_reconcile(&mut self, path: PathBuf, merged: Vec<u64>, prompt: String) {
+        let last = crate::config::last_used(&self.dirs, &self.cfg);
+        let Some(mut spec) = self.cfg.providers.get(&last.provider).cloned() else {
+            self.message = Some(format!("reconcile: unknown provider `{}`", last.provider));
+            return;
+        };
+        if let Some(m) = &last.model {
+            spec.extra.extend([spec.model_flag.clone(), m.clone()]);
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let cwd = polish_cwd(self.store.root(), &stem);
+        if std::fs::create_dir_all(&cwd).is_err() {
+            return;
+        }
+        match Turn::start(&spec, &prompt, None, &cwd, &self.provider_env) {
+            Ok(turn) => {
+                self.reconcile_jobs.insert(path, (merged, turn));
+            }
+            Err(e) => self.message = Some(format!("reconcile could not start: {e:#}")),
+        }
+    }
+
+    /// Apply finished reconciles: the capability gets the agent's rewrite, the
+    /// old version is kept for undo, and it is marked unread.
+    fn poll_reconciles(&mut self) {
+        let mut done: Vec<(PathBuf, Vec<u64>, Result<Reply, String>)> = Vec::new();
+        for (path, (merged, turn)) in &self.reconcile_jobs {
+            while let Some(msg) = turn.try_recv() {
+                match msg {
+                    TurnMsg::Finished(reply) => {
+                        done.push((path.clone(), merged.clone(), Ok(reply)))
+                    }
+                    TurnMsg::Failed(e) => done.push((path.clone(), merged.clone(), Err(e))),
+                    _ => {}
+                }
+            }
+        }
+        for (path, merged, result) in done {
+            self.reconcile_jobs.remove(&path);
+            match result {
+                Ok(reply) => match reply.proposal {
+                    Some(prop) => {
+                        let body = merge_questions(&prop, &reply.questions);
+                        match crate::reconcile::apply(&path, &body, &merged) {
+                            Ok(it) => {
+                                self.message = Some(format!(
+                                    "reconciled `{}` with what shipped (* until you read it, u undoes)",
+                                    it.fm.title
+                                ));
+                                self.reload_tree();
+                            }
+                            Err(e) => self.message = Some(format!("reconcile not saved: {e:#}")),
+                        }
+                    }
+                    None => self.message = Some("reconcile: the agent returned no proposal".into()),
+                },
+                Err(e) => self.message = Some(format!("reconcile failed: {e}")),
+            }
+        }
+    }
+
+    /// Opening a capability (it shows in the detail panes) reads it.
+    fn mark_read(&mut self) {
+        if self.layout != Layout::Tree || !matches!(self.screen, Screen::Browse) {
+            return;
+        }
+        let Some(path) = self
+            .selected_intent()
+            .filter(|it| it.fm.unread)
+            .map(|it| it.path.clone())
+        else {
+            return;
+        };
+        if Store::update_meta(&path, |fm| fm.unread = false).is_ok() {
+            self.reload_tree();
+        }
+    }
+
+    /// `u`: put back the version before the last reconcile.
+    fn undo_reconcile(&mut self) {
+        let Some(path) = self.selected_intent().map(|it| it.path.clone()) else {
+            return;
+        };
+        self.message = Some(match crate::reconcile::undo(&path) {
+            Ok(true) => {
+                self.reload_tree();
+                "restored the version before the reconcile".into()
+            }
+            Ok(false) => "nothing to undo: no reconcile backup".into(),
+            Err(e) => format!("undo failed: {e:#}"),
+        });
     }
 
     /// Ask for agent states and, when `all`, every sent capability's plans and
@@ -855,11 +987,17 @@ impl App {
                 crate::progress::Update::FoundPrs { path, by_name } => {
                     self.found_prs.insert(path, by_name);
                 }
+                crate::progress::Update::Reconcile {
+                    path,
+                    merged,
+                    prompt,
+                } => self.start_reconcile(path, merged, prompt),
             }
         }
         if matches!(self.sort, SortOrder::Progress | SortOrder::LongestRunning) {
             self.rebuild_list();
         }
+        self.check_reconciles();
     }
 
     /// `s`: refuse with the reason, or open the hand-off picker.
@@ -978,6 +1116,7 @@ impl App {
             _ => {}
         }
         self.refresh_found();
+        self.mark_read();
     }
 
     /// Every group's path under the root, e.g. `skoolscout/org/candidates`.
@@ -1081,6 +1220,7 @@ impl App {
             KeyCode::Char('s') => self.start_send(),
             KeyCode::Char('g') => self.go_to_agent(),
             KeyCode::Char('+') => self.open_areas_input(),
+            KeyCode::Char('u') => self.undo_reconcile(),
             KeyCode::Char('a') => {
                 let group = self.selected_group_dir();
                 let place = match group.strip_prefix(self.store.root()) {
@@ -1236,6 +1376,7 @@ impl App {
     pub fn key(&mut self, k: KeyEvent) -> Flow {
         let flow = self.key_inner(k);
         self.refresh_found();
+        self.mark_read();
         flow
     }
 
@@ -1489,6 +1630,7 @@ impl App {
             }
             KeyCode::Char('s') => self.start_send(),
             KeyCode::Char('+') => self.open_areas_input(),
+            KeyCode::Char('u') => self.undo_reconcile(),
             KeyCode::Char('t') => {
                 if let Some(it) = self.selected_intent() {
                     self.screen = Screen::Input {
@@ -2724,6 +2866,7 @@ impl App {
         // list evidence: agents every ~3 s, plans and PRs on entry, on r and
         // every ~60 s; all on background threads
         self.drain_polls();
+        self.poll_reconciles();
         if self.layout == Layout::List {
             if self.poll_ticks.is_multiple_of(18000) {
                 self.request_found_prs();
@@ -3056,6 +3199,7 @@ impl App {
                     agent: o.agent.clone(),
                     running: o.running.clone(),
                     title: &i.fm.title,
+                    unread: i.fm.unread,
                     group: o.group.clone(),
                     worktree: o.worktree.clone(),
                     when: when.format("%b %d %H:%M").to_string(),
@@ -3131,6 +3275,7 @@ impl App {
                     broken: false,
                     reference: false,
                     refs: *refs,
+                    unread: false,
                 },
                 Row::Intent {
                     intent,
@@ -3147,6 +3292,7 @@ impl App {
                     broken: false,
                     reference: reference.is_some(),
                     refs: 0,
+                    unread: intent.fm.unread,
                 },
                 Row::Broken { path, depth, .. } => ui::TreeRow {
                     depth: *depth,
@@ -3159,6 +3305,7 @@ impl App {
                     broken: true,
                     reference: false,
                     refs: 0,
+                    unread: false,
                 },
             })
             .collect();
@@ -4304,7 +4451,9 @@ mod tests {
             config: tmp.path().join("cfg"),
             root: tmp.path().join("root"),
         };
-        let cfg = load_or_init(&dirs).unwrap();
+        let mut cfg = load_or_init(&dirs).unwrap();
+        cfg.providers.insert("fake".into(), fake_spec());
+        cfg.polish_provider = "fake".into();
         let repo = tmp.path().join("repo");
         fs::create_dir_all(repo.join("docs/superpowers/plans")).unwrap();
         fs::write(
@@ -4425,6 +4574,20 @@ mod tests {
                 fixtures().join("fake-gh.sh").display().to_string(),
             ),
             ("FAKE_GH_DIR".into(), prs.display().to_string()),
+        ];
+        app.provider_env = vec![
+            (
+                "FAKE_EVENTS".into(),
+                fixtures()
+                    .join("events")
+                    .join("agy.jsonl")
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "FAKE_PROVIDER_LOG".into(),
+                tmp.path().join("provider.log").display().to_string(),
+            ),
         ];
         ListFx { tmp, app }
     }
@@ -4830,6 +4993,61 @@ mod tests {
             Store::load(&it.path).unwrap().fm.areas,
             vec!["skoolscout/family"]
         );
+    }
+
+    #[test]
+    fn a_merged_capability_is_reconciled_marked_unread_and_read_on_open() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap(); // Notify's only PR
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        let it = Store::load(&path).unwrap();
+        assert!(
+            it.body
+                .contains("Parents who skip the report card folder see Pending."),
+            "the agent's rewrite was applied: {}",
+            it.body
+        );
+        assert!(it.body.contains("- Which org?"), "its questions merged in");
+        assert!(it.fm.unread, "marked unread");
+        assert_eq!(it.fm.reconciled_for, vec![42]);
+        assert!(
+            crate::reconcile::backup_path(&path).exists(),
+            "previous version kept"
+        );
+        let shown = render(&fx.app, 120, 70);
+        assert!(
+            shown
+                .lines()
+                .any(|l| l.starts_with(" * Notify primary contact")),
+            "the card shows * until it is read: {shown}"
+        );
+        // the same merged set is not reconciled twice
+        for _ in 0..5 {
+            settle(&mut fx.app);
+        }
+        let runs = fs::read_to_string(fx.tmp.path().join("provider.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("--prompt="))
+            .count();
+        assert_eq!(runs, 1, "one agent run per merged set");
+        // opening it reads it
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Notify");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().layout, "tree");
+        assert!(!Store::load(&path).unwrap().fm.unread, "read once opened");
+        // u puts the previous version back
+        key(&mut fx.app, KeyCode::Char('u'));
+        let back = Store::load(&path).unwrap();
+        assert!(
+            back.body.contains("The primary contact gets no prompt"),
+            "{}",
+            back.body
+        );
+        assert!(!crate::reconcile::backup_path(&path).exists());
     }
 
     #[test]

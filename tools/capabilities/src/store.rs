@@ -86,6 +86,13 @@ pub struct FrontMatter {
         deserialize_with = "one_or_many"
     )]
     pub areas: Vec<String>,
+    /// The merged pull requests the last reconcile covered (sorted), so each
+    /// merged set is reconciled once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconciled_for: Vec<u64>,
+    /// Updated by a reconcile and not yet read by the owner (shown as `*`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -301,6 +308,8 @@ impl Store {
             sent_to: None,
             conversations: BTreeMap::new(),
             areas: Vec::new(),
+            reconciled_for: Vec::new(),
+            unread: false,
             extra: BTreeMap::new(),
         };
         let mut it = Intent {

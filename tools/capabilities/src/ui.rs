@@ -23,6 +23,8 @@ pub struct TreeRow<'a> {
     pub reference: bool,
     /// For a group: capabilities living elsewhere that affect it or its sub-groups.
     pub refs: usize,
+    /// Updated by a reconcile and not yet read: drawn with a leading `*`.
+    pub unread: bool,
 }
 
 /// Control characters other than tab/newline become a visible placeholder so
@@ -109,6 +111,12 @@ pub fn render_tree(rows: &[TreeRow], selected: usize, scroll: usize, area: Rect,
                 _ => "○ ",
             };
             spans.push(Span::raw(mark));
+            if row.unread {
+                spans.push(Span::styled(
+                    "* ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+            }
             spans.push(Span::raw(sanitize(row.label)));
             if row.questions > 0 {
                 spans.push(Span::styled(
@@ -363,6 +371,7 @@ mod tests {
                 broken: false,
                 reference: false,
                 refs: 0,
+                unread: false,
             },
             TreeRow {
                 depth: 0,
@@ -375,6 +384,7 @@ mod tests {
                 broken: true,
                 reference: false,
                 refs: 0,
+                unread: false,
             },
             TreeRow {
                 depth: 0,
@@ -387,6 +397,7 @@ mod tests {
                 broken: false,
                 reference: false,
                 refs: 0,
+                unread: false,
             },
         ];
         let mut t = Terminal::new(TestBackend::new(40, 5)).unwrap();
@@ -948,6 +959,8 @@ pub struct ListRow<'a> {
     /// Time since the capability was sent, e.g. `15h ago`.
     pub running: Option<String>,
     pub title: &'a str,
+    /// Updated by a reconcile and not yet read: the title gets a leading `*`.
+    pub unread: bool,
     /// The group path in the tree, e.g. `skoolscout/org`.
     pub group: String,
     /// The sent agent's worktree path and slot, once it is in one.
@@ -1099,10 +1112,14 @@ pub fn render_capability_list(
         put(Line::styled("─".repeat(w), dim), &mut y);
         let card_top = y;
         // the title, and its path in the tree under it
+        let star = if r.unread { "* " } else { "" };
         put(
             Line::from(vec![
                 Span::raw(" "),
-                Span::styled(fit(r.title, inner_w), bold),
+                Span::styled(
+                    format!("{star}{}", fit(r.title, inner_w.saturating_sub(star.len()))),
+                    bold,
+                ),
             ]),
             &mut y,
         );

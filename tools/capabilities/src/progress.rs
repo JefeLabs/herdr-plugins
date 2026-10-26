@@ -776,6 +776,12 @@ pub enum Update {
         path: PathBuf,
         plans: Vec<PlanTasks>,
     },
+    /// Everything a reconcile needs, gathered: the prompt for the agent.
+    Reconcile {
+        path: PathBuf,
+        merged: Vec<u64>,
+        prompt: String,
+    },
     /// Pull requests found mentioning each of the capability's spec or plan
     /// file names, per name.
     FoundPrs {
@@ -877,6 +883,32 @@ impl Poller {
                 None => Vec::new(),
             };
             let _ = tx.send((key, Update::FoundPrs { path, by_name }));
+        });
+    }
+
+    /// Gather the spec, merged PRs and follow-ups for a reconcile, off the UI thread.
+    pub fn request_reconcile(&mut self, intent: Intent, merged: Vec<u64>) {
+        let key = format!("reconcile:{}", intent.path.display());
+        let Some(repo) = intent.fm.repo.clone() else {
+            return;
+        };
+        if !self.in_flight.insert(key.clone()) {
+            return;
+        }
+        let env = self.env.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let gh = tool_bin(&env, "GH_BIN_PATH", Some("gh")).unwrap_or_else(|| "gh".into());
+            let ctx = crate::reconcile::gather(&repo, &intent, &merged, &gh, &env);
+            let prompt = crate::reconcile::reconcile_prompt(&intent, &ctx);
+            let _ = tx.send((
+                key,
+                Update::Reconcile {
+                    path: intent.path,
+                    merged,
+                    prompt,
+                },
+            ));
         });
     }
 
