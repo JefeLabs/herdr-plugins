@@ -320,3 +320,13 @@ fn every_turn_carries_the_happy_path_rule() {
         assert!(t.contains(HAPPY_PATH_RULE), "bundled polish template: {t}");
     }
 }
+
+#[test]
+fn every_turn_asks_for_criteria_grouped_by_area() {
+    let rule = "group `## Acceptance criteria` under `### <area path>` sub-headings, one per area (its own group first), keeping every criterion's wording and checkbox";
+    assert!(FORMAT_REMINDER.contains(rule), "{FORMAT_REMINDER}");
+    assert!(seed_prompt("template", "body", None, "idea").contains(rule));
+    assert!(
+        follow_up_prompt("SEED", &[("user".into(), "polish".into())], "again", true).contains(rule)
+    );
+}

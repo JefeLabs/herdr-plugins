@@ -3,9 +3,9 @@ use std::path::Path;
 
 use herdr_capabilities::store::{
     Readiness, SaveError, State, Store, acknowledge_criteria, add_artifact, add_checklist_item,
-    add_question, answer_question, artifacts, criteria, criterion_key, discover_artifacts,
-    new_criteria, open_questions, preconditions, questions, readiness, send_refusal, slugify,
-    toggle_criterion, toggle_precondition,
+    add_question, answer_question, artifacts, criteria, criteria_groups, criterion_key,
+    discover_artifacts, new_criteria, open_questions, preconditions, questions, readiness,
+    send_refusal, slugify, toggle_criterion, toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -650,4 +650,18 @@ fn new_criteria_are_the_ones_nobody_acknowledged() {
         .replace("original two", "original two, reworded");
     Store::save_force(&mut changed).unwrap();
     assert_eq!(new_criteria(&Store::load(&it.path).unwrap()), vec![1]);
+}
+
+#[test]
+fn criteria_groups_are_the_sub_headings_and_where_they_start() {
+    let body = "## Acceptance criteria\n- [ ] own one\n- [ ] \n### org/candidates\n- [x] header button\n- [ ] modal\n### family/dashboard \n- [ ] banner\n\n## Open questions\n### not a group\n- q\n";
+    assert_eq!(
+        criteria_groups(body),
+        vec![
+            (1, "org/candidates".to_string()),
+            (3, "family/dashboard".to_string())
+        ],
+        "an empty checkbox is not a criterion, and headings after the section are not groups"
+    );
+    assert!(criteria_groups("## Acceptance criteria\n- [ ] a\n").is_empty());
 }

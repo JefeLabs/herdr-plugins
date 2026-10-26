@@ -362,6 +362,15 @@ mod tests {
     }
 
     fn checklist_text(items: &[crate::store::Criterion], selected: usize, h: u16) -> String {
+        grouped_checklist_text(items, &[], selected, h)
+    }
+
+    fn grouped_checklist_text(
+        items: &[crate::store::Criterion],
+        groups: &[(usize, String)],
+        selected: usize,
+        h: u16,
+    ) -> String {
         let mut t = Terminal::new(TestBackend::new(40, h)).unwrap();
         t.draw(|f| {
             render_checklist(
@@ -372,7 +381,7 @@ mod tests {
                 selected,
                 &[],
                 &[],
-                &[],
+                groups,
                 f.area(),
                 f.buffer_mut(),
             )
@@ -413,6 +422,69 @@ mod tests {
         // nothing hidden, no hint
         let all = checklist_text(&items[..3], 0, 6);
         assert!(!all.contains("more"), "{all}");
+    }
+
+    fn criterion(text: &str, done: bool) -> crate::store::Criterion {
+        crate::store::Criterion {
+            text: text.into(),
+            done,
+        }
+    }
+
+    #[test]
+    fn criteria_are_drawn_under_their_area_with_its_own_count() {
+        let items = [
+            criterion("own one", false),
+            criterion("header button", true),
+            criterion("modal", false),
+            criterion("banner", false),
+        ];
+        // an area heading with nothing under it yet, then one with a criterion
+        let groups = [
+            (1, "org/candidates".to_string()),
+            (3, "org/empty".to_string()),
+            (3, "family/dashboard".to_string()),
+        ];
+        let text = grouped_checklist_text(&items, &groups, 0, 10);
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|l| l.trim_matches(|c: char| c == '│' || c == ' '))
+            .filter(|l| !l.is_empty() && !l.contains('─'))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "[ ] own one",
+                "org/candidates (1/2)",
+                "[x] header button",
+                "[ ] modal",
+                "org/empty (0/0)",
+                "family/dashboard (0/1)",
+                "[ ] banner",
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn group_headers_take_lines_but_the_selection_stays_in_view() {
+        let items: Vec<_> = (0..6)
+            .map(|i| criterion(&format!("item {i}"), false))
+            .collect();
+        let groups = [
+            (0, "a".to_string()),
+            (2, "b".to_string()),
+            (4, "c".to_string()),
+        ];
+        // five lines inside the border: four rows and the hint
+        let low = grouped_checklist_text(&items, &groups, 5, 6);
+        assert!(low.contains("item 5"), "{low}");
+        assert!(
+            low.contains("c (0/2)"),
+            "the selection's header shows: {low}"
+        );
+        assert!(!low.contains("item 0"), "{low}");
+        assert!(low.contains("↑ 3"), "{low}");
     }
 
     #[test]
@@ -996,12 +1068,8 @@ fn render_checklist(
             if used >= room {
                 break 'items;
             }
-            let end = groups
-                .iter()
-                .skip(g + 1)
-                .map(|(s, _)| *s)
-                .find(|s| *s > *start)
-                .unwrap_or(items.len());
+            // a group ends where the next one starts (an empty one ends at once)
+            let end = groups.get(g + 1).map_or(items.len(), |(s, _)| *s);
             let members = &items[*start..end.max(*start)];
             let done = members.iter().filter(|c| c.done).count();
             Line::styled(
