@@ -400,6 +400,102 @@ mod tests {
             .join("\n")
     }
 
+    /// One checklist drawn unfocused at `w`×`h`: its rows and the terminal.
+    fn checklist_term(
+        items: &[crate::store::Criterion],
+        w: u16,
+        h: u16,
+    ) -> (Terminal<TestBackend>, Vec<String>) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| {
+            render_checklist(
+                items,
+                "Acceptance criteria",
+                "none",
+                false,
+                0,
+                &[],
+                &[],
+                &[],
+                f.area(),
+                f.buffer_mut(),
+            )
+        })
+        .unwrap();
+        let rows = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| t.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        (t, rows)
+    }
+
+    fn modifier_at(t: &Terminal<TestBackend>, rows: &[String], needle: &str) -> Modifier {
+        let y = rows
+            .iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not in {rows:?}"));
+        let x = rows[y][..rows[y].find(needle).unwrap()].chars().count();
+        t.backend().buffer()[(x as u16, y as u16)].modifier
+    }
+
+    #[test]
+    fn criteria_render_markdown_like_the_description() {
+        let items = [crate::store::Criterion {
+            text: "Opens **Schedule a Meeting** via `POST /api/x`.".into(),
+            done: false,
+        }];
+        let (t, rows) = checklist_term(&items, 60, 4);
+        assert!(
+            rows.iter()
+                .any(|r| r == "[ ] Opens Schedule a Meeting via POST /api/x."),
+            "{rows:?}"
+        );
+        assert!(modifier_at(&t, &rows, "Schedule").contains(Modifier::BOLD));
+        assert!(modifier_at(&t, &rows, "POST").contains(Modifier::REVERSED));
+        assert!(!modifier_at(&t, &rows, "Opens").contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn styles_carry_across_a_wrapped_line() {
+        let items = [crate::store::Criterion {
+            text: "Plain words then **a bold run that wraps onto the next line** and plain again"
+                .into(),
+            done: false,
+        }];
+        let (t, rows) = checklist_term(&items, 34, 6);
+        let all = rows.join("\n");
+        assert!(!all.contains("**"), "{all}");
+        // the bold run starts on one line and continues on the next
+        assert!(
+            modifier_at(&t, &rows, "a bold").contains(Modifier::BOLD),
+            "{all}"
+        );
+        assert!(
+            modifier_at(&t, &rows, "next").contains(Modifier::BOLD),
+            "{all}"
+        );
+        assert!(
+            !modifier_at(&t, &rows, "plain again").contains(Modifier::BOLD),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn preconditions_render_markdown_too() {
+        let it =
+            intent_with(&SECTIONS_BODY.replace("- [x] pre one", "- [x] pre **one** with `code`"));
+        let (_t, rows) = detail(&it, Pane::Preconditions, Pane::Preconditions, 80, 24);
+        assert!(
+            rows.iter().any(|r| r == "[x] pre one with code"),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn a_long_checklist_scrolls_to_the_selection_and_says_what_is_hidden() {
         let items: Vec<crate::store::Criterion> = (0..10)
@@ -932,6 +1028,68 @@ pub enum Pane {
     Questions,
     PullRequests,
     Artifacts,
+}
+
+/// `wrap_text` for styled spans: the same greedy wrap, with each word keeping
+/// its styles (a word may change style midway) and each space between two
+/// words keeping the style it had, so a code span stays one piece.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let w = width.max(1);
+    // words as styled chars, each with the style of the space before it
+    let mut words: Vec<(Style, Vec<(char, Style)>)> = Vec::new();
+    let mut word: Vec<(char, Style)> = Vec::new();
+    let mut gap = Style::default();
+    for sp in spans {
+        for ch in sp.content.chars() {
+            if ch.is_whitespace() {
+                if !word.is_empty() {
+                    words.push((gap, std::mem::take(&mut word)));
+                }
+                gap = sp.style;
+            } else {
+                word.push((ch, sp.style));
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push((gap, word));
+    }
+    let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut line: Vec<(char, Style)> = Vec::new();
+    for (gap, word) in words {
+        let mut rest = &word[..];
+        while rest.len() > w {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            lines.push(rest[..w].to_vec());
+            rest = &rest[w..];
+        }
+        if !line.is_empty() && line.len() + 1 + rest.len() > w {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push((' ', gap));
+        }
+        line.extend_from_slice(rest);
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    // back to spans: one per run of a single style
+    lines
+        .into_iter()
+        .map(|chars| {
+            let mut out: Vec<Span<'static>> = Vec::new();
+            for (ch, st) in chars {
+                match out.last_mut() {
+                    Some(last) if last.style == st => last.content.to_mut().push(ch),
+                    _ => out.push(Span::styled(ch.to_string(), st)),
+                }
+            }
+            out
+        })
+        .collect()
 }
 
 /// Greedy word wrap to `width` columns; a word longer than the width is split.
@@ -1516,12 +1674,15 @@ fn render_checklist(
     // each item's wrapped lines; scroll so the selection is in view and say
     // how many items are hidden above and below
     let width = (inner.width as usize).saturating_sub(4);
-    let wrapped: Vec<Vec<String>> = items
+    let wrapped: Vec<Vec<Vec<Span<'static>>>> = items
         .iter()
         .enumerate()
         .map(|(i, c)| {
             let extra = 2 * (usize::from(marked.contains(&i)) + usize::from(fresh.contains(&i)));
-            wrap_text(&sanitize(&c.text), width.saturating_sub(extra))
+            wrap_spans(
+                &crate::markdown::inline_spans(&c.text),
+                width.saturating_sub(extra),
+            )
         })
         .collect();
     // group headers sit above their first item and count toward its height
@@ -1601,7 +1762,13 @@ fn render_checklist(
             } else {
                 Style::default()
             };
-            Line::styled(format!("{lead}{piece}"), style).render(rect, buf);
+            let mut line = vec![Span::styled(lead, style)];
+            line.extend(
+                piece
+                    .iter()
+                    .map(|sp| Span::styled(sp.content.clone(), sp.style.patch(style))),
+            );
+            Line::from(line).render(rect, buf);
             y += 1;
             used += 1;
         }
