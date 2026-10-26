@@ -563,6 +563,128 @@ mod tests {
             .unwrap();
         assert!(!text_of(&t).contains('\u{1b}'), "raw ESC in status");
     }
+    const SECTIONS_BODY: &str = "## Description\nThe description.\n\n## Preconditions\n- [x] pre one\n- [ ] pre two\n\n## Acceptance criteria\n- [x] crit one\n- [ ] crit two\n- [ ] crit three\n\n## Open questions\n- q one?\n  → yes\n- q two?\n\n## Artifacts\n- spec: docs/spec.md\n";
+
+    fn intent_with(body: &str) -> crate::store::Intent {
+        crate::store::Intent {
+            path: std::path::PathBuf::from("/x/a.md"),
+            fm: serde_yaml_ng::from_str("title: T\nkind: idea\n").unwrap(),
+            body: body.into(),
+            loaded_updated: chrono::Local::now(),
+        }
+    }
+
+    /// The detail view drawn at `w`×`h`: its rows, and the terminal for styles.
+    fn detail(
+        it: &crate::store::Intent,
+        focus: Pane,
+        open: Pane,
+        w: u16,
+        h: u16,
+    ) -> (Terminal<TestBackend>, Vec<String>) {
+        let view = DetailView {
+            intent: it,
+            attachments: &[],
+            focus,
+            description_scroll: 0,
+            preconditions_selected: 0,
+            criteria_selected: 0,
+            question_selected: 0,
+            artifacts_selected: 0,
+            found: &[],
+            answering: None,
+            open,
+        };
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render_capability(&view, f.area(), f.buffer_mut()))
+            .unwrap();
+        let rows = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| t.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        (t, rows)
+    }
+
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not found:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn only_the_open_section_expands_under_the_description() {
+        let it = intent_with(SECTIONS_BODY);
+        let (_t, rows) = detail(&it, Pane::Tree, Pane::Criteria, 80, 24);
+        let all = rows.join("\n");
+        // every section keeps its title and count; only the open one shows its items
+        for title in [
+            "▸ Preconditions (1/2)",
+            "▾ Acceptance criteria (1/3)",
+            "▸ Open questions (1 open)",
+            "▸ Artifacts (1)",
+        ] {
+            assert!(all.contains(title), "missing {title:?}:\n{all}");
+        }
+        assert!(
+            all.contains("crit one") && all.contains("crit three"),
+            "{all}"
+        );
+        for hidden in ["pre one", "q one?", "docs/spec.md"] {
+            assert!(!all.contains(hidden), "{hidden:?} is collapsed:\n{all}");
+        }
+        // stacked in order right under the description; the closed ones below
+        // the open section sit at the bottom
+        let desc = row_of(&rows, "The description.");
+        assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 1, "{all}");
+        assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 1);
+        assert_eq!(row_of(&rows, "▸ Open questions"), 22, "{all}");
+        assert_eq!(row_of(&rows, "▸ Artifacts"), 23, "{all}");
+
+        let (_t, rows) = detail(&it, Pane::Tree, Pane::Artifacts, 80, 24);
+        let all = rows.join("\n");
+        assert!(
+            all.contains("▾ Artifacts (1)") && all.contains("docs/spec.md"),
+            "{all}"
+        );
+        assert!(!all.contains("crit one"), "{all}");
+        assert!(all.contains("▸ Acceptance criteria (1/3)"), "{all}");
+    }
+
+    #[test]
+    fn the_open_section_is_highlighted_while_it_has_focus() {
+        let it = intent_with(SECTIONS_BODY);
+        let reversed = |t: &Terminal<TestBackend>, rows: &[String], needle: &str| {
+            let y = row_of(rows, needle) as u16;
+            let x = rows[y as usize].find(needle).unwrap();
+            let x = rows[y as usize][..x].chars().count() as u16;
+            t.backend().buffer()[(x, y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        let (t, rows) = detail(&it, Pane::Criteria, Pane::Criteria, 80, 24);
+        assert!(reversed(&t, &rows, "▾ Acceptance criteria"));
+        assert!(!reversed(&t, &rows, "▸ Preconditions"));
+        let (t, rows) = detail(&it, Pane::Tree, Pane::Criteria, 80, 24);
+        assert!(!reversed(&t, &rows, "▾ Acceptance criteria"));
+    }
+
+    #[test]
+    fn a_long_description_leaves_room_for_the_open_section() {
+        let long: String = (0..30).map(|i| format!("line {i}\n\n")).collect();
+        let body = SECTIONS_BODY.replace("The description.\n", &long);
+        let it = intent_with(&body);
+        let (_t, rows) = detail(&it, Pane::Tree, Pane::Criteria, 80, 30);
+        let all = rows.join("\n");
+        // at most a third of the height for the description (it scrolls)
+        assert!(row_of(&rows, "▸ Preconditions") <= 2 + 10, "{all}");
+        assert!(all.contains("crit three"), "{all}");
+    }
+
     #[test]
     fn long_questions_wrap_so_they_can_be_read_in_full() {
         let long = "Is `Pending` a generic status shared across all folders, and would we want a distinct Skipped state instead of reusing it everywhere?";
@@ -586,6 +708,7 @@ mod tests {
             artifacts_selected: 0,
             found: &[],
             answering: None,
+            open: Pane::Questions,
         };
         let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
         t.draw(|f| render_capability(&view, f.area(), f.buffer_mut()))
@@ -692,6 +815,9 @@ pub struct DetailView<'a> {
     pub found: &'a [crate::store::Artifact],
     /// `(question index, text so far)` while an answer is being typed.
     pub answering: Option<(usize, &'a str)>,
+    /// The section open under the description (an accordion): the others
+    /// show only their title line.
+    pub open: Pane,
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'static> {
@@ -712,39 +838,32 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     let it = v.intent;
     let qs = questions(&it.body);
     let cs = criteria(&it.body);
-    let text_width = (area.width as usize).saturating_sub(2); // after the "? " prefix
-    let q_rows: u16 = qs
-        .iter()
-        .map(|q| {
-            wrap_text(&q.text, text_width).len()
-                + q.answer
-                    .as_ref()
-                    .map(|a| wrap_text(a, text_width.saturating_sub(2)).len())
-                    .unwrap_or(0)
-        })
-        .sum::<usize>() as u16
-        + if v.answering.is_some() { 2 } else { 0 };
     let ps = crate::store::preconditions(&it.body);
-    let rows_of = |items: &[crate::store::Criterion]| {
-        items
-            .iter()
-            .map(|c| wrap_text(&c.text, text_width.saturating_sub(2)).len())
-            .sum::<usize>() as u16
-    };
-    let c_rows = rows_of(&cs);
-    let p_rows = rows_of(&ps);
     let arts = crate::store::artifacts(&it.body);
-    let third = (area.height / 3).max(3);
+    let fresh = crate::store::new_criteria(it);
+    let desc = description_text(&it.body);
+    // the description takes what it needs, up to a third of the height (it
+    // scrolls); below it the four sections are an accordion: the open one
+    // gets the rest, the others a title line each
+    let desc_rows = wrap_text(&desc, area.width as usize).len() as u16;
+    let desc_h = (desc_rows + 1).clamp(2, (area.height / 3).max(4));
+    let sections = [
+        Pane::Preconditions,
+        Pane::Criteria,
+        Pane::Questions,
+        Pane::Artifacts,
+    ];
+    let mut constraints = vec![Constraint::Length(2), Constraint::Length(desc_h)];
+    constraints.extend(sections.iter().map(|s| {
+        if *s == v.open {
+            Constraint::Min(2)
+        } else {
+            Constraint::Length(1)
+        }
+    }));
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length((p_rows + 1).clamp(2, third.min(8))),
-            Constraint::Length((c_rows + 1).clamp(2, third.min(8))),
-            Constraint::Length((q_rows + 1).clamp(2, third + 2)),
-            Constraint::Length(((arts.len() + v.found.len()) as u16 + 1).clamp(2, 8)),
-        ])
+        .constraints(constraints)
         .split(area);
 
     // header
@@ -780,57 +899,94 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
     ];
     Paragraph::new(header).render(layout[0], buf);
 
-    // description: everything outside the two list sections
-    // preconditions
-    render_checklist(
-        &ps,
-        "Preconditions",
-        "none — what must already be true for this to be worth building?",
-        v.focus == Pane::Preconditions,
-        v.preconditions_selected,
-        &[],
-        &[],
-        &[],
-        layout[2],
-        buf,
-    );
-
     let block = pane_block("Description", v.focus == Pane::Description);
     let inner = block.inner(layout[1]);
     block.render(layout[1], buf);
-    let desc = description_text(&it.body);
     Paragraph::new(crate::markdown::render_markdown(&desc))
         .wrap(Wrap { trim: false })
         .scroll((v.description_scroll, 0))
         .render(inner, buf);
 
-    // criteria: the same scrolling checklist, with ▶ on those an app-demo shows
-    let demoed: Vec<usize> = crate::store::artifacts(&it.body)
-        .iter()
-        .filter(|a| a.kind.eq_ignore_ascii_case("demo"))
-        .flat_map(|a| crate::demos::demo_target(&a.target).1)
-        .filter_map(|n| n.checked_sub(1))
-        .collect();
-    render_checklist(
-        &cs,
-        "Acceptance criteria",
-        "none yet — add `- [ ]` items in the editor or let polish propose them",
-        v.focus == Pane::Criteria,
-        v.criteria_selected,
-        &demoed,
-        &crate::store::new_criteria(it),
-        &crate::store::criteria_groups(&it.body),
-        layout[3],
-        buf,
-    );
+    let marker = |s: Pane| if s == v.open { "▾" } else { "▸" };
+    let names = [
+        format!("{} Preconditions", marker(Pane::Preconditions)),
+        format!("{} Acceptance criteria", marker(Pane::Criteria)),
+    ];
+    let titles = [
+        checklist_title(&names[0], &ps, &[]),
+        checklist_title(&names[1], &cs, &fresh),
+        format!(
+            "{} Open questions ({} open)",
+            marker(Pane::Questions),
+            it.open_questions()
+        ),
+        format!(
+            "{} {}",
+            marker(Pane::Artifacts),
+            if v.found.is_empty() {
+                format!("Artifacts ({})", arts.len())
+            } else {
+                format!("Artifacts ({} linked, {} found)", arts.len(), v.found.len())
+            }
+        ),
+    ];
+    for (i, section) in sections.into_iter().enumerate() {
+        let rect = layout[2 + i];
+        if section != v.open {
+            pane_block(&titles[i], false).render(rect, buf);
+            continue;
+        }
+        match section {
+            Pane::Preconditions => render_checklist(
+                &ps,
+                &names[0],
+                "none — what must already be true for this to be worth building?",
+                v.focus == Pane::Preconditions,
+                v.preconditions_selected,
+                &[],
+                &[],
+                &[],
+                rect,
+                buf,
+            ),
+            Pane::Criteria => {
+                // ▶ on the criteria an app-demo shows
+                let demoed: Vec<usize> = arts
+                    .iter()
+                    .filter(|a| a.kind.eq_ignore_ascii_case("demo"))
+                    .flat_map(|a| crate::demos::demo_target(&a.target).1)
+                    .filter_map(|n| n.checked_sub(1))
+                    .collect();
+                render_checklist(
+                    &cs,
+                    &names[1],
+                    "none yet — add `- [ ]` items in the editor or let polish propose them",
+                    v.focus == Pane::Criteria,
+                    v.criteria_selected,
+                    &demoed,
+                    &fresh,
+                    &crate::store::criteria_groups(&it.body),
+                    rect,
+                    buf,
+                )
+            }
+            Pane::Questions => render_questions(v, &qs, &titles[i], rect, buf),
+            _ => render_artifacts(v, &arts, &titles[i], rect, buf),
+        }
+    }
+}
 
-    // questions
-    let block = pane_block(
-        &format!("Open questions ({} open)", open),
-        v.focus == Pane::Questions,
-    );
-    let inner = block.inner(layout[4]);
-    block.render(layout[4], buf);
+/// The Open questions section: each question wrapped, its answer under it.
+fn render_questions(
+    v: &DetailView,
+    qs: &[crate::store::Question],
+    title: &str,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let block = pane_block(title, v.focus == Pane::Questions);
+    let inner = block.inner(area);
+    block.render(area, buf);
     if qs.is_empty() {
         Paragraph::new(Span::styled(
             "none",
@@ -910,16 +1066,19 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         }
         line.render(rect, buf);
     }
+}
 
-    // artifacts: linked first, then those found in the repo (dim, "found")
-    let title = if v.found.is_empty() {
-        format!("Artifacts ({})", arts.len())
-    } else {
-        format!("Artifacts ({} linked, {} found)", arts.len(), v.found.len())
-    };
-    let block = pane_block(&title, v.focus == Pane::Artifacts);
-    let inner = block.inner(layout[5]);
-    block.render(layout[5], buf);
+/// The Artifacts section: linked first, then those found in the repo (dim, "found").
+fn render_artifacts(
+    v: &DetailView,
+    arts: &[crate::store::Artifact],
+    title: &str,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let block = pane_block(title, v.focus == Pane::Artifacts);
+    let inner = block.inner(area);
+    block.render(area, buf);
     let all: Vec<(&crate::store::Artifact, bool)> = arts
         .iter()
         .map(|a| (a, false))
@@ -985,6 +1144,21 @@ pub fn render_reader(
 }
 
 /// A titled checklist pane with wrapped items; the selected one is highlighted when focused.
+/// A checklist's title with its counts: `Name (done/total)`, plus how many
+/// are new when some are.
+fn checklist_title(name: &str, items: &[crate::store::Criterion], fresh: &[usize]) -> String {
+    let counts = format!(
+        "{}/{}",
+        items.iter().filter(|c| c.done).count(),
+        items.len()
+    );
+    if fresh.is_empty() {
+        format!("{name} ({counts})")
+    } else {
+        format!("{name} ({counts} · {} new)", fresh.len())
+    }
+}
+
 /// A checklist pane (Preconditions, Acceptance criteria). `marked` holds the
 /// (0-based) items an app-demo shows; they get `▶` after the checkbox.
 /// `fresh` holds items added by someone else and not yet acknowledged: drawn
@@ -1004,19 +1178,7 @@ fn render_checklist(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let counts = format!(
-        "{}/{}",
-        items.iter().filter(|c| c.done).count(),
-        items.len()
-    );
-    let block = pane_block(
-        &if fresh.is_empty() {
-            format!("{title} ({counts})")
-        } else {
-            format!("{title} ({counts} · {} new)", fresh.len())
-        },
-        focused,
-    );
+    let block = pane_block(&checklist_title(title, items, fresh), focused);
     let inner = block.inner(area);
     block.render(area, buf);
     if items.is_empty() {

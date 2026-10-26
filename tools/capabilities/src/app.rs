@@ -318,6 +318,8 @@ pub struct View {
     pub pick_items: Vec<String>,
     pub pick_selected: usize,
     pub focus: &'static str,
+    /// The detail section open under the description.
+    pub open: &'static str,
     pub question_count: usize,
     pub question_selected: usize,
     pub criteria_selected: usize,
@@ -360,6 +362,9 @@ pub struct App {
     /// Chat state kept while the Diff or a Prompt screen is showing.
     parked_chat: Option<ChatState>,
     pub focus: Pane,
+    /// The detail section open under the description; follows focus into a
+    /// section and stays when focus leaves for the tree or the description.
+    open: Pane,
     description_scroll: u16,
     /// mtime of our own binary at startup; a newer one on disk means a rebuild
     /// is waiting for a restart of the slot.
@@ -417,6 +422,17 @@ pub struct App {
     card_hits: std::cell::RefCell<Vec<(usize, u16, u16)>>,
 }
 
+fn pane_name(p: Pane) -> &'static str {
+    match p {
+        Pane::Tree => "tree",
+        Pane::Description => "description",
+        Pane::Preconditions => "preconditions",
+        Pane::Criteria => "criteria",
+        Pane::Questions => "questions",
+        Pane::Artifacts => "artifacts",
+    }
+}
+
 impl App {
     pub fn new(cfg: Config, dirs: Dirs) -> anyhow::Result<Self> {
         let store = Store::open(&cfg.root)?;
@@ -438,6 +454,7 @@ impl App {
             herdr_env: Vec::new(),
             parked_chat: None,
             focus: Pane::Tree,
+            open: Pane::Criteria,
             description_scroll: 0,
             binary_stamp: binary_mtime(),
             newer_build: false,
@@ -1449,6 +1466,14 @@ impl App {
 
     pub fn key(&mut self, k: KeyEvent) -> Flow {
         let flow = self.key_inner(k);
+        // the accordion: a section that gets focus opens, and stays open
+        // while focus is on the tree or the description
+        if matches!(
+            self.focus,
+            Pane::Preconditions | Pane::Criteria | Pane::Questions | Pane::Artifacts
+        ) {
+            self.open = self.focus;
+        }
         self.refresh_found();
         self.mark_read();
         flow
@@ -3187,14 +3212,8 @@ impl App {
             send_prompt: None,
             pick_items: Vec::new(),
             pick_selected: 0,
-            focus: match self.focus {
-                Pane::Tree => "tree",
-                Pane::Description => "description",
-                Pane::Preconditions => "preconditions",
-                Pane::Criteria => "criteria",
-                Pane::Questions => "questions",
-                Pane::Artifacts => "artifacts",
-            },
+            focus: pane_name(self.focus),
+            open: pane_name(self.open),
             question_count: self
                 .selected_intent()
                 .map(|i| crate::store::questions(&i.body).len())
@@ -3617,6 +3636,7 @@ impl App {
                             artifacts_selected: self.artifacts_selected,
                             found: self.found_artifacts(),
                             answering,
+                            open: self.open,
                         },
                         right,
                         buf,
@@ -4551,7 +4571,8 @@ mod tests {
         select(&mut fx.app, "Alpha");
         let path = fx.app.selected_intent().unwrap().path.clone();
         let mut body = String::from("## Description\nx\n\n## Acceptance criteria\n");
-        for i in 0..10 {
+        // more than the open section holds
+        for i in 0..30 {
             body.push_str(&format!("- [ ] criterion number {i}\n"));
         }
         let mut it = Store::load(&path).unwrap();
@@ -4559,12 +4580,12 @@ mod tests {
         Store::save_force(&mut it).unwrap();
         fx.app.rescan();
         key(&mut fx.app, KeyCode::Char('C'));
-        for _ in 0..8 {
+        for _ in 0..25 {
             key(&mut fx.app, KeyCode::Char('j'));
         }
         let shown = render(&fx.app, 100, 24);
         assert!(
-            shown.contains("criterion number 8"),
+            shown.contains("criterion number 25"),
             "the selection is in view: {shown}"
         );
         assert!(shown.contains("more (j/k)"), "says what is hidden: {shown}");
@@ -6374,6 +6395,38 @@ mod tests {
     }
 
     #[test]
+    fn tab_opens_one_section_at_a_time_and_the_last_stays_open() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox");
+        assert_eq!(fx.app.view().open, "criteria", "criteria open to start");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "description");
+        assert_eq!(
+            fx.app.view().open,
+            "criteria",
+            "the description leaves it open"
+        );
+        for pane in ["preconditions", "criteria", "questions", "artifacts"] {
+            key(&mut fx.app, KeyCode::Tab);
+            assert_eq!(fx.app.view().focus, pane);
+            assert_eq!(fx.app.view().open, pane, "the focused section opens");
+        }
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "tree");
+        assert_eq!(fx.app.view().open, "artifacts", "the last one stays open");
+        select(&mut fx.app, "Alpha");
+        assert_eq!(
+            fx.app.view().open,
+            "artifacts",
+            "and stays open on the next capability"
+        );
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().open, "artifacts");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().open, "questions");
+    }
+
+    #[test]
     fn tab_cycles_focus_through_the_three_panes() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
@@ -6467,21 +6520,25 @@ mod tests {
     }
 
     #[test]
-    fn detail_draws_three_separate_panes() {
+    fn detail_shows_every_section_title_and_opens_one() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
-        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| fx.app.draw(Rect::new(0, 0, 100, 24), f.buffer_mut()))
-            .unwrap();
-        let text = format!("{:?}", t.backend().buffer());
+        let text = render(&fx.app, 100, 24);
         for title in [
             "Description",
             "Preconditions",
             "Acceptance criteria",
             "Open questions",
+            "Artifacts",
         ] {
-            assert!(text.contains(title), "pane {title} missing");
+            assert!(text.contains(title), "pane {title} missing: {text}");
         }
+        assert!(!text.contains("? a?"), "questions start collapsed: {text}");
+        // tree → description → preconditions → criteria → questions
+        for _ in 0..4 {
+            key(&mut fx.app, KeyCode::Tab);
+        }
+        let text = render(&fx.app, 100, 24);
         assert!(
             text.contains("? a?") && text.contains("? b?"),
             "questions listed with their open mark: {text}"
