@@ -372,6 +372,7 @@ mod tests {
                 selected,
                 &[],
                 &[],
+                &[],
                 f.area(),
                 f.buffer_mut(),
             )
@@ -717,6 +718,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         v.preconditions_selected,
         &[],
         &[],
+        &[],
         layout[2],
         buf,
     );
@@ -745,6 +747,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         v.criteria_selected,
         &demoed,
         &crate::store::new_criteria(it),
+        &crate::store::criteria_groups(&it.body),
         layout[3],
         buf,
     );
@@ -913,7 +916,9 @@ pub fn render_reader(
 /// A checklist pane (Preconditions, Acceptance criteria). `marked` holds the
 /// (0-based) items an app-demo shows; they get `▶` after the checkbox.
 /// `fresh` holds items added by someone else and not yet acknowledged: drawn
-/// bold with a `+`, and counted in the title.
+/// bold with a `+`, and counted in the title. `groups` are sub-headings (an
+/// area each) with the index of their first item: drawn as bold headers with
+/// their own counts.
 #[allow(clippy::too_many_arguments)]
 fn render_checklist(
     items: &[crate::store::Criterion],
@@ -923,6 +928,7 @@ fn render_checklist(
     selected: usize,
     marked: &[usize],
     fresh: &[usize],
+    groups: &[(usize, String)],
     area: Rect,
     buf: &mut Buffer,
 ) {
@@ -960,8 +966,13 @@ fn render_checklist(
             wrap_text(&sanitize(&c.text), width.saturating_sub(extra))
         })
         .collect();
+    // group headers sit above their first item and count toward its height
+    let headers_at = |i: usize| groups.iter().filter(|(first, _)| *first == i).count();
+    let heights: Vec<usize> = (0..items.len())
+        .map(|i| wrapped[i].len() + headers_at(i))
+        .collect();
     let height = inner.height as usize;
-    let total: usize = wrapped.iter().map(Vec::len).sum();
+    let total: usize = heights.iter().sum();
     let overflow = total > height;
     let room = if overflow {
         height.saturating_sub(1).max(1)
@@ -974,13 +985,40 @@ fn render_checklist(
         0
     };
     let mut first = 0;
-    while first < sel && wrapped[first..=sel].iter().map(Vec::len).sum::<usize>() > room {
+    while first < sel && heights[first..=sel].iter().sum::<usize>() > room {
         first += 1;
     }
     let mut y = inner.y;
     let mut used = 0usize;
     let mut last_shown = first;
     'items: for (i, c) in items.iter().enumerate().skip(first) {
+        for (g, (start, name)) in groups.iter().enumerate().filter(|(_, (s, _))| *s == i) {
+            if used >= room {
+                break 'items;
+            }
+            let end = groups
+                .iter()
+                .skip(g + 1)
+                .map(|(s, _)| *s)
+                .find(|s| *s > *start)
+                .unwrap_or(items.len());
+            let members = &items[*start..end.max(*start)];
+            let done = members.iter().filter(|c| c.done).count();
+            Line::styled(
+                format!("{} ({done}/{})", sanitize(name), members.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            )
+            .render(
+                Rect {
+                    y,
+                    height: 1,
+                    ..inner
+                },
+                buf,
+            );
+            y += 1;
+            used += 1;
+        }
         let box_ = if c.done { "[x] " } else { "[ ] " };
         for (j, piece) in wrapped[i].iter().enumerate() {
             if used >= room {

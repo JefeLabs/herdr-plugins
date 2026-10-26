@@ -962,6 +962,22 @@ pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<A
 
 pub const CRITERIA_HEADING: &str = "## Acceptance criteria";
 
+/// The `### ` sub-headings inside Acceptance criteria (one per area, say),
+/// each with the index of the first criterion under it.
+pub fn criteria_groups(body: &str) -> Vec<(usize, String)> {
+    let mut groups = Vec::new();
+    let mut count = 0usize;
+    for (_, line) in section_lines(body, CRITERIA_HEADING) {
+        let t = line.trim_start();
+        if let Some(h) = t.strip_prefix("### ") {
+            groups.push((count, h.trim().to_string()));
+        } else if checkbox_text(t).is_some_and(|r| !r.trim().is_empty()) {
+            count += 1;
+        }
+    }
+    groups
+}
+
 /// A stable key for a criterion's wording (FNV-1a over its words), so a
 /// reworded criterion counts as new while ticking it does not.
 pub fn criterion_key(text: &str) -> String {

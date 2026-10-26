@@ -790,6 +790,13 @@ impl App {
             if it.fm.repo.is_none() || self.reconcile_jobs.contains_key(&it.path) {
                 continue;
             }
+            // wait for the pull-request search (it suggests the areas the work touched)
+            let searched = crate::store::artifacts(&it.body).iter().any(|a| {
+                a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
+            });
+            if searched && !self.found_prs.contains_key(&it.path) {
+                continue;
+            }
             let Some(merged) = crate::reconcile::needs_reconcile(&it, &self.evidence_for(&it))
             else {
                 continue;
@@ -798,6 +805,10 @@ impl App {
                 .reconcile_tried
                 .insert((it.path.clone(), merged.clone()))
             {
+                // the agent groups criteria by area: give it the suggested areas too
+                let mut it = it;
+                let suggested = self.suggested_areas(&it);
+                it.fm.areas.extend(suggested);
                 self.poller().request_reconcile(it, merged);
             }
         }
@@ -5328,6 +5339,27 @@ mod tests {
         settle(&mut fx.app);
         let cards = render(&fx.app, 120, 70);
         assert!(cards.contains("│ → sent │"), "{cards}");
+    }
+
+    #[test]
+    fn a_reconcile_hands_the_agent_the_suggested_areas_too() {
+        let mut fx = list_fixture(true);
+        fs::create_dir_all(fx.app.store.root().join("skoolscout/family")).unwrap();
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        fs::write(
+            fx.tmp.path().join("prs/search-notify.md.json"),
+            r#"[{"number":42,"state":"MERGED","headRefName":"feature/family--notify-family"}]"#,
+        )
+        .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let log = fs::read_to_string(fx.tmp.path().join("provider.log")).unwrap_or_default();
+        assert!(
+            log.contains("Areas it affects besides its own group: Inbox, skoolscout/family"),
+            "the reconcile prompt lists the suggested area: {log}"
+        );
     }
 
     #[test]
