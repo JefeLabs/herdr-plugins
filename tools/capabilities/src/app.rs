@@ -405,6 +405,9 @@ pub struct App {
     reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn)>,
     /// Merged sets already started this session, so a failure is not retried in a loop.
     reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
+    /// Why the last reconcile of a capability failed; shown while it is
+    /// selected until `r` retries it.
+    reconcile_failed: HashMap<PathBuf, String>,
     /// The area last drawn, so mouse clicks can be mapped to what is there.
     last_area: std::cell::Cell<Rect>,
     /// Where each list card was last drawn: `(list index, first line, end line)`.
@@ -457,6 +460,7 @@ impl App {
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
             reconcile_tried: HashSet::new(),
+            reconcile_failed: HashMap::new(),
             last_area: std::cell::Cell::new(Rect::default()),
             card_hits: std::cell::RefCell::new(Vec::new()),
         };
@@ -871,26 +875,49 @@ impl App {
         }
         for (path, merged, result) in done {
             self.reconcile_jobs.remove(&path);
-            match result {
+            // Ok(title) when the rewrite was applied, Err(reason) otherwise
+            let outcome: Result<String, String> = match result {
                 Ok(reply) => match reply.proposal {
                     Some(prop) => {
                         let body = merge_questions(&prop, &reply.questions);
-                        match crate::reconcile::apply(&path, &body, &merged) {
-                            Ok(it) => {
-                                self.message = Some(format!(
-                                    "reconciled `{}` with what shipped (* until you read it, u undoes)",
-                                    it.fm.title
-                                ));
-                                self.reload_tree();
-                            }
-                            Err(e) => self.message = Some(format!("reconcile not saved: {e:#}")),
-                        }
+                        crate::reconcile::apply(&path, &body, &merged)
+                            .map(|it| it.fm.title)
+                            .map_err(|e| format!("reconcile not saved: {e:#}"))
                     }
-                    None => self.message = Some("reconcile: the agent returned no proposal".into()),
+                    None => Err("reconcile: the agent returned no proposal".into()),
                 },
-                Err(e) => self.message = Some(format!("reconcile failed: {e}")),
+                Err(e) => Err(format!("reconcile failed: {e}")),
+            };
+            match outcome {
+                Ok(title) => {
+                    self.reconcile_failed.remove(&path);
+                    self.message = Some(format!(
+                        "reconciled `{title}` with what shipped (* until you read it, u undoes)"
+                    ));
+                    self.reload_tree();
+                }
+                Err(why) => {
+                    // kept until r retries it, shown while the capability is selected
+                    self.message = Some(why.clone());
+                    self.reconcile_failed.insert(path, why);
+                }
             }
         }
+    }
+
+    /// `r`: forget failed reconciles so the next check starts them again.
+    fn retry_reconciles(&mut self) {
+        let failed: Vec<PathBuf> = self.reconcile_failed.drain().map(|(p, _)| p).collect();
+        self.reconcile_tried.retain(|(p, _)| !failed.contains(p));
+    }
+
+    /// The status line for the selected capability when nothing else is said:
+    /// a reconcile that failed, and how to retry it.
+    fn reconcile_note(&self) -> Option<String> {
+        let it = self.selected_intent()?;
+        self.reconcile_failed
+            .get(&it.path)
+            .map(|why| format!("{why} · r retries"))
     }
 
     /// Opening a capability (it shows in the detail panes) reads it.
@@ -1241,7 +1268,10 @@ impl App {
                     Some(self.filter.label()),
                 );
             }
-            KeyCode::Char('r') => self.rescan(),
+            KeyCode::Char('r') => {
+                self.retry_reconciles();
+                self.rescan();
+            }
             KeyCode::Char('s') => self.start_send(),
             KeyCode::Char('g') => self.go_to_agent(),
             KeyCode::Char('+') => self.open_areas_input(),
@@ -1627,6 +1657,16 @@ impl App {
                 let i = KINDS.iter().position(|k| *k == fm.kind).unwrap_or(0);
                 fm.kind = KINDS[(i + 1) % KINDS.len()].to_string();
             }),
+            KeyCode::Char('R') | KeyCode::Char('U')
+                if self
+                    .selected_intent()
+                    .is_some_and(|i| i.fm.state == State::Sent) =>
+            {
+                self.message = Some(
+                    "already sent: R and U only apply before sending (its progress tracks the work now)"
+                        .into(),
+                );
+            }
             KeyCode::Char('R') => {
                 // ready means nothing is left unanswered
                 let open = self
@@ -1665,7 +1705,10 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('r') => self.rescan(),
+            KeyCode::Char('r') => {
+                self.retry_reconciles();
+                self.rescan();
+            }
             _ => {}
         }
         Flow::Continue
@@ -3364,7 +3407,7 @@ impl App {
         let text = match &self.screen {
             Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
             Screen::Prompt { question, .. } => question.clone(),
-            _ => self.message.clone().unwrap_or_else(|| {
+            _ => self.message.clone().or_else(|| self.reconcile_note()).unwrap_or_else(|| {
                 "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
                     .to_string()
             }),
@@ -3585,6 +3628,9 @@ impl App {
             Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
             Screen::Browse => match (&self.message, self.focus) {
                 (Some(m), _) => m.clone(),
+                (None, _) if self.reconcile_note().is_some() => {
+                    self.reconcile_note().unwrap_or_default()
+                }
                 (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
@@ -5388,6 +5434,80 @@ mod tests {
         assert!(
             !herdr.contains("agent list"),
             "agent states only poll for the cards: {herdr}"
+        );
+    }
+
+    #[test]
+    fn ready_and_refining_keys_leave_a_sent_capability_sent() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&path, |fm| fm.state = State::Sent).unwrap();
+        fx.app.rescan();
+        for k in ['R', 'U'] {
+            key(&mut fx.app, KeyCode::Char(k));
+            assert_eq!(
+                Store::load(&path).unwrap().fm.state,
+                State::Sent,
+                "{k} kept it sent"
+            );
+            assert!(
+                fx.app
+                    .view()
+                    .message
+                    .unwrap_or_default()
+                    .contains("already sent"),
+                "{:?}",
+                fx.app.view().message
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_reconcile_stays_visible_and_r_retries_it() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        let empty = fx.tmp.path().join("empty.jsonl");
+        fs::write(&empty, "").unwrap();
+        fx.app.provider_env[0].1 = empty.display().to_string(); // the agent says nothing useful
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        assert!(
+            Store::load(&path).unwrap().fm.reconciled_for.is_empty(),
+            "not applied"
+        );
+        // select the capability and press an unrelated key: the reason is still shown
+        let groups: Vec<PathBuf> = fx.app.collapsed.iter().cloned().collect();
+        for g in groups {
+            fx.app.collapsed.remove(&g);
+        }
+        fx.app.rebuild_rows();
+        fx.app.select_path(&path);
+        key(&mut fx.app, KeyCode::Char('Q'));
+        key(&mut fx.app, KeyCode::Esc);
+        let status = render(&fx.app, 120, 30)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            status.contains("reconcile") && status.contains("r retries"),
+            "{status}"
+        );
+        // a working agent and r: it runs again
+        fx.app.provider_env[0].1 = fixtures()
+            .join("events")
+            .join("agy.jsonl")
+            .display()
+            .to_string();
+        key(&mut fx.app, KeyCode::Char('r'));
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        assert_eq!(
+            Store::load(&path).unwrap().fm.reconciled_for,
+            vec![42],
+            "retried"
         );
     }
 
