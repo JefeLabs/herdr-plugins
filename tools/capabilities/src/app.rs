@@ -775,6 +775,19 @@ impl App {
         self.poller.as_ref().map_or(0, |p| p.in_flight()) + self.reconcile_jobs.len()
     }
 
+    /// Every capability in the tree, whatever the list's filter.
+    fn all_intents(&self) -> Vec<Intent> {
+        fn all(g: &Group, out: &mut Vec<Intent>) {
+            out.extend(g.intents.iter().cloned());
+            for sub in &g.groups {
+                all(sub, out);
+            }
+        }
+        let mut out = Vec::new();
+        all(&self.tree, &mut out);
+        out
+    }
+
     /// Start a reconcile for every sent capability whose pull requests have all
     /// merged since its last reconcile.
     fn check_reconciles(&mut self) {
@@ -915,15 +928,16 @@ impl App {
     /// Ask for agent states and, when `all`, every sent capability's plans and
     /// PR states.
     fn request_polls(&mut self, all: bool) {
-        self.poller().request_agents();
+        if self.layout == Layout::List {
+            self.poller().request_agents();
+        }
         if !all {
             return;
         }
         let sent: Vec<Intent> = self
-            .list
-            .iter()
+            .all_intents()
+            .into_iter()
             .filter(|i| i.fm.state == State::Sent)
-            .cloned()
             .collect();
         for it in sent {
             let prs: Vec<String> = crate::store::artifacts(&it.body)
@@ -946,7 +960,7 @@ impl App {
     /// `r` and about every ten minutes).
     fn request_found_prs(&mut self) {
         let sent: Vec<(PathBuf, PathBuf, Vec<String>)> = self
-            .list
+            .all_intents()
             .iter()
             .filter(|i| i.fm.state == State::Sent)
             .filter_map(|i| {
@@ -1253,9 +1267,7 @@ impl App {
         self.found_cache = None;
         self.reload_tree();
         self.refresh_found();
-        if self.layout == Layout::List {
-            self.poll_ticks = 0;
-        }
+        self.poll_ticks = 0;
     }
 
     /// Re-read every capability from disk, keeping both selections.
@@ -2983,21 +2995,22 @@ impl App {
         // every ~60 s; all on background threads
         self.drain_polls();
         self.poll_reconciles();
-        if self.layout == Layout::List {
-            if self.poll_ticks.is_multiple_of(18000) {
-                self.request_found_prs();
-            }
-            if self.poll_ticks.is_multiple_of(1800) {
-                // pick up lines agents appended to capability files
-                if self.poll_ticks > 0 {
-                    self.reload_tree();
-                }
-                self.request_polls(true);
-            } else if self.poll_ticks.is_multiple_of(90) {
-                self.request_polls(false);
-            }
-            self.poll_ticks = self.poll_ticks.wrapping_add(1);
+        // pull requests, plans and searches are checked in either layout (a
+        // merge must reconcile from the tree too); agent states only matter
+        // to the cards, so they poll only while the list shows
+        if self.poll_ticks.is_multiple_of(18000) {
+            self.request_found_prs();
         }
+        if self.poll_ticks.is_multiple_of(1800) {
+            // pick up lines agents appended to capability files
+            if self.poll_ticks > 0 {
+                self.reload_tree();
+            }
+            self.request_polls(true);
+        } else if self.layout == Layout::List && self.poll_ticks.is_multiple_of(90) {
+            self.request_polls(false);
+        }
+        self.poll_ticks = self.poll_ticks.wrapping_add(1);
         let Screen::Chat(st) = &mut self.screen else {
             return;
         };
@@ -5359,6 +5372,22 @@ mod tests {
         assert!(
             log.contains("Areas it affects besides its own group: Inbox, skoolscout/family"),
             "the reconcile prompt lists the suggested area: {log}"
+        );
+    }
+
+    #[test]
+    fn a_merged_capability_is_reconciled_while_the_tree_shows() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        assert_eq!(fx.app.view().layout, "tree", "never opening the list");
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let it = Store::load(&fx.app.store.root().join("skoolscout/org/pr.md")).unwrap();
+        assert_eq!(it.fm.reconciled_for, vec![42], "reconciled from the tree");
+        let herdr = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(
+            !herdr.contains("agent list"),
+            "agent states only poll for the cards: {herdr}"
         );
     }
 
