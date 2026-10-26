@@ -371,6 +371,7 @@ mod tests {
                 true,
                 selected,
                 &[],
+                &[],
                 f.area(),
                 f.buffer_mut(),
             )
@@ -715,6 +716,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         v.focus == Pane::Preconditions,
         v.preconditions_selected,
         &[],
+        &[],
         layout[2],
         buf,
     );
@@ -742,6 +744,7 @@ pub fn render_capability(v: &DetailView, area: Rect, buf: &mut Buffer) {
         v.focus == Pane::Criteria,
         v.criteria_selected,
         &demoed,
+        &crate::store::new_criteria(it),
         layout[3],
         buf,
     );
@@ -909,6 +912,8 @@ pub fn render_reader(
 /// A titled checklist pane with wrapped items; the selected one is highlighted when focused.
 /// A checklist pane (Preconditions, Acceptance criteria). `marked` holds the
 /// (0-based) items an app-demo shows; they get `▶` after the checkbox.
+/// `fresh` holds items added by someone else and not yet acknowledged: drawn
+/// bold with a `+`, and counted in the title.
 #[allow(clippy::too_many_arguments)]
 fn render_checklist(
     items: &[crate::store::Criterion],
@@ -917,15 +922,21 @@ fn render_checklist(
     focused: bool,
     selected: usize,
     marked: &[usize],
+    fresh: &[usize],
     area: Rect,
     buf: &mut Buffer,
 ) {
+    let counts = format!(
+        "{}/{}",
+        items.iter().filter(|c| c.done).count(),
+        items.len()
+    );
     let block = pane_block(
-        &format!(
-            "{title} ({}/{})",
-            items.iter().filter(|c| c.done).count(),
-            items.len()
-        ),
+        &if fresh.is_empty() {
+            format!("{title} ({counts})")
+        } else {
+            format!("{title} ({counts} · {} new)", fresh.len())
+        },
         focused,
     );
     let inner = block.inner(area);
@@ -945,12 +956,8 @@ fn render_checklist(
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let w = if marked.contains(&i) {
-                width.saturating_sub(2)
-            } else {
-                width
-            };
-            wrap_text(&sanitize(&c.text), w)
+            let extra = 2 * (usize::from(marked.contains(&i)) + usize::from(fresh.contains(&i)));
+            wrap_text(&sanitize(&c.text), width.saturating_sub(extra))
         })
         .collect();
     let height = inner.height as usize;
@@ -987,13 +994,22 @@ fn render_checklist(
             if focused && i == selected {
                 buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
             }
-            let lead = match (j, marked.contains(&i)) {
-                (0, true) => format!("{box_}▶ "),
-                (0, false) => box_.to_string(),
-                (_, true) => "      ".to_string(),
-                (_, false) => "    ".to_string(),
+            let tags = format!(
+                "{}{}",
+                if fresh.contains(&i) { "+ " } else { "" },
+                if marked.contains(&i) { "▶ " } else { "" }
+            );
+            let lead = if j == 0 {
+                format!("{box_}{tags}")
+            } else {
+                " ".repeat(4 + tags.chars().count())
             };
-            Line::from(format!("{lead}{piece}")).render(rect, buf);
+            let style = if fresh.contains(&i) {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(format!("{lead}{piece}"), style).render(rect, buf);
             y += 1;
             used += 1;
         }

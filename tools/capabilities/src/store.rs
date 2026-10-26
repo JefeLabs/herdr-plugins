@@ -93,6 +93,10 @@ pub struct FrontMatter {
     /// Updated by a reconcile and not yet read by the owner (shown as `*`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unread: bool,
+    /// Keys (`criterion_key`) of the acceptance criteria the owner has seen.
+    /// `None` until first recorded; see `new_criteria` for how that is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged: Option<Vec<String>>,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -310,6 +314,7 @@ impl Store {
             areas: Vec::new(),
             reconciled_for: Vec::new(),
             unread: false,
+            acknowledged: None,
             extra: BTreeMap::new(),
         };
         let mut it = Intent {
@@ -956,6 +961,79 @@ pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<A
 }
 
 pub const CRITERIA_HEADING: &str = "## Acceptance criteria";
+
+/// A stable key for a criterion's wording (FNV-1a over its words), so a
+/// reworded criterion counts as new while ticking it does not.
+pub fn criterion_key(text: &str) -> String {
+    let normal = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in normal.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The criteria keys the owner has seen. With no record yet: before sending,
+/// every criterion is the owner's own; once sent, those whose wording appears
+/// in the refinement transcript (the proposals the owner worked through), or
+/// all of them when there is no transcript to tell.
+fn seen_keys(it: &Intent) -> Vec<String> {
+    if let Some(keys) = &it.fm.acknowledged {
+        return keys.clone();
+    }
+    let all = criteria(&it.body);
+    if it.fm.state != State::Sent {
+        return all.iter().map(|c| criterion_key(&c.text)).collect();
+    }
+    // without a transcript nothing tells who wrote what: count them all as seen
+    let Ok(transcript) = std::fs::read_to_string(it.transcript_path()) else {
+        return all.iter().map(|c| criterion_key(&c.text)).collect();
+    };
+    let transcript = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+    all.iter()
+        .filter(|c| {
+            let words = c.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            !words.is_empty() && transcript.contains(&words)
+        })
+        .map(|c| criterion_key(&c.text))
+        .collect()
+}
+
+/// Acceptance criteria (0-based) added or reworded by someone else (an
+/// agent, a reconcile) and not yet acknowledged by the owner.
+pub fn new_criteria(it: &Intent) -> Vec<usize> {
+    let seen = seen_keys(it);
+    criteria(&it.body)
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !seen.contains(&criterion_key(&c.text)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Record criteria `indexes` (0-based) as seen, keeping what was already
+/// seen, without counting as an edit (`updated` is not bumped).
+pub fn acknowledge_criteria(path: &Path, indexes: &[usize]) -> anyhow::Result<Intent> {
+    let it = Store::load(path)?;
+    let mut seen = seen_keys(&it);
+    let all = criteria(&it.body);
+    for i in indexes {
+        if let Some(c) = all.get(*i) {
+            let k = criterion_key(&c.text);
+            if !seen.contains(&k) {
+                seen.push(k);
+            }
+        }
+    }
+    Store::update_meta(path, |fm| fm.acknowledged = Some(seen))
+}
+
+/// Record every current criterion as seen (the owner authored or accepted them).
+pub fn acknowledge_all_criteria(path: &Path) -> anyhow::Result<Intent> {
+    let n = criteria(&Store::load(path)?.body).len();
+    acknowledge_criteria(path, &(0..n).collect::<Vec<_>>())
+}
 pub const PRECONDITIONS_HEADING: &str = "## Preconditions";
 
 /// Checks that prove the capability is done.

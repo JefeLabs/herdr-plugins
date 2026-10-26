@@ -2,9 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use herdr_capabilities::store::{
-    Readiness, SaveError, State, Store, add_artifact, add_checklist_item, add_question,
-    answer_question, artifacts, criteria, discover_artifacts, open_questions, preconditions,
-    questions, readiness, send_refusal, slugify, toggle_criterion, toggle_precondition,
+    Readiness, SaveError, State, Store, acknowledge_criteria, add_artifact, add_checklist_item,
+    add_question, answer_question, artifacts, criteria, criterion_key, discover_artifacts,
+    new_criteria, open_questions, preconditions, questions, readiness, send_refusal, slugify,
+    toggle_criterion, toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -605,4 +606,48 @@ fn affected_areas_round_trip_and_stay_out_of_the_file_when_empty() {
         back.fm.extra.is_empty(),
         "areas is a known field, not extra"
     );
+}
+
+#[test]
+fn a_criterion_key_ignores_spacing_and_survives_ticking() {
+    assert_eq!(
+        criterion_key("Family gets  a notice "),
+        criterion_key("Family gets a notice")
+    );
+    assert_ne!(
+        criterion_key("Family gets a notice"),
+        criterion_key("Family gets an email")
+    );
+    assert_eq!(criterion_key("x").len(), 16, "a stable 64-bit hex key");
+}
+
+#[test]
+fn new_criteria_are_the_ones_nobody_acknowledged() {
+    let (_tmp, s) = store();
+    let body = "## Acceptance criteria\n- [x] original one\n- [ ] original two\n- [ ] added by the agent\n";
+    let it = s
+        .create(Path::new("org"), "Cap", "idea", body, None)
+        .unwrap();
+    // before sending, everything is the owner's own
+    assert!(new_criteria(&it).is_empty());
+    // sent, with no record and no transcript: nothing tells, so nothing is new
+    let it = Store::update_fields(&it.path, |fm| fm.state = State::Sent).unwrap();
+    assert!(new_criteria(&it).is_empty());
+    // with a transcript: criteria found in it count as seen
+    fs::write(
+        it.transcript_path(),
+        "### agent\n```proposal\n- [ ] original one\n- [ ] original two\n```\n",
+    )
+    .unwrap();
+    assert_eq!(new_criteria(&it), vec![2]);
+    // acknowledging writes the record (seed included); a reworded one is new again
+    let it = acknowledge_criteria(&it.path, &[2]).unwrap();
+    assert!(new_criteria(&it).is_empty());
+    assert_eq!(it.fm.acknowledged.as_ref().map(Vec::len), Some(3));
+    let mut changed = Store::load(&it.path).unwrap();
+    changed.body = changed
+        .body
+        .replace("original two", "original two, reworded");
+    Store::save_force(&mut changed).unwrap();
+    assert_eq!(new_criteria(&Store::load(&it.path).unwrap()), vec![1]);
 }

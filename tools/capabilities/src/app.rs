@@ -1737,6 +1737,18 @@ impl App {
                         crate::store::CRITERIA_HEADING,
                         self.criteria_selected,
                     ),
+                    // acknowledge a criterion someone else added: the selected one, or all
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let which: Vec<usize> = if k.code == KeyCode::Char('Y') {
+                            (0..n).collect()
+                        } else {
+                            vec![self.criteria_selected]
+                        };
+                        match crate::store::acknowledge_criteria(&it.path, &which) {
+                            Ok(_) => self.reload_tree(),
+                            Err(e) => self.message = Some(format!("not saved: {e:#}")),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2107,6 +2119,21 @@ impl App {
             return;
         };
         it.body = self.editor.text();
+        // criteria the owner typed in this save count as seen
+        let before: Vec<String> = Store::load(&it.path)
+            .map(|d| {
+                crate::store::criteria(&d.body)
+                    .iter()
+                    .map(|c| crate::store::criterion_key(&c.text))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let typed: Vec<usize> = crate::store::criteria(&it.body)
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !before.contains(&crate::store::criterion_key(&c.text)))
+            .map(|(i, _)| i)
+            .collect();
         let result = if force {
             Store::save_force(&mut it).map_err(SaveError::Io)
         } else {
@@ -2114,6 +2141,9 @@ impl App {
         };
         match result {
             Ok(()) => {
+                if !typed.is_empty() {
+                    let _ = crate::store::acknowledge_criteria(&it.path, &typed);
+                }
                 self.editing = Some(it);
                 self.message = Some("saved".into());
                 self.rescan();
@@ -2488,6 +2518,8 @@ impl App {
         }
         match Store::save_force(&mut it) {
             Ok(()) => {
+                // the owner reviewed and accepted this text: its criteria are seen
+                let _ = crate::store::acknowledge_all_criteria(&it.path);
                 self.message = Some("proposal applied".into());
                 self.rescan();
                 // Apply ends the refinement for now: back to the view, or to the
@@ -2655,6 +2687,8 @@ impl App {
                     fm.sent_to = Some(record);
                 }) {
                     Ok(_) => {
+                        // what is sent is the owner's: every criterion counts as seen
+                        let _ = crate::store::acknowledge_all_criteria(&path);
                         self.message = Some(format!(
                             "sent to {} in workspace {} (agent {})",
                             handoff.name, outcome.workspace_id, outcome.agent
@@ -2828,6 +2862,16 @@ impl App {
                 self.edit_selected_body(|body| {
                     crate::store::add_checklist_item(body, heading, value)
                 });
+                if heading == crate::store::CRITERIA_HEADING
+                    && let Some(it) = self.selected_intent().cloned()
+                {
+                    // the owner's own criterion is seen
+                    let n = crate::store::criteria(&it.body).len();
+                    if n > 0 {
+                        let _ = crate::store::acknowledge_criteria(&it.path, &[n - 1]);
+                        self.reload_tree();
+                    }
+                }
                 self.focus = pane;
                 let n = self
                     .selected_intent()
@@ -3263,7 +3307,7 @@ impl App {
                     agent: o.agent.clone(),
                     running: o.running.clone(),
                     title: &i.fm.title,
-                    unread: i.fm.unread,
+                    unread: i.fm.unread || !crate::store::new_criteria(i).is_empty(),
                     group: o.group.clone(),
                     worktree: o.worktree.clone(),
                     when: when.format("%b %d %H:%M").to_string(),
@@ -3357,7 +3401,7 @@ impl App {
                     broken: false,
                     reference: reference.is_some(),
                     refs: 0,
-                    unread: intent.fm.unread,
+                    unread: intent.fm.unread || !crate::store::new_criteria(intent).is_empty(),
                     complete: crate::progress::progress(intent, &self.evidence_for(intent))
                         .is_some_and(|p| p.complete),
                 },
@@ -3520,7 +3564,7 @@ impl App {
                 (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
             },
@@ -4457,6 +4501,86 @@ mod tests {
         let v = fx.app.view();
         assert_eq!(v.screen, "reader", "{v:?}");
         assert_eq!(v.reader_title, "Alex shows Alpha working");
+    }
+
+    /// Alpha, sent, with one criterion from its refinement transcript and two
+    /// an agent added.
+    fn alpha_with_agent_added_criteria(fx: &mut Fx) -> PathBuf {
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.state = State::Sent;
+        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] owner wrote this\n- [ ] agent added one\n- [ ] agent added two\n".into();
+        Store::save_force(&mut it).unwrap();
+        fs::write(
+            it.transcript_path(),
+            "```proposal\n- [ ] owner wrote this\n```\n",
+        )
+        .unwrap();
+        fx.app.rescan();
+        path
+    }
+
+    #[test]
+    fn added_criteria_are_highlighted_until_each_is_acknowledged() {
+        let mut fx = setup("agy.jsonl");
+        let path = alpha_with_agent_added_criteria(&mut fx);
+        let shown = render(&fx.app, 110, 30);
+        assert!(shown.contains("(0/3 · 2 new)"), "{shown}");
+        assert!(shown.contains("[ ] + agent added one"), "{shown}");
+        assert!(shown.contains("[ ] owner wrote this"), "{shown}");
+        assert!(
+            shown.contains("* Alpha"),
+            "the capability carries * meanwhile: {shown}"
+        );
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('j')); // agent added one
+        key(&mut fx.app, KeyCode::Char('y'));
+        assert_eq!(
+            crate::store::new_criteria(&Store::load(&path).unwrap()),
+            vec![2]
+        );
+        assert!(render(&fx.app, 110, 30).contains("* Alpha"), "one left");
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('y'));
+        let shown = render(&fx.app, 110, 30);
+        assert!(!shown.contains("* Alpha"), "the last one clears *: {shown}");
+        assert!(!shown.contains("new)"), "{shown}");
+    }
+
+    #[test]
+    fn y_capital_acknowledges_every_new_criterion() {
+        let mut fx = setup("agy.jsonl");
+        let path = alpha_with_agent_added_criteria(&mut fx);
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('Y'));
+        assert!(crate::store::new_criteria(&Store::load(&path).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn the_owners_own_criteria_never_show_as_new() {
+        let mut fx = setup("agy.jsonl");
+        let path = alpha_with_agent_added_criteria(&mut fx);
+        // adding one in the pane
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_text(&mut fx.app, "owner added later");
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&path).unwrap();
+        let cs = crate::store::criteria(&it.body);
+        let fresh = cs
+            .iter()
+            .position(|c| c.text == "owner added later")
+            .unwrap();
+        assert!(
+            !crate::store::new_criteria(&it).contains(&fresh),
+            "added by the owner"
+        );
+        assert_eq!(
+            crate::store::new_criteria(&it).len(),
+            2,
+            "the agent's two still new"
+        );
     }
 
     #[test]
@@ -5623,6 +5747,10 @@ mod tests {
         key(&mut fx.app, KeyCode::Enter);
         let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
         assert_eq!(it.fm.state, State::Sent);
+        assert!(
+            it.fm.acknowledged.is_some(),
+            "what was sent is recorded as seen"
+        );
         let sent = it.fm.sent_to.unwrap();
         assert_eq!(sent.handoff, "grill");
         assert_eq!(sent.workspace_id, "w9");

@@ -143,6 +143,10 @@ The tree then shows the capability as a dim `↳` row under each affected group;
 
 Areas are also suggested from the work itself: a pull request found for the capability whose branch follows workbrokr's `<type>/<area>--<task>` shape names an area (`feature/org/candidates--…` gives `org/candidates`), and when exactly one group's path ends with it, the card shows `suggested: …`. `+` opens with suggestions already added, so Enter confirms them; nothing is added without that.
 
+## New acceptance criteria
+
+Criteria someone else adds or rewords (an agent editing the file, a reconcile) are new until you acknowledge them. The criteria pane draws them bold with `+` and counts them in its title (`Acceptance criteria (2/10 · 7 new)`); `y` acknowledges the selected one, `Y` all of them. While any are unacknowledged the capability carries `*` before its title, in the tree and on its card, so the last `y` clears it. Your own criteria never count as new: everything present when you send, the criteria of a refinement proposal you apply, and criteria you add with `a` or type in the editor are recorded as seen (`acknowledged:` in the front matter holds a key per criterion's wording, so rewording one makes it new again while ticking it does not). For a capability sent before this record existed, criteria found in its refinement transcript count as seen; with no transcript, all do.
+
 ## Reconcile after merge
 
 When every pull request of a sent capability has merged (one closed without merging is ignored), the tool reconciles it with what shipped: in the background it reads the spec, the plan names, the merged pull requests' titles and descriptions and the `issue:` follow-ups, and asks your refinement agent (the last one used) for a rewrite. The rewrite corrects the acceptance criteria to match the shipped behaviour (grouped under `### <area path>` when the work spans areas), names any dropped criterion under Open questions, keeps Description, Preconditions and Artifacts, and leaves follow-ups out of the criteria.
