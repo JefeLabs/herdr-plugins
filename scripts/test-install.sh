@@ -64,12 +64,17 @@ with zipfile.ZipFile(out, "w") as z:
 EOF
 }
 t="$work/tools"
-mkdir -p "$t/procs" "$t/oxker" "$t/dua" "$t/yazi" "$t/lazysql"
+mkdir -p "$t/procs" "$t/oxker" "$t/dua" "$t/yazi" "$t/lazysql" "$t/nvim"
 fake_bin "$t/procs/procs" procs && zip_of "$rel/procs-fake.zip" "$t/procs"
 fake_bin "$t/oxker/oxker" oxker && tar -czf "$rel/oxker-fake.tar.gz" -C "$t/oxker" oxker
 fake_bin "$t/dua/dua-fake/dua" dua && tar -czf "$rel/dua-fake.tar.gz" -C "$t/dua" dua-fake
 fake_bin "$t/yazi/yazi-fake/yazi" yazi && fake_bin "$t/yazi/yazi-fake/ya" ya && zip_of "$rel/yazi-fake.zip" "$t/yazi"
 fake_bin "$t/lazysql/lazysql" lazysql && tar -czf "$rel/lazysql-fake.tar.gz" -C "$t/lazysql" lazysql
+# a folder tool, like Neovim's release: the program plus its runtime files
+fake_bin "$t/nvim/nvim-fake/bin/nvim" nvim
+mkdir -p "$t/nvim/nvim-fake/share/nvim/runtime"
+echo "-- runtime" > "$t/nvim/nvim-fake/share/nvim/runtime/filetype.lua"
+tar -czf "$rel/nvim-fake.tar.gz" -C "$t/nvim" nvim-fake
 write_manifest() { # <file> <bad tool or -> <missing tool or ->
   bad=$2 missing=$3
   {
@@ -85,6 +90,7 @@ oxker oxker-fake.tar.gz oxker
 dua dua-fake.tar.gz dua-fake/dua
 yazi yazi-fake.zip yazi-fake/yazi yazi-fake/ya
 lazysql lazysql-fake.tar.gz lazysql
+nvim nvim-fake.tar.gz dir=nvim-fake:bin/nvim needs=glibc
 ROWS
   } > "$1"
 }
@@ -95,7 +101,7 @@ run() { # <home> <extra PATH or -> <manifest> <args...>; output in $out, status 
   shift 3
   p=$base_path
   [ "$extra" = - ] || p="$extra:$p"
-  out=$(env -i HOME="$h" PATH="$p" HERDR_PLUGINS_TOOLS_MANIFEST="$m" ${REPOS:+HERDR_PLUGINS_REPOS="$REPOS"} \
+  out=$(env -i HOME="$h" PATH="$p" HERDR_PLUGINS_TOOLS_MANIFEST="$m" ${REPOS:+HERDR_PLUGINS_REPOS="$REPOS"} ${LIBC:+HERDR_PLUGINS_LIBC="$LIBC"} \
     sh "$rel/install.sh" --from "$rel" "$@" 2>&1)
   status=$?
 }
@@ -220,6 +226,57 @@ case "$status:$out" in
   1:*"unknown option --bogus"*) pass "unknown option refused" ;;
   *) flunk "unknown option refused" "exit $status: $out" ;;
 esac
+
+# 9. a folder tool (Neovim) unpacks whole and is linked into the bin folder
+h="$work/h9"
+mkdir -p "$h"
+run "$h" - "$work/good" --tools
+vendor="$h/.local/share/herdr-plugins/vendor/nvim/nvim-fake"
+if [ $status -eq 0 ] && [ -L "$h/.local/bin/nvim" ] && [ "$("$h/.local/bin/nvim")" = "nvim fake" ] &&
+  [ -f "$vendor/share/nvim/runtime/filetype.lua" ]; then
+  pass "nvim installs as a folder, linked into the bin folder"
+else
+  flunk "nvim installs as a folder, linked into the bin folder" "exit $status; link: $(ls -l "$h/.local/bin/nvim" 2>&1): $out"
+fi
+
+# 10. the Editor tool is added, listening so files can be opened in it
+t10=$(toml "$h")
+if grep -q '^id *= *"editor"' "$t10" 2>/dev/null && grep -q 'exec nvim --listen' "$t10" &&
+  sed -n '/^id *= *"editor"/,/^\[\[tool\]\]/p' "$t10" | grep -q '^open *= *"pane"'; then
+  pass "Editor tool added, Neovim listening in a pane"
+else
+  flunk "Editor tool added, Neovim listening in a pane" "$(cat "$t10" 2>&1)"
+fi
+
+# 11. a second run keeps Neovim and adds the Editor once
+run "$h" "$h/.local/bin" "$work/good" --tools
+n=$(grep -c '^id *= *"editor"' "$(toml "$h")")
+case "$status:$n:$out" in
+  0:1:*"nvim: already installed"*) pass "second run keeps Neovim and one Editor" ;;
+  *) flunk "second run keeps Neovim and one Editor" "exit $status, editor blocks $n: $out" ;;
+esac
+
+# 12. reinstalling the plugins keeps the unpacked Neovim
+run "$h" - "$work/good"
+if [ "$("$h/.local/bin/nvim" 2>&1)" = "nvim fake" ]; then
+  pass "plugin reinstall keeps the Neovim folder"
+else
+  flunk "plugin reinstall keeps the Neovim folder" "$(ls -l "$h/.local/bin/nvim" 2>&1)"
+fi
+
+# 13. on a musl system (Alpine) Neovim's glibc build is skipped with a hint
+h="$work/h13"
+mkdir -p "$h"
+LIBC=musl run "$h" - "$work/good" --tools
+if [ $status -eq 0 ] && [ ! -e "$h/.local/bin/nvim" ] && [ -x "$h/.local/bin/procs" ] &&
+  ! grep -q '^id *= *"editor"' "$(toml "$h")"; then
+  case "$out" in
+    *"nvim: "*"needs glibc"*) pass "musl: Neovim skipped with a hint" ;;
+    *) flunk "musl: Neovim skipped with a hint" "no hint: $out" ;;
+  esac
+else
+  flunk "musl: Neovim skipped with a hint" "exit $status: $out"
+fi
 
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"
 [ $failures -eq 0 ]
