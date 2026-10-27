@@ -32,6 +32,21 @@ pub struct ToolConfig {
     /// slot can show images (terminal-browser pages). Off by default.
     #[serde(default)]
     pub graphics: bool,
+    /// A pane tool that opens several panes, stacked top to bottom: one
+    /// command each, in place of `command`.
+    #[serde(default)]
+    pub panes: Vec<Vec<String>>,
+}
+
+impl ToolConfig {
+    /// What a pane tool runs, one command per pane: `panes`, else `command`.
+    pub fn pane_commands(&self) -> Vec<Vec<String>> {
+        if self.panes.is_empty() {
+            vec![self.command.clone()]
+        } else {
+            self.panes.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -71,7 +86,17 @@ pub fn parse(text: &str) -> anyhow::Result<RawConfig> {
     let raw: RawConfig =
         toml::from_str(text).map_err(|e| anyhow::anyhow!("{}", describe(&e, text)))?;
     for t in &raw.tool {
-        if t.command.is_empty() {
+        if !t.panes.is_empty() {
+            if t.open != Open::Pane {
+                bail!("tool `{}`: panes need open = \"pane\"", t.id);
+            }
+            if !t.command.is_empty() {
+                bail!("tool `{}` has both command and panes", t.id);
+            }
+            if t.panes.iter().any(Vec::is_empty) {
+                bail!("tool `{}` has an empty pane command", t.id);
+            }
+        } else if t.command.is_empty() {
             bail!("tool `{}` has no command", t.id);
         }
         if t.id.is_empty() {
@@ -274,6 +299,61 @@ mod tests {
         assert!(
             parse("[[tool]]\nid = \"x\"\nname = \"X\"\nicon = \"x\"\ncommand = [\"x\"]\nopen = \"window\"\n").is_err(),
             "only slot or pane"
+        );
+    }
+
+    #[test]
+    fn a_pane_tool_can_open_several_stacked_panes() {
+        let raw = parse(
+            "[[tool]]\nid = \"usage\"\nname = \"Usage\"\nicon = \"u\"\nopen = \"pane\"\npanes = [[\"procs\", \"--watch\"], [\"oxker\"], [\"dua\", \"i\"]]\n",
+        )
+        .unwrap();
+        let t = &raw.tool[0];
+        assert!(t.command.is_empty());
+        let want: Vec<Vec<String>> = vec![
+            vec!["procs".into(), "--watch".into()],
+            vec!["oxker".into()],
+            vec!["dua".into(), "i".into()],
+        ];
+        assert_eq!(t.pane_commands(), want);
+        let single = parse(
+            "[[tool]]\nid = \"b\"\nname = \"B\"\nicon = \"o\"\ncommand = [\"tb\"]\nopen = \"pane\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            single.tool[0].pane_commands(),
+            vec![vec!["tb".to_string()]],
+            "one command is one pane"
+        );
+    }
+
+    #[test]
+    fn panes_need_a_pane_tool_and_no_command() {
+        let base = "[[tool]]\nid = \"usage\"\nname = \"Usage\"\nicon = \"u\"\n";
+        let in_slot = parse(&format!("{base}panes = [[\"procs\"]]\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            in_slot.contains("tool `usage`: panes need open = \"pane\""),
+            "got: {in_slot}"
+        );
+        let both = parse(&format!(
+            "{base}open = \"pane\"\ncommand = [\"x\"]\npanes = [[\"procs\"]]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            both.contains("tool `usage` has both command and panes"),
+            "got: {both}"
+        );
+        let empty = parse(&format!(
+            "{base}open = \"pane\"\npanes = [[\"procs\"], []]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            empty.contains("tool `usage` has an empty pane command"),
+            "got: {empty}"
         );
     }
     use super::*;

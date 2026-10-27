@@ -3,6 +3,8 @@
 printf '%s\n' "$*" >> "$FAKE_HERDR_LOG"
 case "$1 $2" in
   "pane get")
+    # FAKE_GONE: space-separated ids closed since they were recorded
+    case " ${FAKE_GONE:-} " in *" $3 "*) exit 1 ;; esac
     if [ "${FAKE_PANE_EXISTS:-0}" = 1 ]; then
       # A real non-plugin pane has no plugin_id field; only the label tells it apart.
       printf '{"id":"cli:pane","result":{"pane":{"pane_id":"%s","label":"%s"}}}\n' "$3" "${FAKE_PANE_LABEL:-Toolbar}"
@@ -20,7 +22,14 @@ case "$1 $2" in
       printf '{"id":"cli:pane:neighbor","result":{"neighbor":{"direction":"left","pane_id":"w1:p9"}}}\n'
     fi ;;
   "pane split")
-    printf '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p12","tab_id":"w1:t1"}}}\n' ;;
+    # each split gets the next id: w1:p12, w1:p13, ...
+    n=$(cat "$FAKE_HERDR_LOG.next" 2>/dev/null || echo 12)
+    if [ -n "${FAKE_SPLIT_FAIL_FROM:-}" ] && [ "$n" -ge "$FAKE_SPLIT_FAIL_FROM" ]; then
+      echo "no room to split" >&2
+      exit 1
+    fi
+    echo $((n + 1)) > "$FAKE_HERDR_LOG.next"
+    printf '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p%s","tab_id":"w1:t1"}}}\n' "$n" ;;
   "plugin pane")
     # Real 0.9.5 shape: result.plugin_pane.pane.pane_id
     printf '{"id":"cli:plugin","result":{"plugin_pane":{"entrypoint":"toolbar","pane":{"pane_id":"w1:p9","tab_id":"w1:t1"},"plugin_id":"jefelabs.toolbar"},"type":"plugin_pane_opened"}}\n' ;;

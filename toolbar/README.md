@@ -98,6 +98,21 @@ Tools start the first time you select them.
 
 A tool with `open = "pane"` runs in a Herdr pane instead of the toolbar's slot: selecting it opens a right split of the work pane (the toolbar's left neighbour, else the focused pane), runs its `command` there with its `cwd` and `env`, and focuses it. The pane is labelled with the tool's name. Selecting the tool again closes that pane, so the button works as a toggle; if the pane was closed some other way, the next selection opens a new one. The pane id is kept under the plugin's state folder, so this survives a toolbar restart, and a recorded pane is closed only while it still carries the tool's name (Herdr reuses pane ids after a restart). Use it for tools that need the room or draw with graphics, such as `terminal-browser`, which shows pages as images.
 
+A pane tool can open several panes at once: give it `panes`, one command per pane, in place of `command`. The first pane opens beside the work pane as above; the others stack below it at equal heights, each running its own command with the tool's `cwd` and `env`. Every pane carries the tool's name, and selecting the tool again closes all of them, skipping any you already closed. Arguments are passed as written, so `~` is not expanded: write paths in full.
+
+```toml
+[[tool]]
+id    = "usage"
+name  = "Usage"
+icon  = "▤"
+open  = "pane"
+panes = [
+  ["procs", "--watch-interval", "2", "--sortd", "cpu", "--or", "herdr", "docker", "Workspaces"],
+  ["oxker"],
+  ["dua", "i", "/path/to/your/repos"],
+]
+```
+
 `graphics = true` (experimental) lets a slot tool draw Kitty images. The slot's screen model drops them, so the toolbar cuts each image command out of the tool's output, keeps the cursor where it was printed, and after each frame writes it to Herdr placed at that cell of the slot, with replies turned off (`q=2`) so nothing comes back into the toolbar's input. It also answers what a graphics tool asks before drawing: whether images work, the device attributes (`CSI c`), and, when the toolbar's terminal reports its pixel size, the cell and text-area size (`CSI 16 t`, `CSI 14 t`, and the pty's pixel size). Switching to another tool clears the images; switching back makes the tool redraw. Every frame passes through the toolbar, so a busy page is slower than in its own pane, and the slot is only as big as the toolbar: `open = "pane"` is the faster choice for real browsing. A tool that is not installed shows a one-line "cannot start" message in its slot and the other tools keep working.
 
 ### Per-worktree overrides
