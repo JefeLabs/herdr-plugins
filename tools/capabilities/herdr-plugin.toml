@@ -1,6 +1,6 @@
 id = "jefelabs.capabilities"
 name = "Capabilities"
-version = "0.1.3"
+version = "0.1.4"
 min_herdr_version = "0.9.0"
 description = "Capture capabilities, refine them in a streaming conversation with an agent CLI, and send them to a new Herdr agent"
 platforms = ["macos", "linux"]
