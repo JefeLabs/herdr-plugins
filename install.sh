@@ -3,11 +3,22 @@
 #
 #   curl -fsSL https://github.com/JefeLabs/herdr-plugins/releases/latest/download/install.sh | sh
 #
+# On a machine without internet access, copy over install.sh, SHA256SUMS and
+# the archive for that machine (herdr-plugins-<os>-<arch>.tar.gz), then run
+#
+#   sh install.sh --from <folder holding them>
+#
 # No sudo, Rust or compiler needed. Settings (environment variables):
 #   HERDR_PLUGINS_VERSION   a release tag such as v0.1.0 (default: the latest)
 #   HERDR_PLUGINS_DIR       where the plugins go (default: ~/.local/share/herdr-plugins)
 #   HERDR_PLUGINS_BASE_URL  download from here instead of GitHub (for testing)
 set -eu
+
+from="${HERDR_PLUGINS_FROM:-}"
+if [ "${1:-}" = "--from" ]; then
+  [ -n "${2:-}" ] || { echo "herdr-plugins: --from needs a folder" >&2; exit 1; }
+  from=$2
+fi
 
 repo="JefeLabs/herdr-plugins"
 version="${HERDR_PLUGINS_VERSION:-latest}"
@@ -38,7 +49,9 @@ esac
 asset="herdr-plugins-$os-$arch.tar.gz"
 
 fetch() {
-  if command -v curl >/dev/null 2>&1; then
+  if [ -n "$from" ]; then
+    cp "$from/$(basename "$1")" "$2"
+  elif command -v curl >/dev/null 2>&1; then
     curl -fsSL "$1" -o "$2"
   else
     wget -qO "$2" "$1"
@@ -54,9 +67,14 @@ sha256() {
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-say "Downloading $asset ($version)"
-fetch "$base/$asset" "$tmp/$asset" || fail "could not download $base/$asset"
-fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || fail "could not download $base/SHA256SUMS"
+if [ -n "$from" ]; then
+  [ -d "$from" ] || fail "no folder $from"
+  say "Installing $asset from $from"
+else
+  say "Downloading $asset ($version)"
+fi
+fetch "$base/$asset" "$tmp/$asset" || fail "could not get $asset${from:+ from $from}"
+fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || fail "could not get SHA256SUMS${from:+ from $from}"
 want=$(grep " $asset\$" "$tmp/SHA256SUMS" | cut -d ' ' -f 1)
 [ -n "$want" ] || fail "SHA256SUMS has no line for $asset"
 [ "$(sha256 "$tmp/$asset")" = "$want" ] || fail "checksum mismatch for $asset: not installing"

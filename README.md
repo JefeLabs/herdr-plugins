@@ -12,6 +12,8 @@ curl -fsSL https://github.com/JefeLabs/herdr-plugins/releases/latest/download/in
 
 It downloads the build for your machine from the latest release, checks it against the release's `SHA256SUMS`, puts both plugins in `~/.local/share/herdr-plugins`, links them with `herdr plugin link`, writes a first toolbar `tools.toml` if you have none, and prints the Herdr key bindings to add. No sudo, Rust or compiler is needed: the Linux builds are static. Run it again to update; `HERDR_PLUGINS_VERSION=v0.1.0` installs a given release.
 
+Without internet access (a closed network), copy `install.sh`, `SHA256SUMS` and the archive for that machine from a release (or from `dist/`) into one folder there, and run `sh install.sh --from <that folder>`. It checks and installs the same way and makes no network calls.
+
 ## Develop
 
 Link one for development with `herdr plugin link <this checkout>/<plugin>` after `cargo build --release`.
