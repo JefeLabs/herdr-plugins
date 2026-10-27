@@ -56,8 +56,11 @@ Everything goes to the hosted tool except a two-key prefix, default `Ctrl-]`:
 | `Ctrl-]` `Ctrl-]` | send a literal `Ctrl-]` to the tool |
 | `Enter` on an exited tool | restart it |
 | click an icon | select that tool |
+| rest the mouse on an icon | show the tool's name beside it |
 
 Change the prefix with `prefix = "ctrl-b"` (or `alt-t`, ...) at the top of `tools.toml`.
+
+`bar = "large"` at the top of `tools.toml` makes each button five columns wide and three rows tall, with the icon centred: a bigger target to click. When the pane is too short for every button at that size, the bar uses small buttons (three columns, one row, the default `bar = "small"`) until it is tall enough again. Resting the mouse on a button shows the tool's name beside it, over the tool's area: a box as tall as the button with large buttons, a single highlighted line with small ones. It goes when the mouse moves off the bar. This needs the terminal to report mouse movement to the toolbar; under Herdr it depends on Herdr passing movement on to the pane. `r` applies a change to `bar`.
 
 ## tools.toml
 

@@ -57,10 +57,21 @@ pub enum Open {
     Pane,
 }
 
+/// How big the bar's buttons are: `small` (three columns by one row, the
+/// default) or `large` (five columns by three rows, while they all fit).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BarSize {
+    #[default]
+    Small,
+    Large,
+}
+
 /// One file, as written.
 #[derive(Debug, Default, Deserialize)]
 pub struct RawConfig {
     pub prefix: Option<String>,
+    pub bar: Option<BarSize>,
     pub order: Option<Vec<String>>,
     #[serde(default)]
     pub tool: Vec<ToolConfig>,
@@ -70,6 +81,7 @@ pub struct RawConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub prefix: String,
+    pub bar: BarSize,
     pub tools: Vec<ToolConfig>,
 }
 
@@ -77,6 +89,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             prefix: DEFAULT_PREFIX.to_string(),
+            bar: BarSize::Small,
             tools: Vec::new(),
         }
     }
@@ -244,6 +257,7 @@ pub fn load_merged(global: &Path, workspace_root: &Path, trust: &Trust) -> anyho
 pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<Config> {
     let mut tools = global.tool;
     let mut prefix = global.prefix;
+    let mut bar = global.bar;
     let mut order = global.order;
 
     if let Some(ws) = workspace {
@@ -255,6 +269,9 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         }
         if ws.prefix.is_some() {
             prefix = ws.prefix;
+        }
+        if ws.bar.is_some() {
+            bar = ws.bar;
         }
         if ws.order.is_some() {
             order = ws.order;
@@ -281,12 +298,25 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
 
     Ok(Config {
         prefix: prefix.unwrap_or_else(|| DEFAULT_PREFIX.to_string()),
+        bar: bar.unwrap_or_default(),
         tools,
     })
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_bar_is_small_unless_set_large() {
+        let small = merge(parse("").unwrap(), None).unwrap();
+        assert_eq!(small.bar, BarSize::Small);
+        let large = merge(parse("bar = \"large\"\n").unwrap(), None).unwrap();
+        assert_eq!(large.bar, BarSize::Large);
+        let ws = parse("bar = \"small\"\n").unwrap();
+        let both = merge(parse("bar = \"large\"\n").unwrap(), Some(ws)).unwrap();
+        assert_eq!(both.bar, BarSize::Small, "a workspace file wins");
+        assert!(parse("bar = \"huge\"\n").is_err());
+    }
 
     #[test]
     fn a_tool_opens_in_the_slot_unless_it_asks_for_a_pane() {

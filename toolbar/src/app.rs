@@ -84,6 +84,10 @@ pub struct App {
     /// Bytes for the terminal after the next frame (clearing a hidden
     /// graphics tool's images).
     pending_out: Vec<u8>,
+    /// Button size, from the config.
+    bar: crate::config::BarSize,
+    /// The tool whose button the mouse rests on.
+    pub hover: Option<usize>,
 }
 
 impl App {
@@ -100,6 +104,8 @@ impl App {
             notes_tx,
             notes_rx,
             pending_out: Vec::new(),
+            bar: Default::default(),
+            hover: None,
             prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
             size,
@@ -119,6 +125,8 @@ impl App {
             config,
             ignored_untrusted,
         } = loaded;
+        self.bar = config.bar;
+        self.hover = None;
         let mut old: Vec<Slot> = std::mem::take(&mut self.slots);
         let selected_id = old.get(self.selected).map(|s| s.cfg.id.clone());
         for cfg in config.tools {
@@ -156,10 +164,18 @@ impl App {
         let _ = config.prefix; // prefix changes apply on next start; see reload()
     }
 
+    /// The bar's shape now: large buttons only while they all fit.
+    fn layout(&self) -> ui::BarLayout {
+        ui::bar_layout(self.bar, self.slots.len(), self.size.rows)
+    }
+
     fn content_size(&self) -> Size {
         let footer = self.footer().is_some();
-        let (rows, cols) =
-            ui::content_size(Rect::new(0, 0, self.size.cols, self.size.rows), footer);
+        let (rows, cols) = ui::content_size(
+            Rect::new(0, 0, self.size.cols, self.size.rows),
+            footer,
+            self.layout().width,
+        );
         Size { rows, cols }
     }
 
@@ -369,25 +385,33 @@ impl App {
         Flow::Continue
     }
 
-    /// A click on an icon selects that tool. Inside the tool's area, mouse
-    /// events go to the tool when it has turned mouse reporting on, in the
-    /// mode and encoding it asked for, at its own coordinates.
+    /// A click on a button selects that tool, and resting the mouse on one
+    /// names it. Inside the tool's area, mouse events go to the tool when it
+    /// has turned mouse reporting on, in the mode and encoding it asked for,
+    /// at its own coordinates.
     pub fn apply_mouse(&mut self, ev: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
         let area = Rect::new(0, 0, self.size.cols, self.size.rows);
-        let (content, bar) = ui::split(area);
+        let layout = self.layout();
+        let (content, bar) = ui::split(area, layout.width);
         if ev.column >= bar.x && bar.width > 0 {
-            // the last bar row holds the reload/armed marker, not an icon
-            let icon_rows = bar.height.saturating_sub(1);
-            if ev.kind == MouseEventKind::Down(MouseButton::Left)
-                && ev.row < icon_rows
-                && usize::from(ev.row) < self.slots.len()
-            {
-                self.message = None;
-                self.select(usize::from(ev.row));
+            // the last bar row holds the reload/armed marker, not a button
+            let button_rows = bar.height.saturating_sub(1);
+            let index = usize::from(ev.row / layout.rows.max(1));
+            let on_button = ev.row < button_rows
+                && index < self.slots.len()
+                && (index as u16 + 1) * layout.rows <= button_rows;
+            match ev.kind {
+                MouseEventKind::Down(MouseButton::Left) if on_button => {
+                    self.message = None;
+                    self.select(index);
+                }
+                MouseEventKind::Moved => self.hover = on_button.then_some(index),
+                _ => {}
             }
             return;
         }
+        self.hover = None;
         let tool_rows = self.content_size().rows;
         if ev.column < content.x || ev.row < content.y || ev.row - content.y >= tool_rows {
             return;
@@ -509,6 +533,8 @@ impl App {
             message: self.message_text(),
             footer: footer.as_deref(),
             prefix_armed: self.prefix.armed(),
+            bar: self.bar,
+            hover: self.hover,
         };
         ui::render(&frame, area, buf);
     }
@@ -786,6 +812,44 @@ mod tests {
         // below the icons nothing happens
         app.apply_mouse(click(SIZE.cols - 2, 7));
         assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    fn moved(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_anywhere_on_a_large_button_selects_its_tool() {
+        let fx = fixture(&format!("bar = \"large\"\n{}", three()));
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        // large buttons: the rightmost five columns, three rows each
+        app.apply_mouse(click(SIZE.cols - 5, 3));
+        assert_eq!(app.selected, 1);
+        app.apply_mouse(click(SIZE.cols - 1, 8));
+        assert_eq!(app.selected, 2);
+        app.apply_mouse(click(SIZE.cols - 3, 0));
+        assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    #[test]
+    fn moving_over_an_icon_names_it_and_moving_off_the_bar_clears_it() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.apply_mouse(moved(SIZE.cols - 2, 1));
+        assert_eq!(app.hover, Some(1));
+        app.apply_mouse(moved(SIZE.cols - 2, SIZE.rows - 1));
+        assert_eq!(app.hover, None, "the marker row is no tool");
+        app.apply_mouse(moved(SIZE.cols - 2, 2));
+        assert_eq!(app.hover, Some(2));
+        app.apply_mouse(moved(3, 3));
+        assert_eq!(app.hover, None, "off the bar");
         app.shutdown();
     }
 
