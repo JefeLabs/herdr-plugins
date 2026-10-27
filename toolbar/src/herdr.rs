@@ -347,50 +347,55 @@ pub fn launched_pane_file(ctx: &HerdrContext, tool_id: &str) -> PathBuf {
 /// What a press on a pane tool did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PaneToggle {
-    /// A new pane was opened, with this id.
-    Opened(String),
-    /// The pane the tool opened before was closed.
-    Closed(String),
+    /// New panes were opened, with these ids, top to bottom.
+    Opened(Vec<String>),
+    /// The panes the tool opened before were closed.
+    Closed(Vec<String>),
 }
 
-/// Open `tool` in a Herdr pane beside the work pane, or close the pane it
-/// opened before when that pane is still there.
+/// Open `tool` in Herdr panes beside the work pane, or close the panes it
+/// opened before when any of them is still there.
 ///
-/// The new pane is a right split of the toolbar's left neighbour (the work
-/// pane), else of the focused pane; the tool's command runs in it. This is
-/// how terminal-browser opens itself in Herdr, so a browser gets a real pane.
-/// The pane is labelled with the tool's name, and a recorded pane is closed
-/// only while it still carries that label: Herdr reuses pane ids after a
-/// restart, so the id alone could name someone else's pane.
+/// The first pane is a right split of the toolbar's left neighbour (the work
+/// pane), else of the focused pane. A tool with several `panes` stacks the
+/// rest below the first, in equal heights. Each pane runs its command. This
+/// is how terminal-browser opens itself in Herdr, so a browser gets a real
+/// pane. Every pane is labelled with the tool's name, and a recorded pane is
+/// closed only while it still carries that label: Herdr reuses pane ids
+/// after a restart, so the id alone could name someone else's pane.
 pub fn toggle_pane(
     ctx: &HerdrContext,
     tool: &crate::config::ToolConfig,
 ) -> anyhow::Result<PaneToggle> {
-    if tool.command.is_empty() {
+    let commands = tool.pane_commands();
+    if commands.iter().any(Vec::is_empty) {
         bail!("{} has no command", tool.name);
     }
     let file = launched_pane_file(ctx, &tool.id);
-    if let Ok(recorded) = std::fs::read_to_string(&file) {
-        let id = recorded.trim();
-        if !id.is_empty() {
-            let out = ctx.herdr(&["pane", "get", id])?;
-            if out.status.success()
-                && json_str(&out.stdout, "/result/pane/label").as_deref()
-                    == Some(tool.name.as_str())
-            {
-                let close = ctx.herdr(&["pane", "close", id])?;
-                if !close.status.success() {
-                    bail!(
-                        "herdr pane close failed: {}",
-                        String::from_utf8_lossy(&close.stderr).trim()
-                    );
-                }
-                let _ = std::fs::remove_file(&file);
-                return Ok(PaneToggle::Closed(id.to_string()));
-            }
+    let recorded = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut ours = Vec::new();
+    for id in recorded.lines().map(str::trim).filter(|id| !id.is_empty()) {
+        let out = ctx.herdr(&["pane", "get", id])?;
+        if out.status.success()
+            && json_str(&out.stdout, "/result/pane/label").as_deref() == Some(tool.name.as_str())
+        {
+            ours.push(id.to_string());
         }
     }
-    let from = ctx
+    if !ours.is_empty() {
+        for id in &ours {
+            let close = ctx.herdr(&["pane", "close", id])?;
+            if !close.status.success() {
+                bail!(
+                    "herdr pane close failed: {}",
+                    String::from_utf8_lossy(&close.stderr).trim()
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&file);
+        return Ok(PaneToggle::Closed(ours));
+    }
+    let beside = ctx
         .pane_id
         .as_deref()
         .and_then(|toolbar| left_neighbour(ctx, toolbar))
@@ -402,47 +407,66 @@ pub fn toggle_pane(
         None => ctx.workspace_cwd.clone(),
     };
     let cwd = cwd.display().to_string();
-    let mut args: Vec<String> = [
-        "pane",
-        "split",
-        "--pane",
-        &from,
-        "--direction",
-        "right",
-        "--focus",
-        "--cwd",
-        &cwd,
-    ]
-    .iter()
-    .map(|a| a.to_string())
-    .collect();
-    for (k, v) in &tool.env {
-        args.push("--env".into());
-        args.push(format!("{k}={v}"));
-    }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = ctx.herdr(&refs)?;
-    if !out.status.success() {
-        bail!(
-            "herdr pane split failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let id = json_str(&out.stdout, "/result/pane/pane_id")
-        .context("herdr pane split gave no pane id")?;
-    // best effort: unlabelled, the pane still works, and the next press
-    // opens another one instead of closing it
-    let _ = ctx.herdr(&["pane", "rename", &id, &tool.name]);
-    let run = ctx.herdr(&["pane", "run", &id, &shell_quote(&tool.command)])?;
-    if !run.status.success() {
-        bail!(
-            "herdr pane run failed: {}",
-            String::from_utf8_lossy(&run.stderr).trim()
-        );
-    }
     std::fs::create_dir_all(&ctx.state_dir)?;
-    std::fs::write(&file, format!("{id}\n"))?;
-    Ok(PaneToggle::Opened(id))
+    let mut opened: Vec<String> = Vec::new();
+    let count = commands.len();
+    for (i, command) in commands.iter().enumerate() {
+        let mut args: Vec<String> = match opened.last() {
+            None => [
+                "pane",
+                "split",
+                "--pane",
+                &beside,
+                "--direction",
+                "right",
+                "--focus",
+            ]
+            .map(String::from)
+            .to_vec(),
+            // the pane above keeps one share of what is left, so all end equal
+            Some(above) => {
+                let ratio = format!("{:.3}", 1.0 / (count - i + 1) as f64);
+                ["pane", "split", "--pane", above, "--direction", "down"]
+                    .map(String::from)
+                    .into_iter()
+                    .chain(["--ratio".to_string(), ratio, "--no-focus".to_string()])
+                    .collect()
+            }
+        };
+        args.push("--cwd".into());
+        args.push(cwd.clone());
+        for (k, v) in &tool.env {
+            args.push("--env".into());
+            args.push(format!("{k}={v}"));
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = ctx.herdr(&refs)?;
+        if !out.status.success() {
+            bail!(
+                "herdr pane split failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let id = json_str(&out.stdout, "/result/pane/pane_id")
+            .context("herdr pane split gave no pane id")?;
+        // best effort: unlabelled, the pane still works, and the next press
+        // opens another one instead of closing it
+        let _ = ctx.herdr(&["pane", "rename", &id, &tool.name]);
+        // recorded before it runs, so a later failure leaves it closable
+        opened.push(id.clone());
+        std::fs::write(
+            &file,
+            opened.iter().map(|o| format!("{o}\n")).collect::<String>(),
+        )?;
+        let run = ctx.herdr(&["pane", "run", &id, &shell_quote(command)])?;
+        if !run.status.success() {
+            bail!(
+                "herdr pane run failed: {}",
+                String::from_utf8_lossy(&run.stderr).trim()
+            );
+        }
+    }
+    Ok(PaneToggle::Opened(opened))
 }
 
 /// The pane on `pane`'s left, if there is one.

@@ -45,3 +45,16 @@ name    = "Browser"
 icon    = "◎"
 command = ["terminal-browser", "open"]
 open    = "pane"
+
+# A pane tool can open several panes, stacked top to bottom: one command per
+# pane in `panes`, in place of `command`. Selecting it again closes them all.
+# [[tool]]
+# id    = "usage"
+# name  = "Usage"
+# icon  = "▤"
+# open  = "pane"
+# panes = [
+#   ["procs", "--watch-interval", "2", "--sortd", "cpu", "--or", "herdr", "docker", "Workspaces"],
+#   ["oxker"],
+#   ["dua", "i", "/path/to/your/repos"],
+# ]

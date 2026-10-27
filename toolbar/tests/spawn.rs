@@ -17,6 +17,7 @@ fn cfg(cmd: &[&str]) -> ToolConfig {
         env: BTreeMap::new(),
         open: Default::default(),
         graphics: false,
+        panes: vec![],
     }
 }
 

@@ -73,7 +73,37 @@ fn browser() -> ToolConfig {
         env: BTreeMap::from([("TB_X".to_string(), "1".to_string())]),
         open: Open::Pane,
         graphics: false,
+        panes: vec![],
     }
+}
+
+/// A pane tool that opens three panes stacked.
+fn usage() -> ToolConfig {
+    ToolConfig {
+        id: "usage".into(),
+        name: "Usage".into(),
+        icon: "u".into(),
+        command: vec![],
+        cwd: None,
+        env: BTreeMap::new(),
+        open: Open::Pane,
+        graphics: false,
+        panes: vec![
+            vec!["procs".into()],
+            vec!["oxker".into()],
+            vec!["dua".into(), "i".into(), "/w s".into()],
+        ],
+    }
+}
+
+fn ids(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+/// Where `needle` first appears in `hay`; fails the test when it is absent.
+fn at(hay: &str, needle: &str) -> usize {
+    hay.find(needle)
+        .unwrap_or_else(|| panic!("missing `{needle}` in:\n{hay}"))
 }
 
 fn log(fx: &Fx) -> String {
@@ -85,7 +115,7 @@ fn a_pane_tool_opens_beside_the_work_pane_and_runs_its_command() {
     let fx = fx(Some("w1:p3"), false);
     assert_eq!(
         toggle_pane(&fx.ctx, &browser()).unwrap(),
-        PaneToggle::Opened("w1:p12".into())
+        PaneToggle::Opened(vec!["w1:p12".into()])
     );
     let l = log(&fx);
     assert!(
@@ -116,7 +146,7 @@ fn a_second_press_closes_the_pane_it_opened() {
     fs::write(&record, "w1:p12\n").unwrap();
     assert_eq!(
         toggle_pane(&fx.ctx, &browser()).unwrap(),
-        PaneToggle::Closed("w1:p12".into())
+        PaneToggle::Closed(vec!["w1:p12".into()])
     );
     let l = log(&fx);
     assert!(l.contains("pane close w1:p12"), "{l}");
@@ -131,7 +161,7 @@ fn a_pane_that_is_no_longer_the_tools_is_never_closed() {
     fs::write(launched_pane_file(&fx.ctx, "browser"), "w1:p12\n").unwrap();
     assert_eq!(
         toggle_pane(&fx.ctx, &browser()).unwrap(),
-        PaneToggle::Opened("w1:p12".into())
+        PaneToggle::Opened(vec!["w1:p12".into()])
     );
     let l = log(&fx);
     assert!(!l.contains("pane close"), "{l}");
@@ -147,7 +177,7 @@ fn a_closed_pane_is_opened_again() {
     fs::write(launched_pane_file(&fx.ctx, "browser"), "w1:p12\n").unwrap();
     assert_eq!(
         toggle_pane(&fx.ctx, &browser()).unwrap(),
-        PaneToggle::Opened("w1:p12".into())
+        PaneToggle::Opened(vec!["w1:p12".into()])
     );
     assert!(log(&fx).contains("pane split --pane w1:p3"), "{}", log(&fx));
 }
@@ -173,4 +203,82 @@ fn arguments_are_quoted_for_the_shell() {
         shell_quote(&["open".into(), "it's here".into()]),
         "'open' 'it'\\''s here'"
     );
+}
+
+#[test]
+fn a_tool_with_panes_opens_them_stacked_in_equal_thirds() {
+    let fx = fx(Some("w1:p3"), false);
+    assert_eq!(
+        toggle_pane(&fx.ctx, &usage()).unwrap(),
+        PaneToggle::Opened(ids(&["w1:p12", "w1:p13", "w1:p14"]))
+    );
+    let l = log(&fx);
+    let cwd = fx.ctx.workspace_cwd.display().to_string();
+    let steps = [
+        format!("pane split --pane w1:p3 --direction right --focus --cwd {cwd}"),
+        "pane rename w1:p12 Usage".to_string(),
+        "pane run w1:p12 'procs'".to_string(),
+        format!("pane split --pane w1:p12 --direction down --ratio 0.333 --no-focus --cwd {cwd}"),
+        "pane rename w1:p13 Usage".to_string(),
+        "pane run w1:p13 'oxker'".to_string(),
+        format!("pane split --pane w1:p13 --direction down --ratio 0.500 --no-focus --cwd {cwd}"),
+        "pane rename w1:p14 Usage".to_string(),
+        "pane run w1:p14 'dua' 'i' '/w s'".to_string(),
+    ];
+    let mut last = 0;
+    for step in &steps {
+        let i = at(&l, step);
+        assert!(i >= last, "`{step}` came out of order:\n{l}");
+        last = i;
+    }
+    let recorded = fs::read_to_string(launched_pane_file(&fx.ctx, "usage")).unwrap();
+    assert_eq!(recorded, "w1:p12\nw1:p13\nw1:p14\n");
+}
+
+#[test]
+fn a_second_press_closes_every_pane_of_the_group() {
+    let fx = fx_labelled(Some("w1:p3"), true, "Usage");
+    let record = launched_pane_file(&fx.ctx, "usage");
+    fs::write(&record, "w1:p12\nw1:p13\nw1:p14\n").unwrap();
+    assert_eq!(
+        toggle_pane(&fx.ctx, &usage()).unwrap(),
+        PaneToggle::Closed(ids(&["w1:p12", "w1:p13", "w1:p14"]))
+    );
+    let l = log(&fx);
+    for id in ["w1:p12", "w1:p13", "w1:p14"] {
+        assert!(l.contains(&format!("pane close {id}")), "{l}");
+    }
+    assert!(!l.contains("pane split"), "{l}");
+    assert!(
+        !record.exists(),
+        "forgotten, so the next press opens the group"
+    );
+}
+
+#[test]
+fn panes_closed_by_hand_are_skipped_and_the_rest_close() {
+    let mut fx = fx_labelled(Some("w1:p3"), true, "Usage");
+    fx.ctx.extra_env.push(("FAKE_GONE".into(), "w1:p13".into()));
+    fs::write(
+        launched_pane_file(&fx.ctx, "usage"),
+        "w1:p12\nw1:p13\nw1:p14\n",
+    )
+    .unwrap();
+    assert_eq!(
+        toggle_pane(&fx.ctx, &usage()).unwrap(),
+        PaneToggle::Closed(ids(&["w1:p12", "w1:p14"]))
+    );
+    assert!(!log(&fx).contains("pane close w1:p13"), "{}", log(&fx));
+}
+
+#[test]
+fn a_group_that_fails_partway_remembers_the_panes_it_opened() {
+    let mut fx = fx(Some("w1:p3"), false);
+    fx.ctx
+        .extra_env
+        .push(("FAKE_SPLIT_FAIL_FROM".into(), "13".into()));
+    let e = toggle_pane(&fx.ctx, &usage()).unwrap_err().to_string();
+    assert!(e.contains("herdr pane split failed"), "got: {e}");
+    let recorded = fs::read_to_string(launched_pane_file(&fx.ctx, "usage")).unwrap();
+    assert_eq!(recorded, "w1:p12\n", "so the next press closes it");
 }
