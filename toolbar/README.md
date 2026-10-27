@@ -57,10 +57,13 @@ Everything goes to the hosted tool except a two-key prefix, default `Ctrl-]`:
 | `Enter` on an exited tool | restart it |
 | click an icon | select that tool |
 | rest the mouse on an icon | show the tool's name beside it |
+| click `»` / `«` (the top button, inside Herdr) | compact the toolbar to its bar / expand it again |
 
 Change the prefix with `prefix = "ctrl-b"` (or `alt-t`, ...) at the top of `tools.toml`.
 
 `bar = "large"` at the top of `tools.toml` makes each button five columns wide and two rows tall, with the icon centred across and a blank row between icons: a bigger target to click. When the pane is too short for every button at that size, the bar uses small buttons (three columns, one row, the default `bar = "small"`) until it is tall enough again. Resting the mouse on a button shows the tool's name beside it, over the tool's area: a box whose text lines up with the icon with large buttons, a single highlighted line with small ones. It goes when the mouse moves off the bar. This needs the terminal to report mouse movement to the toolbar; under Herdr it depends on Herdr passing movement on to the pane. `r` applies a change to `bar`.
+
+Inside Herdr the top button of the bar toggles a compact toolbar. `»` shrinks the toolbar's pane to just the bar; Herdr keeps every pane at least a tenth of the tab wide, so on a wide tab some blank space stays beside it. `«` gives back the width the pane had. While compact the tools keep running, unseen and at their size; choosing a tool that runs in the toolbar (a click or `Ctrl-]` then its number) expands it again, and tools that open a pane leave it compact.
 
 ## tools.toml
 

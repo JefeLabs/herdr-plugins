@@ -12,8 +12,9 @@ case "$1 $2" in
     fi
     exit 1 ;;
   "pane layout")
-    # tab 200 wide: agent 110, toolbar 90 (45%)
-    printf '{"id":"cli:pane:layout","result":{"layout":{"area":{"x":0,"y":0,"width":200,"height":50},"panes":[{"pane_id":"w1:p3","rect":{"x":0,"y":0,"width":110,"height":50}},{"pane_id":"w1:p9","rect":{"x":110,"y":0,"width":90,"height":50}}]}}}\n' ;;
+    # tab 200 wide: agent and toolbar (90 unless FAKE_TOOLBAR_WIDTH says)
+    tw=${FAKE_TOOLBAR_WIDTH:-90}
+    printf '{"id":"cli:pane:layout","result":{"layout":{"area":{"x":0,"y":0,"width":200,"height":50},"panes":[{"pane_id":"w1:p3","rect":{"x":0,"y":0,"width":%s,"height":50}},{"pane_id":"w1:p9","rect":{"x":%s,"y":0,"width":%s,"height":50}}]}}}\n' $((200 - tw)) $((200 - tw)) "$tw" ;;
   "pane neighbor")
     # real shape: neighbor_pane_id is absent when there is no neighbour
     if [ -n "${FAKE_NEIGHBOR:-}" ]; then

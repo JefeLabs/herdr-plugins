@@ -209,25 +209,49 @@ pub fn toggle(ctx: &HerdrContext) -> anyhow::Result<()> {
 /// Best effort: any failure leaves Herdr's default width.
 const TARGET_WIDTH_FRACTION: f64 = 0.33;
 
-fn fit_width(ctx: &HerdrContext, pane_id: &str) {
-    let Ok(out) = ctx.herdr(&["pane", "layout", "--pane", pane_id]) else {
-        return;
-    };
-    let Ok(v) =
-        serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&out.stdout).trim())
-    else {
-        return;
-    };
+/// The tab's width and pane `pane_id`'s, in columns, from `herdr pane layout`.
+fn widths(ctx: &HerdrContext, pane_id: &str) -> Option<(f64, f64)> {
+    let out = ctx.herdr(&["pane", "layout", "--pane", pane_id]).ok()?;
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).ok()?;
     let layout = &v["result"]["layout"];
-    let total = layout["area"]["width"].as_f64().unwrap_or(0.0);
+    let total = layout["area"]["width"].as_f64()?;
     let mine = layout["panes"]
-        .as_array()
-        .and_then(|ps| ps.iter().find(|p| p["pane_id"].as_str() == Some(pane_id)))
-        .and_then(|p| p["rect"]["width"].as_f64())
-        .unwrap_or(0.0);
-    if total <= 0.0 || mine <= 0.0 {
-        return;
+        .as_array()?
+        .iter()
+        .find(|p| p["pane_id"].as_str() == Some(pane_id))?["rect"]["width"]
+        .as_f64()?;
+    (total > 0.0 && mine > 0.0).then_some((total, mine))
+}
+
+/// Move the divider so pane `pane_id` is `cols` columns wide, as far as
+/// Herdr allows: it keeps every pane at least a tenth of the tab. Returns the
+/// width the pane had, or `None` when Herdr could not say.
+pub fn set_width(ctx: &HerdrContext, pane_id: &str, cols: u16) -> Option<u16> {
+    let (total, mine) = widths(ctx, pane_id)?;
+    let delta = (mine - f64::from(cols)) / total;
+    if delta.abs() * total >= 1.0 {
+        // `right` moves a right-hand pane's left edge right: it narrows
+        let direction = if delta > 0.0 { "right" } else { "left" };
+        let amount = format!("{:.4}", delta.abs());
+        let _ = ctx.herdr(&[
+            "pane",
+            "resize",
+            "--pane",
+            pane_id,
+            "--direction",
+            direction,
+            "--amount",
+            &amount,
+        ]);
     }
+    Some(mine as u16)
+}
+
+fn fit_width(ctx: &HerdrContext, pane_id: &str) {
+    let Some((total, mine)) = widths(ctx, pane_id) else {
+        return;
+    };
     let delta = mine / total - TARGET_WIDTH_FRACTION;
     if delta > 0.02 {
         let amount = format!("{:.2}", delta);
