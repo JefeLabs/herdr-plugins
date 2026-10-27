@@ -333,6 +333,16 @@ fn every_handoff_says_edge_cases_are_the_agents_and_asks_for_pr_lines() {
             "{}: {p}",
             h.name
         );
+        assert!(
+            p.contains("The numbers count this capability's own acceptance criteria from 1"),
+            "{}: {p}",
+            h.name
+        );
+        assert!(
+            p.contains("`- plan: <slice name>` with no path"),
+            "{}: {p}",
+            h.name
+        );
     }
 }
 

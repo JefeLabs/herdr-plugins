@@ -236,8 +236,11 @@ pub fn backup_path(path: &Path) -> PathBuf {
 /// `root` (other than the capability's own) are added to `areas:`.
 pub fn apply(path: &Path, body: &str, merged: &[u64], root: &Path) -> anyhow::Result<Intent> {
     let mut it = Store::load(path)?;
+    rotate_backups(path)?;
     std::fs::copy(path, backup_path(path))?;
-    it.body = owner_ticks(&it.body, body);
+    let kept = keep_left_out(&it.body, body);
+    let kept = remap_demos(&it.body, &kept);
+    it.body = owner_ticks(&it.body, &kept);
     let own = path
         .parent()
         .and_then(|p| p.strip_prefix(root).ok())
@@ -286,7 +289,8 @@ pub fn heading_areas(body: &str, root: &Path) -> Vec<String> {
     out
 }
 
-/// Put the version before the last reconcile back. `false` when there is none.
+/// Put the version before the last reconcile back; the one before that
+/// becomes the next to undo. `false` when there is none.
 pub fn undo(path: &Path) -> anyhow::Result<bool> {
     let backup = backup_path(path);
     if !backup.exists() {
@@ -294,5 +298,154 @@ pub fn undo(path: &Path) -> anyhow::Result<bool> {
     }
     std::fs::copy(&backup, path)?;
     std::fs::remove_file(&backup)?;
+    for n in 1..BACKUPS {
+        let older = numbered_backup(path, n);
+        if older.exists() {
+            std::fs::rename(&older, numbered_backup(path, n - 1))?;
+        }
+    }
     Ok(true)
+}
+
+/// How many versions before reconciles are kept, newest first.
+const BACKUPS: usize = 5;
+
+/// The `n`th newest backup: `n = 0` is `backup_path`.
+fn numbered_backup(path: &Path, n: usize) -> PathBuf {
+    if n == 0 {
+        return backup_path(path);
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    path.with_file_name(format!("{stem}.before-reconcile.{n}.bak"))
+}
+
+/// Make room for a new newest backup: each one moves a place older, and the
+/// oldest kept is dropped.
+fn rotate_backups(path: &Path) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(numbered_backup(path, BACKUPS - 1));
+    for n in (0..BACKUPS - 1).rev() {
+        let b = numbered_backup(path, n);
+        if b.exists() {
+            std::fs::rename(&b, numbered_backup(path, n + 1))?;
+        }
+    }
+    Ok(())
+}
+
+/// The body's `## ` sections in order, each as (lowercased heading, its text
+/// with the heading line); text before the first heading has no heading.
+fn sections(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in body.split_inclusive('\n') {
+        if line.starts_with("## ") {
+            out.push((line.trim().to_lowercase(), line.to_string()));
+        } else if let Some(last) = out.last_mut() {
+            last.1.push_str(line);
+        } else {
+            out.push((String::new(), line.to_string()));
+        }
+    }
+    out
+}
+
+/// `after` with what it left out of `before` put back: every `## ` section it
+/// dropped (after the section it followed), and every artifact line. The agent
+/// is asked to keep them; this makes sure, since a dropped section (a
+/// Decisions list, say) is lost for good once a second reconcile runs.
+pub fn keep_left_out(before: &str, after: &str) -> String {
+    let old = sections(before);
+    let mut new = sections(after);
+    for (i, (heading, text)) in old.iter().enumerate() {
+        if heading.is_empty() || new.iter().any(|(h, _)| h == heading) {
+            continue;
+        }
+        let at = old[..i]
+            .iter()
+            .rev()
+            .find_map(|(p, _)| new.iter().position(|(h, _)| h == p).map(|j| j + 1))
+            .unwrap_or_else(|| usize::from(new.first().is_some_and(|(h, _)| h.is_empty())));
+        new.insert(at, (heading.clone(), text.clone()));
+    }
+    let artifacts = crate::store::ARTIFACTS_HEADING.to_lowercase();
+    let old_lines: Vec<String> = old
+        .iter()
+        .find(|(h, _)| *h == artifacts)
+        .map(|(_, t)| {
+            t.lines()
+                .filter(|l| l.trim_start().starts_with("- "))
+                .map(|l| l.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some((_, text)) = new.iter_mut().find(|(h, _)| *h == artifacts) {
+        let have: Vec<String> = text.lines().map(|l| l.trim().to_string()).collect();
+        let missing: Vec<&String> = old_lines.iter().filter(|l| !have.contains(l)).collect();
+        if !missing.is_empty() {
+            let mut t = text.trim_end().to_string();
+            for line in missing {
+                t.push('\n');
+                t.push_str(line);
+            }
+            t.push('\n');
+            *text = t;
+        }
+    }
+    // one blank line between sections, one newline at the end
+    let last = new.len().saturating_sub(1);
+    new.into_iter()
+        .enumerate()
+        .map(|(i, (_, t))| {
+            let t = t.trim_end().to_string();
+            if i == last { t + "\n" } else { t + "\n\n" }
+        })
+        .collect()
+}
+
+/// `after` with each demo line that is unchanged from `before` renumbered to
+/// point at the same acceptance criteria (matched by wording) in `after`; a
+/// criterion that is gone drops out. Lines the agent wrote or changed stand.
+pub fn remap_demos(before: &str, after: &str) -> String {
+    use crate::store::{criteria, criterion_key};
+    let old: Vec<String> = criteria(before)
+        .iter()
+        .map(|c| criterion_key(&c.text))
+        .collect();
+    let new: Vec<String> = criteria(after)
+        .iter()
+        .map(|c| criterion_key(&c.text))
+        .collect();
+    let old_lines: Vec<&str> = before.lines().map(str::trim).collect();
+    let mut out: Vec<String> = Vec::new();
+    for line in after.lines() {
+        let target = line.trim().strip_prefix("- demo:").map(str::trim);
+        match target {
+            Some(t) if old_lines.contains(&line.trim()) => {
+                let (id, nums) = crate::demos::demo_target(t);
+                let moved: Vec<String> = nums
+                    .iter()
+                    .filter_map(|n| old.get(n.checked_sub(1)?))
+                    .filter_map(|key| new.iter().position(|k| k == key))
+                    .map(|i| (i + 1).to_string())
+                    .collect();
+                let indent = &line[..line.len() - line.trim_start().len()];
+                if moved.is_empty() {
+                    out.push(format!("{indent}- demo: {id}"));
+                } else {
+                    out.push(format!(
+                        "{indent}- demo: {id} (criteria: {})",
+                        moved.join(", ")
+                    ));
+                }
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if after.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }

@@ -179,3 +179,78 @@ fn a_reconcile_records_the_areas_its_criteria_are_grouped_by() {
         "undo puts the areas back too"
     );
 }
+
+#[test]
+fn a_reconcile_keeps_every_section_and_artifact_line_it_left_out() {
+    let before = "## Description\nd\n\n## Decisions\n- **D1** keep this\n- **D2** and this\n\n## Preconditions\n- [ ] p\n\n## Acceptance criteria\n- [ ] a\n\n## Notes\nfree text\n\n## Artifacts\n- spec: docs/s.md\n- pr: #1\n";
+    let (t, it) = intent(State::Sent, before);
+    let root = t.path().join("root");
+    // the agent drops Decisions, Notes and the pr line, and changes the rest
+    let rewrite = "## Description\nd2\n\n## Preconditions\n- [ ] p\n\n## Acceptance criteria\n- [ ] a\n- [ ] b\n\n## Artifacts\n- spec: docs/s.md\n- plan: docs/p.md\n";
+    let after = apply(&it.path, rewrite, &[1], &root).unwrap().body;
+    let headings: Vec<&str> = after.lines().filter(|l| l.starts_with("## ")).collect();
+    assert_eq!(
+        headings,
+        vec![
+            "## Description",
+            "## Decisions",
+            "## Preconditions",
+            "## Acceptance criteria",
+            "## Notes",
+            "## Artifacts"
+        ],
+        "kept where they were:\n{after}"
+    );
+    assert!(
+        after.contains("- **D1** keep this\n- **D2** and this"),
+        "{after}"
+    );
+    assert!(after.contains("free text"), "{after}");
+    assert!(
+        after.contains("d2") && after.contains("- [ ] b"),
+        "the rewrite stands"
+    );
+    for line in ["- spec: docs/s.md", "- plan: docs/p.md", "- pr: #1"] {
+        assert_eq!(after.matches(line).count(), 1, "{line}:\n{after}");
+    }
+}
+
+#[test]
+fn undo_steps_back_through_several_reconciles() {
+    let (t, it) = intent(State::Sent, "## Acceptance criteria\n- [ ] v0\n");
+    let root = t.path().join("root");
+    let v0 = fs::read_to_string(&it.path).unwrap();
+    apply(&it.path, "## Acceptance criteria\n- [ ] v1\n", &[1], &root).unwrap();
+    let v1 = fs::read_to_string(&it.path).unwrap();
+    apply(
+        &it.path,
+        "## Acceptance criteria\n- [ ] v2\n",
+        &[1, 2],
+        &root,
+    )
+    .unwrap();
+    assert!(undo(&it.path).unwrap());
+    assert_eq!(fs::read_to_string(&it.path).unwrap(), v1);
+    assert!(undo(&it.path).unwrap());
+    assert_eq!(fs::read_to_string(&it.path).unwrap(), v0);
+    assert!(!undo(&it.path).unwrap(), "nothing older");
+}
+
+#[test]
+fn demo_lines_keep_pointing_at_the_same_criteria() {
+    let before = "## Acceptance criteria\n- [ ] first\n- [ ] second\n- [ ] third\n\n## Artifacts\n- demo: story-a (criteria: 2, 3)\n- demo: story-b (criteria: 1)\n";
+    let (t, it) = intent(State::Sent, before);
+    let root = t.path().join("root");
+    // a new criterion first, "third" dropped; story-a's line kept as it was,
+    // story-b's line rewritten by the agent
+    let rewrite = "## Acceptance criteria\n- [ ] new one\n- [ ] first\n- [ ] second\n\n## Artifacts\n- demo: story-a (criteria: 2, 3)\n- demo: story-b (criteria: 2)\n";
+    let after = apply(&it.path, rewrite, &[1], &root).unwrap().body;
+    assert!(
+        after.contains("- demo: story-a (criteria: 3)"),
+        "second moved to 3, third is gone:\n{after}"
+    );
+    assert!(
+        after.contains("- demo: story-b (criteria: 2)"),
+        "a line the agent changed is its own:\n{after}"
+    );
+}

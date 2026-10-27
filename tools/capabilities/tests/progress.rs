@@ -462,6 +462,56 @@ fn without_a_repo_a_relative_plan_is_read_beside_the_capability() {
 }
 
 #[test]
+fn slices_not_yet_planned_hold_the_bar_at_building() {
+    // slice 1's plan: 15 tasks, 14 done, its PR merged; four slices to plan
+    let slice1 = PlanTasks {
+        pr: Some(PrState::Merged),
+        ..tasks(14, 15)
+    };
+    let to_plan = PlanTasks {
+        unplanned: true,
+        readable: true,
+        counted: true,
+        ..Default::default()
+    };
+    let ev = Evidence {
+        plans: vec![slice1, to_plan, to_plan, to_plan, to_plan],
+        prs: vec![(1, PrState::Merged)],
+    };
+    let (_tmp, it) = intent(
+        State::Sent,
+        "## Acceptance criteria\n- [ ] one\n\n## Artifacts\n- plan: a.md\n- plan: Slice 2: data\n- plan: Slice 3\n- plan: Slice 4\n- plan: Slice 5\n- pr: #1\n",
+    );
+    let p = progress(&it, &ev).unwrap();
+    assert_eq!(p.label, "building 14/15 · 4 to plan");
+    assert_eq!(p.segments[4], 0.0, "not at PR open");
+    assert_eq!(p.segments[5], 0.0, "not merged");
+    assert!(
+        p.segments[3] < 0.5,
+        "building share counts the slices: {}",
+        p.segments[3]
+    );
+    let blocks: Vec<(usize, f32)> = p.plans.iter().map(|b| (b.cells, b.fill)).collect();
+    assert_eq!(blocks.len(), 5, "{blocks:?}");
+    assert!(
+        blocks[1..].iter().all(|b| *b == (1, 0.0)),
+        "empty slices: {blocks:?}"
+    );
+}
+
+#[test]
+fn a_plan_line_without_a_path_is_a_slice_to_plan() {
+    let (_t, it) = sent_with("## Artifacts\n- plan: Slice 2: data\n- plan: docs/x/missing.md\n");
+    let ev = plan_evidence(None, &it);
+    assert!(ev[0].unplanned && ev[0].readable, "{:?}", ev[0]);
+    assert!(
+        !ev[1].unplanned && !ev[1].readable,
+        "a missing file is unreadable: {:?}",
+        ev[1]
+    );
+}
+
+#[test]
 fn plan_evidence_without_repo_marks_unreadable() {
     let (_t, it) = sent_with("## Artifacts\n- plan: docs/superpowers/plans/p.md\n");
     assert_eq!(
@@ -719,6 +769,7 @@ fn building_holds_one_block_per_sized_plan() {
         done: 0,
         total,
         readable: true,
+        unplanned: false,
         counted: false,
         files,
         pr,
@@ -749,6 +800,7 @@ fn building_holds_one_block_per_sized_plan() {
             done: 1,
             total: 4,
             readable: true,
+            unplanned: false,
             counted: true,
             files: 0,
             pr: None,

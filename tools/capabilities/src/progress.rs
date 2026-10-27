@@ -30,6 +30,8 @@ pub struct PlanTasks {
     pub done: usize,
     pub total: usize,
     pub readable: bool,
+    /// A slice the spec plans for later: a `plan:` line with no path yet.
+    pub unplanned: bool,
     pub counted: bool,
     /// Distinct files the plan names in its `- Create/Modify/Test:` lines.
     pub files: usize,
@@ -270,16 +272,19 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         .filter(|(_, s)| *s != PrState::Closed)
         .collect();
     let merged = prs.iter().filter(|(_, s)| *s == PrState::Merged).count();
+    // slices the spec plans for later hold the capability at building, even
+    // once the planned slices' pull requests are open or merged
+    let to_plan = ev.plans.iter().filter(|p| p.unplanned).count();
 
     let mut building_share = 0.0f32;
-    let (base, label) = if !prs.is_empty() && merged == prs.len() {
+    let (base, label) = if to_plan == 0 && !prs.is_empty() && merged == prs.len() {
         let label = if crit.is_empty() {
             "no criteria".to_string()
         } else {
             format!("verifying {ticked}/{}", crit.len())
         };
         (MERGED, label)
-    } else if !prs.is_empty() {
+    } else if to_plan == 0 && !prs.is_empty() {
         // a state gh could not give is not shown as one
         let unknown = prs.iter().any(|(_, s)| *s == PrState::Unknown);
         let label = match (prs.len(), unknown) {
@@ -290,7 +295,12 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         };
         (PR_OPEN, label)
     } else if count("plan") > 0 {
-        let readable: Vec<&PlanTasks> = ev.plans.iter().filter(|p| p.readable).collect();
+        let planned = ev.plans.len() - to_plan;
+        let readable: Vec<&PlanTasks> = ev
+            .plans
+            .iter()
+            .filter(|p| p.readable && !p.unplanned)
+            .collect();
         // a plan without a ledger has an unknown done count: guess nothing
         let uncounted = readable.iter().any(|p| !p.counted && p.total > 0);
         let total: usize = readable.iter().map(|p| p.total).sum();
@@ -298,14 +308,20 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         building_share = if total == 0 || uncounted {
             0.0
         } else {
-            done as f32 / total as f32
+            // each slice still to plan counts as one more plan not started
+            done as f32 / total as f32 * planned as f32 / (planned + to_plan) as f32
         };
-        let label = if readable.len() < ev.plans.len() {
+        let label = if readable.len() < planned {
             "building ?".to_string()
         } else if total == 0 || uncounted {
             "building".to_string()
         } else {
             format!("building {done}/{total}")
+        };
+        let label = if to_plan > 0 {
+            format!("{label} · {to_plan} to plan")
+        } else {
+            label
         };
         (PLANNED + BUILDING * building_share, label)
     } else if count("spec") > 0 || count("issue") > 0 {
@@ -344,14 +360,29 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
             })
         })
         .collect();
-    if !plans.is_empty() && base < PR_OPEN {
+    // a slice still to plan is an empty one-cell block; it weighs like the
+    // average planned block, since its size is not known yet
+    let mut plans = plans;
+    let average = if plans.is_empty() {
+        1.0
+    } else {
+        plans.iter().map(|b| b.cells).sum::<usize>() as f32 / plans.len() as f32
+    };
+    let sized = plans.len();
+    plans.extend((0..to_plan).map(|_| PlanBlock {
+        cells: 1,
+        fill: 0.0,
+        in_review: false,
+    }));
+    if sized > 0 && base < PR_OPEN {
         // weigh the building share by plan size; a plan in review is built
-        let weight: usize = plans.iter().map(|b| b.cells).sum();
+        let weight: f32 =
+            plans[..sized].iter().map(|b| b.cells as f32).sum::<f32>() + average * to_plan as f32;
         let built: f32 = plans
             .iter()
             .map(|b| b.cells as f32 * if b.in_review { 1.0 } else { b.fill })
             .sum();
-        building_share = built / weight as f32;
+        building_share = built / weight;
     }
     let reached = |stage: f32| if base >= stage { 1.0 } else { 0.0 };
     let segments = [
@@ -396,6 +427,7 @@ pub fn plan_tasks(plan: &str, ledger: Option<&str>) -> PlanTasks {
             done: 0,
             total: headings.len(),
             readable: true,
+            unplanned: false,
             counted: false,
             files,
             pr: None,
@@ -415,6 +447,7 @@ pub fn plan_tasks(plan: &str, ledger: Option<&str>) -> PlanTasks {
         done: done.len(),
         total: headings.len(),
         readable: true,
+        unplanned: false,
         counted: true,
         files,
         pr: None,
@@ -510,6 +543,16 @@ pub fn plan_evidence(repo: Option<&Path>, it: &Intent) -> Vec<PlanTasks> {
         .into_iter()
         .filter(|a| a.kind.eq_ignore_ascii_case("plan"))
         .map(|a| {
+            // a line that names no file is a slice the spec plans for later
+            let t = a.target.trim();
+            if !t.contains('/') && !t.ends_with(".md") {
+                return PlanTasks {
+                    unplanned: true,
+                    readable: true,
+                    counted: true,
+                    ..PlanTasks::default()
+                };
+            }
             let unreadable = PlanTasks::default();
             let path = match repo {
                 Some(r) => crate::send::resolve_in_repo(r, &a.target),
