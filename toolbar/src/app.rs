@@ -13,7 +13,7 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
 
-use crate::config::{Loaded, ToolConfig, Trust, load_merged};
+use crate::config::{Loaded, Open, ToolConfig, Trust, load_merged};
 use crate::keys::{Action, Prefix};
 use crate::pty::{Size, SpawnEnv, ToolProcess, ToolState};
 use crate::ui;
@@ -76,6 +76,14 @@ pub struct App {
     paths: ConfigPaths,
     wake_tx: Sender<()>,
     wake_rx: Receiver<()>,
+    /// Set when running inside Herdr: pane tools need it.
+    herdr: Option<crate::herdr::HerdrContext>,
+    /// What background launches have to say (a failure), for the footer.
+    notes_tx: Sender<String>,
+    notes_rx: Receiver<String>,
+    /// Bytes for the terminal after the next frame (clearing a hidden
+    /// graphics tool's images).
+    pending_out: Vec<u8>,
 }
 
 impl App {
@@ -84,9 +92,14 @@ impl App {
     /// reserved for things no reload can fix (none today).
     pub fn new(paths: ConfigPaths, env: SpawnEnv, size: Size) -> anyhow::Result<Self> {
         let (wake_tx, wake_rx) = channel();
+        let (notes_tx, notes_rx) = channel();
         let mut app = Self {
             slots: Vec::new(),
             selected: 0,
+            herdr: None,
+            notes_tx,
+            notes_rx,
+            pending_out: Vec::new(),
             prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
             size,
@@ -169,12 +182,41 @@ impl App {
         }
     }
 
+    /// The Herdr context, for tools that open in a Herdr pane.
+    pub fn set_herdr(&mut self, ctx: crate::herdr::HerdrContext) {
+        self.herdr = Some(ctx);
+    }
+
     /// Show tool `idx`, starting it on first selection. Out-of-range is clamped.
     pub fn select(&mut self, idx: usize) {
         if self.slots.is_empty() {
             return;
         }
         let idx = idx.min(self.slots.len() - 1);
+        // a pane tool opens beside the work pane and leaves the slot alone
+        if self.slots[idx].cfg.open == Open::Pane {
+            self.toggle_pane(idx);
+            return;
+        }
+        let previous = self.selected;
+        if previous != idx {
+            // a hidden graphics tool's images would stay on screen
+            if self.slots.get(previous).is_some_and(|s| s.cfg.graphics) {
+                self.pending_out
+                    .extend_from_slice(crate::graphics::DELETE_ALL);
+            }
+            // a graphics tool shown again redraws: its images were cleared
+            if self.slots[idx].cfg.graphics
+                && let Some(p) = self.slots[idx].proc.as_ref()
+            {
+                let size = self.content_size();
+                p.resize(Size {
+                    rows: size.rows,
+                    cols: size.cols.saturating_sub(1).max(1),
+                });
+                p.resize(size);
+            }
+        }
         self.selected = idx;
         if self.slots[idx].proc.is_none() && self.slots[idx].last_error.is_none() {
             self.spawn(idx);
@@ -185,6 +227,57 @@ impl App {
             && p.screen().size() != (size.rows, size.cols)
         {
             p.resize(size);
+        }
+    }
+
+    /// Open a pane tool, or close the pane it opened, off the UI thread;
+    /// Herdr answers in tens of milliseconds but the toolbar must never wait.
+    fn toggle_pane(&mut self, idx: usize) {
+        let cfg = self.slots[idx].cfg.clone();
+        let Some(ctx) = self.herdr.clone() else {
+            self.message = Some(format!(
+                "{} opens in a Herdr pane: run the toolbar inside Herdr",
+                cfg.name
+            ));
+            return;
+        };
+        self.message = None;
+        let (tx, wake) = (self.notes_tx.clone(), self.wake_tx.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = crate::herdr::toggle_pane(&ctx, &cfg) {
+                let _ = tx.send(format!("{}: {e:#}", cfg.name));
+                let _ = wake.send(());
+            }
+        });
+    }
+
+    /// Bytes to write after a frame: what is pending, then the image
+    /// commands of the shown graphics tool placed in the slot. Hidden graphics
+    /// tools' commands are dropped; the tool redraws when shown again.
+    pub fn graphics_out(&mut self) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.pending_out);
+        for (i, slot) in self.slots.iter().enumerate() {
+            if !slot.cfg.graphics {
+                continue;
+            }
+            let Some(p) = slot.proc.as_ref() else {
+                continue;
+            };
+            let cmds = p.take_graphics();
+            if i == self.selected {
+                // the slot's screen starts at the pane's top-left cell
+                for (cmd, row, col) in cmds {
+                    out.extend(crate::graphics::placed(&cmd, 0, 0, row, col));
+                }
+            }
+        }
+        out
+    }
+
+    /// Show what background launches reported.
+    pub fn drain_notes(&mut self) {
+        while let Ok(note) = self.notes_rx.try_recv() {
+            self.message = Some(note);
         }
     }
 
@@ -274,6 +367,53 @@ impl App {
             Action::Ignore => {}
         }
         Flow::Continue
+    }
+
+    /// A click on an icon selects that tool. Inside the tool's area, mouse
+    /// events go to the tool when it has turned mouse reporting on, in the
+    /// mode and encoding it asked for, at its own coordinates.
+    pub fn apply_mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let area = Rect::new(0, 0, self.size.cols, self.size.rows);
+        let (content, bar) = ui::split(area);
+        if ev.column >= bar.x && bar.width > 0 {
+            // the last bar row holds the reload/armed marker, not an icon
+            let icon_rows = bar.height.saturating_sub(1);
+            if ev.kind == MouseEventKind::Down(MouseButton::Left)
+                && ev.row < icon_rows
+                && usize::from(ev.row) < self.slots.len()
+            {
+                self.message = None;
+                self.select(usize::from(ev.row));
+            }
+            return;
+        }
+        let tool_rows = self.content_size().rows;
+        if ev.column < content.x || ev.row < content.y || ev.row - content.y >= tool_rows {
+            return;
+        }
+        let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else {
+            return;
+        };
+        if p.state() != ToolState::Running {
+            return;
+        }
+        let (mode, encoding) = {
+            let screen = p.screen();
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        };
+        if let Some(bytes) = crate::keys::mouse_to_bytes(
+            &ev,
+            ev.column - content.x,
+            ev.row - content.y,
+            mode,
+            encoding,
+        ) {
+            let _ = p.write(&bytes);
+        }
     }
 
     /// Forward pasted text to the selected running tool, sanitised (see `keys::paste_bytes`).
@@ -394,6 +534,7 @@ impl App {
 pub fn run(
     paths: ConfigPaths,
     env: SpawnEnv,
+    herdr: Option<crate::herdr::HerdrContext>,
     mut control: Option<Box<dyn FnMut() -> Vec<ControlCmd>>>,
     on_exit: Option<Box<dyn FnOnce()>>,
 ) -> anyhow::Result<()> {
@@ -406,11 +547,21 @@ pub fn run(
     }));
 
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
     let area = terminal.size().unwrap_or(ratatui::layout::Size {
         width: 80,
         height: 24,
     });
+    // the cell size in pixels, when the terminal reports its pixel size
+    let cell = crossterm::terminal::window_size().ok().and_then(|w| {
+        (w.width > 0 && w.height > 0 && w.columns > 0 && w.rows > 0)
+            .then(|| (w.width / w.columns, w.height / w.rows))
+    });
+    let env = SpawnEnv { cell, ..env };
     let mut app = match App::new(
         paths,
         env,
@@ -425,6 +576,9 @@ pub fn run(
             return Err(e);
         }
     };
+    if let Some(ctx) = herdr {
+        app.set_herdr(ctx);
+    }
 
     let (events_tx, events_rx) = channel::<Event>();
     std::thread::spawn(move || {
@@ -443,6 +597,14 @@ pub fn run(
         {
             return Ok(()); // the terminal is gone
         }
+        // graphics tools' images go after the frame, placed in the slot
+        let images = app.graphics_out();
+        if !images.is_empty() {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&images);
+            let _ = out.flush();
+        }
         if STOP.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -459,12 +621,14 @@ pub fn run(
             }
             Ok(Event::Resize(cols, rows)) => app.resize(Size { rows, cols }),
             Ok(Event::Paste(text)) => app.paste(&text),
+            Ok(Event::Mouse(m)) => app.apply_mouse(m),
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
         // Drain pty wakes so one redraw covers a burst of output.
         while app.wake_rx.try_recv().is_ok() {}
+        app.drain_notes();
     })();
 
     app.shutdown();
@@ -514,11 +678,16 @@ fn install_signal_handlers() {
 /// which itself panics when stderr is dead and would abort the process from
 /// inside the panic hook.
 fn restore_terminal() {
-    use crossterm::{cursor::Show, event::DisableBracketedPaste, terminal::LeaveAlternateScreen};
+    use crossterm::{
+        cursor::Show,
+        event::{DisableBracketedPaste, DisableMouseCapture},
+        terminal::LeaveAlternateScreen,
+    };
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         Show
     );
@@ -534,6 +703,7 @@ mod tests {
 
     use crate::config::{Trust, WORKSPACE_FILE};
     use crate::pty::ToolState;
+    use tui_term::vt100;
 
     const SIZE: Size = Size { rows: 10, cols: 50 };
 
@@ -564,6 +734,7 @@ mod tests {
             cwd: ws,
             inherit: vec![],
             tool_id: String::new(),
+            cell: None,
         };
         Fixture {
             _tmp: tmp,
@@ -581,8 +752,9 @@ mod tests {
     fn wait_until(what: &str, f: impl Fn() -> bool) {
         let start = Instant::now();
         while !f() {
+            // generous: under a full parallel test run a shell can take seconds to start
             assert!(
-                start.elapsed() < Duration::from_secs(3),
+                start.elapsed() < Duration::from_secs(10),
                 "timed out: {what}"
             );
             std::thread::sleep(Duration::from_millis(10));
@@ -593,8 +765,79 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn click(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_an_icon_selects_its_tool() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        // the bar is the rightmost three columns, one icon per row
+        app.apply_mouse(click(SIZE.cols - 2, 2));
+        assert_eq!(app.selected, 2);
+        app.apply_mouse(click(SIZE.cols - 1, 0));
+        assert_eq!(app.selected, 0);
+        // below the icons nothing happens
+        app.apply_mouse(click(SIZE.cols - 2, 7));
+        assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    #[test]
+    fn clicks_reach_the_tool_only_when_it_asked_for_the_mouse() {
+        let fx = fixture("");
+        let out = fx._tmp.path().join("mouse.out");
+        let plain = fx._tmp.path().join("plain.out");
+        let cfg = tool(
+            "m",
+            &format!(
+                "printf '\\\\033[?1000h\\\\033[?1006h'; stty raw -echo; exec cat > {}",
+                out.display()
+            ),
+        ) + &tool(
+            "p",
+            &format!("stty raw -echo; exec cat > {}", plain.display()),
+        );
+        fs::write(&fx.paths.global, cfg).unwrap();
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        wait_until("tool m turns mouse reporting on", || {
+            app.slots[0]
+                .proc
+                .as_ref()
+                .is_some_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+        });
+        app.apply_mouse(click(3, 1));
+        wait_until("the click arrives as SGR, 1-based", || {
+            fs::read(&out).unwrap_or_default() == b"\x1b[<0;4;2M"
+        });
+        // a tool that never asked gets nothing
+        app.select(1);
+        wait_until("tool p runs", || {
+            app.slots[1]
+                .proc
+                .as_ref()
+                .is_some_and(|p| p.state() == ToolState::Running)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        app.apply_mouse(click(3, 1));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(fs::read(&plain).unwrap_or_default().is_empty());
+        app.shutdown();
+    }
+
     fn pid(app: &App, i: usize) -> u32 {
-        app.slots[i].proc.as_ref().unwrap().pid().unwrap()
+        app.slots[i]
+            .proc
+            .as_ref()
+            .unwrap_or_else(|| panic!("slot {i} did not start: {:?}", app.slots[i].last_error))
+            .pid()
+            .unwrap()
     }
 
     fn alive(pid: u32) -> bool {
@@ -609,6 +852,90 @@ mod tests {
         assert!(app.slots[1].proc.is_none());
         assert!(app.slots[2].proc.is_none());
         app.shutdown();
+    }
+
+    #[test]
+    fn a_graphics_tool_draws_its_images_in_the_slot_and_clears_them_when_hidden() {
+        let fx = fixture("");
+        let script = fx._tmp.path().join("draw.sh");
+        fs::write(
+            &script,
+            "stty raw -echo; printf 'ab\\033_Ga=T,f=100;AAAA\\033\\\\'; sleep 30\n",
+        )
+        .unwrap();
+        let cfg = format!(
+            "[[tool]]\nid = \"browser\"\nname = \"Browser\"\nicon = \"o\"\ncommand = [\"sh\", \"{}\"]\ngraphics = true\n\n{}",
+            script.display(),
+            tool("b", "echo B; sleep 30")
+        );
+        fs::write(&fx.paths.global, cfg).unwrap();
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.select(0);
+        let mut out = Vec::new();
+        let start = Instant::now();
+        while out.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no image");
+            out = app.graphics_out();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            out,
+            crate::graphics::placed(b"\x1b_Ga=T,f=100;AAAA\x1b\\", 0, 0, 0, 2),
+            "placed at the tool's cursor, the slot's top-left being the pane's"
+        );
+        app.select(1);
+        assert_eq!(
+            app.graphics_out(),
+            crate::graphics::DELETE_ALL,
+            "switching away clears its images"
+        );
+        assert!(app.graphics_out().is_empty());
+    }
+
+    #[test]
+    fn a_pane_tool_never_takes_the_slot() {
+        let cfg = tool("a", "echo A; sleep 30")
+            + "[[tool]]\nid = \"browser\"\nname = \"Browser\"\nicon = \"o\"\ncommand = [\"terminal-browser\", \"open\"]\nopen = \"pane\"\n";
+        let fx = fixture(&cfg);
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.select(0);
+        app.select(1);
+        assert_eq!(app.selected, 0, "the slot keeps showing a");
+        assert!(app.slots[1].proc.is_none(), "nothing runs in the slot");
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("Herdr"),
+            "outside Herdr it says why: {:?}",
+            app.message
+        );
+
+        // inside Herdr it opens the pane in the background
+        let log = fx._tmp.path().join("herdr.log");
+        let state = fx._tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        app.set_herdr(crate::herdr::HerdrContext {
+            bin: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-herdr.sh"),
+            workspace_id: Some("w1".into()),
+            pane_id: Some("w1:p9".into()),
+            tab_id: Some("w1:t1".into()),
+            target_pane_id: Some("w1:p9".into()),
+            workspace_cwd: fx.env.cwd.clone(),
+            config_dir: fx._tmp.path().join("config"),
+            state_dir: state,
+            socket: fx._tmp.path().join("herdr.sock"),
+            inherit: vec![],
+            extra_env: vec![
+                ("FAKE_HERDR_LOG".into(), log.display().to_string()),
+                ("FAKE_NEIGHBOR".into(), "w1:p3".into()),
+            ],
+        });
+        app.select(1);
+        assert_eq!(app.selected, 0);
+        wait_until("the pane is opened", || {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("pane run w1:p12 'terminal-browser' 'open'")
+        });
     }
 
     #[test]
@@ -700,6 +1027,11 @@ mod tests {
         app.select(0);
         app.resize(Size { rows: 9, cols: 50 });
         // content = 50 - 3 bar columns = 47 wide, footer not showing
+        assert!(
+            app.slots[0].proc.is_some(),
+            "slot 0 did not start: {:?}",
+            app.slots[0].last_error
+        );
         assert_eq!(app.slots[0].proc.as_ref().unwrap().screen().size(), (9, 47));
         assert_eq!(app.slots[1].proc.as_ref().unwrap().screen().size(), (9, 47));
         app.shutdown();

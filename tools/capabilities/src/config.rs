@@ -151,11 +151,20 @@ fn default_model_flag() -> String {
 }
 
 /// The provider and model used last time; preselected in the picker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastUsed {
     pub provider: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// `tree` or `list`: the layout the browser opens in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// The list's sort order (`Updated`, `Progress`, `Captured`, `Title`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+    /// The list's filter (`All`, `In progress`, `Completed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
 }
 
 fn last_used_path(dirs: &Dirs) -> PathBuf {
@@ -164,14 +173,44 @@ fn last_used_path(dirs: &Dirs) -> PathBuf {
 
 /// Last choice if recorded, else the config's polish provider with no model.
 pub fn last_used(dirs: &Dirs, cfg: &Config) -> LastUsed {
-    std::fs::read_to_string(last_used_path(dirs))
+    let saved = std::fs::read_to_string(last_used_path(dirs))
         .ok()
         .and_then(|t| toml::from_str::<LastUsed>(&t).ok())
-        .filter(|l| cfg.providers.contains_key(&l.provider))
-        .unwrap_or(LastUsed {
-            provider: cfg.polish_provider.clone(),
-            model: None,
-        })
+        .unwrap_or_default();
+    if cfg.providers.contains_key(&saved.provider) {
+        return saved;
+    }
+    // an unknown (or never chosen) provider falls back, the view settings stay
+    LastUsed {
+        provider: cfg.polish_provider.clone(),
+        model: None,
+        ..saved
+    }
+}
+
+/// Record the browser's layout and sort order without touching the provider
+/// and model stored beside them.
+pub fn save_view(dirs: &Dirs, layout: &str, sort: &str) -> anyhow::Result<()> {
+    save_view_with(dirs, layout, sort, None)
+}
+
+/// `save_view`, also recording the list filter when given.
+pub fn save_view_with(
+    dirs: &Dirs,
+    layout: &str,
+    sort: &str,
+    filter: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut last = std::fs::read_to_string(last_used_path(dirs))
+        .ok()
+        .and_then(|t| toml::from_str::<LastUsed>(&t).ok())
+        .unwrap_or_default();
+    last.layout = Some(layout.to_string());
+    last.sort = Some(sort.to_string());
+    if let Some(f) = filter {
+        last.filter = Some(f.to_string());
+    }
+    save_last_used(dirs, &last)
 }
 
 pub fn save_last_used(dirs: &Dirs, last: &LastUsed) -> anyhow::Result<()> {
@@ -421,7 +460,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--output-format",
                 "stream-json",
                 "--print-timeout",
-                "90s",
+                "0s",
                 "--disable-slash-commands",
                 "--sandbox",
             ]),
@@ -433,7 +472,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "--output-format",
                 "stream-json",
                 "--print-timeout",
-                "90s",
+                "0s",
                 "--disable-slash-commands",
                 "--sandbox",
             ]),
@@ -717,6 +756,16 @@ mod tests {
     }
 
     #[test]
+    fn agy_waits_for_the_turn_to_finish() {
+        // agy hangs instead of exiting when its print timeout fires mid-turn
+        let p = builtin_providers();
+        for argv in [&p["agy"].polish, &p["agy"].resume] {
+            let i = argv.iter().position(|a| a == "--print-timeout").unwrap();
+            assert_eq!(argv[i + 1], "0s", "{argv:?}");
+        }
+    }
+
+    #[test]
     fn builtin_providers_and_handoffs_present() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs {
@@ -888,7 +937,8 @@ mod tests {
             first,
             LastUsed {
                 provider: "agy".into(),
-                model: None
+                model: None,
+                ..Default::default()
             },
             "no file yet: the config's polish provider"
         );
@@ -897,6 +947,7 @@ mod tests {
             &LastUsed {
                 provider: "agy".into(),
                 model: Some("gemini-4-argon-high".into()),
+                ..Default::default()
             },
         )
         .unwrap();

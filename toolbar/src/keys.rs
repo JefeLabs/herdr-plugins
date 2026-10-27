@@ -406,3 +406,169 @@ mod tests {
         assert_eq!(paste_bytes("plain", false), b"plain".to_vec());
     }
 }
+
+/// A mouse event at `(col, row)` (0-based, relative to the tool) as the bytes
+/// a terminal would send the tool, or `None` when its mouse `mode` does not
+/// report this kind of event or the position cannot be encoded.
+pub fn mouse_to_bytes(
+    ev: &crossterm::event::MouseEvent,
+    col: u16,
+    row: u16,
+    mode: tui_term::vt100::MouseProtocolMode,
+    encoding: tui_term::vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    use crossterm::event::{MouseButton, MouseEventKind as K};
+    use tui_term::vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+    let button = |b: MouseButton| match b {
+        MouseButton::Left => 0u32,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    // (button code, is a release, the lowest mode that reports it)
+    let (code, release, needs) = match ev.kind {
+        K::Down(b) => (button(b), false, Mode::Press),
+        K::Up(b) => (button(b), true, Mode::PressRelease),
+        K::Drag(b) => (32 + button(b), false, Mode::ButtonMotion),
+        K::Moved => (35, false, Mode::AnyMotion),
+        K::ScrollUp => (64, false, Mode::Press),
+        K::ScrollDown => (65, false, Mode::Press),
+        K::ScrollLeft => (66, false, Mode::Press),
+        K::ScrollRight => (67, false, Mode::Press),
+    };
+    let rank = |m: Mode| match m {
+        Mode::None => 0,
+        Mode::Press => 1,
+        Mode::PressRelease => 2,
+        Mode::ButtonMotion => 3,
+        Mode::AnyMotion => 4,
+    };
+    if rank(mode) < rank(needs) {
+        return None;
+    }
+    let mut mods = 0;
+    if ev.modifiers.contains(KeyModifiers::SHIFT) {
+        mods += 4;
+    }
+    if ev.modifiers.contains(KeyModifiers::ALT) {
+        mods += 8;
+    }
+    if ev.modifiers.contains(KeyModifiers::CONTROL) {
+        mods += 16;
+    }
+    let (x, y) = (u32::from(col) + 1, u32::from(row) + 1);
+    match encoding {
+        Enc::Sgr => Some(
+            format!(
+                "\x1b[<{};{x};{y}{}",
+                code + mods,
+                if release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        Enc::Default | Enc::Utf8 => {
+            // the legacy forms cannot say which button was released
+            let b = if release { 3 } else { code } + mods;
+            let mut out = vec![0x1b, b'[', b'M', (32 + b) as u8];
+            for v in [x, y] {
+                let n = 32 + v;
+                match encoding {
+                    Enc::Default if n <= 255 => out.push(n as u8),
+                    Enc::Utf8 => {
+                        let c = char::from_u32(n)?;
+                        let mut tmp = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                    }
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::mouse_to_bytes;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use tui_term::vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+
+    fn ev(kind: MouseEventKind, m: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: m,
+        }
+    }
+    const NONE: KeyModifiers = KeyModifiers::NONE;
+    use MouseEventKind::*;
+
+    #[test]
+    fn sgr_reports_press_release_scroll_and_drag() {
+        let at = |k, m| mouse_to_bytes(&ev(k, m), 4, 1, Mode::ButtonMotion, Enc::Sgr);
+        assert_eq!(at(Down(MouseButton::Left), NONE).unwrap(), b"\x1b[<0;5;2M");
+        assert_eq!(at(Up(MouseButton::Left), NONE).unwrap(), b"\x1b[<0;5;2m");
+        assert_eq!(at(Down(MouseButton::Right), NONE).unwrap(), b"\x1b[<2;5;2M");
+        assert_eq!(at(ScrollUp, NONE).unwrap(), b"\x1b[<64;5;2M");
+        assert_eq!(at(ScrollDown, NONE).unwrap(), b"\x1b[<65;5;2M");
+        assert_eq!(at(Drag(MouseButton::Left), NONE).unwrap(), b"\x1b[<32;5;2M");
+        assert_eq!(
+            at(
+                Down(MouseButton::Left),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )
+            .unwrap(),
+            b"\x1b[<20;5;2M"
+        );
+    }
+
+    #[test]
+    fn modes_decide_which_events_go_through() {
+        let go = |k, mode| mouse_to_bytes(&ev(k, NONE), 0, 0, mode, Enc::Sgr).is_some();
+        assert!(!go(Down(MouseButton::Left), Mode::None));
+        assert!(go(Down(MouseButton::Left), Mode::Press));
+        assert!(!go(Up(MouseButton::Left), Mode::Press));
+        assert!(go(Up(MouseButton::Left), Mode::PressRelease));
+        assert!(!go(Drag(MouseButton::Left), Mode::PressRelease));
+        assert!(go(Drag(MouseButton::Left), Mode::ButtonMotion));
+        assert!(!go(Moved, Mode::ButtonMotion));
+        assert!(go(Moved, Mode::AnyMotion));
+        assert!(go(ScrollDown, Mode::PressRelease));
+    }
+
+    #[test]
+    fn default_encoding_is_offset_bytes_and_release_is_button_three() {
+        let at = |k| mouse_to_bytes(&ev(k, NONE), 4, 1, Mode::PressRelease, Enc::Default);
+        assert_eq!(
+            at(Down(MouseButton::Left)).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 32 + 5, 32 + 2]
+        );
+        assert_eq!(
+            at(Up(MouseButton::Left)).unwrap(),
+            vec![0x1b, b'[', b'M', 32 + 3, 32 + 5, 32 + 2]
+        );
+        // beyond what one byte can carry, nothing is sent
+        assert!(
+            mouse_to_bytes(
+                &ev(Down(MouseButton::Left), NONE),
+                300,
+                1,
+                Mode::Press,
+                Enc::Default
+            )
+            .is_none()
+        );
+        // UTF-8 encoding carries larger columns
+        assert_eq!(
+            mouse_to_bytes(
+                &ev(Down(MouseButton::Left), NONE),
+                300,
+                1,
+                Mode::Press,
+                Enc::Utf8
+            )
+            .unwrap(),
+            [&[0x1b, b'[', b'M', 32][..], "\u{14d}".as_bytes(), &[32 + 2]].concat()
+        );
+    }
+}

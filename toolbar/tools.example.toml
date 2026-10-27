@@ -3,7 +3,7 @@
 # its entries replace global ones with the same id, and its `order`, if present, wins.
 
 prefix = "ctrl-]"
-order  = ["issues", "capabilities", "db", "files", "jira"]
+order  = ["issues", "capabilities", "db", "files", "jira", "browser"]
 
 [[tool]]
 id      = "issues"
@@ -36,3 +36,12 @@ name    = "Jira"
 icon    = "◆"
 command = ["jira", "issue", "list"]
 env     = { JIRA_PROJECT = "SKOOL" }
+
+# Opens in a Herdr pane beside the work pane, at full size and speed;
+# selecting it again closes that pane.
+[[tool]]
+id      = "browser"
+name    = "Browser"
+icon    = "◎"
+command = ["terminal-browser", "open"]
+open    = "pane"

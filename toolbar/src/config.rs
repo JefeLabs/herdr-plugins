@@ -24,6 +24,22 @@ pub struct ToolConfig {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Where the tool runs: in the toolbar's slot (the default), or in a
+    /// Herdr pane opened beside the work pane (`open = "pane"`).
+    #[serde(default)]
+    pub open: Open,
+    /// Experimental: pass the tool's Kitty graphics through to Herdr, so a
+    /// slot can show images (terminal-browser pages). Off by default.
+    #[serde(default)]
+    pub graphics: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Open {
+    #[default]
+    Slot,
+    Pane,
 }
 
 /// One file, as written.
@@ -246,6 +262,20 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_tool_opens_in_the_slot_unless_it_asks_for_a_pane() {
+        let raw = parse(
+            "[[tool]]\nid = \"files\"\nname = \"Files\"\nicon = \"x\"\ncommand = [\"yazi\"]\n\n[[tool]]\nid = \"browser\"\nname = \"Browser\"\nicon = \"o\"\ncommand = [\"terminal-browser\", \"open\"]\nopen = \"pane\"\n",
+        )
+        .unwrap();
+        assert_eq!(raw.tool[0].open, Open::Slot);
+        assert_eq!(raw.tool[1].open, Open::Pane);
+        assert!(
+            parse("[[tool]]\nid = \"x\"\nname = \"X\"\nicon = \"x\"\ncommand = [\"x\"]\nopen = \"window\"\n").is_err(),
+            "only slot or pane"
+        );
+    }
     use super::*;
     use std::fs;
 
@@ -278,14 +308,16 @@ mod tests {
     #[test]
     fn parses_the_spec_example() {
         let raw = parse(GLOBAL).unwrap();
-        assert_eq!(raw.tool.len(), 5);
+        assert_eq!(raw.tool.len(), 6);
         assert_eq!(raw.tool[2].id, "db");
         assert_eq!(raw.tool[4].env["JIRA_PROJECT"], "SKOOL");
-        let want: Vec<String> = ["issues", "todo", "db", "files", "jira"]
+        let want: Vec<String> = ["issues", "capabilities", "db", "files", "jira", "browser"]
             .map(String::from)
             .to_vec();
         assert_eq!(raw.order.as_deref(), Some(&want[..]));
         assert_eq!(raw.prefix.as_deref(), Some("ctrl-]"));
+        assert_eq!(raw.tool[5].id, "browser");
+        assert_eq!(raw.tool[5].open, Open::Pane, "the browser opens in a pane");
     }
 
     #[test]
@@ -299,7 +331,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
 "#;
         let (t, g, w) = dirs(GLOBAL, Some(ws));
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
-        assert_eq!(cfg.tools.len(), 5);
+        assert_eq!(cfg.tools.len(), 6);
         assert_eq!(cfg.tools[2].id, "db");
         assert_eq!(cfg.tools[2].name, "Slot DB");
         assert_eq!(cfg.tools[2].command[1], "postgres://localhost:5433/x");
@@ -311,14 +343,17 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let (t, g, w) = dirs(GLOBAL, Some(ws));
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
         let ids: Vec<&str> = cfg.tools.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, ["files", "db", "issues", "todo", "jira"]);
+        assert_eq!(
+            ids,
+            ["files", "db", "issues", "capabilities", "jira", "browser"]
+        );
     }
 
     #[test]
     fn missing_workspace_file_is_fine() {
         let (t, g, w) = dirs(GLOBAL, None);
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
-        assert_eq!(cfg.tools.len(), 5);
+        assert_eq!(cfg.tools.len(), 6);
         assert_eq!(cfg.prefix, "ctrl-]");
     }
 
@@ -362,7 +397,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let loaded = load_merged(&g, &w, &trust).unwrap();
         assert_eq!(
             loaded.config.tools.len(),
-            5,
+            6,
             "workspace tool must not be merged"
         );
         assert_eq!(loaded.ignored_untrusted, Some(w.join(WORKSPACE_FILE)));
@@ -375,13 +410,13 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let trust = Trust::new(t.path().join("trusted.json"));
         trust.allow(&w.join(WORKSPACE_FILE)).unwrap();
         let loaded = load_merged(&g, &w, &trust).unwrap();
-        assert_eq!(loaded.config.tools.len(), 6);
+        assert_eq!(loaded.config.tools.len(), 7);
         assert_eq!(loaded.ignored_untrusted, None);
         fs::write(w.join(WORKSPACE_FILE), format!("{ws}# changed\n")).unwrap();
         let loaded = load_merged(&g, &w, &trust).unwrap();
         assert_eq!(
             loaded.config.tools.len(),
-            5,
+            6,
             "a changed file needs re-trusting"
         );
         assert!(loaded.ignored_untrusted.is_some());
@@ -413,7 +448,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         trust.allow(&real).unwrap();
         std::os::unix::fs::symlink(&real, w.join(WORKSPACE_FILE)).unwrap();
         let loaded = load_merged(&g, &w, &trust).unwrap();
-        assert_eq!(loaded.config.tools.len(), 5);
+        assert_eq!(loaded.config.tools.len(), 6);
         assert!(loaded.ignored_untrusted.is_some());
         // and `allow` on the symlink itself must refuse
         assert!(trust.allow(&w.join(WORKSPACE_FILE)).is_err());

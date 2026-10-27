@@ -29,10 +29,12 @@ fn fx() -> Fx {
         bin: fake_herdr(),
         workspace_id: Some("w1".into()),
         pane_id: None,
+        tab_id: None,
         target_pane_id: Some("w1:p3".into()),
         workspace_cwd: ws,
         config_dir: config,
         state_dir: state,
+        socket: tmp.path().join("herdr.sock"),
         inherit: vec![],
         extra_env: vec![("FAKE_HERDR_LOG".into(), log.display().to_string())],
     };

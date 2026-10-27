@@ -5,7 +5,7 @@
 //! row never clobbers another writer's body. The chat is about one intent path,
 //! records the change stamp it opened with, and apply prompts if that moved.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
@@ -41,10 +41,15 @@ enum Row {
         name: String,
         depth: usize,
         count: usize,
+        /// Capabilities living elsewhere that affect this group or its sub-groups.
+        refs: usize,
     },
     Intent {
         intent: Intent,
         depth: usize,
+        /// `Some(group)` when shown under `group` because it affects it; the
+        /// capability itself lives elsewhere.
+        reference: Option<PathBuf>,
     },
     Broken {
         path: PathBuf,
@@ -116,7 +121,13 @@ pub enum InputAction {
     /// Append an open question.
     AddQuestion,
     /// Append `- kind: target` under Artifacts (input is "kind: target").
-    AddArtifact,
+    /// `kind` is used when the text does not start with `kind:`.
+    AddArtifact {
+        kind: &'static str,
+    },
+    /// Replace the capability's affected areas (comma-separated group paths;
+    /// empty clears them).
+    EditAreas,
 }
 
 #[allow(clippy::large_enum_variant)] // Chat carries the live turn; boxing buys nothing here
@@ -170,12 +181,125 @@ pub enum Screen {
     },
 }
 
+/// What the browser shows: the group tree with detail panes, or one flat list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    Tree,
+    List,
+}
+
+impl Layout {
+    pub fn label(self) -> &'static str {
+        match self {
+            Layout::Tree => "tree",
+            Layout::List => "list",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tree" => Some(Layout::Tree),
+            "list" => Some(Layout::List),
+            _ => None,
+        }
+    }
+}
+
+/// The list's sort orders, cycled with `S`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    /// Most recently changed first.
+    Updated,
+    /// Least advanced first: raw, ?N, ready, sent by bar fill, complete.
+    Progress,
+    /// Agents Herdr still lists, sent longest ago first; then the rest by Updated.
+    LongestRunning,
+    /// Newest created first.
+    Captured,
+    /// Oldest created first.
+    CreatedAsc,
+    /// A to Z.
+    Title,
+}
+
+impl SortOrder {
+    pub fn next(self) -> Self {
+        match self {
+            SortOrder::Updated => SortOrder::Progress,
+            SortOrder::Progress => SortOrder::LongestRunning,
+            SortOrder::LongestRunning => SortOrder::Captured,
+            SortOrder::Captured => SortOrder::CreatedAsc,
+            SortOrder::CreatedAsc => SortOrder::Title,
+            SortOrder::Title => SortOrder::Updated,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            SortOrder::Updated => "Updated",
+            SortOrder::Progress => "Progress",
+            SortOrder::LongestRunning => "Longest running",
+            SortOrder::Captured => "Captured",
+            SortOrder::CreatedAsc => "Created Asc",
+            SortOrder::Title => "Title",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        [
+            SortOrder::Updated,
+            SortOrder::Progress,
+            SortOrder::LongestRunning,
+            SortOrder::Captured,
+            SortOrder::CreatedAsc,
+            SortOrder::Title,
+        ]
+        .into_iter()
+        .find(|o| o.label() == s)
+    }
+}
+
+/// The list's filter, cycled with `f`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFilter {
+    All,
+    /// Everything not yet complete, drafts included.
+    InProgress,
+    /// Sent with every acceptance criterion ticked.
+    Completed,
+}
+
+impl ListFilter {
+    pub fn next(self) -> Self {
+        match self {
+            ListFilter::All => ListFilter::InProgress,
+            ListFilter::InProgress => ListFilter::Completed,
+            ListFilter::Completed => ListFilter::All,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ListFilter::All => "All",
+            ListFilter::InProgress => "In progress",
+            ListFilter::Completed => "Completed",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        [
+            ListFilter::All,
+            ListFilter::InProgress,
+            ListFilter::Completed,
+        ]
+        .into_iter()
+        .find(|f| f.label() == s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowView {
     pub depth: usize,
     pub label: String,
     pub is_group: bool,
     pub questions: usize,
+    /// Shown here because it affects this group; it lives elsewhere.
+    pub reference: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +321,8 @@ pub struct View {
     pub pick_items: Vec<String>,
     pub pick_selected: usize,
     pub focus: &'static str,
+    /// The detail section open under the description.
+    pub open: &'static str,
     pub question_count: usize,
     pub question_selected: usize,
     pub criteria_selected: usize,
@@ -205,6 +331,15 @@ pub struct View {
     /// Artifacts found in the repo but not yet linked.
     pub found_count: usize,
     pub reader_title: String,
+    /// `tree` or `list`.
+    pub layout: &'static str,
+    /// Every capability's title in list order.
+    pub list_titles: Vec<String>,
+    pub list_selected: usize,
+    /// The list's sort order label.
+    pub sort: &'static str,
+    /// The list's filter label.
+    pub filter: &'static str,
 }
 
 pub struct App {
@@ -230,6 +365,9 @@ pub struct App {
     /// Chat state kept while the Diff or a Prompt screen is showing.
     parked_chat: Option<ChatState>,
     pub focus: Pane,
+    /// The detail section open under the description; follows focus into a
+    /// section and stays when focus leaves for the tree or the description.
+    open: Pane,
     description_scroll: u16,
     /// mtime of our own binary at startup; a newer one on disk means a rebuild
     /// is waiting for a restart of the slot.
@@ -240,8 +378,68 @@ pub struct App {
     criteria_selected: usize,
     question_selected: usize,
     artifacts_selected: usize,
+    prs_selected: usize,
+    demos_selected: usize,
+    /// PR titles from `gh`, keyed like `pr_states`.
+    pr_titles: HashMap<(PathBuf, String), String>,
     /// Artifacts found in the selected capability's repo, cached per path.
     found_cache: Option<(PathBuf, Vec<crate::store::Artifact>)>,
+    pub layout: Layout,
+    pub sort: SortOrder,
+    pub filter: ListFilter,
+    /// Every capability in the tree that passes the filter, in list order
+    /// (all groups, collapsed or not).
+    list: Vec<Intent>,
+    /// How many capabilities there are before filtering.
+    list_total: usize,
+    list_selected: usize,
+    /// Plan tasks per capability path, as last reported by the poller.
+    plan_evidence: HashMap<PathBuf, Vec<crate::progress::PlanTasks>>,
+    /// Pull requests found mentioning each capability's spec or plan files.
+    found_prs: HashMap<PathBuf, crate::progress::FoundByName>,
+    /// Pull request states per `(repo, pr: target as linked)`, as last
+    /// reported by `gh`.
+    pr_states: HashMap<(PathBuf, String), crate::progress::PrState>,
+    /// Latest `herdr agent list` (`name → agent_status`); `None` until known
+    /// or when herdr cannot answer.
+    agents: Option<HashMap<String, crate::progress::AgentInfo>>,
+    /// herdr was asked and could not answer: the agent field stays blank
+    /// rather than looking like it is still loading.
+    agents_unavailable: bool,
+    /// Background runner for herdr, gh and plan reads; made on first use so
+    /// it picks up `herdr_env`.
+    poller: Option<crate::progress::Poller>,
+    /// Ticks since the list started polling; 0 means "poll everything now".
+    poll_ticks: u32,
+    /// Tests pin the clock here; `None` means the real time.
+    fixed_now: Option<chrono::DateTime<chrono::Local>>,
+    /// Reconciles running: per capability, the merged set it covers, the
+    /// agent turn, and when it started.
+    reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant)>,
+    /// How long a reconcile may run before it is stopped and reported.
+    reconcile_limit: std::time::Duration,
+    /// Merged sets already started this session, so a failure is not retried in a loop.
+    reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
+    /// Why the last reconcile of a capability failed; shown while it is
+    /// selected until `r` retries it.
+    reconcile_failed: HashMap<PathBuf, String>,
+    /// The area last drawn, so mouse clicks can be mapped to what is there.
+    last_area: std::cell::Cell<Rect>,
+    /// Where each list card was last drawn: `(list index, first line, end line)`.
+    card_hits: std::cell::RefCell<Vec<(usize, u16, u16)>>,
+}
+
+fn pane_name(p: Pane) -> &'static str {
+    match p {
+        Pane::Tree => "tree",
+        Pane::Description => "description",
+        Pane::Preconditions => "preconditions",
+        Pane::Criteria => "criteria",
+        Pane::Questions => "questions",
+        Pane::Artifacts => "artifacts",
+        Pane::Demos => "demos",
+        Pane::PullRequests => "pull requests",
+    }
 }
 
 impl App {
@@ -265,6 +463,7 @@ impl App {
             herdr_env: Vec::new(),
             parked_chat: None,
             focus: Pane::Tree,
+            open: Pane::Criteria,
             description_scroll: 0,
             binary_stamp: binary_mtime(),
             newer_build: false,
@@ -273,8 +472,41 @@ impl App {
             criteria_selected: 0,
             question_selected: 0,
             artifacts_selected: 0,
+            prs_selected: 0,
+            demos_selected: 0,
+            pr_titles: HashMap::new(),
             found_cache: None,
+            layout: Layout::Tree,
+            sort: SortOrder::Updated,
+            filter: ListFilter::All,
+            list: Vec::new(),
+            list_total: 0,
+            list_selected: 0,
+            plan_evidence: HashMap::new(),
+            pr_states: HashMap::new(),
+            found_prs: HashMap::new(),
+            agents: None,
+            agents_unavailable: false,
+            poller: None,
+            poll_ticks: 0,
+            fixed_now: None,
+            reconcile_jobs: HashMap::new(),
+            reconcile_limit: std::time::Duration::from_secs(600),
+            reconcile_tried: HashSet::new(),
+            reconcile_failed: HashMap::new(),
+            last_area: std::cell::Cell::new(Rect::default()),
+            card_hits: std::cell::RefCell::new(Vec::new()),
         };
+        let last = crate::config::last_used(&app.dirs, &app.cfg);
+        if let Some(l) = last.layout.as_deref().and_then(Layout::parse) {
+            app.layout = l;
+        }
+        if let Some(o) = last.sort.as_deref().and_then(SortOrder::parse) {
+            app.sort = o;
+        }
+        if let Some(f) = last.filter.as_deref().and_then(ListFilter::parse) {
+            app.filter = f;
+        }
         app.rebuild_rows();
         Ok(app)
     }
@@ -286,11 +518,39 @@ impl App {
         fn count_intents(g: &Group) -> usize {
             g.intents.len() + g.groups.iter().map(count_intents).sum::<usize>()
         }
+        // capabilities by the groups they affect, keyed by group folder
+        fn index(g: &Group, root: &Path, out: &mut HashMap<PathBuf, Vec<Intent>>) {
+            for it in &g.intents {
+                for area in &it.fm.areas {
+                    let area = area.trim().trim_matches('/');
+                    if area.is_empty() {
+                        continue;
+                    }
+                    let dir = root.join(area);
+                    if Some(dir.as_path()) != it.path.parent() {
+                        out.entry(dir).or_default().push(it.clone());
+                    }
+                }
+            }
+            for sub in &g.groups {
+                index(sub, root, out);
+            }
+        }
+        let mut affecting: HashMap<PathBuf, Vec<Intent>> = HashMap::new();
+        index(&self.tree, self.store.root(), &mut affecting);
+        fn count_refs(g: &Group, affecting: &HashMap<PathBuf, Vec<Intent>>) -> usize {
+            affecting.get(&g.path).map_or(0, Vec::len)
+                + g.groups
+                    .iter()
+                    .map(|s| count_refs(s, affecting))
+                    .sum::<usize>()
+        }
         fn walk(
             g: &Group,
             depth: usize,
             collapsed: &mut HashSet<PathBuf>,
             seen: &mut HashSet<PathBuf>,
+            affecting: &HashMap<PathBuf, Vec<Intent>>,
             rows: &mut Vec<Row>,
         ) {
             for sub in &g.groups {
@@ -303,15 +563,24 @@ impl App {
                     name: sub.name.clone(),
                     depth,
                     count: count_intents(sub),
+                    refs: count_refs(sub, affecting),
                 });
                 if !collapsed.contains(&sub.path) {
-                    walk(sub, depth + 1, collapsed, seen, rows);
+                    walk(sub, depth + 1, collapsed, seen, affecting, rows);
                 }
             }
             for it in &g.intents {
                 rows.push(Row::Intent {
                     intent: it.clone(),
                     depth,
+                    reference: None,
+                });
+            }
+            for it in affecting.get(&g.path).into_iter().flatten() {
+                rows.push(Row::Intent {
+                    intent: it.clone(),
+                    depth,
+                    reference: Some(g.path.clone()),
                 });
             }
             for (path, error) in &g.broken {
@@ -327,17 +596,780 @@ impl App {
             0,
             &mut self.collapsed,
             &mut self.seen_groups,
+            &affecting,
             &mut rows,
         );
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
+        self.rebuild_list();
+    }
+
+    // ---- list -------------------------------------------------------------
+
+    /// Every capability in the tree, sorted by `self.sort`, keeping the list
+    /// selection on the same capability when it still exists.
+    fn rebuild_list(&mut self) {
+        let keep = self.list.get(self.list_selected).map(|i| i.path.clone());
+        fn collect(g: &Group, out: &mut Vec<Intent>) {
+            out.extend(g.intents.iter().cloned());
+            for sub in &g.groups {
+                collect(sub, out);
+            }
+        }
+        let mut list = Vec::new();
+        collect(&self.tree, &mut list);
+        self.list_total = list.len();
+        let complete = |i: &Intent| {
+            crate::progress::progress(i, &self.evidence_for(i)).is_some_and(|p| p.complete)
+        };
+        match self.filter {
+            ListFilter::All => {}
+            ListFilter::InProgress => list.retain(|i| !complete(i)),
+            ListFilter::Completed => list.retain(complete),
+        }
+        match self.sort {
+            SortOrder::Updated => list.sort_by_key(|i| std::cmp::Reverse(crate::store::stamp(i))),
+            SortOrder::Captured => list.sort_by_key(|i| std::cmp::Reverse(i.fm.created)),
+            SortOrder::CreatedAsc => list.sort_by_key(|i| i.fm.created),
+            SortOrder::LongestRunning => {
+                // running = sent, and Herdr still lists its agent
+                let started = |i: &Intent| {
+                    let sent = i.fm.sent_to.as_ref()?;
+                    let listed = i.fm.state == State::Sent
+                        && self
+                            .agents
+                            .as_ref()
+                            .is_some_and(|a| a.contains_key(&sent.agent));
+                    listed.then_some(sent.at)
+                };
+                list.sort_by(|a, b| match (started(a), started(b)) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => crate::store::stamp(b).cmp(&crate::store::stamp(a)),
+                });
+            }
+            SortOrder::Title => list.sort_by_key(|i| i.fm.title.to_lowercase()),
+            SortOrder::Progress => {
+                let key = |i: &Intent| {
+                    use crate::store::Readiness;
+                    let prog = crate::progress::progress(i, &self.evidence_for(i));
+                    let (rank, open, fill) = match crate::store::readiness(i) {
+                        Readiness::Raw => (0, 0, 0.0),
+                        Readiness::Open(n) => (1, n, 0.0),
+                        Readiness::Ready => (2, 0, 0.0),
+                        Readiness::Sent => match prog {
+                            Some(p) if p.complete => (4, 0, 10.0),
+                            Some(p) => (3, 0, p.fill),
+                            None => (3, 0, 0.0),
+                        },
+                    };
+                    (rank, open, fill, crate::store::stamp(i))
+                };
+                list.sort_by(|a, b| {
+                    let (ra, oa, fa, sa) = key(a);
+                    let (rb, ob, fb, sb) = key(b);
+                    ra.cmp(&rb)
+                        .then(ob.cmp(&oa)) // more open questions first
+                        .then(fa.total_cmp(&fb))
+                        .then(sb.cmp(&sa)) // then most recently changed
+                });
+            }
+        }
+        self.list = list;
+        self.list_selected = keep
+            .and_then(|p| self.list.iter().position(|i| i.path == p))
+            .unwrap_or(self.list_selected)
+            .min(self.list.len().saturating_sub(1));
+    }
+
+    /// Switch layout, carrying the selected capability across.
+    fn set_layout(&mut self, layout: Layout) {
+        match layout {
+            Layout::List => {
+                // the tree's capability, or the first one under a selected group
+                let target = match self.rows.get(self.selected) {
+                    Some(Row::Intent { intent, .. }) => Some(intent.path.clone()),
+                    Some(Row::Group { path, .. }) => self
+                        .list
+                        .iter()
+                        .filter(|i| i.path.starts_with(path))
+                        .map(|i| i.path.clone())
+                        .next(),
+                    _ => None,
+                };
+                self.layout = Layout::List;
+                self.poll_ticks = 0;
+                // no card for the tree's selection (an empty group): the first
+                self.list_selected = target
+                    .and_then(|p| self.list.iter().position(|i| i.path == p))
+                    .unwrap_or(0);
+            }
+            Layout::Tree => {
+                let target = self.list.get(self.list_selected).map(|i| i.path.clone());
+                self.layout = Layout::Tree;
+                if let Some(p) = target {
+                    self.reveal(&p);
+                }
+            }
+        }
+        let _ = crate::config::save_view(&self.dirs, self.layout.label(), self.sort.label());
+    }
+
+    /// Expand every group above `path` in the tree and select it.
+    fn reveal(&mut self, path: &Path) {
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if !d.starts_with(self.store.root()) {
+                break;
+            }
+            // mark it seen too: a group never drawn before would otherwise be
+            // collapsed again by rebuild_rows' first-sight rule
+            self.seen_groups.insert(d.to_path_buf());
+            self.collapsed.remove(d);
+            dir = d.parent();
+        }
+        self.rebuild_rows();
+        self.select_path(path);
+    }
+
+    /// Plans and PR states gathered so far for `it`; a PR not yet answered by
+    /// `gh` reads as `Unknown` (open).
+    fn evidence_for(&self, it: &Intent) -> crate::progress::Evidence {
+        use crate::progress::{PrState, pr_number};
+        let prs = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+            .filter_map(|a| {
+                let n = pr_number(&a.target)?;
+                let state = it
+                    .fm
+                    .repo
+                    .as_ref()
+                    .and_then(|r| {
+                        self.pr_states
+                            .get(&(r.clone(), a.target.trim().to_string()))
+                    })
+                    .copied()
+                    .unwrap_or(PrState::Unknown);
+                Some((n, state))
+            })
+            .collect();
+        // add pull requests found by spec/plan name that no pr: line names
+        let mut prs: Vec<(u64, PrState)> = prs;
+        let found = self.found_prs.get(&it.path);
+        for f in found.into_iter().flatten().flat_map(|(_, prs)| prs) {
+            if !prs.iter().any(|(m, _)| *m == f.number) {
+                prs.push((f.number, f.state));
+            }
+        }
+        // each plan learns the state of the pull requests found by its name
+        let mut plans = self
+            .plan_evidence
+            .get(&it.path)
+            .cloned()
+            .unwrap_or_default();
+        let plan_names: Vec<String> = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| a.kind.eq_ignore_ascii_case("plan"))
+            .map(|a| {
+                Path::new(a.target.trim())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (plan, name) in plans.iter_mut().zip(&plan_names) {
+            let mine: Vec<PrState> = found
+                .into_iter()
+                .flatten()
+                .filter(|(q, _)| q == name)
+                .flat_map(|(_, prs)| prs.iter().map(|f| f.state))
+                .collect();
+            plan.pr = if mine
+                .iter()
+                .any(|s| matches!(s, PrState::Open | PrState::Unknown))
+            {
+                Some(PrState::Open)
+            } else if mine.contains(&PrState::Merged) {
+                Some(PrState::Merged)
+            } else {
+                None
+            };
+        }
+        crate::progress::Evidence { plans, prs }
+    }
+
+    fn poller(&mut self) -> &mut crate::progress::Poller {
+        let env = self.herdr_env.clone();
+        self.poller
+            .get_or_insert_with(|| crate::progress::Poller::new(env))
+    }
+
+    /// Background requests started and not yet reported, reconciles included.
+    pub fn polls_in_flight(&self) -> usize {
+        self.poller.as_ref().map_or(0, |p| p.in_flight()) + self.reconcile_jobs.len()
+    }
+
+    /// Every capability in the tree, whatever the list's filter.
+    fn all_intents(&self) -> Vec<Intent> {
+        fn all(g: &Group, out: &mut Vec<Intent>) {
+            out.extend(g.intents.iter().cloned());
+            for sub in &g.groups {
+                all(sub, out);
+            }
+        }
+        let mut out = Vec::new();
+        all(&self.tree, &mut out);
+        out
+    }
+
+    /// Start a reconcile for every sent capability whose pull requests have all
+    /// merged since its last reconcile.
+    fn check_reconciles(&mut self) {
+        fn all(g: &Group, out: &mut Vec<Intent>) {
+            out.extend(g.intents.iter().cloned());
+            for sub in &g.groups {
+                all(sub, out);
+            }
+        }
+        let mut intents = Vec::new();
+        all(&self.tree, &mut intents);
+        for it in intents {
+            if it.fm.repo.is_none() || self.reconcile_jobs.contains_key(&it.path) {
+                continue;
+            }
+            // wait for the pull-request search (it suggests the areas the work touched)
+            let searched = crate::store::artifacts(&it.body).iter().any(|a| {
+                a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
+            });
+            if searched && !self.found_prs.contains_key(&it.path) {
+                continue;
+            }
+            let Some(merged) = crate::reconcile::needs_reconcile(&it, &self.evidence_for(&it))
+            else {
+                continue;
+            };
+            if self
+                .reconcile_tried
+                .insert((it.path.clone(), merged.clone()))
+            {
+                // the agent groups criteria by area: give it the suggested areas too
+                let mut it = it;
+                let suggested = self.suggested_areas(&it);
+                it.fm.areas.extend(suggested);
+                self.poller().request_reconcile(it, merged);
+            }
+        }
+    }
+
+    /// Ask the refinement agent (the last one used, else the configured one)
+    /// for the reconciled text.
+    fn start_reconcile(&mut self, path: PathBuf, merged: Vec<u64>, prompt: String) {
+        let last = crate::config::last_used(&self.dirs, &self.cfg);
+        let Some(mut spec) = self.cfg.providers.get(&last.provider).cloned() else {
+            self.message = Some(format!("reconcile: unknown provider `{}`", last.provider));
+            return;
+        };
+        if let Some(m) = &last.model {
+            spec.extra.extend([spec.model_flag.clone(), m.clone()]);
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let cwd = polish_cwd(self.store.root(), &stem);
+        if std::fs::create_dir_all(&cwd).is_err() {
+            return;
+        }
+        match Turn::start(&spec, &prompt, None, &cwd, &self.provider_env) {
+            Ok(turn) => {
+                self.reconcile_jobs
+                    .insert(path, (merged, turn, std::time::Instant::now()));
+            }
+            Err(e) => self.message = Some(format!("reconcile could not start: {e:#}")),
+        }
+    }
+
+    /// Apply finished reconciles: the capability gets the agent's rewrite, the
+    /// old version is kept for undo, and it is marked unread.
+    fn poll_reconciles(&mut self) {
+        let mut done: Vec<(PathBuf, Vec<u64>, Result<Reply, String>)> = Vec::new();
+        let limit = self.reconcile_limit;
+        for (path, (merged, turn, started)) in &mut self.reconcile_jobs {
+            if started.elapsed() > limit {
+                // the agent is stuck: stop its process group and say so
+                turn.cancel();
+                done.push((
+                    path.clone(),
+                    merged.clone(),
+                    Err(format!(
+                        "the agent did not finish within {} minutes",
+                        limit.as_secs().div_ceil(60)
+                    )),
+                ));
+                continue;
+            }
+            while let Some(msg) = turn.try_recv() {
+                match msg {
+                    TurnMsg::Finished(reply) => {
+                        done.push((path.clone(), merged.clone(), Ok(reply)))
+                    }
+                    TurnMsg::Failed(e) => done.push((path.clone(), merged.clone(), Err(e))),
+                    _ => {}
+                }
+            }
+        }
+        for (path, merged, result) in done {
+            self.reconcile_jobs.remove(&path);
+            // Ok(title) when the rewrite was applied, Err(reason) otherwise
+            let outcome: Result<String, String> = match result {
+                Ok(reply) => match reply.proposal {
+                    Some(prop) => {
+                        let body = merge_questions(&prop, &reply.questions);
+                        crate::reconcile::apply(&path, &body, &merged, self.store.root())
+                            .map(|it| it.fm.title)
+                            .map_err(|e| format!("reconcile not saved: {e:#}"))
+                    }
+                    None => Err("reconcile: the agent returned no proposal".into()),
+                },
+                Err(e) => Err(format!("reconcile failed: {e}")),
+            };
+            match outcome {
+                Ok(title) => {
+                    self.reconcile_failed.remove(&path);
+                    self.message = Some(format!(
+                        "reconciled `{title}` with what shipped (* until you read it, u undoes)"
+                    ));
+                    self.reload_tree();
+                }
+                Err(why) => {
+                    // kept until r retries it, shown while the capability is selected
+                    self.message = Some(why.clone());
+                    self.reconcile_failed.insert(path, why);
+                }
+            }
+        }
+    }
+
+    /// `r`: forget failed reconciles so the next check starts them again.
+    fn retry_reconciles(&mut self) {
+        let failed: Vec<PathBuf> = self.reconcile_failed.drain().map(|(p, _)| p).collect();
+        self.reconcile_tried.retain(|(p, _)| !failed.contains(p));
+    }
+
+    /// The status line for the selected capability when nothing else is said:
+    /// a reconcile that failed, and how to retry it.
+    fn reconcile_note(&self) -> Option<String> {
+        let it = self.selected_intent()?;
+        self.reconcile_failed
+            .get(&it.path)
+            .map(|why| format!("{why} · r retries"))
+    }
+
+    /// Opening a capability (it shows in the detail panes) reads it.
+    fn mark_read(&mut self) {
+        if self.layout != Layout::Tree || !matches!(self.screen, Screen::Browse) {
+            return;
+        }
+        let Some(path) = self
+            .selected_intent()
+            .filter(|it| it.fm.unread)
+            .map(|it| it.path.clone())
+        else {
+            return;
+        };
+        if Store::update_meta(&path, |fm| fm.unread = false).is_ok() {
+            self.reload_tree();
+        }
+    }
+
+    /// `u`: put back the version before the last reconcile.
+    fn undo_reconcile(&mut self) {
+        let Some(path) = self.selected_intent().map(|it| it.path.clone()) else {
+            return;
+        };
+        self.message = Some(match crate::reconcile::undo(&path) {
+            Ok(true) => {
+                self.reload_tree();
+                "restored the version before the reconcile".into()
+            }
+            Ok(false) => "nothing to undo: no reconcile backup".into(),
+            Err(e) => format!("undo failed: {e:#}"),
+        });
+    }
+
+    /// Ask for agent states and, when `all`, every sent capability's plans and
+    /// PR states.
+    fn request_polls(&mut self, all: bool) {
+        if self.layout == Layout::List {
+            self.poller().request_agents();
+        }
+        if !all {
+            return;
+        }
+        let sent: Vec<Intent> = self
+            .all_intents()
+            .into_iter()
+            .filter(|i| i.fm.state == State::Sent)
+            .collect();
+        for it in sent {
+            let prs: Vec<String> = crate::store::artifacts(&it.body)
+                .into_iter()
+                .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+                .filter(|a| crate::progress::pr_number(&a.target).is_some())
+                .map(|a| a.target.trim().to_string())
+                .collect();
+            if let Some(repo) = it.fm.repo.clone() {
+                for target in prs {
+                    self.poller().request_pr(repo.clone(), target);
+                }
+            }
+            self.poller().request_plans(it);
+        }
+    }
+
+    /// Search GitHub for pull requests mentioning each sent capability's spec
+    /// and plan file names (search is rate-limited, so this runs on entry, on
+    /// `r` and about every ten minutes).
+    fn request_found_prs(&mut self) {
+        let sent: Vec<(PathBuf, PathBuf, Vec<String>)> = self
+            .all_intents()
+            .iter()
+            .filter(|i| i.fm.state == State::Sent)
+            .filter_map(|i| {
+                let repo = i.fm.repo.clone()?;
+                let names: Vec<String> = crate::store::artifacts(&i.body)
+                    .into_iter()
+                    .filter(|a| {
+                        a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
+                    })
+                    .filter_map(|a| {
+                        Path::new(a.target.trim())
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                    })
+                    .collect();
+                (!names.is_empty()).then(|| (i.path.clone(), repo, names))
+            })
+            .collect();
+        for (path, repo, names) in sent {
+            self.poller().request_found_prs(path, repo, names);
+        }
+    }
+
+    /// Fold finished background requests into the list's evidence.
+    fn drain_polls(&mut self) {
+        let Some(p) = self.poller.as_mut() else {
+            return;
+        };
+        let updates = p.drain();
+        if updates.is_empty() {
+            return;
+        }
+        for u in updates {
+            match u {
+                crate::progress::Update::Agents(a) => {
+                    self.agents_unavailable = a.is_none();
+                    self.agents = a;
+                }
+                crate::progress::Update::Pr {
+                    repo,
+                    target,
+                    state,
+                    title,
+                } => {
+                    if let Some(t) = title {
+                        self.pr_titles.insert((repo.clone(), target.clone()), t);
+                    }
+                    self.pr_states.insert((repo, target), state);
+                }
+                crate::progress::Update::Plans { path, plans } => {
+                    self.plan_evidence.insert(path, plans);
+                }
+                crate::progress::Update::FoundPrs { path, by_name } => {
+                    self.found_prs.insert(path, by_name);
+                }
+                crate::progress::Update::Reconcile {
+                    path,
+                    merged,
+                    prompt,
+                } => self.start_reconcile(path, merged, prompt),
+            }
+        }
+        if matches!(self.sort, SortOrder::Progress | SortOrder::LongestRunning) {
+            self.rebuild_list();
+        }
+        self.check_reconciles();
+    }
+
+    /// `s`: refuse with the reason, or open the hand-off picker.
+    /// A page of the list: the cards on screen at the last draw, less one so
+    /// the last card seen stays on screen (and a card cut off at the bottom
+    /// is not skipped); one before anything has been drawn.
+    fn list_page(&self) -> usize {
+        self.card_hits.borrow().len().saturating_sub(1).max(1)
+    }
+
+    fn start_send(&mut self) {
+        // the picker is drawn beside the tree: point the tree at this capability
+        if self.layout == Layout::List
+            && let Some(p) = self.selected_intent().map(|i| i.path.clone())
+        {
+            self.reveal(&p);
+        }
+        if let Some(refusal) = self.selected_intent().and_then(crate::store::send_refusal) {
+            self.message = Some(refusal);
+        } else if let Some(it) = self.selected_intent() {
+            let handoffs: Vec<Handoff> = self
+                .cfg
+                .handoffs
+                .iter()
+                .filter(|h| h.applies_to(&it.fm.kind))
+                .cloned()
+                .collect();
+            if handoffs.is_empty() {
+                self.message = Some(format!("no handoff for kind `{}`", it.fm.kind));
+            } else {
+                self.screen = Screen::SendPick {
+                    handoffs,
+                    selected: 0,
+                };
+            }
+        }
+    }
+
+    /// `g`: focus the agent the selected capability was sent to.
+    fn go_to_agent(&mut self) {
+        let Some(agent) = self
+            .selected_intent()
+            .and_then(|i| i.fm.sent_to.as_ref())
+            .map(|s| s.agent.clone())
+        else {
+            self.message = Some("not sent yet".into());
+            return;
+        };
+        let env = self.herdr_env.clone();
+        let Some(bin) = crate::progress::tool_bin(&env, "HERDR_BIN_PATH", None) else {
+            self.message = Some("Herdr is required: HERDR_BIN_PATH is not set".into());
+            return;
+        };
+        self.message = Some(format!("focusing {agent}"));
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new(bin)
+                .args(["agent", "focus", &agent])
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
+
+    /// Mouse in the browser: a click selects a tree row or a list card; a
+    /// click on the selected group opens or closes it, on the selected card
+    /// opens it in the tree; the wheel moves the selection.
+    pub fn mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind as K};
+        if !matches!(self.screen, Screen::Browse) {
+            return;
+        }
+        let step = |app: &mut App, c: char| {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        };
+        let area = self.last_area.get();
+        match (self.layout, ev.kind) {
+            (Layout::List, K::Down(MouseButton::Left)) => {
+                let hit = self
+                    .card_hits
+                    .borrow()
+                    .iter()
+                    .find(|(_, top, end)| ev.row >= *top && ev.row < *end)
+                    .map(|(i, _, _)| *i);
+                match hit {
+                    Some(i) if i == self.list_selected => self.set_layout(Layout::Tree),
+                    Some(i) => self.list_selected = i,
+                    None => {}
+                }
+            }
+            (Layout::Tree, K::Down(MouseButton::Left)) => {
+                let (left, _, _) = ui::split(area);
+                if ev.column >= left.x + left.width || ev.row < left.y {
+                    return;
+                }
+                // the same scroll the tree was drawn with
+                let visible = left.height as usize;
+                let scroll = if visible > 0 && self.selected >= visible {
+                    self.selected + 1 - visible
+                } else {
+                    0
+                };
+                let i = scroll + usize::from(ev.row - left.y);
+                if i >= self.rows.len() {
+                    return;
+                }
+                self.focus = Pane::Tree;
+                if i == self.selected
+                    && let Some(Row::Group { path, .. }) = self.rows.get(i)
+                {
+                    let path = path.clone();
+                    if !self.collapsed.remove(&path) {
+                        self.collapsed.insert(path);
+                    }
+                    self.rebuild_rows();
+                } else {
+                    self.selected = i;
+                }
+            }
+            (_, K::ScrollDown) => step(self, 'j'),
+            (_, K::ScrollUp) => step(self, 'k'),
+            _ => {}
+        }
+        self.refresh_found();
+        self.mark_read();
+    }
+
+    /// Every group's path under the root, e.g. `skoolscout/org/candidates`.
+    fn group_paths(&self) -> Vec<String> {
+        fn walk(g: &Group, root: &Path, out: &mut Vec<String>) {
+            for sub in &g.groups {
+                if let Ok(rel) = sub.path.strip_prefix(root) {
+                    out.push(rel.display().to_string());
+                }
+                walk(sub, root, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.tree, self.store.root(), &mut out);
+        out
+    }
+
+    /// Areas the capability's pull requests were built in (workbrokr branch
+    /// names) that it does not list yet: a branch area maps to the one group
+    /// whose path ends with it; ambiguous or unknown areas are skipped.
+    fn suggested_areas(&self, it: &Intent) -> Vec<String> {
+        let Some(found) = self.found_prs.get(&it.path) else {
+            return Vec::new();
+        };
+        let home = it
+            .path
+            .parent()
+            .and_then(|d| d.strip_prefix(self.store.root()).ok())
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let groups = self.group_paths();
+        let mut out: Vec<String> = Vec::new();
+        for f in found.iter().flat_map(|(_, prs)| prs) {
+            let Some(area) = crate::progress::branch_area(&f.branch) else {
+                continue;
+            };
+            let matches: Vec<&String> = groups
+                .iter()
+                .filter(|g| **g == area || g.ends_with(&format!("/{area}")))
+                .collect();
+            if let [only] = matches.as_slice()
+                && **only != home
+                && !it
+                    .fm
+                    .areas
+                    .iter()
+                    .any(|a| a.trim().trim_matches('/') == only.as_str())
+                && !out.contains(only)
+            {
+                out.push((*only).clone());
+            }
+        }
+        out
+    }
+
+    /// `+`: edit the selected capability's affected areas; suggestions from
+    /// its pull requests are already added, so Enter confirms them.
+    fn open_areas_input(&mut self) {
+        if let Some(it) = self.selected_intent().cloned() {
+            let mut areas = it.fm.areas.clone();
+            areas.extend(self.suggested_areas(&it));
+            self.screen = Screen::Input {
+                label: "affected areas (group paths, comma-separated; empty clears)".into(),
+                text: areas.join(", "),
+                action: InputAction::EditAreas,
+            };
+        }
+    }
+
+    fn key_list(&mut self, k: KeyEvent) -> Flow {
+        let last = self.list.len().saturating_sub(1);
+        match k.code {
+            KeyCode::Char('q') => return Flow::Quit,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.list_selected = (self.list_selected + 1).min(last)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.list_selected = self.list_selected.saturating_sub(1)
+            }
+            KeyCode::PageDown => {
+                self.list_selected = (self.list_selected + self.list_page()).min(last)
+            }
+            KeyCode::PageUp => {
+                self.list_selected = self.list_selected.saturating_sub(self.list_page())
+            }
+            KeyCode::Char('v') => self.set_layout(Layout::Tree),
+            KeyCode::Enter => self.set_layout(Layout::Tree),
+            KeyCode::Char('S') => {
+                self.sort = self.sort.next();
+                self.rebuild_list();
+                let _ =
+                    crate::config::save_view(&self.dirs, self.layout.label(), self.sort.label());
+            }
+            KeyCode::Char('f') => {
+                self.filter = self.filter.next();
+                self.rebuild_list();
+                let _ = crate::config::save_view_with(
+                    &self.dirs,
+                    self.layout.label(),
+                    self.sort.label(),
+                    Some(self.filter.label()),
+                );
+            }
+            KeyCode::Char('r') => {
+                self.retry_reconciles();
+                self.rescan();
+            }
+            KeyCode::Char('s') => self.start_send(),
+            KeyCode::Char('g') => self.go_to_agent(),
+            KeyCode::Char('+') => self.open_areas_input(),
+            KeyCode::Char('u') => self.undo_reconcile(),
+            KeyCode::Char('a') => {
+                let group = self.selected_group_dir();
+                let place = match group.strip_prefix(self.store.root()) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+                    _ => "the top level".to_string(),
+                };
+                self.screen = Screen::Input {
+                    label: format!("new capability in {place}: title"),
+                    text: String::new(),
+                    action: InputAction::AddIntent { group },
+                };
+            }
+            _ => {}
+        }
+        Flow::Continue
     }
 
     pub fn rescan(&mut self) {
         self.found_cache = None;
-        let keep = self.selected_path();
+        self.reload_tree();
+        self.refresh_found();
+        self.poll_ticks = 0;
+    }
+
+    /// Re-read every capability from disk, keeping both selections.
+    fn reload_tree(&mut self) {
+        let keep = match self.layout {
+            Layout::Tree => self.selected_path(),
+            Layout::List => self.list.get(self.list_selected).map(|i| i.path.clone()),
+        };
         match self.store.scan() {
             Ok(t) => self.tree = t,
             Err(e) => self.message = Some(format!("rescan failed: {e:#}")),
@@ -345,15 +1377,22 @@ impl App {
         self.rebuild_rows();
         if let Some(p) = keep {
             self.select_path(&p);
+            if let Some(i) = self.list.iter().position(|i| i.path == p) {
+                self.list_selected = i;
+            }
         }
-        self.refresh_found();
     }
 
     fn selected_path(&self) -> Option<PathBuf> {
         self.rows.get(self.selected).map(row_path)
     }
 
+    /// The capability under the cursor: the list's in the list layout, the
+    /// tree's otherwise.
     pub fn selected_intent(&self) -> Option<&Intent> {
+        if self.layout == Layout::List {
+            return self.list.get(self.list_selected);
+        }
         match self.rows.get(self.selected) {
             Some(Row::Intent { intent, .. }) => Some(intent),
             _ => None,
@@ -362,6 +1401,14 @@ impl App {
 
     /// Group directory the selection belongs to (the group itself, or the intent's parent).
     fn selected_group_dir(&self) -> PathBuf {
+        if self.layout == Layout::List {
+            // the card view adds next to the selected card, else at the top
+            return self
+                .selected_intent()
+                .and_then(|it| it.path.parent())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.store.root().to_path_buf());
+        }
         match self.rows.get(self.selected) {
             Some(Row::Group { path, .. }) => path.clone(),
             Some(Row::Intent { intent, .. }) => intent
@@ -373,7 +1420,7 @@ impl App {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.store.root().to_path_buf()),
-            None => self.store.root().join(crate::store::INBOX),
+            None => self.store.root().to_path_buf(),
         }
     }
 
@@ -389,6 +1436,8 @@ impl App {
         self.criteria_selected = 0;
         self.question_selected = 0;
         self.artifacts_selected = 0;
+        self.prs_selected = 0;
+        self.demos_selected = 0;
     }
 
     fn select_path(&mut self, p: &Path) {
@@ -401,6 +1450,10 @@ impl App {
     /// repo's `docs/superpowers/{specs,plans}` and `docs/adr`). Cached per path,
     /// dropped on rescan, so a key press costs nothing once computed.
     fn refresh_found(&mut self) {
+        // only the detail view (tree layout) shows found artifacts
+        if self.layout == Layout::List {
+            return;
+        }
         let Some(it) = self.selected_intent().cloned() else {
             self.found_cache = None;
             return;
@@ -414,11 +1467,116 @@ impl App {
                     .into_iter()
                     .map(|a| a.target)
                     .collect();
-                crate::store::discover_artifacts(repo, &it.fm.title, &already)
+                let mut found = crate::store::discover_artifacts(repo, &it.fm.title, &already);
+                found.extend(crate::demos::discover_demos(repo, &it.fm.title, &already));
+                found
             }
             _ => Vec::new(),
         };
         self.found_cache = Some((it.path, found));
+    }
+
+    /// Pull requests for the detail view: the linked ones with what `gh`
+    /// said about them, then those the repo search found that no `pr:`
+    /// line names.
+    fn pr_rows(&self, it: &Intent) -> Vec<ui::PrRow> {
+        use crate::progress::{PrState, pr_number};
+        let key = |t: &str| {
+            it.fm
+                .repo
+                .as_ref()
+                .map(|r| (r.clone(), t.trim().to_string()))
+        };
+        let found: Vec<&crate::progress::FoundPr> = self
+            .found_prs
+            .get(&it.path)
+            .into_iter()
+            .flatten()
+            .flat_map(|(_, prs)| prs)
+            .collect();
+        // until `gh` answers for a linked PR, the search's answer stands in
+        // (a found PR just linked keeps its state and title)
+        let searched = |target: &str| {
+            let n = pr_number(target)?;
+            found.iter().find(|f| f.number == n).copied()
+        };
+        let mut rows: Vec<ui::PrRow> = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| ui::list_section(&a.kind) == Pane::PullRequests)
+            .map(|a| {
+                let k = key(&a.target);
+                let s = searched(&a.target);
+                ui::PrRow {
+                    state: k
+                        .as_ref()
+                        .and_then(|k| self.pr_states.get(k))
+                        .copied()
+                        .filter(|st| *st != PrState::Unknown)
+                        .or(s.map(|f| f.state))
+                        .unwrap_or(PrState::Unknown),
+                    title: k
+                        .as_ref()
+                        .and_then(|k| self.pr_titles.get(k))
+                        .cloned()
+                        .or_else(|| s.map(|f| f.title.clone()).filter(|t| !t.trim().is_empty())),
+                    target: a.target.trim().to_string(),
+                    found: false,
+                }
+            })
+            .collect();
+        let mut seen: Vec<u64> = rows.iter().filter_map(|r| pr_number(&r.target)).collect();
+        for f in found {
+            if seen.contains(&f.number) {
+                continue;
+            }
+            seen.push(f.number);
+            rows.push(ui::PrRow {
+                target: format!("#{}", f.number),
+                state: f.state,
+                title: (!f.title.trim().is_empty()).then(|| f.title.clone()),
+                found: true,
+            });
+        }
+        rows
+    }
+
+    /// A list section's rows: (linked, found), in the order the section
+    /// draws them.
+    fn section_lists(
+        &self,
+        it: &Intent,
+        pane: Pane,
+    ) -> (Vec<crate::store::Artifact>, Vec<crate::store::Artifact>) {
+        let linked = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| ui::list_section(&a.kind) == pane)
+            .collect();
+        let found = if pane == Pane::PullRequests {
+            self.pr_rows(it)
+                .into_iter()
+                .filter(|r| r.found)
+                .map(|r| crate::store::Artifact {
+                    kind: "pr".into(),
+                    target: r.target,
+                })
+                .collect()
+        } else {
+            self.found_artifacts()
+                .iter()
+                .filter(|a| ui::list_section(&a.kind) == pane)
+                .cloned()
+                .collect()
+        };
+        (linked, found)
+    }
+
+    /// The selection of a list section (Artifacts, Demos, Pull requests).
+    fn list_selected(&mut self, pane: Pane) -> &mut usize {
+        match pane {
+            Pane::PullRequests => &mut self.prs_selected,
+            Pane::Demos => &mut self.demos_selected,
+            _ => &mut self.artifacts_selected,
+        }
     }
 
     /// The cached found artifacts for the selected capability.
@@ -445,7 +1603,21 @@ impl App {
 
     pub fn key(&mut self, k: KeyEvent) -> Flow {
         let flow = self.key_inner(k);
+        // the accordion: a section that gets focus opens, and stays open
+        // while focus is on the tree or the description
+        if matches!(
+            self.focus,
+            Pane::Preconditions
+                | Pane::Criteria
+                | Pane::Demos
+                | Pane::Questions
+                | Pane::PullRequests
+                | Pane::Artifacts
+        ) {
+            self.open = self.focus;
+        }
         self.refresh_found();
+        self.mark_read();
         flow
     }
 
@@ -502,6 +1674,13 @@ impl App {
 
     fn key_browse(&mut self, k: KeyEvent) -> Flow {
         self.screen = Screen::Browse;
+        if self.layout == Layout::List {
+            return self.key_list(k);
+        }
+        if k.code == KeyCode::Char('v') {
+            self.set_layout(Layout::List);
+            return Flow::Continue;
+        }
         // pane focus: Tab / Shift-Tab cycle, Esc returns to the tree
         match k.code {
             KeyCode::Tab => {
@@ -509,8 +1688,10 @@ impl App {
                     Pane::Tree => Pane::Description,
                     Pane::Description => Pane::Preconditions,
                     Pane::Preconditions => Pane::Criteria,
-                    Pane::Criteria => Pane::Questions,
-                    Pane::Questions => Pane::Artifacts,
+                    Pane::Criteria => Pane::Demos,
+                    Pane::Demos => Pane::Questions,
+                    Pane::Questions => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Artifacts,
                     Pane::Artifacts => Pane::Tree,
                 };
                 return Flow::Continue;
@@ -518,11 +1699,13 @@ impl App {
             KeyCode::BackTab => {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Questions,
-                    Pane::Description => Pane::Tree,
-                    Pane::Preconditions => Pane::Description,
+                    Pane::Artifacts => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Questions,
+                    Pane::Questions => Pane::Demos,
+                    Pane::Demos => Pane::Criteria,
                     Pane::Criteria => Pane::Preconditions,
-                    Pane::Questions => Pane::Criteria,
+                    Pane::Preconditions => Pane::Description,
+                    Pane::Description => Pane::Tree,
                 };
                 return Flow::Continue;
             }
@@ -664,6 +1847,16 @@ impl App {
                 let i = KINDS.iter().position(|k| *k == fm.kind).unwrap_or(0);
                 fm.kind = KINDS[(i + 1) % KINDS.len()].to_string();
             }),
+            KeyCode::Char('R') | KeyCode::Char('U')
+                if self
+                    .selected_intent()
+                    .is_some_and(|i| i.fm.state == State::Sent) =>
+            {
+                self.message = Some(
+                    "already sent: R and U only apply before sending (its progress tracks the work now)"
+                        .into(),
+                );
+            }
             KeyCode::Char('R') => {
                 // ready means nothing is left unanswered
                 let open = self
@@ -690,25 +1883,9 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('s') => {
-                if let Some(it) = self.selected_intent() {
-                    let handoffs: Vec<Handoff> = self
-                        .cfg
-                        .handoffs
-                        .iter()
-                        .filter(|h| h.applies_to(&it.fm.kind))
-                        .cloned()
-                        .collect();
-                    if handoffs.is_empty() {
-                        self.message = Some(format!("no handoff for kind `{}`", it.fm.kind));
-                    } else {
-                        self.screen = Screen::SendPick {
-                            handoffs,
-                            selected: 0,
-                        };
-                    }
-                }
-            }
+            KeyCode::Char('s') => self.start_send(),
+            KeyCode::Char('+') => self.open_areas_input(),
+            KeyCode::Char('u') => self.undo_reconcile(),
             KeyCode::Char('t') => {
                 if let Some(it) = self.selected_intent() {
                     self.screen = Screen::Input {
@@ -718,7 +1895,10 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('r') => self.rescan(),
+            KeyCode::Char('r') => {
+                self.retry_reconciles();
+                self.rescan();
+            }
             _ => {}
         }
         Flow::Continue
@@ -749,7 +1929,15 @@ impl App {
                 Pane::Questions => ("new open question", InputAction::AddQuestion),
                 Pane::Artifacts => (
                     "new artifact as kind: path-or-url (spec, plan, adr, decision, issue)",
-                    InputAction::AddArtifact,
+                    InputAction::AddArtifact { kind: "link" },
+                ),
+                Pane::PullRequests => (
+                    "new pull request: #number or URL",
+                    InputAction::AddArtifact { kind: "pr" },
+                ),
+                Pane::Demos => (
+                    "new demo: story-id (criteria: 1, 4)",
+                    InputAction::AddArtifact { kind: "demo" },
                 ),
                 _ => return Flow::Continue,
             };
@@ -813,6 +2001,18 @@ impl App {
                         crate::store::CRITERIA_HEADING,
                         self.criteria_selected,
                     ),
+                    // acknowledge a criterion someone else added: the selected one, or all
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let which: Vec<usize> = if k.code == KeyCode::Char('Y') {
+                            (0..n).collect()
+                        } else {
+                            vec![self.criteria_selected]
+                        };
+                        match crate::store::acknowledge_criteria(&it.path, &which) {
+                            Ok(_) => self.reload_tree(),
+                            Err(e) => self.message = Some(format!("not saved: {e:#}")),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -838,10 +2038,11 @@ impl App {
                     _ => {}
                 }
             }
-            Pane::Artifacts => {
-                let linked = crate::store::artifacts(&it.body);
-                let found = self.found_artifacts().to_vec();
+            Pane::Artifacts | Pane::Demos | Pane::PullRequests => {
+                let pane = self.focus;
+                let (linked, found) = self.section_lists(&it, pane);
                 let total = linked.len() + found.len();
+                let selected = *self.list_selected(pane);
                 // (artifact, is_found) at a row of the combined list
                 let pick = |i: usize| {
                     if i < linked.len() {
@@ -853,24 +2054,23 @@ impl App {
                 match k.code {
                     KeyCode::Esc => self.focus = Pane::Tree,
                     KeyCode::Char('j') | KeyCode::Down => {
-                        self.artifacts_selected =
-                            (self.artifacts_selected + 1).min(total.saturating_sub(1))
+                        *self.list_selected(pane) = (selected + 1).min(total.saturating_sub(1))
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        self.artifacts_selected = self.artifacts_selected.saturating_sub(1)
+                        *self.list_selected(pane) = selected.saturating_sub(1)
                     }
                     KeyCode::Enter | KeyCode::Char('o') => {
-                        if let Some((a, _)) = pick(self.artifacts_selected) {
+                        if let Some((a, _)) = pick(selected) {
                             self.open_artifact(&it, &a, k.code == KeyCode::Char('o'));
                         }
                     }
-                    KeyCode::Char('L') => match pick(self.artifacts_selected) {
+                    KeyCode::Char('L') => match pick(selected) {
                         Some((a, true)) => {
                             self.edit_selected_body(|body| {
                                 crate::store::add_artifact(body, &a.kind, &a.target)
                             });
                             self.found_cache = None;
-                            self.artifacts_selected = linked.len();
+                            *self.list_selected(pane) = linked.len();
                             self.message = Some(format!("linked {}", a.target));
                         }
                         Some((_, false)) => {
@@ -888,6 +2088,10 @@ impl App {
 
     /// Enter reads a Markdown file in the tool; tickets, URLs and `o` open externally.
     fn open_artifact(&mut self, it: &Intent, a: &crate::store::Artifact, external: bool) {
+        if a.kind.eq_ignore_ascii_case("demo") {
+            self.open_demo(it, &a.target, external);
+            return;
+        }
         let target = a.target.trim();
         let is_ref = target.starts_with('#')
             || target.starts_with("http://")
@@ -948,8 +2152,71 @@ impl App {
         }
     }
 
+    /// A demo line: Enter shows its app-demos story in the reader; `o` plays
+    /// the newest recorded video, else opens the demos site at the story.
+    fn open_demo(&mut self, it: &Intent, target: &str, external: bool) {
+        let (id, criteria) = crate::demos::demo_target(target);
+        if !crate::demos::safe_story_id(&id) {
+            self.message = Some(format!("`{id}` is not a story id (letters, digits, . _ -)"));
+            return;
+        }
+        let roots: Vec<PathBuf> = it
+            .fm
+            .repo
+            .as_deref()
+            .filter(|r| r.is_dir())
+            .map(crate::send::worktrees)
+            .unwrap_or_default();
+        if external {
+            let arg = crate::demos::video_for(&roots, &id)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| crate::demos::site_url(&id));
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            self.message = Some(
+                match std::process::Command::new(opener)
+                    .arg(&arg)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(_) => format!("opened {arg}"),
+                    Err(e) => format!("cannot open {arg}: {e}"),
+                },
+            );
+            return;
+        }
+        let Some(story) = crate::demos::find_story(&roots, &id) else {
+            self.message = Some(format!(
+                "no app-demos story `{id}` in the capability's repo (o opens the demos site)"
+            ));
+            return;
+        };
+        let cs = crate::store::criteria(&it.body);
+        let shows: Vec<(usize, String)> = criteria
+            .iter()
+            .filter_map(|n| cs.get(n.checked_sub(1)?).map(|c| (*n, c.text.clone())))
+            .collect();
+        self.screen = Screen::Reader {
+            title: story.title.clone(),
+            lines: crate::markdown::render_markdown(&crate::demos::story_markdown(&story, &shows)),
+            scroll: 0,
+        };
+    }
+
     /// Relative targets resolve against the capability's repo, else its own folder.
     fn resolve_artifact_path(&self, it: &Intent, target: &str) -> PathBuf {
+        if let Some(found) = it
+            .fm
+            .repo
+            .as_deref()
+            .and_then(|repo| crate::send::resolve_in_repo(repo, target))
+        {
+            return found;
+        }
         let p = PathBuf::from(shellexpand::tilde(target).into_owned());
         if p.is_absolute() {
             return p;
@@ -970,7 +2237,7 @@ impl App {
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.screen = Screen::Browse;
-                self.focus = Pane::Artifacts;
+                self.focus = self.open;
                 return Flow::Continue;
             }
             KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
@@ -1116,6 +2383,21 @@ impl App {
             return;
         };
         it.body = self.editor.text();
+        // criteria the owner typed in this save count as seen
+        let before: Vec<String> = Store::load(&it.path)
+            .map(|d| {
+                crate::store::criteria(&d.body)
+                    .iter()
+                    .map(|c| crate::store::criterion_key(&c.text))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let typed: Vec<usize> = crate::store::criteria(&it.body)
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !before.contains(&crate::store::criterion_key(&c.text)))
+            .map(|(i, _)| i)
+            .collect();
         let result = if force {
             Store::save_force(&mut it).map_err(SaveError::Io)
         } else {
@@ -1123,6 +2405,9 @@ impl App {
         };
         match result {
             Ok(()) => {
+                if !typed.is_empty() {
+                    let _ = crate::store::acknowledge_criteria(&it.path, &typed);
+                }
                 self.editing = Some(it);
                 self.message = Some("saved".into());
                 self.rescan();
@@ -1246,6 +2531,9 @@ impl App {
             &LastUsed {
                 provider: provider.to_string(),
                 model: model.clone(),
+                layout: Some(self.layout.label().to_string()),
+                sort: Some(self.sort.label().to_string()),
+                filter: Some(self.filter.label().to_string()),
             },
         );
         let conv_id = intent.fm.conversations.get(provider).cloned();
@@ -1494,6 +2782,8 @@ impl App {
         }
         match Store::save_force(&mut it) {
             Ok(()) => {
+                // the owner reviewed and accepted this text: its criteria are seen
+                let _ = crate::store::acknowledge_all_criteria(&it.path);
                 self.message = Some("proposal applied".into());
                 self.rescan();
                 // Apply ends the refinement for now: back to the view, or to the
@@ -1547,6 +2837,12 @@ impl App {
                 let fresh = self
                     .selected_intent()
                     .and_then(|i| Store::load(&i.path).ok());
+                // the file may have changed since `s`: check the gate again
+                if let Some(refusal) = fresh.as_ref().and_then(crate::store::send_refusal) {
+                    self.message = Some(refusal);
+                    self.screen = Screen::Browse;
+                    return Flow::Continue;
+                }
                 match fresh {
                     Some(it) => match crate::send::prepare(
                         &self.cfg,
@@ -1642,6 +2938,11 @@ impl App {
             return;
         };
         let Ok(it) = Store::load(&path) else { return };
+        // and once more right before sending: the confirm screen can stay open
+        if let Some(refusal) = crate::store::send_refusal(&it) {
+            self.message = Some(refusal);
+            return;
+        }
         let kind = self
             .cfg
             .providers
@@ -1661,6 +2962,8 @@ impl App {
                     fm.sent_to = Some(record);
                 }) {
                     Ok(_) => {
+                        // what is sent is the owner's: every criterion counts as seen
+                        let _ = crate::store::acknowledge_all_criteria(&path);
                         self.message = Some(format!(
                             "sent to {} in workspace {} (agent {})",
                             handoff.name, outcome.workspace_id, outcome.agent
@@ -1730,7 +3033,8 @@ impl App {
             KeyCode::Enter => {
                 self.screen = Screen::Browse;
                 let value = text.trim().to_string();
-                if value.is_empty() {
+                // an empty areas list is a real answer: it clears them
+                if value.is_empty() && !matches!(action, InputAction::EditAreas) {
                     return Flow::Continue;
                 }
                 self.run_input_action(action, &value);
@@ -1768,6 +3072,17 @@ impl App {
                         self.collapsed.remove(&group);
                         self.rescan();
                         self.select_path(&it.path);
+                        match self.list.iter().position(|i| i.path == it.path) {
+                            Some(i) => self.list_selected = i,
+                            None if self.layout == Layout::List => {
+                                self.message = Some(format!(
+                                    "added `{}`; the {} filter hides it (f changes it)",
+                                    it.fm.title,
+                                    self.filter.label()
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                     Err(e) => self.message = Some(format!("create failed: {e:#}")),
                 }
@@ -1806,10 +3121,32 @@ impl App {
                 let v = value.to_string();
                 self.update_selected_fields(|fm| fm.title = v);
             }
+            InputAction::EditAreas => {
+                let areas: Vec<String> = value
+                    .split(',')
+                    .map(|a| a.trim().trim_matches('/').to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect();
+                if let Some(bad) = areas.iter().find(|a| !self.store.root().join(a).is_dir()) {
+                    self.message = Some(format!("no group `{bad}`: areas unchanged"));
+                } else {
+                    self.update_selected_fields(|fm| fm.areas = areas);
+                }
+            }
             InputAction::AddItem { heading, pane } => {
                 self.edit_selected_body(|body| {
                     crate::store::add_checklist_item(body, heading, value)
                 });
+                if heading == crate::store::CRITERIA_HEADING
+                    && let Some(it) = self.selected_intent().cloned()
+                {
+                    // the owner's own criterion is seen
+                    let n = crate::store::criteria(&it.body).len();
+                    if n > 0 {
+                        let _ = crate::store::acknowledge_criteria(&it.path, &[n - 1]);
+                        self.reload_tree();
+                    }
+                }
                 self.focus = pane;
                 let n = self
                     .selected_intent()
@@ -1830,7 +3167,7 @@ impl App {
                     .unwrap_or(1)
                     .saturating_sub(1);
             }
-            InputAction::AddArtifact => {
+            InputAction::AddArtifact { kind: default_kind } => {
                 let (kind, target) = match value.split_once(':') {
                     Some((k, t))
                         if !k.trim().contains(' ')
@@ -1839,15 +3176,18 @@ impl App {
                     {
                         (k.trim().to_string(), t.trim().to_string())
                     }
-                    _ => ("link".to_string(), value.to_string()),
+                    _ => (default_kind.to_string(), value.to_string()),
                 };
                 self.edit_selected_body(|body| crate::store::add_artifact(body, &kind, &target));
-                self.focus = Pane::Artifacts;
-                self.artifacts_selected = self
+                // the new line is the last one linked in its section
+                let pane = ui::list_section(&kind);
+                self.focus = pane;
+                let linked = self
                     .selected_intent()
-                    .map(|it| crate::store::artifacts(&it.body).len())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
+                    .cloned()
+                    .map(|it| self.section_lists(&it, pane).0.len())
+                    .unwrap_or(1);
+                *self.list_selected(pane) = linked.saturating_sub(1);
             }
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
@@ -1906,6 +3246,26 @@ impl App {
             // about every 5 s at the loop's 33 ms cadence
             self.check_for_newer_build(binary_mtime());
         }
+        // list evidence: agents every ~3 s, plans and PRs on entry, on r and
+        // every ~60 s; all on background threads
+        self.drain_polls();
+        self.poll_reconciles();
+        // pull requests, plans and searches are checked in either layout (a
+        // merge must reconcile from the tree too); agent states only matter
+        // to the cards, so they poll only while the list shows
+        if self.poll_ticks.is_multiple_of(18000) {
+            self.request_found_prs();
+        }
+        if self.poll_ticks.is_multiple_of(1800) {
+            // pick up lines agents appended to capability files
+            if self.poll_ticks > 0 {
+                self.reload_tree();
+            }
+            self.request_polls(true);
+        } else if self.layout == Layout::List && self.poll_ticks.is_multiple_of(90) {
+            self.request_polls(false);
+        }
+        self.poll_ticks = self.poll_ticks.wrapping_add(1);
         let Screen::Chat(st) = &mut self.screen else {
             return;
         };
@@ -1976,12 +3336,18 @@ impl App {
                     label: name.clone(),
                     is_group: true,
                     questions: 0,
+                    reference: false,
                 },
-                Row::Intent { intent, depth } => RowView {
+                Row::Intent {
+                    intent,
+                    depth,
+                    reference,
+                } => RowView {
                     depth: *depth,
                     label: intent.fm.title.clone(),
                     is_group: false,
                     questions: intent.open_questions(),
+                    reference: reference.is_some(),
                 },
                 Row::Broken { path, depth, .. } => RowView {
                     depth: *depth,
@@ -1993,6 +3359,7 @@ impl App {
                     ),
                     is_group: false,
                     questions: 0,
+                    reference: false,
                 },
             })
             .collect();
@@ -2013,14 +3380,8 @@ impl App {
             send_prompt: None,
             pick_items: Vec::new(),
             pick_selected: 0,
-            focus: match self.focus {
-                Pane::Tree => "tree",
-                Pane::Description => "description",
-                Pane::Preconditions => "preconditions",
-                Pane::Criteria => "criteria",
-                Pane::Questions => "questions",
-                Pane::Artifacts => "artifacts",
-            },
+            focus: pane_name(self.focus),
+            open: pane_name(self.open),
             question_count: self
                 .selected_intent()
                 .map(|i| crate::store::questions(&i.body).len())
@@ -2034,6 +3395,11 @@ impl App {
                 .unwrap_or(0),
             found_count: self.found_artifacts().len(),
             reader_title: String::new(),
+            layout: self.layout.label(),
+            list_titles: self.list.iter().map(|i| i.fm.title.clone()).collect(),
+            list_selected: self.list_selected,
+            sort: self.sort.label(),
+            filter: self.filter.label(),
         };
         match &self.screen {
             Screen::Browse => {}
@@ -2090,7 +3456,184 @@ impl App {
         v
     }
 
+    /// The list layout over the whole area, status line at the bottom.
+    fn draw_list(&self, area: Rect, buf: &mut Buffer) {
+        let list_area = Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        let status = Rect {
+            y: area.y + area.height.saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        struct Owned {
+            description: String,
+            agent: Option<String>,
+            running: Option<String>,
+            group: String,
+            worktree: Option<String>,
+        }
+        let now = self.fixed_now.unwrap_or_else(chrono::Local::now);
+        let owned: Vec<Owned> = self
+            .list
+            .iter()
+            .map(|i| {
+                // every non-empty line of the description; the card wraps it
+                let description = ui::description_text(&i.body)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // the sent agent's live Herdr state; `…` until herdr answers
+                let agent = match (&i.fm.sent_to, i.fm.state) {
+                    (Some(sent), State::Sent) => Some(match &self.agents {
+                        Some(agents) => match agents.get(&sent.agent).map(|a| a.status.as_str()) {
+                            Some("blocked") => "needs you".to_string(),
+                            Some(st) => st.to_string(),
+                            None => "closed".to_string(),
+                        },
+                        None if self.agents_unavailable => "—".to_string(),
+                        None => "…".to_string(),
+                    }),
+                    _ => None,
+                };
+                // time since the capability was sent
+                let running = match (&i.fm.sent_to, i.fm.state) {
+                    (Some(sent), State::Sent) => Some(crate::progress::ago(sent.at, now)),
+                    _ => None,
+                };
+                // its home group, then the other areas it affects
+                let home = i
+                    .path
+                    .parent()
+                    .and_then(|d| d.strip_prefix(self.store.root()).ok())
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default();
+                let group = std::iter::once(home)
+                    .chain(
+                        i.fm.areas
+                            .iter()
+                            .map(|a| a.trim().trim_matches('/').to_string())
+                            .filter(|a| !a.is_empty()),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let suggested = self.suggested_areas(i);
+                let group = if suggested.is_empty() {
+                    group
+                } else {
+                    format!("{group}   suggested: {} (+ adds)", suggested.join(", "))
+                };
+                // the sent agent's worktree, relative to the repo when inside it
+                let worktree = match (&i.fm.sent_to, &self.agents, i.fm.state) {
+                    (Some(sent), Some(agents), State::Sent) => {
+                        agents.get(&sent.agent).and_then(|info| {
+                            let path = info.worktree_path.as_ref()?;
+                            let shown = match i
+                                .fm
+                                .repo
+                                .as_deref()
+                                .and_then(|r| path.strip_prefix(r).ok())
+                            {
+                                Some(rel) => rel.display().to_string(),
+                                None => match dirs_home().and_then(|h| {
+                                    path.strip_prefix(h).ok().map(|p| p.to_path_buf())
+                                }) {
+                                    Some(rel) => format!("~/{}", rel.display()),
+                                    None => path.display().to_string(),
+                                },
+                            };
+                            Some(match info.slot {
+                                Some(n) => format!("{shown} │ slot {n}"),
+                                None => shown,
+                            })
+                        })
+                    }
+                    _ => None,
+                };
+                Owned {
+                    description,
+                    agent,
+                    running,
+                    group,
+                    worktree,
+                }
+            })
+            .collect();
+        let rows: Vec<ui::ListRow> = self
+            .list
+            .iter()
+            .zip(&owned)
+            .map(|(i, o)| {
+                let when = match self.sort {
+                    SortOrder::Captured | SortOrder::CreatedAsc => i.fm.created,
+                    _ => crate::store::stamp(i),
+                };
+                ui::ListRow {
+                    status: match crate::store::readiness(i) {
+                        crate::store::Readiness::Sent => "→ sent".to_string(),
+                        r => r.label(),
+                    },
+                    progress: crate::progress::progress(i, &self.evidence_for(i)),
+                    agent: o.agent.clone(),
+                    running: o.running.clone(),
+                    title: &i.fm.title,
+                    unread: i.fm.unread || !crate::store::new_criteria(i).is_empty(),
+                    group: o.group.clone(),
+                    worktree: o.worktree.clone(),
+                    when: when.format("%b %d %H:%M").to_string(),
+                    description: &o.description,
+                }
+            })
+            .collect();
+        let header = match self.filter {
+            ListFilter::All => format!(
+                "Capabilities · {} · sorted by {}",
+                self.list.len(),
+                self.sort.label()
+            ),
+            f => format!(
+                "Capabilities · sorted by {} · showing {} ({} of {})",
+                self.sort.label(),
+                f.label(),
+                self.list.len(),
+                self.list_total
+            ),
+        };
+        let empty = if self.list_total == 0 {
+            "no capabilities yet: v back to the tree, then a adds one"
+        } else {
+            "nothing matches this filter: f changes it"
+        };
+        let hits =
+            ui::render_capability_list(&rows, self.list_selected, &header, empty, list_area, buf);
+        *self.card_hits.borrow_mut() = hits;
+        let text = match &self.screen {
+            Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
+            Screen::Prompt { question, .. } => question.clone(),
+            _ => self.message.clone().or_else(|| self.reconcile_note()).unwrap_or_else(|| {
+                "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
+                    .to_string()
+            }),
+        };
+        ui::render_status(&text, status, buf);
+    }
+
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
+        self.last_area.set(area);
+        // the card view stays on screen for the browser and for one-line
+        // prompts (title, areas, confirmations), which use the status line
+        if self.layout == Layout::List
+            && matches!(
+                self.screen,
+                Screen::Browse | Screen::Input { .. } | Screen::Prompt { .. }
+            )
+        {
+            self.draw_list(area, buf);
+            return;
+        }
         let (left, right, status) = ui::split(area);
         let tree_rows: Vec<ui::TreeRow> = self
             .rows
@@ -2101,6 +3644,7 @@ impl App {
                     name,
                     depth,
                     count,
+                    refs,
                 } => ui::TreeRow {
                     depth: *depth,
                     label: name,
@@ -2110,8 +3654,16 @@ impl App {
                     state: None,
                     count: *count,
                     broken: false,
+                    reference: false,
+                    refs: *refs,
+                    unread: false,
+                    complete: false,
                 },
-                Row::Intent { intent, depth } => ui::TreeRow {
+                Row::Intent {
+                    intent,
+                    depth,
+                    reference,
+                } => ui::TreeRow {
                     depth: *depth,
                     label: &intent.fm.title,
                     is_group: false,
@@ -2120,6 +3672,11 @@ impl App {
                     state: Some(intent.fm.state),
                     count: 0,
                     broken: false,
+                    reference: reference.is_some(),
+                    refs: 0,
+                    unread: intent.fm.unread || !crate::store::new_criteria(intent).is_empty(),
+                    complete: crate::progress::progress(intent, &self.evidence_for(intent))
+                        .is_some_and(|p| p.complete),
                 },
                 Row::Broken { path, depth, .. } => ui::TreeRow {
                     depth: *depth,
@@ -2130,6 +3687,10 @@ impl App {
                     state: None,
                     count: 0,
                     broken: true,
+                    reference: false,
+                    refs: 0,
+                    unread: false,
+                    complete: false,
                 },
             })
             .collect();
@@ -2231,6 +3792,7 @@ impl App {
                         _ => None,
                     };
                     let attachments = Store::attachments(intent);
+                    let prs = self.pr_rows(intent);
                     ui::render_capability(
                         &ui::DetailView {
                             intent,
@@ -2243,6 +3805,10 @@ impl App {
                             artifacts_selected: self.artifacts_selected,
                             found: self.found_artifacts(),
                             answering,
+                            open: self.open,
+                            prs: &prs,
+                            prs_selected: self.prs_selected,
+                            demos_selected: self.demos_selected,
                         },
                         right,
                         buf,
@@ -2273,12 +3839,17 @@ impl App {
             Screen::SendConfirm { .. } => "Enter send · Tab provider · j/k scroll · Esc cancel".to_string(),
             Screen::Browse => match (&self.message, self.focus) {
                 (Some(m), _) => m.clone(),
-                (None, Pane::Tree) => "Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
+                (None, _) if self.reconcile_note().is_some() => {
+                    self.reconcile_note().unwrap_or_default()
+                }
+                (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
+                (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
+                (None, Pane::PullRequests) => "Pull requests: j/k choose · Enter/o open in the browser · L link a found one · a add · Esc tree".to_string(),
             },
         };
         ui::render_status(&status_text, status, buf);
@@ -2295,6 +3866,20 @@ fn binary_mtime() -> Option<std::time::SystemTime> {
 fn row_path(r: &Row) -> PathBuf {
     match r {
         Row::Group { path, .. } => path.clone(),
+        // a reference row is its own place in the tree, so selections and
+        // reveals by the capability's path land on its home row
+        Row::Intent {
+            intent,
+            reference: Some(group),
+            ..
+        } => group.join(format!(
+            "↳{}",
+            intent
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        )),
         Row::Intent { intent, .. } => intent.path.clone(),
         Row::Broken { path, .. } => path.clone(),
     }
@@ -2368,11 +3953,16 @@ fn install_signal_handlers() {
 }
 
 fn restore_terminal() {
-    use crossterm::{cursor::Show, event::DisableBracketedPaste, terminal::LeaveAlternateScreen};
+    use crossterm::{
+        cursor::Show,
+        event::{DisableBracketedPaste, DisableMouseCapture},
+        terminal::LeaveAlternateScreen,
+    };
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         Show
     );
@@ -2380,7 +3970,11 @@ fn restore_terminal() {
 
 fn init_terminal() -> ratatui::DefaultTerminal {
     let t = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    );
     t
 }
 
@@ -2466,6 +4060,7 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
                 Flow::Continue => {}
             },
             Ok(Event::Paste(text)) => app.paste(&text),
+            Ok(Event::Mouse(m)) => app.mouse(m),
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -2476,6 +4071,11 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
         && let Some(t) = st.turn.as_mut()
     {
         t.cancel();
+    }
+    // stop running reconciles: process::exit below skips destructors, and an
+    // agent left running outlives this slot
+    for (_, turn, _) in app.reconcile_jobs.values_mut() {
+        turn.cancel();
     }
     restore_terminal();
     match outcome {
@@ -2500,7 +4100,7 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
             terminal.draw(|f| {
                 let area = f.area();
                 let p = ratatui::widgets::Paragraph::new(format!(
-                    "New capability (Inbox)\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
+                    "New capability\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
                 ));
                 p.render(area, f.buffer_mut());
             })?;
@@ -2524,7 +4124,8 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
         if let Some(t) = result? {
             let t = t.trim();
             if !t.is_empty() {
-                store.create(Path::new(crate::store::INBOX), t, "idea", &body, repo)?;
+                // quick captures go to the top of the tree; there is no default group
+                store.create(Path::new(""), t, "idea", &body, repo)?;
             }
         }
         return Ok(());
@@ -2553,15 +4154,14 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
             (t, if rest.trim().is_empty() { body } else { rest })
         }
     };
-    let it = store.create(
-        Path::new(crate::store::INBOX),
-        t.trim(),
-        "idea",
-        &body_text,
-        repo,
-    )?;
+    let it = store.create(Path::new(""), t.trim(), "idea", &body_text, repo)?;
     println!("{}", it.path.display());
     Ok(())
+}
+
+/// The user's home folder, for shortening paths to `~/…`.
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -2675,6 +4275,1786 @@ mod tests {
             app,
             log,
         }
+    }
+
+    /// Move the selected capability out of `raw` so the send gate lets it through.
+    fn make_refining(app: &mut App) {
+        let path = app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&path, |fm| fm.state = State::Refining).unwrap();
+        app.rescan();
+    }
+
+    #[test]
+    fn s_refuses_a_raw_capability_and_one_with_open_questions() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox"); // two open questions
+        make_refining(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("2 open questions")
+        );
+        select(&mut fx.app, "Alpha"); // raw
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(fx.app.view().message.unwrap_or_default().contains("raw"));
+    }
+
+    fn list_title(app: &App) -> String {
+        let v = app.view();
+        v.list_titles[v.list_selected].clone()
+    }
+
+    fn set_state(app: &mut App, needle: &str, state: State) {
+        let path = app
+            .store
+            .scan()
+            .unwrap()
+            .groups
+            .iter()
+            .flat_map(|g| g.intents.iter())
+            .find(|i| i.fm.title.contains(needle))
+            .unwrap()
+            .path
+            .clone();
+        Store::update_fields(&path, |fm| fm.state = state).unwrap();
+        app.rescan();
+    }
+
+    /// Press `S` until the list is sorted by `order`.
+    fn sort_by(app: &mut App, order: &str) {
+        for _ in 0..8 {
+            if app.view().sort == order {
+                return;
+            }
+            key(app, KeyCode::Char('S'));
+        }
+        panic!("no sort order {order}");
+    }
+
+    #[test]
+    fn v_toggles_the_list_and_keeps_the_selection() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(fx.app.view().layout, "list");
+        assert_eq!(list_title(&fx.app), "Beta");
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Beta");
+        key(&mut fx.app, KeyCode::Char('j'));
+        if list_title(&fx.app) == "Beta" {
+            key(&mut fx.app, KeyCode::Char('k')); // Beta was last
+        }
+        let now = list_title(&fx.app);
+        assert_ne!(now, "Beta");
+        key(&mut fx.app, KeyCode::Char('v'));
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree");
+        assert!(v.rows[v.selected].label.contains(&now), "{:?}", v.rows);
+    }
+
+    #[test]
+    fn the_list_holds_every_capability_across_groups() {
+        let mut fx = setup("agy.jsonl");
+        let sub = fx
+            .app
+            .store
+            .create_group(Path::new("skoolscout"), "deep")
+            .unwrap();
+        let rel = sub.strip_prefix(fx.app.store.root()).unwrap().to_path_buf();
+        fx.app
+            .store
+            .create(&rel, "Hidden deep", "idea", "x\n", None)
+            .unwrap();
+        fx.app.rescan();
+        assert!(
+            !fx.app
+                .view()
+                .rows
+                .iter()
+                .any(|r| r.label.contains("Hidden deep")),
+            "collapsed in the tree"
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        let v = fx.app.view();
+        assert_eq!(v.list_titles.len(), 4, "{:?}", v.list_titles);
+        assert!(v.list_titles.iter().any(|t| t == "Hidden deep"));
+        // Enter on it opens the tree with its group expanded and it selected
+        sort_by(&mut fx.app, "Title");
+        for _ in 0..10 {
+            key(&mut fx.app, KeyCode::Char('k'));
+        }
+        for _ in 0..10 {
+            if list_title(&fx.app) == "Hidden deep" {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        assert_eq!(list_title(&fx.app), "Hidden deep", "{:?}", fx.app.view());
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree");
+        assert!(
+            v.rows[v.selected].label.contains("Hidden deep"),
+            "{:?}",
+            v.rows
+        );
+    }
+
+    #[test]
+    fn enter_in_the_list_reveals_a_deeply_nested_capability() {
+        let mut fx = setup("agy.jsonl");
+        // skoolscout/discover-schools/org/office-hours: never drawn in the tree yet
+        let mut parent = PathBuf::from("skoolscout");
+        for name in ["discover-schools", "org", "office-hours"] {
+            fx.app.store.create_group(&parent, name).unwrap();
+            parent = parent.join(name);
+        }
+        fx.app
+            .store
+            .create(&parent, "Deep one", "idea", "x\n", None)
+            .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Deep one");
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree");
+        assert!(
+            v.rows[v.selected].label.contains("Deep one"),
+            "Enter lands on the capability: {:?}",
+            v.rows
+        );
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Deep one");
+    }
+
+    fn mouse(
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+    fn left_click(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+        )
+    }
+
+    /// Draw once at `w`×`h` so the app knows where everything is.
+    fn draw_at(app: &App, w: u16, h: u16) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+    }
+
+    #[test]
+    fn clicking_a_tree_row_selects_it_and_a_selected_group_toggles() {
+        let mut fx = setup("agy.jsonl");
+        draw_at(&fx.app, 100, 24);
+        // rows: Inbox, In the inbox, skoolscout, Alpha, Beta
+        fx.app.mouse(left_click(3, 4));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Beta");
+        fx.app.mouse(left_click(3, 2));
+        assert_eq!(
+            fx.app.view().rows[fx.app.view().selected].label,
+            "skoolscout"
+        );
+        let before = fx.app.view().rows.len();
+        fx.app.mouse(left_click(3, 2)); // the selected group: collapse it
+        assert_eq!(
+            fx.app.view().rows.len(),
+            before - 2,
+            "{:?}",
+            fx.app.view().rows
+        );
+        fx.app.mouse(left_click(3, 2)); // and open it again
+        assert_eq!(fx.app.view().rows.len(), before);
+        // the wheel moves the selection
+        fx.app
+            .mouse(mouse(crossterm::event::MouseEventKind::ScrollDown, 3, 2));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Alpha");
+        // a click below the last row changes nothing
+        fx.app.mouse(left_click(3, 20));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.title, "Alpha");
+    }
+
+    #[test]
+    fn clicking_a_card_selects_it_and_clicking_it_again_opens_it() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 100, 60);
+        let y = shown
+            .lines()
+            .position(|l| l.starts_with(" Org admins"))
+            .unwrap() as u16;
+        draw_at(&fx.app, 100, 60);
+        fx.app.mouse(left_click(5, y));
+        assert!(list_title(&fx.app).starts_with("Org admins"));
+        assert_eq!(fx.app.view().layout, "list");
+        fx.app.mouse(left_click(5, y + 2)); // anywhere on the selected card
+        let v = fx.app.view();
+        assert_eq!(v.layout, "tree", "a second click opens it");
+        assert!(v.rows[v.selected].label.starts_with("Org admins"));
+    }
+
+    #[test]
+    fn a_capability_appears_in_each_area_it_affects() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&path, |fm| {
+            fm.areas = vec!["Inbox".into(), "nowhere".into()]
+        })
+        .unwrap();
+        fx.app.rescan();
+        let v = fx.app.view();
+        let at = |label: &str, reference: bool| {
+            v.rows
+                .iter()
+                .position(|r| r.label == label && r.reference == reference)
+        };
+        let inbox = at("Inbox", false).unwrap();
+        let reference = at("Alpha", true).expect("a reference row under Inbox");
+        let home = at("Alpha", false).expect("the capability at home");
+        let skoolscout = at("skoolscout", false).unwrap();
+        assert!(inbox < reference && reference < skoolscout, "{:?}", v.rows);
+        assert!(home > skoolscout);
+        // an area that is no group is ignored
+        assert_eq!(v.rows.iter().filter(|r| r.label == "Alpha").count(), 2);
+        // the reference row acts on the real capability
+        for _ in 0..10 {
+            if fx.app.view().selected == reference {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('k'));
+        }
+        assert_eq!(fx.app.view().selected, reference);
+        assert_eq!(fx.app.selected_intent().unwrap().path, path);
+        // and the group shows its own count plus what affects it
+        let mut t = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, 100, 20), f.buffer_mut()))
+            .unwrap();
+        let text = format!("{:?}", t.backend().buffer());
+        assert!(text.contains("Inbox (1 +1)"), "{text}");
+        assert!(text.contains("↳ Alpha"), "{text}");
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            key(app, KeyCode::Char(c));
+        }
+    }
+    fn clear_input(app: &mut App) {
+        for _ in 0..80 {
+            key(app, KeyCode::Backspace);
+        }
+    }
+
+    #[test]
+    fn plus_edits_the_areas_and_refuses_unknown_groups() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        key(&mut fx.app, KeyCode::Char('+'));
+        assert_eq!(fx.app.view().screen, "input");
+        assert_eq!(fx.app.view().input_text, "");
+        type_text(&mut fx.app, "Inbox");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(Store::load(&path).unwrap().fm.areas, vec!["Inbox"]);
+        assert!(
+            fx.app
+                .view()
+                .rows
+                .iter()
+                .any(|r| r.reference && r.label == "Alpha")
+        );
+        // the input opens on the current areas (the selection stayed on Alpha)
+        assert_eq!(fx.app.selected_intent().unwrap().path, path);
+        key(&mut fx.app, KeyCode::Char('+'));
+        assert_eq!(fx.app.view().input_text, "Inbox");
+        clear_input(&mut fx.app);
+        type_text(&mut fx.app, "Inbox, nowhere");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("no group `nowhere`"),
+            "{:?}",
+            fx.app.view().message
+        );
+        assert_eq!(
+            Store::load(&path).unwrap().fm.areas,
+            vec!["Inbox"],
+            "unchanged"
+        );
+        // an empty input clears them
+        key(&mut fx.app, KeyCode::Char('+'));
+        clear_input(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(Store::load(&path).unwrap().fm.areas.is_empty());
+    }
+
+    #[test]
+    fn plus_works_in_the_list_too() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('+'));
+        type_text(&mut fx.app, "Inbox");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().layout, "list");
+        let beta = fx
+            .app
+            .store
+            .scan()
+            .unwrap()
+            .groups
+            .iter()
+            .flat_map(|g| g.intents.iter())
+            .find(|i| i.fm.title == "Beta")
+            .unwrap()
+            .fm
+            .areas
+            .clone();
+        assert_eq!(beta, vec!["Inbox"]);
+    }
+
+    #[test]
+    fn quick_capture_lands_at_the_top_of_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        add(cfg.clone(), dirs.clone(), Some("Quick one".into()), false).unwrap();
+        let names: Vec<String> = fs::read_dir(&dirs.root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("-quick-one.md")),
+            "{names:?}"
+        );
+        assert!(
+            !dirs.root.join("Inbox").exists(),
+            "no Inbox group: {names:?}"
+        );
+        let app = App::new(cfg, dirs).unwrap();
+        assert!(
+            app.view()
+                .rows
+                .iter()
+                .any(|r| r.label == "Quick one" && r.depth == 0),
+            "{:?}",
+            app.view().rows
+        );
+    }
+
+    #[test]
+    fn a_in_the_card_view_adds_to_the_selected_cards_group() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('a'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "input");
+        type_text(&mut fx.app, "Gamma");
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.layout, "list", "stays in the card view");
+        assert_eq!(list_title(&fx.app), "Gamma", "the new card is selected");
+        let it = fx.app.selected_intent().unwrap();
+        assert_eq!(
+            it.path.parent().unwrap(),
+            fx.app.store.root().join("skoolscout"),
+            "added to the selected card's group"
+        );
+    }
+
+    #[test]
+    fn typing_a_title_in_the_card_view_keeps_the_cards_on_screen() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_text(&mut fx.app, "Gam");
+        let shown = render(&fx.app, 100, 20);
+        assert!(
+            shown.starts_with("Capabilities ·"),
+            "still the card view: {shown}"
+        );
+        let status = shown.lines().last().unwrap_or_default();
+        assert!(
+            status.contains("new capability in") && status.contains("Gam"),
+            "the prompt is on the status line: {status}"
+        );
+        // the areas prompt too
+        key(&mut fx.app, KeyCode::Esc);
+        key(&mut fx.app, KeyCode::Char('+'));
+        let shown = render(&fx.app, 100, 20);
+        assert!(shown.starts_with("Capabilities ·"), "{shown}");
+        assert!(
+            shown
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .contains("affected areas")
+        );
+    }
+
+    #[test]
+    fn a_in_an_empty_card_view_adds_at_the_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let cfg = load_or_init(&dirs).unwrap();
+        let mut app = App::new(cfg, dirs.clone()).unwrap();
+        key(&mut app, KeyCode::Char('v'));
+        key(&mut app, KeyCode::Char('a'));
+        type_text(&mut app, "First one");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(list_title(&app), "First one");
+        assert_eq!(
+            app.selected_intent().unwrap().path.parent().unwrap(),
+            dirs.root.as_path()
+        );
+    }
+
+    #[test]
+    fn the_criteria_pane_scrolls_to_the_selected_criterion() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut body = String::from("## Description\nx\n\n## Acceptance criteria\n");
+        // more than the open section holds
+        for i in 0..30 {
+            body.push_str(&format!("- [ ] criterion number {i}\n"));
+        }
+        let mut it = Store::load(&path).unwrap();
+        it.body = body;
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('C'));
+        for _ in 0..25 {
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        let shown = render(&fx.app, 100, 24);
+        assert!(
+            shown.contains("criterion number 25"),
+            "the selection is in view: {shown}"
+        );
+        assert!(shown.contains("more (j/k)"), "says what is hidden: {shown}");
+    }
+
+    #[test]
+    fn a_demo_line_opens_its_story_and_marks_the_criteria_it_shows() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx._tmp.path().join("repo");
+        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
+        fs::write(
+            repo.join("app-demos/stories/a.yaml"),
+            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
+        )
+        .unwrap();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(repo);
+        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n- [ ] second thing\n\n## Artifacts\n- demo: alex-shows-alpha (criteria: 2)\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        let shown = render(&fx.app, 100, 24);
+        assert!(shown.contains("[ ] ▶ second thing"), "{shown}");
+        assert!(shown.contains("[ ] first thing"), "{shown}");
+        // demos have their own section
+        tab_to(&mut fx.app, "demos");
+        key(&mut fx.app, KeyCode::Enter);
+        let v = fx.app.view();
+        assert_eq!(v.screen, "reader", "{v:?}");
+        assert_eq!(v.reader_title, "Alex shows Alpha working");
+    }
+
+    /// Alpha, sent, with one criterion from its refinement transcript and two
+    /// an agent added.
+    fn alpha_with_agent_added_criteria(fx: &mut Fx) -> PathBuf {
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.state = State::Sent;
+        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] owner wrote this\n- [ ] agent added one\n- [ ] agent added two\n".into();
+        Store::save_force(&mut it).unwrap();
+        fs::write(
+            it.transcript_path(),
+            "```proposal\n- [ ] owner wrote this\n```\n",
+        )
+        .unwrap();
+        fx.app.rescan();
+        path
+    }
+
+    #[test]
+    fn added_criteria_are_highlighted_until_each_is_acknowledged() {
+        let mut fx = setup("agy.jsonl");
+        let path = alpha_with_agent_added_criteria(&mut fx);
+        let shown = render(&fx.app, 110, 30);
+        assert!(shown.contains("(0/3 · 2 new)"), "{shown}");
+        assert!(shown.contains("[ ] + agent added one"), "{shown}");
+        assert!(shown.contains("[ ] owner wrote this"), "{shown}");
+        assert!(
+            shown.contains("* Alpha"),
+            "the capability carries * meanwhile: {shown}"
+        );
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('j')); // agent added one
+        key(&mut fx.app, KeyCode::Char('y'));
+        assert_eq!(
+            crate::store::new_criteria(&Store::load(&path).unwrap()),
+            vec![2]
+        );
+        assert!(render(&fx.app, 110, 30).contains("* Alpha"), "one left");
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('y'));
+        let shown = render(&fx.app, 110, 30);
+        assert!(!shown.contains("* Alpha"), "the last one clears *: {shown}");
+        assert!(!shown.contains("new)"), "{shown}");
+    }
+
+    #[test]
+    fn y_capital_acknowledges_every_new_criterion() {
+        let mut fx = setup("agy.jsonl");
+        let path = alpha_with_agent_added_criteria(&mut fx);
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('Y'));
+        assert!(crate::store::new_criteria(&Store::load(&path).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn the_owners_own_criteria_never_show_as_new() {
+        let mut fx = setup("agy.jsonl");
+        let path = alpha_with_agent_added_criteria(&mut fx);
+        // adding one in the pane
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_text(&mut fx.app, "owner added later");
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&path).unwrap();
+        let cs = crate::store::criteria(&it.body);
+        let fresh = cs
+            .iter()
+            .position(|c| c.text == "owner added later")
+            .unwrap();
+        assert!(
+            !crate::store::new_criteria(&it).contains(&fresh),
+            "added by the owner"
+        );
+        assert_eq!(
+            crate::store::new_criteria(&it).len(),
+            2,
+            "the agent's two still new"
+        );
+    }
+
+    #[test]
+    fn s_cycles_sort_orders() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(fx.app.view().sort, "Updated", "the default");
+        sort_by(&mut fx.app, "Title");
+        assert_eq!(
+            fx.app.view().list_titles,
+            vec!["Alpha", "Beta", "In the inbox"]
+        );
+        // Progress: raw first, then ?N, then ready
+        set_state(&mut fx.app, "In the inbox", State::Refining); // ?2
+        set_state(&mut fx.app, "Beta", State::Refining); // no questions: ready
+        sort_by(&mut fx.app, "Progress");
+        assert_eq!(
+            fx.app.view().list_titles,
+            vec!["Alpha", "In the inbox", "Beta"]
+        );
+        // Captured: newest created first
+        let scan = fx.app.store.scan().unwrap();
+        for (i, it) in scan
+            .groups
+            .iter()
+            .flat_map(|g| g.intents.iter())
+            .enumerate()
+        {
+            let when = chrono::Local::now() - chrono::Duration::days(10 - i as i64);
+            let title = it.fm.title.clone();
+            Store::update_fields(&it.path, |fm| {
+                fm.created = when;
+                fm.title = title;
+            })
+            .unwrap();
+        }
+        fx.app.rescan();
+        sort_by(&mut fx.app, "Captured");
+        let titles = fx.app.view().list_titles;
+        let created: Vec<_> = titles
+            .iter()
+            .map(|t| {
+                fx.app
+                    .store
+                    .scan()
+                    .unwrap()
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.intents.iter())
+                    .find(|i| &i.fm.title == t)
+                    .unwrap()
+                    .fm
+                    .created
+            })
+            .collect();
+        assert!(created.windows(2).all(|w| w[0] >= w[1]), "{titles:?}");
+    }
+
+    #[test]
+    fn the_layout_and_sort_are_remembered() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Progress");
+        let again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        let v = again.view();
+        assert_eq!(v.layout, "list");
+        assert_eq!(v.sort, "Progress");
+    }
+
+    #[test]
+    fn save_view_keeps_the_provider() {
+        let fx = setup("agy.jsonl");
+        crate::config::save_last_used(
+            &fx.app.dirs,
+            &LastUsed {
+                provider: "claude".into(),
+                model: Some("opus".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::config::save_view(&fx.app.dirs, "list", "Title").unwrap();
+        let last = crate::config::last_used(&fx.app.dirs, &fx.app.cfg);
+        assert_eq!(last.provider, "claude");
+        assert_eq!(last.model.as_deref(), Some("opus"));
+        assert_eq!(last.layout.as_deref(), Some("list"));
+        assert_eq!(last.sort.as_deref(), Some("Title"));
+    }
+
+    struct ListFx {
+        tmp: tempfile::TempDir,
+        app: App,
+    }
+
+    /// A capability file written by hand so its timestamps are fixed.
+    fn write_cap(root: &Path, dir: &str, stem: &str, front: &str, body: &str) {
+        let d = root.join(dir);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join(format!("{stem}.md")),
+            format!("---\n{front}---\n{body}"),
+        )
+        .unwrap();
+    }
+
+    /// Six capabilities covering every row kind, a repo with a plan and its
+    /// ledger, a fake gh that knows PR #42 is open, and a fake herdr whose
+    /// agent for the PR capability is blocked.
+    fn list_fixture(repo_for_sent: bool) -> ListFx {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let mut cfg = load_or_init(&dirs).unwrap();
+        cfg.providers.insert("fake".into(), fake_spec());
+        cfg.polish_provider = "fake".into();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("docs/superpowers/plans")).unwrap();
+        fs::write(
+            repo.join("docs/superpowers/plans/reassign.md"),
+            "### Task 1: a\n### Task 2: b\n### Task 3: c\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join(".superpowers/sdd/reassign")).unwrap();
+        fs::write(
+            repo.join(".superpowers/sdd/reassign/progress.md"),
+            "# SDD ledger — plan: docs/superpowers/plans/reassign.md\nTask 1: complete\n",
+        )
+        .unwrap();
+        let repo_line = if repo_for_sent {
+            format!("repo: {}\n", repo.display())
+        } else {
+            String::new()
+        };
+        let sent = |agent: &str, at: &str| {
+            format!(
+                "state: sent\n{repo_line}sent_to:\n  handoff: grill\n  workspace_id: w9\n  agent: {agent}\n  at: 2026-10-25T{at}:00-04:00\n"
+            )
+        };
+        let root = &dirs.root;
+        write_cap(
+            root,
+            "Inbox",
+            "raw",
+            "title: a\nkind: idea\nstate: raw\ncreated: 2026-10-25 07:30:00\nupdated: 2026-10-25 07:30:00\n",
+            "## Description\n\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "open",
+            "title: Families can skip a folder without seeing Pending\nkind: issue\nstate: refining\ncreated: 2026-10-24 09:00:00\nupdated: 2026-10-24 18:02:00\n",
+            "## Description\nWhen a parent uses Skip for now on the report-card folder, the folder still shows up labelled Pending.\nIt reads as if something is still owed, so families write in to ask what they missed and staff have to explain it every time.\nA third line that should be cut.\n\n## Open questions\n- Which org saw this?\n- Since when?\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "ready",
+            "title: Org admins can export candidate lists as CSV\nkind: enhancement\nstate: refining\ncreated: 2026-10-22 09:00:00\nupdated: 2026-10-23 09:41:00\n",
+            "## Description\nAdmins need a one-click export of the filtered candidates table.\n\n## Open questions\n- Which columns?\n  → the visible ones\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "pr",
+            &format!(
+                "title: Notify primary contact to schedule a meeting\nkind: idea\ncreated: 2026-10-25 00:34:00\nupdated: 2026-10-25 08:10:00\nareas:\n  - Inbox\n{}",
+                sent("intent-notify-547e", "08:10")
+            ),
+            "## Description\nThe primary contact gets no prompt to book the intro meeting.\n\n## Acceptance criteria\n- [ ] gets an email\n\n## Artifacts\n- spec: docs/superpowers/specs/notify.md\n- pr: #42\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "building",
+            &format!(
+                "title: Counselors can reassign a student between orgs\nkind: idea\ncreated: 2026-10-21 09:00:00\nupdated: 2026-10-22 16:15:00\n{}",
+                sent("intent-reassign-0001", "07:00")
+            ),
+            "## Description\nReassignment needs a support ticket today.\n\n## Acceptance criteria\n- [ ] moves\n- [ ] keeps history\n\n## Artifacts\n- plan: docs/superpowers/plans/reassign.md\n",
+        );
+        write_cap(
+            root,
+            "skoolscout/org",
+            "done",
+            &format!(
+                "title: Invitees skip the join request\nkind: idea\ncreated: 2026-10-19 09:00:00\nupdated: 2026-10-20 10:30:00\n{}",
+                sent("intent-invitees-0002", "06:00")
+            ),
+            "## Description\nInvited parents no longer file a join request.\n\n## Acceptance criteria\n- [x] no request\n",
+        );
+        write_cap(
+            root,
+            "Inbox",
+            "long",
+            "title: \"A very long title that keeps going \\a well past any reasonable width so that it must be cut off cleanly at the edge\"\nkind: idea\nstate: raw\ncreated: 2026-10-18 09:00:00\nupdated: 2026-10-18 09:00:00\n",
+            "## Description\nshort\n",
+        );
+
+        let notify_wt = repo.join(".claude/worktrees/org/notify");
+        fs::create_dir_all(notify_wt.join("app-ui")).unwrap();
+        fs::write(notify_wt.join(".slot"), "3\n").unwrap();
+        let agents = tmp.path().join("agents.json");
+        fs::write(
+            &agents,
+            format!(
+                r#"{{"result":{{"agents":[{{"agent":"claude","agent_status":"blocked","name":"intent-notify-547e","foreground_cwd":"{}"}},{{"agent":"claude","agent_status":"working","name":"intent-reassign-0001"}}]}}}}"#,
+                notify_wt.join("app-ui").display()
+            ),
+        )
+        .unwrap();
+        let prs = tmp.path().join("prs");
+        fs::create_dir_all(&prs).unwrap();
+        fs::write(prs.join("42"), "OPEN").unwrap();
+        let mut app = App::new(cfg, dirs).unwrap();
+        // a fixed clock keeps running times stable in snapshots
+        app.fixed_now = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-10-25T10:24:00-04:00")
+                .unwrap()
+                .with_timezone(&chrono::Local),
+        );
+        app.herdr_env = vec![
+            (
+                "HERDR_BIN_PATH".into(),
+                fixtures().join("fake-herdr.sh").display().to_string(),
+            ),
+            (
+                "FAKE_HERDR_LOG".into(),
+                tmp.path().join("herdr.log").display().to_string(),
+            ),
+            ("FAKE_AGENT_LIST".into(), agents.display().to_string()),
+            (
+                "GH_BIN_PATH".into(),
+                fixtures().join("fake-gh.sh").display().to_string(),
+            ),
+            ("FAKE_GH_DIR".into(), prs.display().to_string()),
+        ];
+        app.provider_env = vec![
+            (
+                "FAKE_EVENTS".into(),
+                fixtures()
+                    .join("events")
+                    .join("agy.jsonl")
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "FAKE_PROVIDER_LOG".into(),
+                tmp.path().join("provider.log").display().to_string(),
+            ),
+        ];
+        ListFx { tmp, app }
+    }
+
+    /// Tick until every background request has reported (5 s cap).
+    fn settle(app: &mut App) {
+        let start = Instant::now();
+        app.tick();
+        while app.polls_in_flight() > 0 && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+            app.tick();
+        }
+        assert_eq!(app.polls_in_flight(), 0, "background polls never finished");
+    }
+
+    fn render(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn list_snapshot_at_80_and_120_columns() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let wide = render(&fx.app, 120, 60);
+        assert!(wide.contains("! needs you"), "{wide}");
+        assert!(wide.contains("PR #42 open"), "{wide}");
+        assert!(wide.contains("building 1/3"), "{wide}");
+        assert!(wide.contains("✓ complete"), "{wide}");
+        assert!(wide.contains("?2"), "{wide}");
+        assert!(wide.contains("working"), "live agent state: {wide}");
+        assert!(wide.contains("closed"), "agent pane gone: {wide}");
+        insta::assert_snapshot!("list_120", wide);
+        let narrow = render(&fx.app, 80, 60);
+        assert!(
+            narrow.contains('…'),
+            "long titles cut with an ellipsis: {narrow}"
+        );
+        assert!(!narrow.contains('\u{7}'));
+        assert!(
+            wide.contains("A very long title"),
+            "the long row exists: {wide}"
+        );
+        insta::assert_snapshot!("list_80", narrow);
+    }
+
+    #[test]
+    fn a_narrow_card_cuts_the_progress_label_with_an_ellipsis_and_never_the_bar() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let is_bar = |c: char| matches!(c, '█' | '▉' | '▓' | '░');
+        // the Counselors card: agent working, building 1/3
+        let fields_row = |screen: &str| -> Option<String> {
+            screen
+                .lines()
+                .find(|l| l.contains("working"))
+                .map(|l| l.trim_end().to_string())
+        };
+        let wide = fields_row(&render(&fx.app, 120, 60)).unwrap();
+        assert!(wide.contains("building 1/3"), "{wide}");
+        let bar_len = wide.chars().filter(|c| is_bar(*c)).count();
+        assert!(bar_len > 0, "{wide}");
+        for w in 52..=120u16 {
+            let Some(row) = fields_row(&render(&fx.app, w, 60)) else {
+                continue;
+            };
+            let cells = row.chars().filter(|c| is_bar(*c)).count();
+            assert!(
+                cells == 0 || cells == bar_len,
+                "at {w} columns the bar is whole or absent: {row:?}"
+            );
+            if row.contains("buil") && !row.contains("building 1/3") {
+                assert!(
+                    row.ends_with('…'),
+                    "at {w} columns a cut label ends in …: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn card_titles_are_bold_and_cards_open_with_a_rule() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let (w, h) = (100u16, 60u16);
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let row = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let title_y = (0..h)
+            .find(|&y| row(y).starts_with(" Invitees skip"))
+            .expect("card title row");
+        assert!(
+            buf[(1, title_y)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "title is bold"
+        );
+        assert!(
+            row(title_y - 1).starts_with("────"),
+            "the card opens with a rule: {:?}",
+            row(title_y - 1)
+        );
+    }
+
+    fn list_goto(app: &mut App, title: &str) {
+        for _ in 0..10 {
+            key(app, KeyCode::Char('k'));
+        }
+        for _ in 0..10 {
+            if list_title(app).starts_with(title) {
+                return;
+            }
+            key(app, KeyCode::Char('j'));
+        }
+        panic!("no list row {title}");
+    }
+
+    #[test]
+    fn send_from_the_list_shows_that_capability_in_the_tree() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        list_goto(&mut fx.app, "Org admins");
+        key(&mut fx.app, KeyCode::Char('s'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "send-pick");
+        assert!(
+            v.rows[v.selected].label.contains("Org admins"),
+            "the tree beside the picker points at the capability being sent: {:?}",
+            v.rows.get(v.selected)
+        );
+    }
+
+    #[test]
+    fn the_list_timer_picks_up_lines_appended_on_disk() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/43"), "OPEN").unwrap();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/building.md");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("- pr: #43\n");
+        fs::write(&path, text).unwrap();
+        fx.app.poll_ticks = 1800; // the minute timer is due
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 60);
+        assert!(shown.contains("PR #43 open"), "{shown}");
+    }
+
+    #[test]
+    fn the_agent_field_is_blank_when_herdr_cannot_answer() {
+        let mut fx = list_fixture(true);
+        fx.app.herdr_env.retain(|(k, _)| k != "FAKE_AGENT_LIST"); // fake herdr now fails
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 60);
+        assert!(
+            shown.contains("Oct 25 08:10 │ → sent │ —"),
+            "no endless loading mark: {shown}"
+        );
+    }
+
+    #[test]
+    fn cards_show_where_the_capability_lives() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 70);
+        let lines: Vec<&str> = shown.lines().collect();
+        let row = |prefix: &str| {
+            lines
+                .iter()
+                .position(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no line starting {prefix:?}: {shown}"))
+        };
+        // sent card: title, tree path, metadata, worktree path and slot, blank, description
+        let t = row(" Notify primary contact");
+        assert_eq!(
+            lines[t + 1],
+            " skoolscout/org · Inbox",
+            "its home, then the other areas it affects"
+        );
+        assert!(
+            lines[t + 2].starts_with(" Oct 25 08:10 │ → sent"),
+            "{}",
+            lines[t + 2]
+        );
+        assert_eq!(
+            lines[t + 3],
+            " .claude/worktrees/org/notify │ slot 3",
+            "worktree path under the metadata row"
+        );
+        assert_eq!(lines[t + 4], "", "a blank line before the description");
+        assert!(
+            lines[t + 5].starts_with(" The primary contact"),
+            "{}",
+            lines[t + 5]
+        );
+        // unsent card: no worktree row
+        let a = lines.iter().position(|l| *l == " a").unwrap();
+        assert_eq!(lines[a + 1], " Inbox");
+        assert!(lines[a + 2].starts_with(" Oct 25 07:30 │ raw"));
+        assert_eq!(lines[a + 3], "");
+        assert_eq!(lines[a + 4], " (no description yet)");
+    }
+
+    #[test]
+    fn cards_show_how_long_the_agent_has_been_running() {
+        let mut fx = list_fixture(true);
+        // sent at 08:10 -04:00 in the fixture
+        fx.app.fixed_now = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-10-25T10:24:00-04:00")
+                .unwrap()
+                .with_timezone(&chrono::Local),
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 60);
+        assert!(shown.contains("! needs you │ 2h ago"), "{shown}");
+        assert!(shown.contains("working     │ 3h ago"), "{shown}");
+        assert!(
+            shown.contains("closed      │ 4h ago"),
+            "time since sent, whether or not the pane is still there: {shown}"
+        );
+        assert!(
+            shown.contains("│ raw    │ —           │ —"),
+            "nothing before sending: {shown}"
+        );
+    }
+
+    #[test]
+    fn longest_running_and_created_asc_orders() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        sort_by(&mut fx.app, "Longest running");
+        let titles = fx.app.view().list_titles;
+        assert_eq!(
+            &titles[..2],
+            &[
+                "Counselors can reassign a student between orgs".to_string(),
+                "Notify primary contact to schedule a meeting".to_string(),
+            ],
+            "running agents first, longest first: {titles:?}"
+        );
+        assert_eq!(
+            titles[2], "a",
+            "then the rest by most recently changed: {titles:?}"
+        );
+        sort_by(&mut fx.app, "Created Asc");
+        let titles = fx.app.view().list_titles;
+        assert!(titles[0].starts_with("A very long title"), "{titles:?}");
+        assert_eq!(titles[1], "Invitees skip the join request");
+        assert_eq!(titles.last().unwrap(), "a", "newest last: {titles:?}");
+        // the choice is remembered like the others
+        let again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        assert_eq!(again.view().sort, "Created Asc");
+    }
+
+    /// Press `f` until the list is filtered by `filter`.
+    fn filter_by(app: &mut App, filter: &str) {
+        for _ in 0..4 {
+            if app.view().filter == filter {
+                return;
+            }
+            key(app, KeyCode::Char('f'));
+        }
+        panic!("no filter {filter}");
+    }
+
+    #[test]
+    fn f_filters_in_progress_completed_and_all() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        assert_eq!(fx.app.view().filter, "All", "the default");
+        assert_eq!(fx.app.view().list_titles.len(), 7);
+        filter_by(&mut fx.app, "In progress");
+        let titles = fx.app.view().list_titles;
+        assert_eq!(titles.len(), 6, "{titles:?}");
+        assert!(
+            !titles.iter().any(|t| t.starts_with("Invitees")),
+            "{titles:?}"
+        );
+        assert!(
+            titles.iter().any(|t| t == "a"),
+            "drafts count as in progress"
+        );
+        filter_by(&mut fx.app, "Completed");
+        assert_eq!(
+            fx.app.view().list_titles,
+            vec!["Invitees skip the join request"]
+        );
+        let shown = render(&fx.app, 120, 20);
+        assert!(shown.contains("showing Completed (1 of 7)"), "{shown}");
+        let narrow = render(&fx.app, 80, 20);
+        assert!(
+            narrow.contains("showing Completed (1 of 7)"),
+            "the header is never cut for hints: {narrow}"
+        );
+        // remembered like the sort order
+        let again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        assert_eq!(again.view().filter, "Completed");
+        filter_by(&mut fx.app, "All");
+        assert_eq!(fx.app.view().list_titles.len(), 7);
+    }
+
+    #[test]
+    fn an_empty_filter_says_so() {
+        let mut fx = setup("agy.jsonl"); // nothing sent, nothing complete
+        key(&mut fx.app, KeyCode::Char('v'));
+        filter_by(&mut fx.app, "Completed");
+        let shown = render(&fx.app, 100, 12);
+        assert!(shown.contains("nothing matches this filter"), "{shown}");
+    }
+
+    #[test]
+    fn prs_found_by_plan_name_move_the_card() {
+        let mut fx = list_fixture(true);
+        // the Counselors capability links plans/reassign.md but no pr: line
+        fs::write(
+            fx.tmp.path().join("prs/search-reassign.md.json"),
+            r#"[{"number":77,"state":"OPEN"}]"#,
+        )
+        .unwrap();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 70);
+        let line = shown
+            .lines()
+            .skip_while(|l| !l.starts_with(" Counselors"))
+            .nth(2)
+            .unwrap_or_default()
+            .to_string();
+        assert!(line.contains("PR #77 open"), "{line}");
+        assert!(line.contains("▉▉▉▓▉░░░"), "{line}");
+        let it = fx
+            .app
+            .list
+            .iter()
+            .find(|i| i.fm.title.starts_with("Counselors"))
+            .unwrap()
+            .clone();
+        let pr = crate::progress::progress(&it, &fx.app.evidence_for(&it)).unwrap();
+        let kinds: String = crate::progress::stage_cells(&pr)
+            .iter()
+            .map(|c| match c.kind {
+                crate::progress::CellKind::Done => 'D',
+                crate::progress::CellKind::Todo => 'T',
+                crate::progress::CellKind::Review => 'R',
+            })
+            .collect();
+        assert_eq!(kinds, "DDDRDTTT", "the plan's own block shows it in review");
+    }
+
+    #[test]
+    fn bar_cells_are_shades_with_no_styling_and_no_gap_cells() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let (w, h) = (120u16, 60u16);
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| fx.app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        let row = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        // the Notify card: PR open, merged and verified still to do
+        let y = (0..h)
+            .find(|&y| row(y).contains("PR #42 open"))
+            .expect("Notify's metadata row");
+        let text = row(y);
+        assert!(text.contains("▉▉▉██▉▉░░░ PR #42 open"), "{text}");
+        assert!(!text.contains('▕'), "no gap cells: {text}");
+        // Herdr drops colour and dim on block glyphs, so the bar carries none
+        let start = text.find("▉▉▉██▉▉░░░").unwrap();
+        let x0 = text[..start].chars().count() as u16;
+        for x in x0..x0 + 10 {
+            let st = buf[(x, y)].style();
+            assert!(
+                st.add_modifier.is_empty()
+                    && st.fg.is_none_or(|c| c == ratatui::style::Color::Reset),
+                "cell {x} is unstyled: {st:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr_branches_suggest_areas_that_plus_confirms() {
+        let mut fx = list_fixture(true);
+        fs::create_dir_all(fx.app.store.root().join("skoolscout/family")).unwrap();
+        // the Counselors plan's PR was built in the family work area
+        fs::write(
+            fx.tmp.path().join("prs/search-reassign.md.json"),
+            r#"[{"number":78,"state":"OPEN","headRefName":"feature/family--reassign-family"}]"#,
+        )
+        .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 70);
+        let t = shown
+            .lines()
+            .position(|l| l.starts_with(" Counselors"))
+            .unwrap();
+        let path_row = shown.lines().nth(t + 1).unwrap().to_string();
+        assert!(
+            path_row.contains("suggested: skoolscout/family"),
+            "{path_row}"
+        );
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Counselors");
+        key(&mut fx.app, KeyCode::Char('+'));
+        assert_eq!(
+            fx.app.view().input_text,
+            "skoolscout/family",
+            "suggestions prefilled"
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert_eq!(
+            Store::load(&it.path).unwrap().fm.areas,
+            vec!["skoolscout/family"]
+        );
+    }
+
+    #[test]
+    fn a_merged_capability_is_reconciled_marked_unread_and_read_on_open() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap(); // Notify's only PR
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        let it = Store::load(&path).unwrap();
+        assert!(
+            it.body
+                .contains("Parents who skip the report card folder see Pending."),
+            "the agent's rewrite was applied: {}",
+            it.body
+        );
+        assert!(it.body.contains("- Which org?"), "its questions merged in");
+        assert!(it.fm.unread, "marked unread");
+        assert_eq!(it.fm.reconciled_for, vec![42]);
+        assert!(
+            crate::reconcile::backup_path(&path).exists(),
+            "previous version kept"
+        );
+        let shown = render(&fx.app, 120, 70);
+        assert!(
+            shown
+                .lines()
+                .any(|l| l.starts_with(" * Notify primary contact")),
+            "the card shows * until it is read: {shown}"
+        );
+        // the same merged set is not reconciled twice
+        for _ in 0..5 {
+            settle(&mut fx.app);
+        }
+        let runs = fs::read_to_string(fx.tmp.path().join("provider.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("--prompt="))
+            .count();
+        assert_eq!(runs, 1, "one agent run per merged set");
+        // opening it reads it
+        sort_by(&mut fx.app, "Title");
+        list_goto(&mut fx.app, "Notify");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().layout, "tree");
+        assert!(!Store::load(&path).unwrap().fm.unread, "read once opened");
+        // u puts the previous version back
+        key(&mut fx.app, KeyCode::Char('u'));
+        let back = Store::load(&path).unwrap();
+        assert!(
+            back.body.contains("The primary contact gets no prompt"),
+            "{}",
+            back.body
+        );
+        assert!(!crate::reconcile::backup_path(&path).exists());
+    }
+
+    #[test]
+    fn sent_reads_as_an_arrow_and_only_complete_gets_a_check() {
+        let mut fx = list_fixture(true);
+        settle(&mut fx.app);
+        // open every group so all capabilities show in the tree
+        let groups: Vec<PathBuf> = fx.app.collapsed.iter().cloned().collect();
+        for g in groups {
+            fx.app.collapsed.remove(&g);
+        }
+        fx.app.rebuild_rows();
+        let tree = render(&fx.app, 120, 30);
+        let line = |title: &str| {
+            tree.lines()
+                .find(|l| l.contains(title) && !l.contains('↳'))
+                .unwrap_or_else(|| panic!("no {title} in {tree}"))
+                .to_string()
+        };
+        assert!(
+            line("Notify primary contact").contains("→ Notify"),
+            "sent: {tree}"
+        );
+        assert!(
+            line("Invitees skip").contains("✓ Invitees"),
+            "complete: {tree}"
+        );
+        assert!(
+            !line("Counselors").contains('✓'),
+            "sent, not complete: {tree}"
+        );
+        // the card's status field
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let cards = render(&fx.app, 120, 70);
+        assert!(cards.contains("│ → sent │"), "{cards}");
+    }
+
+    #[test]
+    fn moving_between_cards_does_not_scan_the_repo_for_found_artifacts() {
+        let mut fx = list_fixture(true);
+        let specs = fx.tmp.path().join("repo/docs/superpowers/specs");
+        fs::create_dir_all(&specs).unwrap();
+        fs::write(
+            specs.join("reassign-design.md"),
+            "# Counselors reassign a student between orgs\n",
+        )
+        .unwrap();
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(fx.app.view().layout, "list");
+        fx.app.found_cache = None;
+        for _ in 0..6 {
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        assert!(
+            fx.app.found_cache.is_none(),
+            "the list never shows found artifacts, so it does not look for them"
+        );
+        // the tree still finds them for the capability it shows
+        key(&mut fx.app, KeyCode::Char('v'));
+        select(&mut fx.app, "org");
+        key(&mut fx.app, KeyCode::Char('l'));
+        select(&mut fx.app, "Counselors can reassign");
+        assert_eq!(fx.app.view().found_count, 1);
+    }
+
+    #[test]
+    fn a_reconcile_hands_the_agent_the_suggested_areas_too() {
+        let mut fx = list_fixture(true);
+        fs::create_dir_all(fx.app.store.root().join("skoolscout/family")).unwrap();
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        fs::write(
+            fx.tmp.path().join("prs/search-notify.md.json"),
+            r#"[{"number":42,"state":"MERGED","headRefName":"feature/family--notify-family"}]"#,
+        )
+        .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let log = fs::read_to_string(fx.tmp.path().join("provider.log")).unwrap_or_default();
+        assert!(
+            log.contains("Areas it affects besides its own group: Inbox, skoolscout/family"),
+            "the reconcile prompt lists the suggested area: {log}"
+        );
+    }
+
+    #[test]
+    fn a_merged_capability_is_reconciled_while_the_tree_shows() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        assert_eq!(fx.app.view().layout, "tree", "never opening the list");
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let it = Store::load(&fx.app.store.root().join("skoolscout/org/pr.md")).unwrap();
+        assert_eq!(it.fm.reconciled_for, vec![42], "reconciled from the tree");
+        let herdr = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(
+            !herdr.contains("agent list"),
+            "agent states only poll for the cards: {herdr}"
+        );
+    }
+
+    #[test]
+    fn ready_and_refining_keys_leave_a_sent_capability_sent() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&path, |fm| fm.state = State::Sent).unwrap();
+        fx.app.rescan();
+        for k in ['R', 'U'] {
+            key(&mut fx.app, KeyCode::Char(k));
+            assert_eq!(
+                Store::load(&path).unwrap().fm.state,
+                State::Sent,
+                "{k} kept it sent"
+            );
+            assert!(
+                fx.app
+                    .view()
+                    .message
+                    .unwrap_or_default()
+                    .contains("already sent"),
+                "{:?}",
+                fx.app.view().message
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_reconcile_stays_visible_and_r_retries_it() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        let empty = fx.tmp.path().join("empty.jsonl");
+        fs::write(&empty, "").unwrap();
+        fx.app.provider_env[0].1 = empty.display().to_string(); // the agent says nothing useful
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        assert!(
+            Store::load(&path).unwrap().fm.reconciled_for.is_empty(),
+            "not applied"
+        );
+        // select the capability and press an unrelated key: the reason is still shown
+        let groups: Vec<PathBuf> = fx.app.collapsed.iter().cloned().collect();
+        for g in groups {
+            fx.app.collapsed.remove(&g);
+        }
+        fx.app.rebuild_rows();
+        fx.app.select_path(&path);
+        key(&mut fx.app, KeyCode::Char('Q'));
+        key(&mut fx.app, KeyCode::Esc);
+        let status = render(&fx.app, 120, 30)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            status.contains("reconcile") && status.contains("r retries"),
+            "{status}"
+        );
+        // a working agent and r: it runs again
+        fx.app.provider_env[0].1 = fixtures()
+            .join("events")
+            .join("agy.jsonl")
+            .display()
+            .to_string();
+        key(&mut fx.app, KeyCode::Char('r'));
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        assert_eq!(
+            Store::load(&path).unwrap().fm.reconciled_for,
+            vec![42],
+            "retried"
+        );
+    }
+
+    #[test]
+    fn a_reconcile_that_runs_too_long_is_stopped_and_reported() {
+        let mut fx = list_fixture(true);
+        fs::write(fx.tmp.path().join("prs/42"), "MERGED").unwrap();
+        let empty = fx.tmp.path().join("empty.jsonl");
+        fs::write(&empty, "").unwrap();
+        fx.app.provider_env[0].1 = empty.display().to_string();
+        fx.app
+            .provider_env
+            .push(("FAKE_MODE".into(), "hang".into())); // never answers
+        fx.app.reconcile_limit = Duration::from_millis(300);
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        assert!(Store::load(&path).unwrap().fm.reconciled_for.is_empty());
+        assert!(
+            fx.app
+                .reconcile_failed
+                .get(&path)
+                .is_some_and(|m| m.contains("did not finish")),
+            "{:?}",
+            fx.app.reconcile_failed
+        );
+        assert_eq!(fx.app.polls_in_flight(), 0, "the stuck agent is gone");
+    }
+
+    #[test]
+    fn s_in_the_list_is_gated_and_sends_when_ready() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        let goto = |app: &mut App, title: &str| {
+            for _ in 0..10 {
+                key(app, KeyCode::Char('k'));
+            }
+            for _ in 0..10 {
+                if list_title(app).starts_with(title) {
+                    return;
+                }
+                key(app, KeyCode::Char('j'));
+            }
+            panic!("no list row {title}");
+        };
+        goto(&mut fx.app, "Families");
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("2 open questions")
+        );
+        goto(&mut fx.app, "Org admins");
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "send-pick");
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(
+            fx.app.view().layout,
+            "list",
+            "back in the list after the picker"
+        );
+    }
+
+    #[test]
+    fn the_list_opens_on_its_first_card_from_an_empty_group() {
+        let mut fx = list_fixture(true);
+        fs::create_dir_all(fx.app.store.root().join("zz-empty")).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('j'));
+        let moved = fx.app.view().list_selected;
+        assert!(moved > 0);
+        key(&mut fx.app, KeyCode::Char('v'));
+        select(&mut fx.app, "zz-empty");
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(
+            fx.app.view().list_selected,
+            0,
+            "no card under the group: start at the first, not where the list was"
+        );
+    }
+
+    #[test]
+    fn a_poll_that_reorders_the_progress_sort_keeps_the_selection() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        sort_by(&mut fx.app, "Progress");
+        for _ in 0..10 {
+            if list_title(&fx.app).starts_with("Counselors") {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        let before = fx.app.view().list_titles;
+        let at = fx.app.view().list_selected;
+        // the Notify card's PR closes: its progress drops below Counselors'
+        fs::write(fx.tmp.path().join("prs/42"), "CLOSED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let after = fx.app.view().list_titles;
+        assert_ne!(before, after, "the poll re-sorted the list");
+        assert_ne!(
+            after[at], before[at],
+            "another card now sits where the selection was"
+        );
+        assert!(
+            list_title(&fx.app).starts_with("Counselors"),
+            "the selection follows its card: {}",
+            list_title(&fx.app)
+        );
+    }
+
+    #[test]
+    fn a_repo_that_is_a_file_still_renders_in_the_list() {
+        let mut fx = list_fixture(true);
+        let file = fx.tmp.path().join("not-a-folder");
+        fs::write(&file, "x").unwrap();
+        let path = fx.app.store.root().join("skoolscout/org/building.md");
+        Store::update_fields(&path, |fm| fm.repo = Some(file.clone())).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let shown = render(&fx.app, 120, 60);
+        assert!(shown.contains("Counselors can reassign"), "{shown}");
+        let row = shown
+            .lines()
+            .find(|l| l.contains("working"))
+            .unwrap_or_else(|| panic!("its fields row: {shown}"));
+        assert!(!row.contains("building 1/3"), "no plans can be read: {row}");
+    }
+
+    #[test]
+    fn page_keys_move_the_list_by_a_screen() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        let total = fx.app.view().list_titles.len();
+        let _ = render(&fx.app, 120, 20);
+        let shown = fx.app.card_hits.borrow().len();
+        assert!(
+            shown >= 2 && shown < total,
+            "{shown} of {total} cards on screen"
+        );
+        // the list opens on the tree's capability, not necessarily the first
+        let start = fx.app.view().list_selected;
+        key(&mut fx.app, KeyCode::PageDown);
+        assert_eq!(
+            fx.app.view().list_selected,
+            start + shown - 1,
+            "a screen less one: the last card seen stays on screen"
+        );
+        key(&mut fx.app, KeyCode::PageUp);
+        assert_eq!(fx.app.view().list_selected, start);
+    }
+
+    #[test]
+    fn a_question_added_after_s_stops_the_send() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        for _ in 0..10 {
+            if list_title(&fx.app).starts_with("Org admins") {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx.tmp.path().join("repo");
+        Store::update_fields(&path, |fm| fm.repo = Some(repo)).unwrap();
+        fx.app.rescan();
+        let original = Store::load(&path).unwrap().body;
+        let ask = |body: &str| {
+            let mut it = Store::load(&path).unwrap();
+            it.body = body.to_string();
+            Store::save_force(&mut it).unwrap();
+        };
+        let refused = |app: &App| {
+            app.view().screen == "browse"
+                && app
+                    .view()
+                    .message
+                    .unwrap_or_default()
+                    .contains("1 open question")
+        };
+        // a question appears while the handoff picker is open
+        key(&mut fx.app, KeyCode::Char('s'));
+        assert_eq!(fx.app.view().screen, "send-pick");
+        ask(&format!("{original}- And which format?\n"));
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(refused(&fx.app), "{:?}", fx.app.view().message);
+        // and while the confirm screen is showing
+        ask(&original);
+        key(&mut fx.app, KeyCode::Char('s'));
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "send-confirm");
+        ask(&format!("{original}- And which format?\n"));
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(refused(&fx.app), "{:?}", fx.app.view().message);
+        let calls = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(!calls.contains("workspace create"), "nothing sent: {calls}");
+        assert_ne!(Store::load(&path).unwrap().fm.state, State::Sent);
+    }
+
+    #[test]
+    fn g_focuses_the_sent_agent() {
+        let mut fx = list_fixture(true);
+        key(&mut fx.app, KeyCode::Char('v'));
+        sort_by(&mut fx.app, "Title");
+        for _ in 0..10 {
+            if list_title(&fx.app).starts_with("Notify") {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('j'));
+        }
+        key(&mut fx.app, KeyCode::Char('g'));
+        let log = fx.tmp.path().join("herdr.log");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("agent focus intent-notify-547e")
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no focus call: {:?}", fs::read_to_string(&log));
+    }
+
+    #[test]
+    fn a_sent_capability_without_repo_still_renders() {
+        let mut fx = list_fixture(false);
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let text = render(&fx.app, 120, 60);
+        assert!(text.contains("✓ complete"), "{text}");
+        assert!(
+            text.contains("building ?"),
+            "plan unreadable without a repo: {text}"
+        );
+    }
+
+    #[test]
+    fn pollers_only_run_while_the_list_shows() {
+        let mut fx = list_fixture(true);
+        for _ in 0..200 {
+            fx.app.tick();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let log = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(
+            !log.contains("agent list"),
+            "tree layout polls nothing: {log}"
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        settle(&mut fx.app);
+        let log = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
+        assert!(log.contains("agent list"), "the list polls on entry: {log}");
     }
 
     /// Give the selected intent a repo so `send` has somewhere to go.
@@ -2918,7 +6298,7 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         fx.app
             .provider_env
-            .push(("FAKE_MODE".into(), "hang".into()));
+            .push(("FAKE_MODE".into(), "midturn".into()));
         select(&mut fx.app, "Alpha");
         polish(&mut fx.app);
         wait_until(&mut fx.app, "deltas", |a| {
@@ -2991,6 +6371,7 @@ mod tests {
         select(&mut fx.app, "Alpha");
         let repo = fx._tmp.path().to_path_buf();
         set_repo(&mut fx.app, &repo);
+        make_refining(&mut fx.app);
         key(&mut fx.app, KeyCode::Char('s'));
         assert_eq!(fx.app.view().screen, "send-pick");
         key(&mut fx.app, KeyCode::Enter); // first applicable handoff for an idea: grill
@@ -2998,6 +6379,10 @@ mod tests {
         key(&mut fx.app, KeyCode::Enter);
         let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
         assert_eq!(it.fm.state, State::Sent);
+        assert!(
+            it.fm.acknowledged.is_some(),
+            "what was sent is recorded as seen"
+        );
         let sent = it.fm.sent_to.unwrap();
         assert_eq!(sent.handoff, "grill");
         assert_eq!(sent.workspace_id, "w9");
@@ -3040,11 +6425,16 @@ mod tests {
         select(&mut fx.app, "Alpha");
         let repo = fx._tmp.path().to_path_buf();
         set_repo(&mut fx.app, &repo);
+        make_refining(&mut fx.app);
         key(&mut fx.app, KeyCode::Char('s'));
         key(&mut fx.app, KeyCode::Enter);
         key(&mut fx.app, KeyCode::Enter);
         let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
-        assert_eq!(it.fm.state, State::Raw);
+        assert_eq!(
+            it.fm.state,
+            State::Refining,
+            "unchanged when herdr is missing"
+        );
         assert!(
             fx.app
                 .view()
@@ -3207,6 +6597,7 @@ mod tests {
             ),
         ];
         select(&mut fx.app, "Alpha");
+        make_refining(&mut fx.app);
         let path = fx.app.selected_intent().unwrap().path.clone();
         let mut other = Store::load(&path).unwrap();
         other.body = "fresh body from disk\n".into();
@@ -3292,6 +6683,7 @@ mod tests {
             ),
         ];
         select(&mut fx.app, "Alpha"); // created with repo None
+        make_refining(&mut fx.app);
         key(&mut fx.app, KeyCode::Char('s'));
         key(&mut fx.app, KeyCode::Enter);
         assert_ne!(fx.app.view().screen, "send-confirm");
@@ -3383,6 +6775,150 @@ mod tests {
     }
 
     #[test]
+    fn tab_opens_one_section_at_a_time_and_the_last_stays_open() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox");
+        assert_eq!(fx.app.view().open, "criteria", "criteria open to start");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "description");
+        assert_eq!(
+            fx.app.view().open,
+            "criteria",
+            "the description leaves it open"
+        );
+        for pane in [
+            "preconditions",
+            "criteria",
+            "demos",
+            "questions",
+            "pull requests",
+            "artifacts",
+        ] {
+            key(&mut fx.app, KeyCode::Tab);
+            assert_eq!(fx.app.view().focus, pane);
+            assert_eq!(fx.app.view().open, pane, "the focused section opens");
+        }
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "tree");
+        assert_eq!(fx.app.view().open, "artifacts", "the last one stays open");
+        select(&mut fx.app, "Alpha");
+        assert_eq!(
+            fx.app.view().open,
+            "artifacts",
+            "and stays open on the next capability"
+        );
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().open, "artifacts");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().open, "pull requests");
+    }
+
+    /// Tab from the tree to the named section.
+    fn tab_to(app: &mut App, pane: &str) {
+        for _ in 0..8 {
+            if app.view().focus == pane {
+                return;
+            }
+            key(app, KeyCode::Tab);
+        }
+        panic!("never reached {pane}");
+    }
+
+    #[test]
+    fn pull_requests_show_their_titles_and_l_links_a_found_one() {
+        let mut fx = list_fixture(true);
+        let prs = fx.tmp.path().join("prs");
+        fs::write(prs.join("42.title"), "Notify the family by email").unwrap();
+        fs::write(
+            prs.join("search-notify.md.json"),
+            r#"[{"number":43,"state":"MERGED","headRefName":"fix/org/notify--copy","title":"Fix the email copy"}]"#,
+        )
+        .unwrap();
+        select(&mut fx.app, "Notify primary contact");
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        tab_to(&mut fx.app, "pull requests");
+        let shown = render(&fx.app, 120, 40);
+        assert!(
+            shown.contains("Pull requests (0/1 merged, 1 found)"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("open    #42  Notify the family by email"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("merged? #43  Fix the email copy   (found · L links)"),
+            "{shown}"
+        );
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('L'));
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let body = Store::load(&path).unwrap().body;
+        assert!(body.contains("- pr: #43"), "{body}");
+        let shown = render(&fx.app, 120, 40);
+        assert!(shown.contains("Pull requests (1/2 merged)"), "{shown}");
+        assert_eq!(fx.app.view().focus, "pull requests");
+    }
+
+    #[test]
+    fn a_in_pull_requests_and_demos_adds_a_line_of_that_kind() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        tab_to(&mut fx.app, "pull requests");
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "#77");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().focus, "pull requests");
+        tab_to(&mut fx.app, "demos");
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "story-x (criteria: 2)");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().focus, "demos");
+        let body = Store::load(&path).unwrap().body;
+        assert!(body.contains("- pr: #77"), "{body}");
+        assert!(body.contains("- demo: story-x (criteria: 2)"), "{body}");
+    }
+
+    #[test]
+    fn the_demo_videos_help_line_names_the_section() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        tab_to(&mut fx.app, "demos");
+        let shown = render(&fx.app, 140, 30);
+        assert!(shown.contains("Demo Videos: j/k choose"), "{shown}");
+    }
+
+    #[test]
+    fn reading_a_demo_returns_to_the_demos_section() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let repo = fx._tmp.path().join("repo");
+        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
+        fs::write(
+            repo.join("app-demos/stories/a.yaml"),
+            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
+        )
+        .unwrap();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(repo);
+        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n\n## Artifacts\n- spec: docs/x.md\n- demo: alex-shows-alpha (criteria: 1)\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        tab_to(&mut fx.app, "demos");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(
+            fx.app.view().screen,
+            "reader",
+            "the section's first row is the demo"
+        );
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().focus, "demos");
+    }
+
+    #[test]
     fn tab_cycles_focus_through_the_three_panes() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
@@ -3394,13 +6930,20 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "criteria");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "demos");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "questions");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "pull requests");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "artifacts");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "pull requests");
+        key(&mut fx.app, KeyCode::Tab);
         // j/k in the tree still move the selection only while the tree has focus
         key(&mut fx.app, KeyCode::Char('j'));
         assert_eq!(
@@ -3476,21 +7019,25 @@ mod tests {
     }
 
     #[test]
-    fn detail_draws_three_separate_panes() {
+    fn detail_shows_every_section_title_and_opens_one() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
-        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| fx.app.draw(Rect::new(0, 0, 100, 24), f.buffer_mut()))
-            .unwrap();
-        let text = format!("{:?}", t.backend().buffer());
+        let text = render(&fx.app, 100, 24);
         for title in [
             "Description",
             "Preconditions",
             "Acceptance criteria",
             "Open questions",
+            "Artifacts",
         ] {
-            assert!(text.contains(title), "pane {title} missing");
+            assert!(text.contains(title), "pane {title} missing: {text}");
         }
+        assert!(!text.contains("? a?"), "questions start collapsed: {text}");
+        // tree → description → preconditions → criteria → demos → questions
+        for _ in 0..5 {
+            key(&mut fx.app, KeyCode::Tab);
+        }
+        let text = render(&fx.app, 100, 24);
         assert!(
             text.contains("? a?") && text.contains("? b?"),
             "questions listed with their open mark: {text}"

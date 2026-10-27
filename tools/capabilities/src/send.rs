@@ -13,10 +13,13 @@ const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec"];
 
 fn artifacts_preamble(intent: &Intent) -> String {
     format!(
-        "Whenever you create something for this capability — a spec, a plan, an ADR or decision record, a wayfinder decision ticket, or a GitHub issue — append one line under `## Artifacts` in {} (create the section if missing): `- spec: <path>`, `- plan: <path>`, `- adr: <path>`, `- decision: #<n>`, `- issue: <url or #n>`. Paths are relative to the repo root.\n\n",
+        "Whenever you create something for this capability — a spec, a plan, an ADR or decision record, a wayfinder decision ticket, or a GitHub issue — append one line under `## Artifacts` in {} (create the section if missing): `- spec: <path>`, `- plan: <path>`, `- adr: <path>`, `- decision: #<n>`, `- issue: <url or #n>`, `- pr: #<n>` when you open a pull request, and `- demo: <story-id> (criteria: <numbers>)` for each app-demos story you add, naming the acceptance criteria it shows. The numbers count this capability's own acceptance criteria from 1, in order across its area groups, not the spec's. When the spec splits the work into slices you have not planned yet, add `- plan: <slice name>` with no path for each one, and replace it with the plan's path once the plan is written, so progress counts the work still to plan. Paths are relative to the repo root.\n\n",
         intent.path.display()
     )
 }
+
+/// Every hand-off: the happy path is settled, edge cases are the agent's to find.
+pub const EDGE_CASES_PREAMBLE: &str = "The happy path is settled: every open question below has its answer. Edge cases are now yours to find. List the ones you see, ask about those that change what gets built, and record each decision as you go.\n\n";
 
 const PRECONDITIONS_PREAMBLE: &str = "Before anything else, verify each item under Preconditions against the code and the data: tell me which hold, which do not, and ask about any you cannot settle. Do not build on a precondition you have not confirmed.\n\n";
 
@@ -62,6 +65,53 @@ pub fn main_checkout(from: &Path) -> anyhow::Result<PathBuf> {
     Ok(std::fs::canonicalize(&top).unwrap_or(top))
 }
 
+/// Every working tree of `repo`, main checkout first (`git worktree list
+/// --porcelain`), canonicalised. Just `[repo]` when git cannot answer.
+pub fn worktrees(repo: &Path) -> Vec<PathBuf> {
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo)
+        .output();
+    let Ok(out) = out else {
+        return vec![repo.to_path_buf()];
+    };
+    if !out.status.success() {
+        return vec![repo.to_path_buf()];
+    }
+    let roots: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(|p| {
+            let p = PathBuf::from(p);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
+        .collect();
+    if roots.is_empty() {
+        vec![repo.to_path_buf()]
+    } else {
+        roots
+    }
+}
+
+/// A linked target as a file on disk: `~` and absolute paths as written (if
+/// they exist), otherwise `<repo>/<target>` (the capability's own repo, which
+/// may be a worktree or a subfolder), then the first `<worktree>/<target>`
+/// that exists, main checkout first. Specs and plans usually live in a
+/// worktree until merged.
+pub fn resolve_in_repo(repo: &Path, target: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(shellexpand::tilde(target.trim()).into_owned());
+    if p.is_absolute() {
+        return p.exists().then_some(p);
+    }
+    if !repo.is_dir() {
+        return None;
+    }
+    std::iter::once(repo.to_path_buf())
+        .chain(worktrees(repo))
+        .map(|root| root.join(&p))
+        .find(|candidate| candidate.exists())
+}
+
 pub fn uses_workbrokr(repo: &Path, override_: Option<bool>) -> bool {
     match override_ {
         Some(v) => v,
@@ -90,7 +140,20 @@ pub fn render_prompt(
         .replace("\\n", "\n")
         .replace("{intent}", &intent_text)
         .replace("{attachments}", &atts);
-    p = format!("{}{p}", artifacts_preamble(intent));
+    p = format!("{EDGE_CASES_PREAMBLE}{}{p}", artifacts_preamble(intent));
+    let areas: Vec<&str> = intent
+        .fm
+        .areas
+        .iter()
+        .map(|a| a.trim().trim_matches('/'))
+        .filter(|a| !a.is_empty())
+        .collect();
+    if !areas.is_empty() {
+        p = format!(
+            "Besides its own group, this capability also affects these areas: {}. A change that spans areas may need one work area per area.\n\n{p}",
+            areas.join(", ")
+        );
+    }
     if !crate::store::preconditions(&intent.body).is_empty() {
         p = format!("{PRECONDITIONS_PREAMBLE}{p}");
     }

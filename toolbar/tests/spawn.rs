@@ -15,6 +15,8 @@ fn cfg(cmd: &[&str]) -> ToolConfig {
         command: cmd.iter().map(|s| s.to_string()).collect(),
         cwd: None,
         env: BTreeMap::new(),
+        open: Default::default(),
+        graphics: false,
     }
 }
 
@@ -23,6 +25,7 @@ fn env() -> SpawnEnv {
         cwd: std::env::temp_dir(),
         inherit: vec![("HERDR_BIN_PATH".into(), "/x/herdr".into())],
         tool_id: "t".into(),
+        cell: None,
     }
 }
 
@@ -174,5 +177,45 @@ fn parent_environment_is_inherited_except_graphics_identifiers() {
     wait_until("echo", || {
         contents(&p).contains("[/run/agent.sock][unset][unset][unset]")
     });
+    p.kill();
+}
+
+#[test]
+fn a_graphics_tool_keeps_its_image_commands_and_gets_its_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let answers = dir.path().join("answers");
+    // raw mode, some text, an image, then the two questions terminal-browser
+    // asks before drawing; whatever comes back is saved
+    let script = r"stty raw -echo; printf 'abc\033_Ga=T,f=100;AAAA\033\\'; printf '\033_Gi=7,a=q;AAAA\033\\\033[c'; head -c 20 > OUT; sleep 30"
+        .replace("OUT", &answers.display().to_string());
+    let mut c = cfg(&["sh", "-c", &script]);
+    c.graphics = true;
+    let (tx, _rx) = channel();
+    let env = SpawnEnv {
+        cell: Some((8, 16)),
+        ..env()
+    };
+    let mut p = ToolProcess::spawn(&c, &env, Size { rows: 5, cols: 40 }, tx).unwrap();
+    let mut got = Vec::new();
+    let start = Instant::now();
+    while got.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(3), "no image command");
+        got.extend(p.take_graphics());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        got,
+        vec![(b"\x1b_Ga=T,f=100;AAAA\x1b\\".to_vec(), 0, 3)],
+        "the image, at the cursor after `abc`; the query is answered, not shown"
+    );
+    wait_until("the answers", || {
+        std::fs::read(&answers).map(|a| a.len()).unwrap_or(0) == 20
+    });
+    assert_eq!(
+        std::fs::read(&answers).unwrap(),
+        b"\x1b_Gi=7;OK\x1b\\\x1b[?62;22c".to_vec()
+    );
+    let text = contents(&p);
+    assert!(text.contains("abc") && !text.contains("AAAA"), "{text:?}");
     p.kill();
 }

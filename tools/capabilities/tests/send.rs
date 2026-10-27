@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herdr_capabilities::config::{Dirs, load_or_init};
-use herdr_capabilities::send::{agent_name, main_checkout, render_prompt, send, uses_workbrokr};
+use herdr_capabilities::send::{
+    EDGE_CASES_PREAMBLE, agent_name, main_checkout, render_prompt, resolve_in_repo, send,
+    uses_workbrokr, worktrees,
+};
 use herdr_capabilities::store::Store;
 
 fn fake_herdr() -> PathBuf {
@@ -291,4 +294,180 @@ fn prompts_tell_the_agent_where_to_record_artifacts() {
             h.name
         );
     }
+}
+
+#[test]
+fn every_handoff_says_edge_cases_are_the_agents_and_asks_for_pr_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        config: tmp.path().join("cfg"),
+        root: tmp.path().join("root"),
+    };
+    let cfg = load_or_init(&dirs).unwrap();
+    let store = Store::open(&dirs.root).unwrap();
+    let it = store
+        .create(
+            Path::new("Inbox"),
+            "Edge",
+            "idea",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    assert!(EDGE_CASES_PREAMBLE.starts_with("The happy path is settled: every open question below has its answer. Edge cases are now yours to find. List the ones you see, ask about those that change what gets built, and record each decision as you go."));
+    assert!(!cfg.handoffs.is_empty());
+    for h in &cfg.handoffs {
+        let p = render_prompt(h, &it, &[], false);
+        assert!(
+            p.contains(EDGE_CASES_PREAMBLE.trim_end()),
+            "{}: {p}",
+            h.name
+        );
+        assert!(
+            p.contains("`- pr: #<n>` when you open a pull request"),
+            "{}: {p}",
+            h.name
+        );
+        assert!(
+            p.contains("`- demo: <story-id> (criteria: <numbers>)`"),
+            "{}: {p}",
+            h.name
+        );
+        assert!(
+            p.contains("The numbers count this capability's own acceptance criteria from 1"),
+            "{}: {p}",
+            h.name
+        );
+        assert!(
+            p.contains("`- plan: <slice name>` with no path"),
+            "{}: {p}",
+            h.name
+        );
+    }
+}
+
+#[test]
+fn a_file_only_in_a_worktree_resolves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("main");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let id = ["-c", "user.email=t@t", "-c", "user.name=t"];
+    let commit: Vec<&str> = id
+        .iter()
+        .copied()
+        .chain(["commit", "-q", "--allow-empty", "-m", "init"])
+        .collect();
+    git(&repo, &commit);
+    let wt = tmp.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+    fs::create_dir_all(wt.join("docs/superpowers/plans")).unwrap();
+    fs::write(wt.join("docs/superpowers/plans/p.md"), "# P\n").unwrap();
+    let abs = tmp.path().join("elsewhere.md");
+    fs::write(&abs, "x").unwrap();
+
+    let roots = worktrees(&repo);
+    assert_eq!(
+        roots[0],
+        repo.canonicalize().unwrap(),
+        "main checkout first"
+    );
+    assert!(roots.contains(&wt.canonicalize().unwrap()), "{roots:?}");
+    assert_eq!(
+        resolve_in_repo(&repo, "docs/superpowers/plans/p.md")
+            .unwrap()
+            .canonicalize()
+            .unwrap(),
+        wt.join("docs/superpowers/plans/p.md")
+            .canonicalize()
+            .unwrap()
+    );
+    assert_eq!(resolve_in_repo(&repo, "docs/nope.md"), None);
+    assert_eq!(
+        resolve_in_repo(&tmp.path().join("not-a-repo"), "x.md"),
+        None
+    );
+    assert_eq!(
+        resolve_in_repo(&repo, abs.to_str().unwrap()),
+        Some(abs.clone())
+    );
+    assert_eq!(
+        worktrees(&tmp.path().join("not-a-repo")),
+        vec![tmp.path().join("not-a-repo")]
+    );
+}
+
+#[test]
+fn a_handoff_names_the_other_areas_a_capability_affects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        config: tmp.path().join("cfg"),
+        root: tmp.path().join("root"),
+    };
+    let cfg = load_or_init(&dirs).unwrap();
+    let store = Store::open(&dirs.root).unwrap();
+    let it = store
+        .create(
+            Path::new("Inbox"),
+            "Wide",
+            "idea",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    let grill = cfg.handoffs.iter().find(|h| h.name == "grill").unwrap();
+    assert!(!render_prompt(grill, &it, &[], false).contains("also affects"));
+    let it = Store::update_fields(&it.path, |fm| {
+        fm.areas = vec!["skoolscout/org".into(), "skoolscout/family".into()]
+    })
+    .unwrap();
+    let p = render_prompt(grill, &it, &[], false);
+    assert!(
+        p.contains("also affects these areas: skoolscout/org, skoolscout/family"),
+        "{p}"
+    );
+}
+
+#[test]
+fn the_capabilitys_own_repo_is_searched_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    fs::create_dir_all(main.join("docs")).unwrap();
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let wt = tmp.path().join("wt");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+    // the main checkout holds an older copy than the worktree the repo names
+    fs::write(main.join("docs/p.md"), "old").unwrap();
+    fs::create_dir_all(wt.join("docs")).unwrap();
+    fs::write(wt.join("docs/p.md"), "new").unwrap();
+    let found = resolve_in_repo(&wt, "docs/p.md").unwrap();
+    assert_eq!(fs::read_to_string(&found).unwrap(), "new", "{found:?}");
+    // a subfolder as the repo: a path relative to it
+    fs::create_dir_all(main.join("sub")).unwrap();
+    fs::write(main.join("sub/q.md"), "q").unwrap();
+    assert_eq!(
+        resolve_in_repo(&main.join("sub"), "q.md"),
+        Some(main.join("sub/q.md"))
+    );
 }

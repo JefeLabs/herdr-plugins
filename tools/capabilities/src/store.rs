@@ -11,7 +11,6 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
 
-pub const INBOX: &str = "Inbox";
 const SLUG_MAX: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -79,6 +78,25 @@ pub struct FrontMatter {
     pub sent_to: Option<SentTo>,
     #[serde(default)]
     pub conversations: BTreeMap<String, String>,
+    /// Other groups this capability affects (group paths under the root,
+    /// e.g. `skoolscout/org/candidates`); it lives in one, appears in each.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub areas: Vec<String>,
+    /// The merged pull requests the last reconcile covered (sorted), so each
+    /// merged set is reconciled once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconciled_for: Vec<u64>,
+    /// Updated by a reconcile and not yet read by the owner (shown as `*`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
+    /// Keys (`criterion_key`) of the acceptance criteria the owner has seen.
+    /// `None` until first recorded; see `new_criteria` for how that is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged: Option<Vec<String>>,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -205,8 +223,7 @@ pub struct Store {
 impl Store {
     /// Open (creating) the root and its `Inbox`.
     pub fn open(root: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(root.join(INBOX))
-            .with_context(|| format!("creating {}", root.display()))?;
+        std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
         Ok(Self {
             root: root.to_path_buf(),
         })
@@ -294,6 +311,10 @@ impl Store {
             polished_at: None,
             sent_to: None,
             conversations: BTreeMap::new(),
+            areas: Vec::new(),
+            reconciled_for: Vec::new(),
+            unread: false,
+            acknowledged: None,
             extra: BTreeMap::new(),
         };
         let mut it = Intent {
@@ -449,7 +470,8 @@ impl Store {
 
 /// The change stamp used for conflict detection: `updated` when present, else
 /// the file's mtime (hand-written files often lack `updated`).
-fn stamp(intent: &Intent) -> DateTime<Local> {
+/// When the capability last changed: its `updated`, else the file's mtime.
+pub fn stamp(intent: &Intent) -> DateTime<Local> {
     if let Some(u) = intent.fm.updated {
         return u;
     }
@@ -539,6 +561,10 @@ pub fn questions(body: &str) -> Vec<Question> {
     for (_, line) in section_lines(body, "## Open questions") {
         let trimmed = line.trim_start();
         if let Some(q) = trimmed.strip_prefix("- ") {
+            // a bare `- ` is the template's placeholder, not a question
+            if q.trim().is_empty() {
+                continue;
+            }
             out.push(Question {
                 text: q.trim().to_string(),
                 answer: None,
@@ -570,7 +596,11 @@ pub fn answer_question(body: &str, index: usize, answer: &str) -> Option<String>
     let mut seen = 0usize;
     let mut q_line: Option<usize> = None;
     for (i, line) in section_lines(body, "## Open questions") {
-        if line.trim_start().starts_with("- ") {
+        if line
+            .trim_start()
+            .strip_prefix("- ")
+            .is_some_and(|q| !q.trim().is_empty())
+        {
             if seen == index {
                 q_line = Some(i);
                 break;
@@ -597,12 +627,23 @@ pub fn answer_question(body: &str, index: usize, answer: &str) -> Option<String>
     Some(text)
 }
 
+/// The text after a `- [ ] ` / `- [x] ` marker, if `t` is a checklist line.
+fn checkbox_text(t: &str) -> Option<&str> {
+    t.strip_prefix("- [ ] ")
+        .or_else(|| t.strip_prefix("- [x] "))
+        .or_else(|| t.strip_prefix("- [X] "))
+}
+
 /// Checklist items (`- [ ]` / `- [x]`) under a `## Heading`.
 pub fn checklist(body: &str, heading: &str) -> Vec<Criterion> {
     section_lines(body, heading)
         .into_iter()
         .filter_map(|(_, line)| {
             let t = line.trim_start();
+            if checkbox_text(t).is_some_and(|r| r.trim().is_empty()) {
+                // `- [ ] ` with nothing after it is the template's placeholder
+                return None;
+            }
             if let Some(rest) = t.strip_prefix("- [ ] ") {
                 Some(Criterion {
                     text: rest.trim().to_string(),
@@ -626,7 +667,7 @@ pub fn toggle_checklist(body: &str, heading: &str, index: usize) -> Option<Strin
     let mut target: Option<usize> = None;
     for (i, line) in section_lines(body, heading) {
         let t = line.trim_start();
-        if t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ") {
+        if checkbox_text(t).is_some_and(|r| !r.trim().is_empty()) {
             if seen == index {
                 target = Some(i);
                 break;
@@ -656,6 +697,55 @@ pub fn toggle_checklist(body: &str, heading: &str, index: usize) -> Option<Strin
 }
 
 pub const QUESTIONS_HEADING: &str = "## Open questions";
+
+/// Where a capability stands before it is handed off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    Raw,
+    /// Refining with this many unanswered questions.
+    Open(usize),
+    Ready,
+    Sent,
+}
+
+impl Readiness {
+    pub fn label(self) -> String {
+        match self {
+            Readiness::Raw => "raw".into(),
+            Readiness::Open(n) => format!("?{n}"),
+            Readiness::Ready => "ready".into(),
+            Readiness::Sent => "sent".into(),
+        }
+    }
+}
+
+/// Derived from the stored state and the unanswered questions.
+pub fn readiness(it: &Intent) -> Readiness {
+    match it.fm.state {
+        State::Sent => Readiness::Sent,
+        State::Raw => Readiness::Raw,
+        State::Refining | State::Ready => match it.open_questions() {
+            0 => Readiness::Ready,
+            n => Readiness::Open(n),
+        },
+    }
+}
+
+/// Why `s` may not send this capability, or `None` when it may: it must be
+/// past `raw` and every open question must have an answer.
+pub fn send_refusal(it: &Intent) -> Option<String> {
+    if it.fm.state == State::Raw {
+        return Some("still raw: refine it (p) or mark it ready (R) before sending".into());
+    }
+    match it.open_questions() {
+        0 => None,
+        n => Some(format!(
+            "{n} open question{} still unanswered: answer {} before sending (Q)",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        )),
+    }
+}
 
 /// Section order used when a missing section has to be created.
 const SECTION_ORDER: &[&str] = &[
@@ -789,7 +879,7 @@ const ARTIFACT_DIRS: &[(&str, &str)] = &[
     ("docs/adr", "adr"),
 ];
 
-fn significant_words(text: &str) -> Vec<String> {
+pub(crate) fn significant_words(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| {
@@ -812,17 +902,58 @@ fn significant_words(text: &str) -> Vec<String> {
                         | "implementation"
                 )
         })
-        .map(str::to_string)
-        .collect()
+        .fold(Vec::new(), |mut out: Vec<String>, w| {
+            // a word the text repeats counts once
+            if !out.iter().any(|o| o == w) {
+                out.push(w.to_string());
+            }
+            out
+        })
 }
 
-fn word_matches(a: &str, b: &str) -> bool {
-    a == b || (a.len() >= 4 && b.starts_with(a)) || (b.len() >= 4 && a.starts_with(b))
+/// Two words match when they share a stem: plurals (contacts, families,
+/// boxes), -ing and -ed (meeting, skipped) and a final e (schedule,
+/// scheduling) fold away. A word is not matched by every word that merely
+/// starts with it ("specific" is not "specification").
+pub(crate) fn word_matches(a: &str, b: &str) -> bool {
+    stem(a) == stem(b)
 }
 
-/// Files under the known artifact folders of `repo` whose name or first
-/// heading shares at least two significant words with `title`, minus the
-/// targets already linked. Paths are relative to the repo.
+fn stem(word: &str) -> String {
+    let mut w = word.to_string();
+    if w.len() > 4 && w.ends_with("ies") {
+        w.truncate(w.len() - 3);
+        w.push('y');
+    } else if ["sses", "xes", "zes", "ches", "shes"]
+        .iter()
+        .any(|s| w.ends_with(s))
+    {
+        w.truncate(w.len() - 2);
+    } else if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+        w.pop();
+    }
+    for suffix in ["ing", "ed"] {
+        if w.ends_with(suffix) && w.len() - suffix.len() >= 3 {
+            w.truncate(w.len() - suffix.len());
+            // skipped -> skip, but install, pass, buzz keep their double
+            let b = w.as_bytes();
+            if b.len() >= 2 && b[b.len() - 1] == b[b.len() - 2] && !b"lsz".contains(&b[b.len() - 1])
+            {
+                w.pop();
+            }
+            break;
+        }
+    }
+    if w.len() > 3 && w.ends_with('e') {
+        w.pop();
+    }
+    w
+}
+
+/// Files under the known artifact folders of `repo` whose name and first
+/// heading share at least two significant words with `title`, one of them in
+/// the file name, minus the targets already linked. Paths are relative to
+/// the repo.
 pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<Artifact> {
     let wanted = significant_words(title);
     if wanted.is_empty() {
@@ -852,13 +983,16 @@ pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<A
                         .map(|l| l.trim_start_matches('#').trim().to_string())
                 })
                 .unwrap_or_default();
+            let name = significant_words(&e.file_name().to_string_lossy());
             let haystack: Vec<String> =
                 significant_words(&format!("{} {heading}", e.file_name().to_string_lossy()));
-            let hits = wanted
+            let hits: Vec<&String> = wanted
                 .iter()
                 .filter(|w| haystack.iter().any(|h| word_matches(w, h)))
-                .count();
-            if hits >= needed {
+                .collect();
+            // the name must share a word too: a heading alone matches too much
+            let in_name = hits.iter().any(|w| name.iter().any(|n| word_matches(w, n)));
+            if hits.len() >= needed && in_name {
                 out.push(Artifact {
                     kind: kind.to_string(),
                     target: rel,
@@ -871,11 +1005,126 @@ pub fn discover_artifacts(repo: &Path, title: &str, already: &[String]) -> Vec<A
 }
 
 pub const CRITERIA_HEADING: &str = "## Acceptance criteria";
+
+/// The `### ` sub-headings inside Acceptance criteria (one per area, say),
+/// each with the index of the first criterion under it.
+pub fn criteria_groups(body: &str) -> Vec<(usize, String)> {
+    let mut groups = Vec::new();
+    let mut count = 0usize;
+    for (_, line) in section_lines(body, CRITERIA_HEADING) {
+        let t = line.trim_start();
+        if let Some(h) = t.strip_prefix("### ") {
+            groups.push((count, h.trim().to_string()));
+        } else if checkbox_text(t).is_some_and(|r| !r.trim().is_empty()) {
+            count += 1;
+        }
+    }
+    groups
+}
+
+/// A stable key for a criterion's wording (FNV-1a over its words), so a
+/// reworded criterion counts as new while ticking it does not.
+pub fn criterion_key(text: &str) -> String {
+    let normal = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in normal.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The criteria keys the owner has seen. With no record yet: before sending,
+/// every criterion is the owner's own; once sent, those whose wording appears
+/// in the refinement transcript (the proposals the owner worked through), or
+/// all of them when there is no transcript to tell.
+fn seen_keys(it: &Intent) -> Vec<String> {
+    if let Some(keys) = &it.fm.acknowledged {
+        return keys.clone();
+    }
+    let all = criteria(&it.body);
+    if it.fm.state != State::Sent {
+        return all.iter().map(|c| criterion_key(&c.text)).collect();
+    }
+    // without a transcript nothing tells who wrote what: count them all as seen
+    let Ok(transcript) = std::fs::read_to_string(it.transcript_path()) else {
+        return all.iter().map(|c| criterion_key(&c.text)).collect();
+    };
+    let transcript = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+    all.iter()
+        .filter(|c| {
+            let words = c.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            !words.is_empty() && transcript.contains(&words)
+        })
+        .map(|c| criterion_key(&c.text))
+        .collect()
+}
+
+/// Acceptance criteria (0-based) added or reworded by someone else (an
+/// agent, a reconcile) and not yet acknowledged by the owner.
+pub fn new_criteria(it: &Intent) -> Vec<usize> {
+    let seen = seen_keys(it);
+    criteria(&it.body)
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !seen.contains(&criterion_key(&c.text)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Record criteria `indexes` (0-based) as seen, keeping what was already
+/// seen, without counting as an edit (`updated` is not bumped).
+pub fn acknowledge_criteria(path: &Path, indexes: &[usize]) -> anyhow::Result<Intent> {
+    let it = Store::load(path)?;
+    let mut seen = seen_keys(&it);
+    let all = criteria(&it.body);
+    for i in indexes {
+        if let Some(c) = all.get(*i) {
+            let k = criterion_key(&c.text);
+            if !seen.contains(&k) {
+                seen.push(k);
+            }
+        }
+    }
+    Store::update_meta(path, |fm| fm.acknowledged = Some(seen))
+}
+
+/// Record every current criterion as seen (the owner authored or accepted them).
+pub fn acknowledge_all_criteria(path: &Path) -> anyhow::Result<Intent> {
+    let n = criteria(&Store::load(path)?.body).len();
+    acknowledge_criteria(path, &(0..n).collect::<Vec<_>>())
+}
 pub const PRECONDITIONS_HEADING: &str = "## Preconditions";
 
 /// Checks that prove the capability is done.
 pub fn criteria(body: &str) -> Vec<Criterion> {
     checklist(body, CRITERIA_HEADING)
+}
+
+/// Set each acceptance criterion's checkbox from `ticked(text)`, keeping
+/// everything else (indentation, sub-headings, sub-bullets) as it is.
+pub fn set_criteria_ticks(body: &str, ticked: impl Fn(&str) -> bool) -> String {
+    let lines: Vec<usize> = section_lines(body, CRITERIA_HEADING)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        let t = line.trim_start();
+        match checkbox_text(t) {
+            Some(rest) if lines.contains(&i) && !rest.trim().is_empty() => {
+                let indent = &line[..line.len() - t.len()];
+                let mark = if ticked(rest.trim()) { "x" } else { " " };
+                out.push(format!("{indent}- [{mark}] {rest}"));
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if body.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 pub fn toggle_criterion(body: &str, index: usize) -> Option<String> {

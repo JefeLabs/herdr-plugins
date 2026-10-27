@@ -2,9 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use herdr_capabilities::store::{
-    SaveError, State, Store, add_artifact, add_checklist_item, add_question, answer_question,
-    artifacts, criteria, discover_artifacts, open_questions, preconditions, questions, slugify,
-    toggle_criterion, toggle_precondition,
+    Readiness, SaveError, State, Store, acknowledge_criteria, add_artifact, add_checklist_item,
+    add_question, answer_question, artifacts, criteria, criteria_groups, criterion_key,
+    discover_artifacts, new_criteria, open_questions, preconditions, questions, readiness,
+    send_refusal, slugify, toggle_criterion, toggle_precondition,
 };
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -14,9 +15,10 @@ fn store() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
-fn open_creates_root_and_inbox() {
+fn open_creates_the_root_and_no_inbox() {
     let (tmp, _s) = store();
-    assert!(tmp.path().join("root/Inbox").is_dir());
+    assert!(tmp.path().join("root").is_dir());
+    assert!(!tmp.path().join("root/Inbox").exists(), "no default group");
 }
 
 #[test]
@@ -60,6 +62,7 @@ fn create_writes_front_matter_and_body() {
 #[test]
 fn round_trip_preserves_unknown_fields_and_defaults_missing() {
     let (tmp, _s) = store();
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     let p = tmp.path().join("root/Inbox/hand.md");
     fs::write(
         &p,
@@ -240,6 +243,7 @@ fn lenient_front_matter_loads_hand_edits() {
             "---\ntitle: T\nkind: idea\ncreated: 2026-10-24 18:02:11\n---\nb\n",
         ),
     ];
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     for (name, text) in cases {
         let p = tmp.path().join("root/Inbox").join(format!("{name}.md"));
         fs::write(&p, text).unwrap();
@@ -270,6 +274,7 @@ fn lenient_front_matter_loads_hand_edits() {
 #[test]
 fn unparseable_file_shows_up_as_a_broken_entry_not_silently_dropped() {
     let (tmp, s) = store();
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     fs::write(
         tmp.path().join("root/Inbox/bad.md"),
         "---\ntitle: [unclosed\n---\nb\n",
@@ -285,6 +290,7 @@ fn unparseable_file_shows_up_as_a_broken_entry_not_silently_dropped() {
 #[test]
 fn missing_updated_does_not_cause_a_false_conflict() {
     let (tmp, _s) = store();
+    fs::create_dir_all(tmp.path().join("root/Inbox")).unwrap();
     let p = tmp.path().join("root/Inbox/old.md");
     fs::write(&p, "---\ntitle: Old\nkind: idea\n---\nb\n").unwrap();
     let mut it = Store::load(&p).unwrap();
@@ -527,4 +533,187 @@ fn discover_artifacts_finds_specs_plans_and_adrs_that_match_the_title() {
         "only the known folders are scanned: {targets:?}"
     );
     assert!(discover_artifacts(Path::new("/nonexistent"), "x", &[]).is_empty());
+}
+
+#[test]
+fn blank_template_placeholders_are_not_items() {
+    let body = "## Acceptance criteria\n\n- [ ] \n- [ ] real\n\n## Open questions\n\n- \n- who?\n";
+    assert_eq!(questions(body).len(), 1);
+    assert_eq!(open_questions(body), 1);
+    assert_eq!(criteria(body).len(), 1);
+    // index 0 is the first real item, not the placeholder
+    let answered = answer_question(body, 0, "owners").unwrap();
+    assert!(answered.contains("- who?\n  → owners"), "{answered}");
+    let ticked = toggle_criterion(body, 0).unwrap();
+    assert!(ticked.contains("- [x] real"), "{ticked}");
+    assert!(
+        ticked.contains("- [ ] \n"),
+        "placeholder untouched: {ticked}"
+    );
+}
+
+#[test]
+fn readiness_follows_state_and_open_questions() {
+    let (_tmp, s) = store();
+    let mk = |title: &str, state: State, body: &str| {
+        let it = s
+            .create(Path::new("Inbox"), title, "idea", body, None)
+            .unwrap();
+        Store::update_fields(&it.path, |fm| fm.state = state).unwrap()
+    };
+    let two_open = "## Open questions\n- a?\n- b?\n";
+    let answered = "## Open questions\n- a?\n  → yes\n";
+    let raw = mk("raw one", State::Raw, "x\n");
+    let refining_two_open = mk("refining open", State::Refining, two_open);
+    let refining_answered = mk("refining answered", State::Refining, answered);
+    let ready = mk("ready one", State::Ready, answered);
+    let sent_with_open = mk("sent one", State::Sent, two_open);
+    assert_eq!(readiness(&raw), Readiness::Raw);
+    assert_eq!(readiness(&refining_two_open), Readiness::Open(2));
+    assert_eq!(readiness(&refining_answered), Readiness::Ready);
+    assert_eq!(readiness(&ready), Readiness::Ready);
+    assert_eq!(readiness(&sent_with_open), Readiness::Sent);
+    assert_eq!(Readiness::Open(2).label(), "?2");
+    assert_eq!(Readiness::Raw.label(), "raw");
+    assert!(send_refusal(&raw).unwrap().contains("raw"));
+    assert!(
+        send_refusal(&refining_two_open)
+            .unwrap()
+            .contains("2 open questions")
+    );
+    assert_eq!(send_refusal(&refining_answered), None);
+    assert_eq!(send_refusal(&ready), None);
+}
+
+#[test]
+fn affected_areas_round_trip_and_stay_out_of_the_file_when_empty() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("Inbox"), "Spans areas", "idea", "x\n", None)
+        .unwrap();
+    assert!(
+        !std::fs::read_to_string(&it.path)
+            .unwrap()
+            .contains("areas:")
+    );
+    Store::update_fields(&it.path, |fm| {
+        fm.areas = vec!["skoolscout/org".into(), "skoolscout/family".into()]
+    })
+    .unwrap();
+    let back = Store::load(&it.path).unwrap();
+    assert_eq!(back.fm.areas, vec!["skoolscout/org", "skoolscout/family"]);
+    assert!(
+        back.fm.extra.is_empty(),
+        "areas is a known field, not extra"
+    );
+}
+
+#[test]
+fn a_criterion_key_ignores_spacing_and_survives_ticking() {
+    assert_eq!(
+        criterion_key("Family gets  a notice "),
+        criterion_key("Family gets a notice")
+    );
+    assert_ne!(
+        criterion_key("Family gets a notice"),
+        criterion_key("Family gets an email")
+    );
+    assert_eq!(criterion_key("x").len(), 16, "a stable 64-bit hex key");
+}
+
+#[test]
+fn new_criteria_are_the_ones_nobody_acknowledged() {
+    let (_tmp, s) = store();
+    let body = "## Acceptance criteria\n- [x] original one\n- [ ] original two\n- [ ] added by the agent\n";
+    let it = s
+        .create(Path::new("org"), "Cap", "idea", body, None)
+        .unwrap();
+    // before sending, everything is the owner's own
+    assert!(new_criteria(&it).is_empty());
+    // sent, with no record and no transcript: nothing tells, so nothing is new
+    let it = Store::update_fields(&it.path, |fm| fm.state = State::Sent).unwrap();
+    assert!(new_criteria(&it).is_empty());
+    // with a transcript: criteria found in it count as seen
+    fs::write(
+        it.transcript_path(),
+        "### agent\n```proposal\n- [ ] original one\n- [ ] original two\n```\n",
+    )
+    .unwrap();
+    assert_eq!(new_criteria(&it), vec![2]);
+    // acknowledging writes the record (seed included); a reworded one is new again
+    let it = acknowledge_criteria(&it.path, &[2]).unwrap();
+    assert!(new_criteria(&it).is_empty());
+    assert_eq!(it.fm.acknowledged.as_ref().map(Vec::len), Some(3));
+    let mut changed = Store::load(&it.path).unwrap();
+    changed.body = changed
+        .body
+        .replace("original two", "original two, reworded");
+    Store::save_force(&mut changed).unwrap();
+    assert_eq!(new_criteria(&Store::load(&it.path).unwrap()), vec![1]);
+}
+
+#[test]
+fn criteria_groups_are_the_sub_headings_and_where_they_start() {
+    let body = "## Acceptance criteria\n- [ ] own one\n- [ ] \n### org/candidates\n- [x] header button\n- [ ] modal\n### family/dashboard \n- [ ] banner\n\n## Open questions\n### not a group\n- q\n";
+    assert_eq!(
+        criteria_groups(body),
+        vec![
+            (1, "org/candidates".to_string()),
+            (3, "family/dashboard".to_string())
+        ],
+        "an empty checkbox is not a criterion, and headings after the section are not groups"
+    );
+    assert!(criteria_groups("## Acceptance criteria\n- [ ] a\n").is_empty());
+}
+
+#[test]
+fn found_artifacts_need_whole_words_a_name_match_and_each_word_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    let specs = repo.join("docs/superpowers/specs");
+    fs::create_dir_all(&specs).unwrap();
+    let doc = |name: &str, heading: &str| {
+        fs::write(specs.join(name), format!("# {heading}\n")).unwrap();
+    };
+    doc(
+        "2026-10-26-reminders-2-meeting-request-chases.md",
+        "Meeting request reminders",
+    );
+    // "specific" is not the start of "specification": one shared word, not two
+    doc(
+        "2026-09-20-contacts-import-wizard-design.md",
+        "Contacts import wizard: specification",
+    );
+    // two shared words, but only in the heading: the name shares none
+    doc(
+        "2026-08-07-wizard-topic-badge-design.md",
+        "Schedule a Meeting: topic badge",
+    );
+    let found: Vec<String> = discover_artifacts(
+        repo,
+        "Advisor can request a primary contact to schedule a specific type of meeting",
+        &[],
+    )
+    .into_iter()
+    .map(|a| a.target)
+    .collect();
+    assert_eq!(
+        found,
+        vec!["docs/superpowers/specs/2026-10-26-reminders-2-meeting-request-chases.md"]
+    );
+
+    // a word the title repeats counts once
+    doc(
+        "2026-09-17-school-recruitment-profile-design.md",
+        "School recruitment profile",
+    );
+    doc("2026-10-01-school-search-design.md", "School search");
+    let found: Vec<String> = discover_artifacts(repo, "School search for every school", &[])
+        .into_iter()
+        .map(|a| a.target)
+        .collect();
+    assert_eq!(
+        found,
+        vec!["docs/superpowers/specs/2026-10-01-school-search-design.md"]
+    );
 }

@@ -168,6 +168,46 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     lines
 }
 
+/// One line of inline Markdown (a checklist item) as styled spans, the way
+/// `render_markdown` styles them: bold, italic, struck through, link text
+/// underlined, code reversed, markers dropped. Text that would parse as a
+/// block (a heading, a list item, a quote, a rule) is shown as written.
+pub fn inline_spans(text: &str) -> Vec<Span<'static>> {
+    let raw = || vec![Span::raw(sanitize(text))];
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    let events: Vec<Event> = Parser::new_ext(text, opts).collect();
+    if !matches!(events.first(), Some(Event::Start(Tag::Paragraph))) {
+        return raw();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default();
+    for ev in events {
+        match ev {
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {}
+            Event::Start(Tag::Strong) => style = style.add_modifier(Modifier::BOLD),
+            Event::End(TagEnd::Strong) => style = style.remove_modifier(Modifier::BOLD),
+            Event::Start(Tag::Emphasis) => style = style.add_modifier(Modifier::ITALIC),
+            Event::End(TagEnd::Emphasis) => style = style.remove_modifier(Modifier::ITALIC),
+            Event::Start(Tag::Strikethrough) => style = style.add_modifier(Modifier::CROSSED_OUT),
+            Event::End(TagEnd::Strikethrough) => {
+                style = style.remove_modifier(Modifier::CROSSED_OUT)
+            }
+            Event::Start(Tag::Link { .. }) => style = style.add_modifier(Modifier::UNDERLINED),
+            Event::End(TagEnd::Link) => style = style.remove_modifier(Modifier::UNDERLINED),
+            Event::Code(c) => spans.push(Span::styled(
+                sanitize(&c),
+                style.add_modifier(Modifier::REVERSED),
+            )),
+            Event::Text(t) | Event::InlineHtml(t) => spans.push(Span::styled(sanitize(&t), style)),
+            Event::SoftBreak | Event::HardBreak => spans.push(Span::styled(" ", style)),
+            // anything block-level (or an image) is not a single line of text
+            _ => return raw(),
+        }
+    }
+    spans
+}
+
 fn take_prefix(current: &mut Vec<Span<'static>>, pending: &mut Option<String>, style: Style) {
     if let Some(p) = pending.take() {
         current.push(Span::styled(
@@ -255,5 +295,42 @@ mod tests {
         let lines = render_markdown("- [ ] todo\n- [x] done\n");
         assert!(lines[0].to_string().starts_with("[ ] todo"), "{}", lines[0]);
         assert!(lines[1].to_string().starts_with("[x] done"), "{}", lines[1]);
+    }
+
+    fn inline(text: &str) -> Vec<(String, Modifier)> {
+        inline_spans(text)
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.add_modifier))
+            .collect()
+    }
+
+    #[test]
+    fn inline_spans_style_bold_italic_and_code_without_their_markers() {
+        let got = inline("Opens **Schedule a Meeting** via `POST /x` and *maybe*");
+        let text: String = got.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(text, "Opens Schedule a Meeting via POST /x and maybe");
+        let style_of = |needle: &str| {
+            got.iter()
+                .find(|(t, _)| t == needle)
+                .unwrap_or_else(|| panic!("no span {needle:?} in {got:?}"))
+                .1
+        };
+        assert!(style_of("Schedule a Meeting").contains(Modifier::BOLD));
+        assert!(style_of("POST /x").contains(Modifier::REVERSED));
+        assert!(style_of("maybe").contains(Modifier::ITALIC));
+        assert!(style_of("Opens ").is_empty());
+    }
+
+    #[test]
+    fn inline_spans_leave_block_markers_as_text() {
+        for raw in ["1. first", "# a heading", "- an item", "> quoted", "---"] {
+            let text: String = inline(raw).into_iter().map(|(t, _)| t).collect();
+            assert_eq!(text, raw, "{raw:?} is shown as written");
+        }
+        let text: String = inline("#5834 is open")
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(text, "#5834 is open");
     }
 }

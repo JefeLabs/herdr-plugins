@@ -33,6 +33,8 @@ pub struct HerdrContext {
     pub bin: PathBuf,
     pub workspace_id: Option<String>,
     pub pane_id: Option<String>,
+    /// The tab the toolbar is in (`HERDR_TAB_ID`).
+    pub tab_id: Option<String>,
     /// The pane a split should be cut from: `focused_pane_id` from the action
     /// context, else `HERDR_PANE_ID`.
     pub target_pane_id: Option<String>,
@@ -40,6 +42,8 @@ pub struct HerdrContext {
     pub workspace_cwd: PathBuf,
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
+    /// Herdr's API socket: `HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`.
+    pub socket: PathBuf,
     /// Herdr variables to hand to hosted tools.
     pub inherit: Vec<(String, String)>,
     /// Extra variables for `herdr` CLI invocations (tests use this for the fake).
@@ -78,9 +82,16 @@ impl HerdrContext {
             .filter_map(|k| get(k).map(|v| (k.to_string(), v)))
             .collect();
         let pane_id = get("HERDR_PANE_ID");
+        let socket = get("HERDR_SOCKET_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(get("HOME").unwrap_or_default()).join(".config/herdr/herdr.sock")
+            });
         Ok(Self {
             bin: PathBuf::from(bin),
             workspace_id: get("HERDR_WORKSPACE_ID"),
+            tab_id: get("HERDR_TAB_ID"),
+            socket,
             target_pane_id: ctx.focused_pane_id.or_else(|| pane_id.clone()),
             pane_id,
             workspace_cwd,
@@ -316,4 +327,159 @@ impl Drop for Control {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// `<state_dir>/<workspace>.<tool>.pane`: the pane a pane tool was opened in.
+pub fn launched_pane_file(ctx: &HerdrContext, tool_id: &str) -> PathBuf {
+    let safe: String = tool_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    ctx.state_dir.join(format!("{}.{safe}.pane", ctx.ws()))
+}
+
+/// What a press on a pane tool did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaneToggle {
+    /// A new pane was opened, with this id.
+    Opened(String),
+    /// The pane the tool opened before was closed.
+    Closed(String),
+}
+
+/// Open `tool` in a Herdr pane beside the work pane, or close the pane it
+/// opened before when that pane is still there.
+///
+/// The new pane is a right split of the toolbar's left neighbour (the work
+/// pane), else of the focused pane; the tool's command runs in it. This is
+/// how terminal-browser opens itself in Herdr, so a browser gets a real pane.
+/// The pane is labelled with the tool's name, and a recorded pane is closed
+/// only while it still carries that label: Herdr reuses pane ids after a
+/// restart, so the id alone could name someone else's pane.
+pub fn toggle_pane(
+    ctx: &HerdrContext,
+    tool: &crate::config::ToolConfig,
+) -> anyhow::Result<PaneToggle> {
+    if tool.command.is_empty() {
+        bail!("{} has no command", tool.name);
+    }
+    let file = launched_pane_file(ctx, &tool.id);
+    if let Ok(recorded) = std::fs::read_to_string(&file) {
+        let id = recorded.trim();
+        if !id.is_empty() {
+            let out = ctx.herdr(&["pane", "get", id])?;
+            if out.status.success()
+                && json_str(&out.stdout, "/result/pane/label").as_deref()
+                    == Some(tool.name.as_str())
+            {
+                let close = ctx.herdr(&["pane", "close", id])?;
+                if !close.status.success() {
+                    bail!(
+                        "herdr pane close failed: {}",
+                        String::from_utf8_lossy(&close.stderr).trim()
+                    );
+                }
+                let _ = std::fs::remove_file(&file);
+                return Ok(PaneToggle::Closed(id.to_string()));
+            }
+        }
+    }
+    let from = ctx
+        .pane_id
+        .as_deref()
+        .and_then(|toolbar| left_neighbour(ctx, toolbar))
+        .or_else(|| ctx.target_pane_id.clone())
+        .or_else(|| ctx.pane_id.clone())
+        .context("no pane to open beside")?;
+    let cwd = match tool.cwd.as_deref() {
+        Some(c) => expand_home(c),
+        None => ctx.workspace_cwd.clone(),
+    };
+    let cwd = cwd.display().to_string();
+    let mut args: Vec<String> = [
+        "pane",
+        "split",
+        "--pane",
+        &from,
+        "--direction",
+        "right",
+        "--focus",
+        "--cwd",
+        &cwd,
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    for (k, v) in &tool.env {
+        args.push("--env".into());
+        args.push(format!("{k}={v}"));
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = ctx.herdr(&refs)?;
+    if !out.status.success() {
+        bail!(
+            "herdr pane split failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let id = json_str(&out.stdout, "/result/pane/pane_id")
+        .context("herdr pane split gave no pane id")?;
+    // best effort: unlabelled, the pane still works, and the next press
+    // opens another one instead of closing it
+    let _ = ctx.herdr(&["pane", "rename", &id, &tool.name]);
+    let run = ctx.herdr(&["pane", "run", &id, &shell_quote(&tool.command)])?;
+    if !run.status.success() {
+        bail!(
+            "herdr pane run failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        );
+    }
+    std::fs::create_dir_all(&ctx.state_dir)?;
+    std::fs::write(&file, format!("{id}\n"))?;
+    Ok(PaneToggle::Opened(id))
+}
+
+/// The pane on `pane`'s left, if there is one.
+fn left_neighbour(ctx: &HerdrContext, pane: &str) -> Option<String> {
+    let out = ctx
+        .herdr(&["pane", "neighbor", "--pane", pane, "--direction", "left"])
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    json_str(&out.stdout, "/result/neighbor/neighbor_pane_id")
+}
+
+fn json_str(bytes: &[u8], pointer: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(bytes).trim())
+        .ok()?
+        .pointer(pointer)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `~` and `~/…` under `$HOME`; anything else as written.
+fn expand_home(path: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if path == "~" {
+        PathBuf::from(home)
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        Path::new(&home).join(rest)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// A command line for a shell: every argument in single quotes.
+pub fn shell_quote(args: &[String]) -> String {
+    args.iter()
+        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

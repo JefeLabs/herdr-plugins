@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use herdr_capabilities::config::{Output, ProviderSpec, When};
-use herdr_capabilities::conversation::{Turn, TurnMsg, follow_up_prompt, seed_prompt};
+use herdr_capabilities::conversation::{
+    FORMAT_REMINDER, HAPPY_PATH_RULE, POLISH_RULE, Turn, TurnMsg, follow_up_prompt, seed_prompt,
+};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -148,9 +150,10 @@ fn resume_uses_the_resume_argv() {
 }
 
 #[test]
-fn cancel_kills_a_hanging_provider_within_a_second() {
+fn a_provider_that_lingers_after_its_result_still_finishes_the_turn() {
+    // agy can print its result and then never exit; the result ends the turn
     let tmp = tempfile::tempdir().unwrap();
-    let mut turn = Turn::start(
+    let turn = Turn::start(
         &spec(),
         "x",
         None,
@@ -158,7 +161,36 @@ fn cancel_kills_a_hanging_provider_within_a_second() {
         &env(Some("agy.jsonl"), Some("hang")),
     )
     .unwrap();
-    let _ = collect(&turn, Duration::from_millis(400)); // deltas arrive, no Finished (process hangs)
+    let pid = turn.pid().unwrap();
+    let msgs = collect(&turn, Duration::from_secs(3));
+    assert!(
+        matches!(msgs.last(), Some(TurnMsg::Finished(r)) if r.proposal.is_some()),
+        "{:?}",
+        msgs.last()
+    );
+    // and the lingering process is ended
+    let start = Instant::now();
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "provider still alive"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn cancel_kills_a_hanging_provider_within_a_second() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut turn = Turn::start(
+        &spec(),
+        "x",
+        None,
+        tmp.path(),
+        &env(Some("agy.jsonl"), Some("midturn")),
+    )
+    .unwrap();
+    let _ = collect(&turn, Duration::from_millis(400)); // deltas arrive, no Finished (mid-turn)
     let pid = turn.pid().unwrap();
     let t0 = Instant::now();
     turn.cancel();
@@ -300,4 +332,83 @@ fn follow_up_prompts_always_carry_the_format_reminder() {
         fresh.contains("SEED") && fresh.contains("## Preconditions"),
         "{fresh}"
     );
+}
+
+#[test]
+fn every_turn_carries_the_happy_path_rule() {
+    assert_eq!(
+        HAPPY_PATH_RULE,
+        "Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off."
+    );
+    assert!(FORMAT_REMINDER.contains(HAPPY_PATH_RULE));
+    assert!(seed_prompt("template", "body", None, "idea").contains(HAPPY_PATH_RULE));
+    for t in [
+        include_str!("../defaults/idea.polish.md"),
+        include_str!("../defaults/issue.polish.md"),
+        include_str!("../defaults/enhancement.polish.md"),
+    ] {
+        assert!(t.contains(HAPPY_PATH_RULE), "bundled polish template: {t}");
+    }
+}
+
+#[test]
+fn every_turn_asks_for_criteria_grouped_by_area() {
+    let rule = "group `## Acceptance criteria` under `### <area path>` sub-headings, one per area (its own group first), keeping every criterion's wording and checkbox";
+    assert!(FORMAT_REMINDER.contains(rule), "{FORMAT_REMINDER}");
+    assert!(seed_prompt("template", "body", None, "idea").contains(rule));
+    assert!(
+        follow_up_prompt("SEED", &[("user".into(), "polish".into())], "again", true).contains(rule)
+    );
+}
+
+#[test]
+fn a_follow_up_carries_the_format_reminder_once() {
+    let seed = seed_prompt("template", "## Description\nbody\n", None, "idea");
+    assert_eq!(seed.matches(FORMAT_REMINDER).count(), 1);
+    let transcript = [
+        ("user".to_string(), "polish".to_string()),
+        ("agent".to_string(), "a reply".to_string()),
+    ];
+    let p = follow_up_prompt(&seed, &transcript, "again", false);
+    assert_eq!(p.matches(FORMAT_REMINDER).count(), 1, "{p}");
+    assert!(
+        p.find(FORMAT_REMINDER) > p.rfind("again"),
+        "the reminder comes after the new message"
+    );
+    assert!(
+        p.trim_end().ends_with(POLISH_RULE),
+        "then the polish rule, last"
+    );
+    let resumed = follow_up_prompt(&seed, &transcript, "again", true);
+    assert_eq!(resumed.matches(FORMAT_REMINDER).count(), 1);
+}
+
+#[test]
+fn every_turn_asks_to_polish_what_the_author_wrote_answers_included() {
+    assert_eq!(
+        POLISH_RULE,
+        "Polish everything the author wrote, answers included: fix spelling, grammar and unclear wording in the description, preconditions, acceptance criteria, each open question and each `→ answer`, keeping its meaning and every decision in it. Keep every answered question with its polished `→ answer`, and do not re-ask it."
+    );
+    // polish turns carry it; the shared format reminder does not, so a
+    // reconcile (which must copy criteria word for word) never polishes
+    assert!(!FORMAT_REMINDER.contains(POLISH_RULE));
+    let seed = seed_prompt("template", "body", None, "idea");
+    assert_eq!(seed.matches(POLISH_RULE).count(), 1);
+    let transcript = [("user".to_string(), "polish".to_string())];
+    for resumable in [true, false] {
+        let p = follow_up_prompt(&seed, &transcript, "again", resumable);
+        assert_eq!(p.matches(POLISH_RULE).count(), 1, "{p}");
+        assert_eq!(p.matches(FORMAT_REMINDER).count(), 1, "{p}");
+    }
+    for t in [
+        include_str!("../defaults/idea.polish.md"),
+        include_str!("../defaults/issue.polish.md"),
+        include_str!("../defaults/enhancement.polish.md"),
+    ] {
+        assert!(t.contains(POLISH_RULE), "bundled polish template: {t}");
+        assert!(
+            !t.contains("with its answer, and do not re-ask it"),
+            "the old keep-as-is rule is gone: {t}"
+        );
+    }
 }
