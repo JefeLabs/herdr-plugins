@@ -84,6 +84,13 @@ pub struct App {
     /// Bytes for the terminal after the next frame (clearing a hidden
     /// graphics tool's images).
     pending_out: Vec<u8>,
+    /// Button size, from the config.
+    bar: crate::config::BarSize,
+    /// The tool whose button the mouse rests on.
+    pub hover: Option<usize>,
+    /// The too-narrow width we last asked Herdr to widen, so a width Herdr
+    /// will not widen is asked about once.
+    widened_at: Option<u16>,
 }
 
 impl App {
@@ -100,6 +107,9 @@ impl App {
             notes_tx,
             notes_rx,
             pending_out: Vec::new(),
+            bar: Default::default(),
+            hover: None,
+            widened_at: None,
             prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
             size,
@@ -119,6 +129,8 @@ impl App {
             config,
             ignored_untrusted,
         } = loaded;
+        self.bar = config.bar;
+        self.hover = None;
         let mut old: Vec<Slot> = std::mem::take(&mut self.slots);
         let selected_id = old.get(self.selected).map(|s| s.cfg.id.clone());
         for cfg in config.tools {
@@ -156,10 +168,55 @@ impl App {
         let _ = config.prefix; // prefix changes apply on next start; see reload()
     }
 
+    /// Where the bar's rule goes: before the first tool that opens a pane.
+    fn rule(&self) -> Option<usize> {
+        ui::rule_index(self.slots.iter().map(|s| s.cfg.open == Open::Pane))
+    }
+
+    /// Inside Herdr, where the toolbar's pane can be resized.
+    fn can_resize(&self) -> bool {
+        self.herdr.as_ref().is_some_and(|h| h.pane_id.is_some())
+    }
+
+    /// The bar's shape now: large buttons only while they all fit.
+    fn layout(&self) -> ui::BarLayout {
+        ui::bar_layout(
+            self.bar,
+            self.slots.len(),
+            self.rule().is_some(),
+            self.size.rows,
+        )
+    }
+
+    /// Never narrower than the bar: when Herdr (or a dragged divider) leaves
+    /// the pane too narrow for the icons, widen it by the difference. Each
+    /// too-narrow width is tried once, since Herdr may not be able to.
+    fn keep_icons_visible(&mut self) {
+        let need = self.layout().width;
+        if self.size.cols >= need {
+            self.widened_at = None;
+            return;
+        }
+        if !self.can_resize() || self.widened_at == Some(self.size.cols) {
+            return;
+        }
+        let Some(ctx) = self.herdr.clone() else {
+            return;
+        };
+        let Some(pane) = ctx.pane_id.clone() else {
+            return;
+        };
+        self.widened_at = Some(self.size.cols);
+        crate::herdr::widen(&ctx, &pane, need - self.size.cols);
+    }
+
     fn content_size(&self) -> Size {
         let footer = self.footer().is_some();
-        let (rows, cols) =
-            ui::content_size(Rect::new(0, 0, self.size.cols, self.size.rows), footer);
+        let (rows, cols) = ui::content_size(
+            Rect::new(0, 0, self.size.cols, self.size.rows),
+            footer,
+            self.layout().width,
+        );
         Size { rows, cols }
     }
 
@@ -369,25 +426,29 @@ impl App {
         Flow::Continue
     }
 
-    /// A click on an icon selects that tool. Inside the tool's area, mouse
-    /// events go to the tool when it has turned mouse reporting on, in the
-    /// mode and encoding it asked for, at its own coordinates.
+    /// A click on a button selects that tool, and resting the mouse on one
+    /// names it. Inside the tool's area, mouse events go to the tool when it
+    /// has turned mouse reporting on, in the mode and encoding it asked for,
+    /// at its own coordinates.
     pub fn apply_mouse(&mut self, ev: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
         let area = Rect::new(0, 0, self.size.cols, self.size.rows);
-        let (content, bar) = ui::split(area);
+        let layout = self.layout();
+        let (content, bar) = ui::split(area, layout.width);
         if ev.column >= bar.x && bar.width > 0 {
-            // the last bar row holds the reload/armed marker, not an icon
-            let icon_rows = bar.height.saturating_sub(1);
-            if ev.kind == MouseEventKind::Down(MouseButton::Left)
-                && ev.row < icon_rows
-                && usize::from(ev.row) < self.slots.len()
-            {
-                self.message = None;
-                self.select(usize::from(ev.row));
+            // not the rule, the marker row or the empty rows below
+            let at = ui::button_at(bar, layout.rows, self.slots.len(), self.rule(), ev.row);
+            match (ev.kind, at) {
+                (MouseEventKind::Down(MouseButton::Left), Some(index)) => {
+                    self.message = None;
+                    self.select(index);
+                }
+                (MouseEventKind::Moved, at) => self.hover = at,
+                _ => {}
             }
             return;
         }
+        self.hover = None;
         let tool_rows = self.content_size().rows;
         if ev.column < content.x || ev.row < content.y || ev.row - content.y >= tool_rows {
             return;
@@ -441,6 +502,7 @@ impl App {
     /// New whole-pane size; every running tool is resized so hidden ones are right when shown.
     pub fn resize(&mut self, size: Size) {
         self.size = size;
+        self.keep_icons_visible();
         let content = self.content_size();
         for slot in &self.slots {
             if let Some(p) = slot.proc.as_ref() {
@@ -495,6 +557,7 @@ impl App {
                 name: &s.cfg.name,
                 state,
                 selected: i == self.selected,
+                pane: s.cfg.open == Open::Pane,
             })
             .collect();
         let footer = self.footer();
@@ -509,6 +572,8 @@ impl App {
             message: self.message_text(),
             footer: footer.as_deref(),
             prefix_armed: self.prefix.armed(),
+            bar: self.bar,
+            hover: self.hover,
         };
         ui::render(&frame, area, buf);
     }
@@ -697,6 +762,7 @@ fn restore_terminal() {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -786,6 +852,150 @@ mod tests {
         // below the icons nothing happens
         app.apply_mouse(click(SIZE.cols - 2, 7));
         assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    fn moved(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_anywhere_on_a_large_button_selects_its_tool() {
+        let fx = fixture(&format!("bar = \"large\"\n{}", three()));
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        // large buttons: the rightmost five columns, two rows each
+        app.apply_mouse(click(SIZE.cols - 5, 2));
+        assert_eq!(app.selected, 1);
+        app.apply_mouse(click(SIZE.cols - 1, 5));
+        assert_eq!(app.selected, 2);
+        app.apply_mouse(click(SIZE.cols - 3, 0));
+        assert_eq!(app.selected, 0);
+        // below the buttons nothing happens
+        app.apply_mouse(click(SIZE.cols - 3, 7));
+        assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    /// A Herdr context on the fake `herdr`, the toolbar being pane w1:p9.
+    fn herdr_ctx(dir: &Path) -> (crate::herdr::HerdrContext, PathBuf) {
+        let log = dir.join("herdr.log");
+        let ctx = crate::herdr::HerdrContext {
+            bin: Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-herdr.sh"),
+            workspace_id: Some("w1".into()),
+            pane_id: Some("w1:p9".into()),
+            tab_id: Some("w1:t1".into()),
+            target_pane_id: Some("w1:p3".into()),
+            workspace_cwd: dir.to_path_buf(),
+            config_dir: dir.join("config"),
+            state_dir: dir.join("state"),
+            socket: dir.join("herdr.sock"),
+            inherit: vec![],
+            extra_env: vec![("FAKE_HERDR_LOG".into(), log.display().to_string())],
+        };
+        (ctx, log)
+    }
+
+    #[test]
+    fn inside_herdr_the_top_button_is_the_first_tool() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.set_herdr(herdr_ctx(fx._tmp.path()).0);
+        app.apply_mouse(moved(SIZE.cols - 2, 0));
+        assert_eq!(app.hover, Some(0), "no compact toggle");
+        app.apply_mouse(click(SIZE.cols - 2, 0));
+        assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    fn resizes(log: &Path) -> usize {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("pane resize"))
+            .count()
+    }
+
+    #[test]
+    fn a_pane_narrower_than_the_bar_widens_to_show_the_icons() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let (ctx, log) = herdr_ctx(fx._tmp.path());
+        app.set_herdr(ctx);
+        // the small bar needs three columns; the pane shows two
+        app.resize(Size { rows: 10, cols: 2 });
+        let l = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            l.contains("pane resize --pane w1:p9 --direction left --amount 0.0050"),
+            "{l}"
+        );
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_pane_as_wide_as_the_bar_is_left_alone() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let (ctx, log) = herdr_ctx(fx._tmp.path());
+        app.set_herdr(ctx);
+        app.resize(Size { rows: 10, cols: 3 });
+        app.resize(Size { rows: 10, cols: 40 });
+        assert_eq!(resizes(&log), 0);
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_narrow_size_herdr_will_not_widen_is_asked_about_once() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let (ctx, log) = herdr_ctx(fx._tmp.path());
+        app.set_herdr(ctx);
+        app.resize(Size { rows: 10, cols: 2 });
+        app.resize(Size { rows: 10, cols: 2 });
+        assert_eq!(resizes(&log), 1, "no fight with Herdr");
+        app.shutdown();
+    }
+
+    #[test]
+    fn outside_herdr_the_toolbar_does_not_resize_itself() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.resize(Size { rows: 10, cols: 2 });
+        assert!(app.herdr.is_none());
+        app.shutdown();
+    }
+
+    #[test]
+    fn hover_skips_the_rule_between_toolbar_and_pane_tools() {
+        let pane = "[[tool]]\nid = \"p\"\nname = \"p\"\nicon = \"x\"\ncommand = [\"x\"]\nopen = \"pane\"\n";
+        let fx = fixture(&(tool("a", "sleep 30") + &tool("b", "sleep 30") + pane));
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        // small buttons: a on row 0, b on row 1, the rule on row 2, p on row 3
+        app.apply_mouse(moved(SIZE.cols - 2, 1));
+        assert_eq!(app.hover, Some(1));
+        app.apply_mouse(moved(SIZE.cols - 2, 2));
+        assert_eq!(app.hover, None, "the rule");
+        app.apply_mouse(moved(SIZE.cols - 2, 3));
+        assert_eq!(app.hover, Some(2));
+        app.shutdown();
+    }
+
+    #[test]
+    fn moving_over_an_icon_names_it_and_moving_off_the_bar_clears_it() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.apply_mouse(moved(SIZE.cols - 2, 1));
+        assert_eq!(app.hover, Some(1));
+        app.apply_mouse(moved(SIZE.cols - 2, SIZE.rows - 1));
+        assert_eq!(app.hover, None, "the marker row is no tool");
+        app.apply_mouse(moved(SIZE.cols - 2, 2));
+        assert_eq!(app.hover, Some(2));
+        app.apply_mouse(moved(3, 3));
+        assert_eq!(app.hover, None, "off the bar");
         app.shutdown();
     }
 

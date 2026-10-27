@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herdr_toolbar::config::{Open, ToolConfig};
-use herdr_toolbar::herdr::{HerdrContext, PaneToggle, launched_pane_file, toggle_pane};
+use herdr_toolbar::herdr::{
+    HerdrContext, PaneToggle, launched_pane_file, set_width, toggle_pane, widen,
+};
 
 fn fake_herdr() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-herdr.sh")
@@ -281,4 +283,48 @@ fn a_group_that_fails_partway_remembers_the_panes_it_opened() {
     assert!(e.contains("herdr pane split failed"), "got: {e}");
     let recorded = fs::read_to_string(launched_pane_file(&fx.ctx, "usage")).unwrap();
     assert_eq!(recorded, "w1:p12\n", "so the next press closes it");
+}
+
+#[test]
+fn set_width_moves_the_divider_by_the_difference() {
+    let wide = fx(None, false);
+    assert_eq!(
+        set_width(&wide.ctx, "w1:p9", 5),
+        Some(90),
+        "the width it had"
+    );
+    assert!(
+        log(&wide).contains("pane resize --pane w1:p9 --direction right --amount 0.4250"),
+        "{}",
+        log(&wide)
+    );
+    let mut narrow = fx(None, false);
+    narrow
+        .ctx
+        .extra_env
+        .push(("FAKE_TOOLBAR_WIDTH".into(), "14".into()));
+    assert_eq!(set_width(&narrow.ctx, "w1:p9", 90), Some(14));
+    assert!(
+        log(&narrow).contains("pane resize --pane w1:p9 --direction left --amount 0.3800"),
+        "{}",
+        log(&narrow)
+    );
+}
+
+#[test]
+fn set_width_leaves_a_pane_already_that_wide() {
+    let fx = fx(None, false);
+    assert_eq!(set_width(&fx.ctx, "w1:p9", 90), Some(90));
+    assert!(!log(&fx).contains("pane resize"), "{}", log(&fx));
+}
+
+#[test]
+fn widen_moves_the_left_edge_left_by_that_many_columns() {
+    let fx = fx(None, false);
+    assert_eq!(widen(&fx.ctx, "w1:p9", 4), Some(90));
+    assert!(
+        log(&fx).contains("pane resize --pane w1:p9 --direction left --amount 0.0200"),
+        "{}",
+        log(&fx)
+    );
 }

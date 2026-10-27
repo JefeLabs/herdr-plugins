@@ -56,8 +56,13 @@ Everything goes to the hosted tool except a two-key prefix, default `Ctrl-]`:
 | `Ctrl-]` `Ctrl-]` | send a literal `Ctrl-]` to the tool |
 | `Enter` on an exited tool | restart it |
 | click an icon | select that tool |
+| rest the mouse on an icon | show the tool's name beside it |
 
 Change the prefix with `prefix = "ctrl-b"` (or `alt-t`, ...) at the top of `tools.toml`.
+
+`bar = "large"` at the top of `tools.toml` makes each button five columns wide and two rows tall, with the icon centred across and a blank row between icons: a bigger target to click. When the pane is too short for every button at that size, the bar uses small buttons (three columns, one row, the default `bar = "small"`) until it is tall enough again. Resting the mouse on a button shows the tool's name beside it, over the tool's area: a box whose text lines up with the icon with large buttons, a single highlighted line with small ones. It goes when the mouse moves off the bar. This needs the terminal to report mouse movement to the toolbar; under Herdr it depends on Herdr passing movement on to the pane. `r` applies a change to `bar`.
+
+Inside Herdr the toolbar never stays narrower than its bar: when its pane is resized (or its divider dragged) below the width the icons need, it widens itself by the difference. It asks Herdr once per too-narrow width, so a tab too small to make room for it is left as it is.
 
 ## tools.toml
 
@@ -97,6 +102,8 @@ graphics = true                               # experimental: show its images in
 Tools start the first time you select them.
 
 A tool with `open = "pane"` runs in a Herdr pane instead of the toolbar's slot: selecting it opens a right split of the work pane (the toolbar's left neighbour, else the focused pane), runs its `command` there with its `cwd` and `env`, and focuses it. The pane is labelled with the tool's name. Selecting the tool again closes that pane, so the button works as a toggle; if the pane was closed some other way, the next selection opens a new one. The pane id is kept under the plugin's state folder, so this survives a toolbar restart, and a recorded pane is closed only while it still carries the tool's name (Herdr reuses pane ids after a restart). Use it for tools that need the room or draw with graphics, such as `terminal-browser`, which shows pages as images.
+
+In the bar, tools that open a pane always come after the tools that run in the toolbar, below a dim rule (`─`), so you can tell which buttons open a new pane. `order` sorts the tools within each group.
 
 A pane tool can open several panes at once: give it `panes`, one command per pane, in place of `command`. The first pane opens beside the work pane as above; the others stack below it at equal heights, each running its own command with the tool's `cwd` and `env`. Every pane carries the tool's name, and selecting the tool again closes all of them, skipping any you already closed. Arguments are passed as written, so `~` is not expanded: write paths in full.
 
