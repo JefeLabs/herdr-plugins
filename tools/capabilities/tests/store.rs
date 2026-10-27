@@ -717,3 +717,68 @@ fn found_artifacts_need_whole_words_a_name_match_and_each_word_once() {
         vec!["docs/superpowers/specs/2026-10-01-school-search-design.md"]
     );
 }
+
+// --- workspace scope: one Herdr workspace sees one top-level group
+
+/// Loose capability at the top, one in skoolscout/admin, one in skoolz.
+fn three_projects() -> (tempfile::TempDir, Store) {
+    let (tmp, s) = store();
+    s.create(Path::new(""), "Loose", "idea", "x\n", None)
+        .unwrap();
+    s.create(Path::new("skoolscout/admin"), "Ours", "idea", "x\n", None)
+        .unwrap();
+    s.create(Path::new("skoolz"), "Theirs", "idea", "x\n", None)
+        .unwrap();
+    (tmp, s)
+}
+
+#[test]
+fn a_workspace_sees_only_its_own_top_level_group() {
+    let (_tmp, s) = three_projects();
+    let tree = s.scan().unwrap().scoped(Some("skoolscout"));
+    let names: Vec<&str> = tree.groups.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(names, ["skoolscout"]);
+    assert!(tree.intents.is_empty(), "nothing loose at the top");
+    assert_eq!(tree.groups[0].groups[0].name, "admin");
+    assert_eq!(tree.groups[0].groups[0].intents[0].fm.title, "Ours");
+}
+
+#[test]
+fn a_workspace_name_matches_its_group_whatever_the_case() {
+    let (_tmp, s) = three_projects();
+    let tree = s.scan().unwrap().scoped(Some("SkoolScout"));
+    assert_eq!(tree.groups.len(), 1);
+    assert_eq!(tree.groups[0].name, "skoolscout", "the folder's own name");
+    assert_eq!(tree.groups[0].groups.len(), 1);
+}
+
+#[test]
+fn a_workspace_without_a_group_sees_an_empty_one_to_capture_into() {
+    let (_tmp, s) = three_projects();
+    let tree = s.scan().unwrap().scoped(Some("tourneyseason"));
+    assert_eq!(tree.groups.len(), 1);
+    let g = &tree.groups[0];
+    assert_eq!(g.name, "tourneyseason");
+    assert_eq!(g.path, s.root().join("tourneyseason"));
+    assert!(g.groups.is_empty() && g.intents.is_empty());
+    assert!(
+        !g.path.exists(),
+        "nothing is created until something lands there"
+    );
+}
+
+#[test]
+fn without_a_workspace_the_whole_tree_shows() {
+    let (_tmp, s) = three_projects();
+    let tree = s.scan().unwrap().scoped(None);
+    let names: Vec<&str> = tree.groups.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(names, ["skoolscout", "skoolz"]);
+    assert_eq!(tree.intents.len(), 1, "the loose one too");
+}
+
+#[test]
+fn captures_go_into_the_workspace_folder_as_it_is_spelled_on_disk() {
+    let (_tmp, s) = three_projects();
+    assert_eq!(s.scope_group("SkoolScout"), Path::new("skoolscout"));
+    assert_eq!(s.scope_group("tourneyseason"), Path::new("tourneyseason"));
+}

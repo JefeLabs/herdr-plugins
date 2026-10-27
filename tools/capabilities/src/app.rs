@@ -445,7 +445,7 @@ fn pane_name(p: Pane) -> &'static str {
 impl App {
     pub fn new(cfg: Config, dirs: Dirs) -> anyhow::Result<Self> {
         let store = Store::open(&cfg.root)?;
-        let tree = store.scan()?;
+        let tree = store.scan()?.scoped(cfg.scope.as_deref());
         let mut app = Self {
             store,
             cfg,
@@ -1370,7 +1370,7 @@ impl App {
             Layout::Tree => self.selected_path(),
             Layout::List => self.list.get(self.list_selected).map(|i| i.path.clone()),
         };
-        match self.store.scan() {
+        match self.scan() {
             Ok(t) => self.tree = t,
             Err(e) => self.message = Some(format!("rescan failed: {e:#}")),
         }
@@ -1399,6 +1399,19 @@ impl App {
         }
     }
 
+    /// The capability tree as this workspace sees it.
+    fn scan(&self) -> anyhow::Result<Group> {
+        Ok(self.store.scan()?.scoped(self.cfg.scope.as_deref()))
+    }
+
+    /// Where "the top level" is: the workspace's group, or the root.
+    fn home_dir(&self) -> PathBuf {
+        match &self.cfg.scope {
+            Some(scope) => self.store.root().join(self.store.scope_group(scope)),
+            None => self.store.root().to_path_buf(),
+        }
+    }
+
     /// Group directory the selection belongs to (the group itself, or the intent's parent).
     fn selected_group_dir(&self) -> PathBuf {
         if self.layout == Layout::List {
@@ -1407,7 +1420,7 @@ impl App {
                 .selected_intent()
                 .and_then(|it| it.path.parent())
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.store.root().to_path_buf());
+                .unwrap_or_else(|| self.home_dir());
         }
         match self.rows.get(self.selected) {
             Some(Row::Group { path, .. }) => path.clone(),
@@ -1415,12 +1428,12 @@ impl App {
                 .path
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.store.root().to_path_buf()),
+                .unwrap_or_else(|| self.home_dir()),
             Some(Row::Broken { path, .. }) => path
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.store.root().to_path_buf()),
-            None => self.store.root().to_path_buf(),
+                .unwrap_or_else(|| self.home_dir()),
+            None => self.home_dir(),
         }
     }
 
@@ -3315,7 +3328,7 @@ impl App {
 
     fn rescan_keep_screen(&mut self) {
         let keep = self.selected_path();
-        if let Ok(t) = self.store.scan() {
+        if let Ok(t) = self.scan() {
             self.tree = t;
         }
         self.rebuild_rows();
@@ -4089,8 +4102,22 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
 }
 
 /// `add` mode: popup asks for a title; otherwise title from args or stdin's first line, body = rest.
-pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyhow::Result<()> {
+/// `piped` is what arrived on stdin when it is not a terminal; the caller
+/// reads it, so this never blocks on an open stdin.
+pub fn add(
+    cfg: Config,
+    dirs: Dirs,
+    title: Option<String>,
+    popup: bool,
+    piped: Option<String>,
+) -> anyhow::Result<()> {
     let store = Store::open(&cfg.root)?;
+    // the top of the workspace's group, or of the tree; there is no default group
+    let group = cfg
+        .scope
+        .as_deref()
+        .map(|scope| store.scope_group(scope))
+        .unwrap_or_default();
     let repo = crate::send::capture_repo();
     let body = template(&dirs, "idea", false).unwrap_or_default();
     if popup {
@@ -4124,24 +4151,20 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
         if let Some(t) = result? {
             let t = t.trim();
             if !t.is_empty() {
-                // quick captures go to the top of the tree; there is no default group
-                store.create(Path::new(""), t, "idea", &body, repo)?;
+                store.create(&group, t, "idea", &body, repo)?;
             }
         }
         return Ok(());
     }
-    let mut input = String::new();
-    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    if title.is_none() && stdin_is_tty {
+    if title.is_none() && piped.is_none() {
         anyhow::bail!(
             "usage: herdr-capabilities add <title>   (or pipe a title line and body on stdin)"
         );
     }
-    if !stdin_is_tty {
-        use std::io::Read;
-        let _ = std::io::stdin().read_to_string(&mut input);
-    }
-    let input = input.replace("\r\n", "\n").replace('\r', "\n");
+    let input = piped
+        .unwrap_or_default()
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     let (t, body_text) = match title {
         Some(t) => (t, if input.trim().is_empty() { body } else { input }),
         None => {
@@ -4154,7 +4177,7 @@ pub fn add(cfg: Config, dirs: Dirs, title: Option<String>, popup: bool) -> anyho
             (t, if rest.trim().is_empty() { body } else { rest })
         }
     };
-    let it = store.create(Path::new(""), t.trim(), "idea", &body_text, repo)?;
+    let it = store.create(&group, t.trim(), "idea", &body_text, repo)?;
     println!("{}", it.path.display());
     Ok(())
 }
@@ -4636,6 +4659,79 @@ mod tests {
     }
 
     #[test]
+    fn quick_capture_lands_in_the_workspace_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let mut cfg = load_or_init(&dirs).unwrap();
+        cfg.scope = Some("tourneyseason".into());
+        add(cfg, dirs.clone(), Some("Quick one".into()), false, None).unwrap();
+        let names: Vec<String> = fs::read_dir(dirs.root.join("tourneyseason"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("-quick-one.md")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn the_tree_shows_only_the_workspace_group() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.cfg.scope = Some("skoolscout".into());
+        fx.app.reload_tree();
+        let labels: Vec<String> = fx.app.view().rows.iter().map(|r| r.label.clone()).collect();
+        assert!(labels.iter().any(|l| l == "Alpha"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l == "Inbox" || l == "In the inbox"),
+            "another project's group is hidden: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn adding_in_a_new_workspace_creates_its_group() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        fx.app.reload_tree();
+        select(&mut fx.app, "tourneyseason");
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "First one");
+        key(&mut fx.app, KeyCode::Enter);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        assert!(
+            path.starts_with(fx.app.store.root().join("tourneyseason")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn adding_from_an_empty_list_lands_in_the_workspace_group() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        fx.app.reload_tree();
+        key(&mut fx.app, KeyCode::Char('v'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        type_str(&mut fx.app, "From the list");
+        key(&mut fx.app, KeyCode::Enter);
+        let dir = fx.app.store.root().join("tourneyseason");
+        let names: Vec<String> = fs::read_dir(&dir)
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            names.iter().any(|n| n.ends_with("-from-the-list.md")),
+            "not in {}: {names:?}",
+            dir.display()
+        );
+    }
+
+    #[test]
     fn quick_capture_lands_at_the_top_of_the_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs {
@@ -4643,7 +4739,14 @@ mod tests {
             root: tmp.path().join("root"),
         };
         let cfg = load_or_init(&dirs).unwrap();
-        add(cfg.clone(), dirs.clone(), Some("Quick one".into()), false).unwrap();
+        add(
+            cfg.clone(),
+            dirs.clone(),
+            Some("Quick one".into()),
+            false,
+            None,
+        )
+        .unwrap();
         let names: Vec<String> = fs::read_dir(&dirs.root)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())

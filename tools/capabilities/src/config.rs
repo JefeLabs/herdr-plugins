@@ -258,6 +258,9 @@ impl Handoff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub root: PathBuf,
+    /// The top-level group this run sees (the Herdr workspace's name); `None`
+    /// shows the whole tree. Set by the caller from `scope::resolve`.
+    pub scope: Option<String>,
     pub editor: String,
     pub send_provider: String,
     pub polish_provider: String,
@@ -392,6 +395,7 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
 
     Ok(Config {
         root,
+        scope: None,
         editor: raw.editor.unwrap_or_else(|| "$EDITOR".to_string()),
         send_provider,
         polish_provider: raw.polish_provider.unwrap_or_else(|| "agy".to_string()),
