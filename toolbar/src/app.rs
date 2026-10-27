@@ -86,12 +86,8 @@ pub struct App {
     pending_out: Vec<u8>,
     /// Button size, from the config.
     bar: crate::config::BarSize,
-    /// The button the mouse rests on.
-    pub hover: Option<ui::Target>,
-    /// Shrunk to the bar: tools keep running and keep their size, unseen.
-    pub compact: bool,
-    /// Before compacting: the pane's width in Herdr's columns, and ours.
-    expanded: Option<(u16, u16)>,
+    /// The tool whose button the mouse rests on.
+    pub hover: Option<usize>,
     /// The too-narrow width we last asked Herdr to widen, so a width Herdr
     /// will not widen is asked about once.
     widened_at: Option<u16>,
@@ -113,8 +109,6 @@ impl App {
             pending_out: Vec::new(),
             bar: Default::default(),
             hover: None,
-            compact: false,
-            expanded: None,
             widened_at: None,
             prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
@@ -179,8 +173,8 @@ impl App {
         ui::rule_index(self.slots.iter().map(|s| s.cfg.open == Open::Pane))
     }
 
-    /// The compact toggle shows inside Herdr, where the pane can be resized.
-    fn toggle_shown(&self) -> bool {
+    /// Inside Herdr, where the toolbar's pane can be resized.
+    fn can_resize(&self) -> bool {
         self.herdr.as_ref().is_some_and(|h| h.pane_id.is_some())
     }
 
@@ -188,7 +182,7 @@ impl App {
     fn layout(&self) -> ui::BarLayout {
         ui::bar_layout(
             self.bar,
-            self.slots.len() + usize::from(self.toggle_shown()),
+            self.slots.len(),
             self.rule().is_some(),
             self.size.rows,
         )
@@ -203,7 +197,7 @@ impl App {
             self.widened_at = None;
             return;
         }
-        if !self.toggle_shown() || self.widened_at == Some(self.size.cols) {
+        if !self.can_resize() || self.widened_at == Some(self.size.cols) {
             return;
         }
         let Some(ctx) = self.herdr.clone() else {
@@ -214,42 +208,6 @@ impl App {
         };
         self.widened_at = Some(self.size.cols);
         crate::herdr::widen(&ctx, &pane, need - self.size.cols);
-    }
-
-    /// Shrink the toolbar's pane to its bar (as far as Herdr allows), or give
-    /// it back the width it had. Tools keep running and keep their size.
-    pub fn set_compact(&mut self, on: bool) {
-        if on == self.compact {
-            return;
-        }
-        let Some(ctx) = self.herdr.clone() else {
-            return;
-        };
-        let Some(pane) = ctx.pane_id.clone() else {
-            return;
-        };
-        if on {
-            let had = crate::herdr::set_width(&ctx, &pane, self.layout().width);
-            self.expanded = had.map(|w| (w, self.size.cols));
-            // a graphics tool's images would stay on screen
-            if self
-                .slots
-                .get(self.selected)
-                .is_some_and(|s| s.cfg.graphics)
-            {
-                self.pending_out
-                    .extend_from_slice(crate::graphics::DELETE_ALL);
-            }
-            self.compact = true;
-        } else {
-            self.compact = false;
-            if let Some((width, cols)) = self.expanded.take() {
-                crate::herdr::set_width(&ctx, &pane, width);
-                // until Herdr's resize reaches us
-                self.size.cols = cols;
-            }
-            self.resize(self.size);
-        }
     }
 
     fn content_size(&self) -> Size {
@@ -297,8 +255,6 @@ impl App {
             self.toggle_pane(idx);
             return;
         }
-        // a tool that runs here needs the room: expand first
-        self.set_compact(false);
         let previous = self.selected;
         if previous != idx {
             // a hidden graphics tool's images would stay on screen
@@ -365,7 +321,7 @@ impl App {
                 continue;
             };
             let cmds = p.take_graphics();
-            if i == self.selected && !self.compact {
+            if i == self.selected {
                 // the slot's screen starts at the pane's top-left cell
                 for (cmd, row, col) in cmds {
                     out.extend(crate::graphics::placed(&cmd, 0, 0, row, col));
@@ -481,19 +437,9 @@ impl App {
         let (content, bar) = ui::split(area, layout.width);
         if ev.column >= bar.x && bar.width > 0 {
             // not the rule, the marker row or the empty rows below
-            let at = ui::target_at(
-                bar,
-                layout.rows,
-                self.slots.len(),
-                self.rule(),
-                self.toggle_shown(),
-                ev.row,
-            );
+            let at = ui::button_at(bar, layout.rows, self.slots.len(), self.rule(), ev.row);
             match (ev.kind, at) {
-                (MouseEventKind::Down(MouseButton::Left), Some(ui::Target::Toggle)) => {
-                    self.set_compact(!self.compact);
-                }
-                (MouseEventKind::Down(MouseButton::Left), Some(ui::Target::Tool(index))) => {
+                (MouseEventKind::Down(MouseButton::Left), Some(index)) => {
                     self.message = None;
                     self.select(index);
                 }
@@ -557,10 +503,6 @@ impl App {
     pub fn resize(&mut self, size: Size) {
         self.size = size;
         self.keep_icons_visible();
-        if self.compact {
-            // unseen while compact: keep each tool's size until we expand
-            return;
-        }
         let content = self.content_size();
         for slot in &self.slots {
             if let Some(p) = slot.proc.as_ref() {
@@ -632,7 +574,6 @@ impl App {
             prefix_armed: self.prefix.armed(),
             bar: self.bar,
             hover: self.hover,
-            toggle: self.toggle_shown().then_some(self.compact),
         };
         ui::render(&frame, area, buf);
     }
@@ -959,106 +900,15 @@ mod tests {
         (ctx, log)
     }
 
-    fn narrow(app: &mut App, cols: &str) {
-        app.herdr
-            .as_mut()
-            .unwrap()
-            .extra_env
-            .push(("FAKE_TOOLBAR_WIDTH".into(), cols.into()));
-    }
-
     #[test]
-    fn the_toggle_is_the_top_button_only_inside_herdr() {
+    fn inside_herdr_the_top_button_is_the_first_tool() {
         let fx = fixture(&three());
         let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
-        app.apply_mouse(moved(SIZE.cols - 2, 0));
-        assert_eq!(
-            app.hover,
-            Some(ui::Target::Tool(0)),
-            "no toggle outside Herdr"
-        );
         app.set_herdr(herdr_ctx(fx._tmp.path()).0);
         app.apply_mouse(moved(SIZE.cols - 2, 0));
-        assert_eq!(app.hover, Some(ui::Target::Toggle));
-        app.apply_mouse(moved(SIZE.cols - 2, 1));
-        assert_eq!(app.hover, Some(ui::Target::Tool(0)));
-        app.shutdown();
-    }
-
-    #[test]
-    fn the_toggle_compacts_the_pane_and_expands_it_back() {
-        let fx = fixture(&three());
-        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
-        let (ctx, log) = herdr_ctx(fx._tmp.path());
-        app.set_herdr(ctx);
+        assert_eq!(app.hover, Some(0), "no compact toggle");
         app.apply_mouse(click(SIZE.cols - 2, 0));
-        assert!(app.compact);
-        let l = fs::read_to_string(&log).unwrap_or_default();
-        // from 90 columns down to the small bar's 3, of a 200-column tab
-        assert!(
-            l.contains("pane resize --pane w1:p9 --direction right --amount 0.4350"),
-            "{l}"
-        );
-        narrow(&mut app, "14");
-        app.apply_mouse(click(SIZE.cols - 2, 0));
-        assert!(!app.compact);
-        let l = fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            l.contains("pane resize --pane w1:p9 --direction left --amount 0.3800"),
-            "back to 90: {l}"
-        );
-        app.shutdown();
-    }
-
-    #[test]
-    fn while_compact_tools_keep_their_size_and_are_not_drawn() {
-        let fx = fixture(&three());
-        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
-        app.set_herdr(herdr_ctx(fx._tmp.path()).0);
-        wait_until("tool a runs", || app.view().states[0] == ToolState::Running);
-        let size = |app: &App| app.slots[0].proc.as_ref().unwrap().screen().size();
-        let before = size(&app);
-        app.apply_mouse(click(SIZE.cols - 2, 0));
-        app.resize(Size { rows: 10, cols: 14 });
-        assert_eq!(size(&app), before, "not squeezed into the narrow pane");
-        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 14, 10));
-        app.draw(Rect::new(0, 0, 14, 10), &mut buf);
-        let text: String = (0..10)
-            .flat_map(|y| (0..11).map(move |x| (x, y)))
-            .map(|(x, y)| buf[(x, y)].symbol().to_string())
-            .collect();
-        assert_eq!(text.trim(), "", "only the bar is drawn");
-        app.shutdown();
-    }
-
-    #[test]
-    fn clicking_a_toolbar_tool_while_compact_expands_and_shows_it() {
-        let fx = fixture(&three());
-        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
-        let (ctx, log) = herdr_ctx(fx._tmp.path());
-        app.set_herdr(ctx);
-        app.apply_mouse(click(SIZE.cols - 2, 0));
-        narrow(&mut app, "14");
-        // the toggle is row 0, so tool b is row 2
-        app.apply_mouse(click(SIZE.cols - 2, 2));
-        assert!(!app.compact);
-        assert_eq!(app.selected, 1);
-        let l = fs::read_to_string(&log).unwrap_or_default();
-        assert!(l.contains("--direction left"), "expanded: {l}");
-        app.shutdown();
-    }
-
-    #[test]
-    fn clicking_a_pane_tool_while_compact_stays_compact() {
-        let pane = "[[tool]]\nid = \"p\"\nname = \"p\"\nicon = \"x\"\ncommand = [\"x\"]\nopen = \"pane\"\n";
-        let fx = fixture(&(tool("a", "sleep 30") + pane));
-        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
-        app.set_herdr(herdr_ctx(fx._tmp.path()).0);
-        app.apply_mouse(click(SIZE.cols - 2, 0));
-        assert!(app.compact);
-        // toggle row 0, a row 1, the rule row 2, p row 3
-        app.apply_mouse(click(SIZE.cols - 2, 3));
-        assert!(app.compact, "opening a pane does not need the toolbar");
+        assert_eq!(app.selected, 0);
         app.shutdown();
     }
 
@@ -1126,11 +976,11 @@ mod tests {
         let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
         // small buttons: a on row 0, b on row 1, the rule on row 2, p on row 3
         app.apply_mouse(moved(SIZE.cols - 2, 1));
-        assert_eq!(app.hover, Some(ui::Target::Tool(1)));
+        assert_eq!(app.hover, Some(1));
         app.apply_mouse(moved(SIZE.cols - 2, 2));
         assert_eq!(app.hover, None, "the rule");
         app.apply_mouse(moved(SIZE.cols - 2, 3));
-        assert_eq!(app.hover, Some(ui::Target::Tool(2)));
+        assert_eq!(app.hover, Some(2));
         app.shutdown();
     }
 
@@ -1139,11 +989,11 @@ mod tests {
         let fx = fixture(&three());
         let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
         app.apply_mouse(moved(SIZE.cols - 2, 1));
-        assert_eq!(app.hover, Some(ui::Target::Tool(1)));
+        assert_eq!(app.hover, Some(1));
         app.apply_mouse(moved(SIZE.cols - 2, SIZE.rows - 1));
         assert_eq!(app.hover, None, "the marker row is no tool");
         app.apply_mouse(moved(SIZE.cols - 2, 2));
-        assert_eq!(app.hover, Some(ui::Target::Tool(2)));
+        assert_eq!(app.hover, Some(2));
         app.apply_mouse(moved(3, 3));
         assert_eq!(app.hover, None, "off the bar");
         app.shutdown();

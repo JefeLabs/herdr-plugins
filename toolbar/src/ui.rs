@@ -14,8 +14,6 @@ use crate::config::BarSize;
 use crate::pty::ToolState;
 
 const RELOAD_GLYPH: &str = "⟳";
-const COLLAPSE_GLYPH: &str = "»";
-const EXPAND_GLYPH: &str = "«";
 const ARMED_GLYPH: &str = "^]";
 
 pub struct BarItem<'a> {
@@ -36,18 +34,8 @@ pub struct Frame<'a> {
     pub footer: Option<&'a str>,
     pub prefix_armed: bool,
     pub bar: BarSize,
-    /// What the mouse rests on: its name shows beside its button.
-    pub hover: Option<Target>,
-    /// `Some(compact)` when the compact toggle shows (inside Herdr). Compact
-    /// draws only the bar.
-    pub toggle: Option<bool>,
-}
-
-/// A button of the bar: the compact toggle at the top, or a tool's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Target {
-    Toggle,
-    Tool(usize),
+    /// The tool the mouse rests on: its name shows beside its button.
+    pub hover: Option<usize>,
 }
 
 /// The width of the bar and the rows of each button.
@@ -92,33 +80,10 @@ pub fn rule_index(panes: impl IntoIterator<Item = bool>) -> Option<usize> {
     None
 }
 
-/// The button under row `y` of the bar, if any: not the rule, the marker or
-/// the empty rows below the buttons. With `toggle`, the top button is the
-/// compact toggle and the tools follow it.
-pub fn target_at(
-    bar: Rect,
-    rows: u16,
-    count: usize,
-    rule: Option<usize>,
-    toggle: bool,
-    y: u16,
-) -> Option<Target> {
-    let hit = |b: Rect| y >= b.y && y < b.y + b.height;
-    if toggle && toggle_button(bar, rows).is_some_and(hit) {
-        return Some(Target::Toggle);
-    }
-    let lead = if toggle { rows } else { 0 };
-    (0..count)
-        .find(|&i| button(bar, rows, i, rule, lead).is_some_and(hit))
-        .map(Target::Tool)
-}
-
-/// The compact toggle's button: the top of the bar.
-fn toggle_button(bar: Rect, rows: u16) -> Option<Rect> {
-    (rows <= bar.height.saturating_sub(1)).then_some(Rect {
-        height: rows,
-        ..bar
-    })
+/// The tool button under row `y` of the bar, if any: not the rule, the
+/// marker or the empty rows below the buttons.
+pub fn button_at(bar: Rect, rows: u16, count: usize, rule: Option<usize>, y: u16) -> Option<usize> {
+    (0..count).find(|&i| button(bar, rows, i, rule).is_some_and(|b| y >= b.y && y < b.y + b.height))
 }
 
 /// `(content, bar)`: the bar is the rightmost `width` columns.
@@ -149,18 +114,11 @@ pub fn content_size(area: Rect, footer: bool, bar_width: u16) -> (u16, u16) {
 
 pub fn render(frame: &Frame, area: Rect, buf: &mut Buffer) {
     let rule = rule_index(frame.items.iter().map(|i| i.pane));
-    let buttons = frame.items.len() + usize::from(frame.toggle.is_some());
-    let layout = bar_layout(frame.bar, buttons, rule.is_some(), area.height);
+    let layout = bar_layout(frame.bar, frame.items.len(), rule.is_some(), area.height);
     let (content, bar) = split(area, layout.width);
-    let compact = frame.toggle == Some(true);
-    if !compact {
-        render_content(frame, content, buf);
-    }
+    render_content(frame, content, buf);
     render_bar(frame, bar, layout.rows, rule, buf);
-    // compact is just the icons: no names on hover
-    if !compact {
-        render_hover(frame, content, bar, layout.rows, rule, buf);
-    }
+    render_hover(frame, content, bar, layout.rows, rule, buf);
 }
 
 fn render_content(frame: &Frame, area: Rect, buf: &mut Buffer) {
@@ -201,15 +159,15 @@ fn render_content(frame: &Frame, area: Rect, buf: &mut Buffer) {
     }
 }
 
-/// Where tool button `i` sits in the bar, if it fits above the marker row:
-/// below the `lead` rows of the toggle, and below the rule from the rule on.
-fn button(bar: Rect, rows: u16, i: usize, rule: Option<usize>, lead: u16) -> Option<Rect> {
+/// Where tool button `i` sits in the bar, if it fits above the marker row.
+/// Buttons from the rule on sit below it.
+fn button(bar: Rect, rows: u16, i: usize, rule: Option<usize>) -> Option<Rect> {
     let below_rule = if rule.is_some_and(|r| i >= r) {
         rule_rows(rows)
     } else {
         0
     };
-    let y = bar.y + lead + (i as u16).checked_mul(rows)? + below_rule;
+    let y = bar.y + (i as u16).checked_mul(rows)? + below_rule;
     // keep the last row for the reload/armed marker
     (y + rows <= bar.y + bar.height.saturating_sub(1)).then_some(Rect {
         y,
@@ -222,23 +180,9 @@ fn render_bar(frame: &Frame, area: Rect, rows: u16, rule: Option<usize>, buf: &m
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lead = if frame.toggle.is_some() { rows } else { 0 };
-    if let (Some(compact), Some(button)) = (frame.toggle, toggle_button(area, rows)) {
-        let glyph = if compact {
-            EXPAND_GLYPH
-        } else {
-            COLLAPSE_GLYPH
-        };
-        let row = Rect {
-            y: button.y + rows / 2,
-            height: 1,
-            ..button
-        };
-        Line::from(glyph).centered().render(row, buf);
-    }
     // a dim line between the tools that run here and those that open a pane
     if let Some(r) = rule {
-        let y = area.y + lead + r as u16 * rows + rule_rows(rows) - 1;
+        let y = area.y + r as u16 * rows + rule_rows(rows) - 1;
         if y < area.y + area.height.saturating_sub(1) {
             let line = Rect {
                 y,
@@ -251,7 +195,7 @@ fn render_bar(frame: &Frame, area: Rect, rows: u16, rule: Option<usize>, buf: &m
         }
     }
     for (i, item) in frame.items.iter().enumerate() {
-        let Some(button) = button(area, rows, i, rule, lead) else {
+        let Some(button) = button(area, rows, i, rule) else {
             break;
         };
         let row = Rect {
@@ -305,18 +249,13 @@ fn render_hover(
     rule: Option<usize>,
     buf: &mut Buffer,
 ) {
-    let lead = if frame.toggle.is_some() { rows } else { 0 };
-    let (name, button) = match frame.hover {
-        Some(Target::Toggle) => match (frame.toggle, toggle_button(bar, rows)) {
-            (Some(compact), Some(b)) => (if compact { "Expand" } else { "Collapse" }, b),
-            _ => return,
-        },
-        Some(Target::Tool(i)) => match (frame.items.get(i), button(bar, rows, i, rule, lead)) {
-            (Some(item), Some(b)) => (item.name, b),
-            _ => return,
-        },
-        None => return,
+    let Some(i) = frame.hover else {
+        return;
     };
+    let (Some(item), Some(button)) = (frame.items.get(i), button(bar, rows, i, rule)) else {
+        return;
+    };
+    let name = item.name;
     if content.width == 0 {
         return;
     }
@@ -415,8 +354,7 @@ mod tests {
             footer: None,
             prefix_armed: false,
             bar,
-            hover: hover.map(Target::Tool),
-            toggle: None,
+            hover,
         }
     }
 
@@ -540,99 +478,24 @@ mod tests {
     #[test]
     fn rows_map_to_buttons_skipping_the_rule() {
         let bar = Rect::new(35, 0, 5, 12);
-        let at = |y| target_at(bar, 2, 3, Some(1), false, y);
-        let tool = |i| Some(Target::Tool(i));
-        assert_eq!((at(0), at(1)), (tool(0), tool(0)));
+        let at = |y| button_at(bar, 2, 3, Some(1), y);
+        assert_eq!((at(0), at(1)), (Some(0), Some(0)));
         assert_eq!(
             (at(2), at(3)),
             (None, None),
             "the gap and the rule are no button"
         );
-        assert_eq!((at(4), at(5)), (tool(1), tool(1)));
-        assert_eq!((at(6), at(7)), (tool(2), tool(2)));
+        assert_eq!((at(4), at(5)), (Some(1), Some(1)));
+        assert_eq!((at(6), at(7)), (Some(2), Some(2)));
         assert_eq!(at(8), None, "below the buttons");
         assert_eq!(at(11), None, "the marker row");
         let small = Rect::new(37, 0, 3, 8);
         assert_eq!(
-            target_at(small, 1, 3, Some(2), false, 2),
+            button_at(small, 1, 3, Some(2), 2),
             None,
             "small: the rule only"
         );
-        assert_eq!(target_at(small, 1, 3, Some(2), false, 3), tool(2));
-    }
-
-    #[test]
-    fn with_the_toggle_the_top_button_is_the_toggle_and_tools_follow() {
-        let small = Rect::new(37, 0, 3, 8);
-        let at = |y| target_at(small, 1, 3, None, true, y);
-        assert_eq!(at(0), Some(Target::Toggle));
-        assert_eq!(at(1), Some(Target::Tool(0)));
-        assert_eq!(at(3), Some(Target::Tool(2)));
-        assert_eq!(at(4), None);
-    }
-
-    fn toggled<'a>(items: Vec<BarItem<'a>>, compact: bool, hover: Option<Target>) -> Frame<'a> {
-        Frame {
-            items,
-            screen: None,
-            message: None,
-            footer: None,
-            prefix_armed: false,
-            bar: BarSize::Small,
-            hover,
-            toggle: Some(compact),
-        }
-    }
-
-    #[test]
-    fn the_toggle_is_the_top_button() {
-        let t = draw_at(&toggled(items(&RUNNING, 0), false, None), 40, 8);
-        let buf = t.backend().buffer();
-        assert_eq!(buf[(38, 0)].symbol(), "»", "collapse");
-        assert_eq!(buf[(38, 1)].symbol(), "◉");
-        assert_eq!(buf[(38, 3)].symbol(), "▤");
-        let t = draw_at(&toggled(items(&RUNNING, 0), true, None), 40, 8);
-        assert_eq!(t.backend().buffer()[(38, 0)].symbol(), "«", "expand");
-    }
-
-    #[test]
-    fn compact_draws_only_the_bar() {
-        let mut parser = vt100::Parser::new(8, 37, 0);
-        parser.process(b"hello from a tool");
-        let mut frame = toggled(items(&RUNNING, 0), true, None);
-        frame.screen = Some(parser.screen());
-        frame.message = Some("a message");
-        let t = draw_at(&frame, 40, 8);
-        let buf = t.backend().buffer();
-        for y in 0..8 {
-            assert_eq!(
-                row(buf, y, 37).trim(),
-                "",
-                "row {y} of the content is blank"
-            );
-        }
-        assert_eq!(buf[(38, 1)].symbol(), "◉");
-    }
-
-    #[test]
-    fn hovering_the_toggle_says_what_it_does() {
-        let t = draw_at(
-            &toggled(items(&RUNNING, 0), false, Some(Target::Toggle)),
-            40,
-            8,
-        );
-        assert!(row(t.backend().buffer(), 0, 37).ends_with(" Collapse "));
-    }
-
-    #[test]
-    fn compact_shows_only_icons_and_no_hover_names() {
-        for hover in [Target::Toggle, Target::Tool(1)] {
-            let t = draw_at(&toggled(items(&RUNNING, 0), true, Some(hover)), 40, 8);
-            let buf = t.backend().buffer();
-            for y in 0..8 {
-                assert_eq!(row(buf, y, 37).trim(), "", "{hover:?}: row {y} stays blank");
-            }
-        }
+        assert_eq!(button_at(small, 1, 3, Some(2), 3), Some(2));
     }
 
     #[test]
@@ -665,7 +528,6 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
-            toggle: None,
         };
         let t = draw(&frame);
         insta::assert_snapshot!(t.backend());
@@ -692,7 +554,6 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
-            toggle: None,
         };
         let t = draw(&frame);
         insta::assert_snapshot!(t.backend());
@@ -712,7 +573,6 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
-            toggle: None,
         };
         let t = draw(&frame);
         let buf = t.backend().buffer();
@@ -736,7 +596,6 @@ mod tests {
             prefix_armed: true,
             bar: BarSize::Small,
             hover: None,
-            toggle: None,
         };
         let t = draw(&frame);
         let buf = t.backend().buffer();
@@ -763,7 +622,6 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
-            toggle: None,
         };
         let t = draw(&frame);
         let buf = t.backend().buffer();
