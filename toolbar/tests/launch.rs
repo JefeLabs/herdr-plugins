@@ -1,15 +1,11 @@
-//! `open_in_pane` against a fake `herdr` binary and a fake Herdr socket.
+//! `toggle_pane` against a fake `herdr` binary.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
-use std::time::Duration;
 
 use herdr_toolbar::config::{Open, ToolConfig};
-use herdr_toolbar::herdr::{HerdrContext, launched_pane_file, open_in_pane};
+use herdr_toolbar::herdr::{HerdrContext, PaneToggle, launched_pane_file, toggle_pane};
 
 fn fake_herdr() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-herdr.sh")
@@ -24,6 +20,11 @@ struct Fx {
 /// The toolbar is pane w1:p9; the work pane on its left is w1:p3 unless
 /// `neighbour` is None.
 fn fx(neighbour: Option<&str>, pane_exists: bool) -> Fx {
+    fx_labelled(neighbour, pane_exists, "Browser")
+}
+
+/// As `fx`, with the recorded pane carrying `label`.
+fn fx_labelled(neighbour: Option<&str>, pane_exists: bool, label: &str) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     fs::create_dir_all(&state).unwrap();
@@ -36,6 +37,7 @@ fn fx(neighbour: Option<&str>, pane_exists: bool) -> Fx {
     }
     if pane_exists {
         extra.push(("FAKE_PANE_EXISTS".into(), "1".into()));
+        extra.push(("FAKE_PANE_LABEL".into(), label.into()));
     }
     let ctx = HerdrContext {
         bin: fake_herdr(),
@@ -81,8 +83,15 @@ fn log(fx: &Fx) -> String {
 #[test]
 fn a_pane_tool_opens_beside_the_work_pane_and_runs_its_command() {
     let fx = fx(Some("w1:p3"), false);
-    assert_eq!(open_in_pane(&fx.ctx, &browser()).unwrap(), "w1:p12");
+    assert_eq!(
+        toggle_pane(&fx.ctx, &browser()).unwrap(),
+        PaneToggle::Opened("w1:p12".into())
+    );
     let l = log(&fx);
+    assert!(
+        l.contains("pane rename w1:p12 Browser"),
+        "labelled, so a later press knows the pane is ours: {l}"
+    );
     assert!(
         l.contains("pane neighbor --pane w1:p9 --direction left"),
         "{l}"
@@ -101,40 +110,52 @@ fn a_pane_tool_opens_beside_the_work_pane_and_runs_its_command() {
 }
 
 #[test]
-fn a_second_click_focuses_the_pane_it_opened() {
+fn a_second_press_closes_the_pane_it_opened() {
     let fx = fx(Some("w1:p3"), true);
+    let record = launched_pane_file(&fx.ctx, "browser");
+    fs::write(&record, "w1:p12\n").unwrap();
+    assert_eq!(
+        toggle_pane(&fx.ctx, &browser()).unwrap(),
+        PaneToggle::Closed("w1:p12".into())
+    );
+    let l = log(&fx);
+    assert!(l.contains("pane close w1:p12"), "{l}");
+    assert!(!l.contains("pane split"), "{l}");
+    assert!(!record.exists(), "forgotten, so the next press opens one");
+}
+
+#[test]
+fn a_pane_that_is_no_longer_the_tools_is_never_closed() {
+    // after a Herdr restart the recorded id may name someone else's pane
+    let fx = fx_labelled(Some("w1:p3"), true, "claude");
     fs::write(launched_pane_file(&fx.ctx, "browser"), "w1:p12\n").unwrap();
-    let listener = UnixListener::bind(&fx.ctx.socket).unwrap();
-    let (tx, rx) = channel();
-    std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        stream.write_all(b"{\"id\":\"t\",\"result\":{}}\n").unwrap();
-        tx.send(line).unwrap();
-    });
-    assert_eq!(open_in_pane(&fx.ctx, &browser()).unwrap(), "w1:p12");
-    let request: serde_json::Value =
-        serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
-    assert_eq!(request["method"], "pane.focus");
-    assert_eq!(request["params"]["pane_id"], "w1:p12");
-    assert!(!log(&fx).contains("pane split"), "{}", log(&fx));
+    assert_eq!(
+        toggle_pane(&fx.ctx, &browser()).unwrap(),
+        PaneToggle::Opened("w1:p12".into())
+    );
+    let l = log(&fx);
+    assert!(!l.contains("pane close"), "{l}");
+    assert!(
+        l.contains("pane split --pane w1:p3"),
+        "a fresh pane instead: {l}"
+    );
 }
 
 #[test]
 fn a_closed_pane_is_opened_again() {
     let fx = fx(Some("w1:p3"), false);
     fs::write(launched_pane_file(&fx.ctx, "browser"), "w1:p12\n").unwrap();
-    assert_eq!(open_in_pane(&fx.ctx, &browser()).unwrap(), "w1:p12");
+    assert_eq!(
+        toggle_pane(&fx.ctx, &browser()).unwrap(),
+        PaneToggle::Opened("w1:p12".into())
+    );
     assert!(log(&fx).contains("pane split --pane w1:p3"), "{}", log(&fx));
 }
 
 #[test]
 fn without_a_left_neighbour_it_splits_the_focused_pane() {
     let fx = fx(None, false);
-    open_in_pane(&fx.ctx, &browser()).unwrap();
+    toggle_pane(&fx.ctx, &browser()).unwrap();
     assert!(log(&fx).contains("pane split --pane w1:p5"), "{}", log(&fx));
 }
 

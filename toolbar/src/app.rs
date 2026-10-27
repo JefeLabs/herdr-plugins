@@ -195,7 +195,7 @@ impl App {
         let idx = idx.min(self.slots.len() - 1);
         // a pane tool opens beside the work pane and leaves the slot alone
         if self.slots[idx].cfg.open == Open::Pane {
-            self.open_in_pane(idx);
+            self.toggle_pane(idx);
             return;
         }
         let previous = self.selected;
@@ -230,9 +230,9 @@ impl App {
         }
     }
 
-    /// Open (or focus) a pane tool off the UI thread; Herdr answers in tens
-    /// of milliseconds but the toolbar must never wait on it.
-    fn open_in_pane(&mut self, idx: usize) {
+    /// Open a pane tool, or close the pane it opened, off the UI thread;
+    /// Herdr answers in tens of milliseconds but the toolbar must never wait.
+    fn toggle_pane(&mut self, idx: usize) {
         let cfg = self.slots[idx].cfg.clone();
         let Some(ctx) = self.herdr.clone() else {
             self.message = Some(format!(
@@ -244,8 +244,8 @@ impl App {
         self.message = None;
         let (tx, wake) = (self.notes_tx.clone(), self.wake_tx.clone());
         std::thread::spawn(move || {
-            if let Err(e) = crate::herdr::open_in_pane(&ctx, &cfg) {
-                let _ = tx.send(format!("{} did not open: {e:#}", cfg.name));
+            if let Err(e) = crate::herdr::toggle_pane(&ctx, &cfg) {
+                let _ = tx.send(format!("{}: {e:#}", cfg.name));
                 let _ = wake.send(());
             }
         });

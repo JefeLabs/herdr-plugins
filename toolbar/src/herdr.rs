@@ -344,16 +344,28 @@ pub fn launched_pane_file(ctx: &HerdrContext, tool_id: &str) -> PathBuf {
     ctx.state_dir.join(format!("{}.{safe}.pane", ctx.ws()))
 }
 
-/// Open `tool` in a Herdr pane beside the work pane, or focus the pane it
-/// was opened in before if that pane is still there. Returns the pane id.
+/// What a press on a pane tool did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaneToggle {
+    /// A new pane was opened, with this id.
+    Opened(String),
+    /// The pane the tool opened before was closed.
+    Closed(String),
+}
+
+/// Open `tool` in a Herdr pane beside the work pane, or close the pane it
+/// opened before when that pane is still there.
 ///
 /// The new pane is a right split of the toolbar's left neighbour (the work
 /// pane), else of the focused pane; the tool's command runs in it. This is
 /// how terminal-browser opens itself in Herdr, so a browser gets a real pane.
-pub fn open_in_pane(
+/// The pane is labelled with the tool's name, and a recorded pane is closed
+/// only while it still carries that label: Herdr reuses pane ids after a
+/// restart, so the id alone could name someone else's pane.
+pub fn toggle_pane(
     ctx: &HerdrContext,
     tool: &crate::config::ToolConfig,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<PaneToggle> {
     if tool.command.is_empty() {
         bail!("{} has no command", tool.name);
     }
@@ -362,9 +374,19 @@ pub fn open_in_pane(
         let id = recorded.trim();
         if !id.is_empty() {
             let out = ctx.herdr(&["pane", "get", id])?;
-            if out.status.success() {
-                focus_pane(ctx, id, &out.stdout)?;
-                return Ok(id.to_string());
+            if out.status.success()
+                && json_str(&out.stdout, "/result/pane/label").as_deref()
+                    == Some(tool.name.as_str())
+            {
+                let close = ctx.herdr(&["pane", "close", id])?;
+                if !close.status.success() {
+                    bail!(
+                        "herdr pane close failed: {}",
+                        String::from_utf8_lossy(&close.stderr).trim()
+                    );
+                }
+                let _ = std::fs::remove_file(&file);
+                return Ok(PaneToggle::Closed(id.to_string()));
             }
         }
     }
@@ -408,6 +430,9 @@ pub fn open_in_pane(
     }
     let id = json_str(&out.stdout, "/result/pane/pane_id")
         .context("herdr pane split gave no pane id")?;
+    // best effort: unlabelled, the pane still works, and the next press
+    // opens another one instead of closing it
+    let _ = ctx.herdr(&["pane", "rename", &id, &tool.name]);
     let run = ctx.herdr(&["pane", "run", &id, &shell_quote(&tool.command)])?;
     if !run.status.success() {
         bail!(
@@ -417,7 +442,7 @@ pub fn open_in_pane(
     }
     std::fs::create_dir_all(&ctx.state_dir)?;
     std::fs::write(&file, format!("{id}\n"))?;
-    Ok(id)
+    Ok(PaneToggle::Opened(id))
 }
 
 /// The pane on `pane`'s left, if there is one.
@@ -429,47 +454,6 @@ fn left_neighbour(ctx: &HerdrContext, pane: &str) -> Option<String> {
         return None;
     }
     json_str(&out.stdout, "/result/neighbor/neighbor_pane_id")
-}
-
-/// Bring `pane` to the front: its tab first when it is in another one, then
-/// the pane itself through Herdr's socket (the CLI only focuses neighbours).
-fn focus_pane(ctx: &HerdrContext, pane: &str, get_stdout: &[u8]) -> anyhow::Result<()> {
-    if let Some(tab) = json_str(get_stdout, "/result/pane/tab_id")
-        && ctx.tab_id.as_deref() != Some(tab.as_str())
-    {
-        let _ = ctx.herdr(&["tab", "focus", &tab]);
-    }
-    socket_call(ctx, "pane.focus", serde_json::json!({ "pane_id": pane }))?;
-    Ok(())
-}
-
-/// One request on Herdr's API socket: a JSON line out, a JSON line back.
-fn socket_call(
-    ctx: &HerdrContext,
-    method: &str,
-    params: serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    use std::io::BufRead;
-    let mut stream = UnixStream::connect(&ctx.socket)
-        .with_context(|| format!("connecting to Herdr at {}", ctx.socket.display()))?;
-    let limit = Some(std::time::Duration::from_secs(5));
-    stream.set_read_timeout(limit)?;
-    stream.set_write_timeout(limit)?;
-    let request = serde_json::json!({ "id": "herdr-toolbar", "method": method, "params": params });
-    stream.write_all(format!("{request}\n").as_bytes())?;
-    let mut line = String::new();
-    std::io::BufReader::new(stream).read_line(&mut line)?;
-    let reply: serde_json::Value =
-        serde_json::from_str(line.trim()).context("Herdr's reply is not JSON")?;
-    if let Some(err) = reply.get("error") {
-        bail!(
-            "Herdr refused {method}: {}",
-            err.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("error")
-        );
-    }
-    Ok(reply.get("result").cloned().unwrap_or_default())
 }
 
 fn json_str(bytes: &[u8], pointer: &str) -> Option<String> {

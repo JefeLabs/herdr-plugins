@@ -38,7 +38,7 @@ command = ["jira", "issue", "list"]
 env     = { JIRA_PROJECT = "SKOOL" }
 
 # Opens in a Herdr pane beside the work pane, at full size and speed;
-# selecting it again focuses that pane.
+# selecting it again closes that pane.
 [[tool]]
 id      = "browser"
 name    = "Browser"
