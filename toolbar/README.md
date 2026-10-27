@@ -65,6 +65,8 @@ Change the prefix with `prefix = "ctrl-b"` (or `alt-t`, ...) at the top of `tool
 
 Inside Herdr the top button of the bar toggles a compact toolbar. `»` shrinks the toolbar's pane to just the bar; Herdr keeps every pane at least a tenth of the tab wide, so on a wide tab some blank space stays beside it. `«` gives back the width the pane had. While compact the bar shows just the icons, with no names on hover, and the tools keep running, unseen and at their size; choosing a tool that runs in the toolbar (a click or `Ctrl-]` then its number) expands it again, and tools that open a pane leave it compact.
 
+Inside Herdr the toolbar never stays narrower than its bar: when its pane is resized (or its divider dragged) below the width the icons need, it widens itself by the difference, compact or not. It asks Herdr once per too-narrow width, so a tab too small to make room for it is left as it is.
+
 ## tools.toml
 
 ```toml

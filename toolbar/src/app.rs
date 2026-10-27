@@ -92,6 +92,9 @@ pub struct App {
     pub compact: bool,
     /// Before compacting: the pane's width in Herdr's columns, and ours.
     expanded: Option<(u16, u16)>,
+    /// The too-narrow width we last asked Herdr to widen, so a width Herdr
+    /// will not widen is asked about once.
+    widened_at: Option<u16>,
 }
 
 impl App {
@@ -112,6 +115,7 @@ impl App {
             hover: None,
             compact: false,
             expanded: None,
+            widened_at: None,
             prefix: Prefix::new(crate::config::DEFAULT_PREFIX)?,
             message: None,
             size,
@@ -188,6 +192,28 @@ impl App {
             self.rule().is_some(),
             self.size.rows,
         )
+    }
+
+    /// Never narrower than the bar: when Herdr (or a dragged divider) leaves
+    /// the pane too narrow for the icons, widen it by the difference. Each
+    /// too-narrow width is tried once, since Herdr may not be able to.
+    fn keep_icons_visible(&mut self) {
+        let need = self.layout().width;
+        if self.size.cols >= need {
+            self.widened_at = None;
+            return;
+        }
+        if !self.toggle_shown() || self.widened_at == Some(self.size.cols) {
+            return;
+        }
+        let Some(ctx) = self.herdr.clone() else {
+            return;
+        };
+        let Some(pane) = ctx.pane_id.clone() else {
+            return;
+        };
+        self.widened_at = Some(self.size.cols);
+        crate::herdr::widen(&ctx, &pane, need - self.size.cols);
     }
 
     /// Shrink the toolbar's pane to its bar (as far as Herdr allows), or give
@@ -530,6 +556,7 @@ impl App {
     /// New whole-pane size; every running tool is resized so hidden ones are right when shown.
     pub fn resize(&mut self, size: Size) {
         self.size = size;
+        self.keep_icons_visible();
         if self.compact {
             // unseen while compact: keep each tool's size until we expand
             return;
@@ -1032,6 +1059,63 @@ mod tests {
         // toggle row 0, a row 1, the rule row 2, p row 3
         app.apply_mouse(click(SIZE.cols - 2, 3));
         assert!(app.compact, "opening a pane does not need the toolbar");
+        app.shutdown();
+    }
+
+    fn resizes(log: &Path) -> usize {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("pane resize"))
+            .count()
+    }
+
+    #[test]
+    fn a_pane_narrower_than_the_bar_widens_to_show_the_icons() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let (ctx, log) = herdr_ctx(fx._tmp.path());
+        app.set_herdr(ctx);
+        // the small bar needs three columns; the pane shows two
+        app.resize(Size { rows: 10, cols: 2 });
+        let l = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            l.contains("pane resize --pane w1:p9 --direction left --amount 0.0050"),
+            "{l}"
+        );
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_pane_as_wide_as_the_bar_is_left_alone() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let (ctx, log) = herdr_ctx(fx._tmp.path());
+        app.set_herdr(ctx);
+        app.resize(Size { rows: 10, cols: 3 });
+        app.resize(Size { rows: 10, cols: 40 });
+        assert_eq!(resizes(&log), 0);
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_narrow_size_herdr_will_not_widen_is_asked_about_once() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let (ctx, log) = herdr_ctx(fx._tmp.path());
+        app.set_herdr(ctx);
+        app.resize(Size { rows: 10, cols: 2 });
+        app.resize(Size { rows: 10, cols: 2 });
+        assert_eq!(resizes(&log), 1, "no fight with Herdr");
+        app.shutdown();
+    }
+
+    #[test]
+    fn outside_herdr_the_toolbar_does_not_resize_itself() {
+        let fx = fixture(&three());
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        app.resize(Size { rows: 10, cols: 2 });
+        assert!(app.herdr.is_none());
         app.shutdown();
     }
 

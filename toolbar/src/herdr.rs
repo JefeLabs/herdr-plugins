@@ -248,6 +248,13 @@ pub fn set_width(ctx: &HerdrContext, pane_id: &str, cols: u16) -> Option<u16> {
     Some(mine as u16)
 }
 
+/// Widen pane `pane_id` by `cols` columns, as far as Herdr allows (it keeps
+/// a pane at most nine tenths of the tab). Returns the width it had.
+pub fn widen(ctx: &HerdrContext, pane_id: &str, cols: u16) -> Option<u16> {
+    let (_, mine) = widths(ctx, pane_id)?;
+    set_width(ctx, pane_id, mine as u16 + cols)
+}
+
 fn fit_width(ctx: &HerdrContext, pane_id: &str) {
     let Some((total, mine)) = widths(ctx, pane_id) else {
         return;
