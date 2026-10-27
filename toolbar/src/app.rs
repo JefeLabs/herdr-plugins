@@ -164,9 +164,19 @@ impl App {
         let _ = config.prefix; // prefix changes apply on next start; see reload()
     }
 
+    /// Where the bar's rule goes: before the first tool that opens a pane.
+    fn rule(&self) -> Option<usize> {
+        ui::rule_index(self.slots.iter().map(|s| s.cfg.open == Open::Pane))
+    }
+
     /// The bar's shape now: large buttons only while they all fit.
     fn layout(&self) -> ui::BarLayout {
-        ui::bar_layout(self.bar, self.slots.len(), self.size.rows)
+        ui::bar_layout(
+            self.bar,
+            self.slots.len(),
+            self.rule().is_some(),
+            self.size.rows,
+        )
     }
 
     fn content_size(&self) -> Size {
@@ -395,18 +405,14 @@ impl App {
         let layout = self.layout();
         let (content, bar) = ui::split(area, layout.width);
         if ev.column >= bar.x && bar.width > 0 {
-            // the last bar row holds the reload/armed marker, not a button
-            let button_rows = bar.height.saturating_sub(1);
-            let index = usize::from(ev.row / layout.rows.max(1));
-            let on_button = ev.row < button_rows
-                && index < self.slots.len()
-                && (index as u16 + 1) * layout.rows <= button_rows;
-            match ev.kind {
-                MouseEventKind::Down(MouseButton::Left) if on_button => {
+            // not the rule, the marker row or the empty rows below
+            let at = ui::button_at(bar, layout.rows, self.slots.len(), self.rule(), ev.row);
+            match (ev.kind, at) {
+                (MouseEventKind::Down(MouseButton::Left), Some(index)) => {
                     self.message = None;
                     self.select(index);
                 }
-                MouseEventKind::Moved => self.hover = on_button.then_some(index),
+                (MouseEventKind::Moved, at) => self.hover = at,
                 _ => {}
             }
             return;
@@ -519,6 +525,7 @@ impl App {
                 name: &s.cfg.name,
                 state,
                 selected: i == self.selected,
+                pane: s.cfg.open == Open::Pane,
             })
             .collect();
         let footer = self.footer();
@@ -838,6 +845,21 @@ mod tests {
         // below the buttons nothing happens
         app.apply_mouse(click(SIZE.cols - 3, 7));
         assert_eq!(app.selected, 0);
+        app.shutdown();
+    }
+
+    #[test]
+    fn hover_skips_the_rule_between_toolbar_and_pane_tools() {
+        let pane = "[[tool]]\nid = \"p\"\nname = \"p\"\nicon = \"x\"\ncommand = [\"x\"]\nopen = \"pane\"\n";
+        let fx = fixture(&(tool("a", "sleep 30") + &tool("b", "sleep 30") + pane));
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        // small buttons: a on row 0, b on row 1, the rule on row 2, p on row 3
+        app.apply_mouse(moved(SIZE.cols - 2, 1));
+        assert_eq!(app.hover, Some(1));
+        app.apply_mouse(moved(SIZE.cols - 2, 2));
+        assert_eq!(app.hover, None, "the rule");
+        app.apply_mouse(moved(SIZE.cols - 2, 3));
+        assert_eq!(app.hover, Some(2));
         app.shutdown();
     }
 

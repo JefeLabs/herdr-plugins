@@ -289,6 +289,9 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         ordered.append(&mut tools);
         tools = ordered;
     }
+    // tools that run in the toolbar first, then those that open a pane, so
+    // the bar can draw one rule between them; `order` holds within each group
+    tools.sort_by_key(|t| t.open == Open::Pane);
 
     for t in &mut tools {
         if let Some(cwd) = &t.cwd {
@@ -305,6 +308,30 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tools_that_open_a_pane_come_after_the_ones_in_the_toolbar() {
+        let t = |id: &str, pane: bool| {
+            format!(
+                "[[tool]]\nid = \"{id}\"\nname = \"{id}\"\nicon = \"x\"\ncommand = [\"x\"]\n{}",
+                if pane { "open = \"pane\"\n" } else { "" }
+            )
+        };
+        let text = format!(
+            "order = [\"browser\", \"files\", \"usage\", \"web\"]\n{}{}{}{}",
+            t("browser", true),
+            t("files", false),
+            t("usage", true),
+            t("web", false)
+        );
+        let cfg = merge(parse(&text).unwrap(), None).unwrap();
+        let ids: Vec<&str> = cfg.tools.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["files", "web", "browser", "usage"],
+            "order holds within each group"
+        );
+    }
 
     #[test]
     fn the_bar_is_small_unless_set_large() {
