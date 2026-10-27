@@ -3,7 +3,7 @@
 # its entries replace global ones with the same id, and its `order`, if present, wins.
 
 prefix = "ctrl-]"
-# bar  = "large"   # bigger buttons: five columns by three rows (default "small")
+# bar  = "large"   # bigger buttons: five columns by two rows (default "small")
 order  = ["issues", "capabilities", "db", "files", "jira", "browser"]
 
 [[tool]]

@@ -828,12 +828,15 @@ mod tests {
     fn clicking_anywhere_on_a_large_button_selects_its_tool() {
         let fx = fixture(&format!("bar = \"large\"\n{}", three()));
         let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
-        // large buttons: the rightmost five columns, three rows each
-        app.apply_mouse(click(SIZE.cols - 5, 3));
+        // large buttons: the rightmost five columns, two rows each
+        app.apply_mouse(click(SIZE.cols - 5, 2));
         assert_eq!(app.selected, 1);
-        app.apply_mouse(click(SIZE.cols - 1, 8));
+        app.apply_mouse(click(SIZE.cols - 1, 5));
         assert_eq!(app.selected, 2);
         app.apply_mouse(click(SIZE.cols - 3, 0));
+        assert_eq!(app.selected, 0);
+        // below the buttons nothing happens
+        app.apply_mouse(click(SIZE.cols - 3, 7));
         assert_eq!(app.selected, 0);
         app.shutdown();
     }

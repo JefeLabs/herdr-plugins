@@ -44,14 +44,15 @@ pub struct BarLayout {
 }
 
 /// The bar's shape for `count` tools in a pane `height` rows tall. Large
-/// buttons are five columns by three rows; they fall back to small ones
-/// (three columns, one row) when they would not all fit above the marker row.
+/// buttons are five columns by two rows (one blank row between icons); they
+/// fall back to small ones (three columns, one row) when they would not all
+/// fit above the marker row.
 pub fn bar_layout(size: BarSize, count: usize, height: u16) -> BarLayout {
     let small = BarLayout { width: 3, rows: 1 };
     match size {
         BarSize::Small => small,
-        BarSize::Large if count * 3 <= usize::from(height.saturating_sub(1)) => {
-            BarLayout { width: 5, rows: 3 }
+        BarSize::Large if count * 2 <= usize::from(height.saturating_sub(1)) => {
+            BarLayout { width: 5, rows: 2 }
         }
         BarSize::Large => small,
     }
@@ -189,7 +190,8 @@ fn render_bar(frame: &Frame, area: Rect, rows: u16, buf: &mut Buffer) {
 }
 
 /// The hovered tool's name beside its button, over the content area: a box
-/// as tall as a large button, or one reversed line beside a small one.
+/// whose text lines up with a large button's icon, or one reversed line
+/// beside a small one.
 fn render_hover(frame: &Frame, content: Rect, bar: Rect, rows: u16, buf: &mut Buffer) {
     let Some(i) = frame.hover else {
         return;
@@ -200,7 +202,7 @@ fn render_hover(frame: &Frame, content: Rect, bar: Rect, rows: u16, buf: &mut Bu
     if content.width == 0 {
         return;
     }
-    if rows >= 3 {
+    if rows >= 2 {
         let width = (Line::from(item.name).width() as u16 + 4).min(content.width);
         let rect = Rect {
             x: content.x + content.width - width,
@@ -298,13 +300,13 @@ mod tests {
     const RUNNING: [ToolState; 3] = [ToolState::Running, ToolState::Running, ToolState::Running];
 
     #[test]
-    fn large_buttons_are_five_wide_three_tall_with_the_icon_centred() {
+    fn large_buttons_are_five_wide_two_tall_one_blank_row_between_icons() {
         let t = draw_at(&bare(items(&RUNNING, 1), BarSize::Large, None), 40, 12);
         let buf = t.backend().buffer();
         assert_eq!(buf[(37, 1)].symbol(), "◉");
-        assert_eq!(buf[(37, 4)].symbol(), "☑");
-        assert_eq!(buf[(37, 7)].symbol(), "▤");
-        for y in 3..6 {
+        assert_eq!(buf[(37, 3)].symbol(), "☑");
+        assert_eq!(buf[(37, 5)].symbol(), "▤");
+        for y in 2..4 {
             for x in 35..40 {
                 assert!(
                     buf[(x, y)].modifier.contains(Modifier::REVERSED),
@@ -312,25 +314,25 @@ mod tests {
                 );
             }
         }
-        assert!(!buf[(35, 2)].modifier.contains(Modifier::REVERSED));
-        assert!(!buf[(35, 6)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(35, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(35, 4)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
     fn large_buttons_that_do_not_fit_fall_back_to_small_ones() {
-        // three tools need nine rows above the marker; eight rows leave seven
-        let t = draw_at(&bare(items(&RUNNING, 0), BarSize::Large, None), 40, 8);
+        // three tools need six rows above the marker; six rows leave five
+        let t = draw_at(&bare(items(&RUNNING, 0), BarSize::Large, None), 40, 6);
         let buf = t.backend().buffer();
         assert_eq!(buf[(38, 0)].symbol(), "◉");
         assert_eq!(buf[(38, 1)].symbol(), "☑");
         assert_eq!(buf[(38, 2)].symbol(), "▤");
         assert_eq!(
-            bar_layout(BarSize::Large, 3, 8),
+            bar_layout(BarSize::Large, 3, 6),
             BarLayout { width: 3, rows: 1 }
         );
         assert_eq!(
-            bar_layout(BarSize::Large, 3, 10),
-            BarLayout { width: 5, rows: 3 }
+            bar_layout(BarSize::Large, 3, 7),
+            BarLayout { width: 5, rows: 2 }
         );
         assert_eq!(
             bar_layout(BarSize::Small, 3, 40),
@@ -342,22 +344,23 @@ mod tests {
     fn hovering_a_large_button_shows_its_name_in_a_box_beside_it() {
         let t = draw_at(&bare(items(&RUNNING, 0), BarSize::Large, Some(2)), 40, 12);
         let buf = t.backend().buffer();
+        // the third button is rows 4-5, its icon on row 5: the name lines up with it
         assert!(
-            row(buf, 6, 35).ends_with("┌──────────┐"),
+            row(buf, 4, 35).ends_with("┌──────────┐"),
+            "{:?}",
+            row(buf, 4, 35)
+        );
+        assert!(
+            row(buf, 5, 35).ends_with("│ Database │"),
+            "{:?}",
+            row(buf, 5, 35)
+        );
+        assert!(
+            row(buf, 6, 35).ends_with("└──────────┘"),
             "{:?}",
             row(buf, 6, 35)
         );
-        assert!(
-            row(buf, 7, 35).ends_with("│ Database │"),
-            "{:?}",
-            row(buf, 7, 35)
-        );
-        assert!(
-            row(buf, 8, 35).ends_with("└──────────┘"),
-            "{:?}",
-            row(buf, 8, 35)
-        );
-        assert!(!row(buf, 4, 35).contains("Todo"), "only the hovered tool");
+        assert!(!row(buf, 3, 35).contains("Todo"), "only the hovered tool");
     }
 
     #[test]

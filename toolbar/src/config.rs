@@ -58,7 +58,7 @@ pub enum Open {
 }
 
 /// How big the bar's buttons are: `small` (three columns by one row, the
-/// default) or `large` (five columns by three rows, while they all fit).
+/// default) or `large` (five columns by two rows, while they all fit).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BarSize {
