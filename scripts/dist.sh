@@ -11,6 +11,25 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' toolbar/herdr-plugin.toml | head -
 rm -rf dist
 mkdir -p dist
 
+# An archive must not carry macOS metadata (extended attributes such as
+# com.apple.provenance, or ._ AppleDouble files): Linux tar prints a warning
+# for each one on install.
+check_clean() { # <archive>
+  if gzip -dc "$1" | grep -aq 'LIBARCHIVE\.xattr' || tar -tzf "$1" | grep -q '/\._'; then
+    echo "dist: $1 carries macOS metadata" >&2
+    exit 1
+  fi
+}
+
+pack() { # <archive> <folder> <entry>
+  if tar --version 2>/dev/null | grep -q bsdtar; then
+    # macOS tar: leave the metadata out, and no ._ files
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --no-acls -czf "$1" -C "$2" "$3"
+  else
+    tar -czf "$1" -C "$2" "$3"
+  fi
+}
+
 build() { # <rust target> <asset name>
   target=$1
   name=$2
@@ -32,8 +51,9 @@ build() { # <rust target> <asset name>
   cp tools/capabilities/herdr-plugin.toml tools/capabilities/README.md "$root/tools/capabilities/"
   cp "target/$target/release/herdr-toolbar" "target/$target/release/herdr-capabilities" \
     "$root/target/release/"
-  tar -czf "dist/herdr-plugins-$name.tar.gz" -C "$stage" herdr-plugins
+  pack "dist/herdr-plugins-$name.tar.gz" "$stage" herdr-plugins
   rm -rf "$stage"
+  check_clean "dist/herdr-plugins-$name.tar.gz"
   echo "built dist/herdr-plugins-$name.tar.gz"
 }
 
