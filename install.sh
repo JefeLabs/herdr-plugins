@@ -9,7 +9,8 @@
 #   sh install.sh --from <folder holding them>
 #
 # Add --tools to also install the command-line tools the toolbar uses
-# (procs, oxker, dua, yazi, lazysql) and a Usage tool (one icon, three panes):
+# (procs, oxker, dua, yazi, lazysql, Neovim), a Usage tool (one icon, three
+# panes) and an Editor tool (Neovim in a pane, reachable for remote opens):
 #
 #   curl -fsSL https://github.com/JefeLabs/herdr-plugins/releases/latest/download/install.sh | sh -s -- --tools
 #
@@ -26,6 +27,7 @@
 #   HERDR_PLUGINS_REPOS     the folder the Usage tool's disk pane opens (default: ~)
 #   HERDR_PLUGINS_BASE_URL  download from here instead of GitHub (for testing)
 #   HERDR_PLUGINS_TOOLS_MANIFEST  a tools table to use instead of the one below (for testing)
+#   HERDR_PLUGINS_LIBC      glibc or musl, instead of detecting it (for testing)
 set -eu
 
 from="${HERDR_PLUGINS_FROM:-}"
@@ -134,7 +136,10 @@ fi
 
 # Third-party tools for --tools: name, platform, download, the SHA-256 it
 # must match (GitHub's recorded digest of that upload), and the programs
-# inside the archive. oxker has no Intel Mac build.
+# inside the archive. `dir=<folder>:<program>` unpacks the whole folder (a
+# program with runtime files, like Neovim) and links the program into the bin
+# folder; `needs=glibc` skips the row on musl systems such as Alpine, where
+# that build cannot run. oxker has no Intel Mac build.
 builtin_tools() {
   cat <<'TOOLS'
 procs linux-x86_64 https://github.com/dalance/procs/releases/download/v0.14.12/procs-v0.14.12-x86_64-linux.zip 81964faf9d5cd0e9f399d5d0954fb6fe4d4d9f7d3cbec4507633df5a45b11713 procs
@@ -156,6 +161,10 @@ lazysql linux-x86_64 https://github.com/jorgerojas26/lazysql/releases/download/v
 lazysql linux-arm64 https://github.com/jorgerojas26/lazysql/releases/download/v0.7.0/lazysql_Linux_arm64.tar.gz 2157e58f107bd9c250ad4d106e31d3f3484cfd93280b1c59f25a2dd0965e9128 lazysql
 lazysql macos-arm64 https://github.com/jorgerojas26/lazysql/releases/download/v0.7.0/lazysql_Darwin_arm64.tar.gz b6e6ac70d67f737cb8cf8e88a076e697f0b171518adc31d9c88f4e06856c81a1 lazysql
 lazysql macos-x86_64 https://github.com/jorgerojas26/lazysql/releases/download/v0.7.0/lazysql_Darwin_x86_64.tar.gz 9a070da390bc024ee9da14435ef3801ef7fd25c6387458fea9a3d0f549ad46b4 lazysql
+nvim linux-x86_64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz 474430d53e6264f6d6dd18db42d6dc9df3a1b56ca9e88a325bbf860e1a811d87 dir=nvim-linux-x86_64:bin/nvim needs=glibc
+nvim linux-arm64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-arm64.tar.gz 8f1f64a0bdb97247034038c3823c6cbad5bdf9ecd5751b85494b71c3ee04c815 dir=nvim-linux-arm64:bin/nvim needs=glibc
+nvim macos-arm64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-macos-arm64.tar.gz 1dbd148222b051ba6c307c4d17a318ed083df018a4f6a5a0ce46955ffc9ab87b dir=nvim-macos-arm64:bin/nvim
+nvim macos-x86_64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-macos-x86_64.tar.gz 481424f1dbc85f637d57e47d27d042aa9c883e5a4fe9ee64fc4ee9573b221998 dir=nvim-macos-x86_64:bin/nvim
 TOOLS
 }
 tool_rows() {
@@ -175,13 +184,19 @@ unzip_member() { # <zip> <member> <folder>
   fi
 }
 
+# glibc unless this is a musl system (Alpine): release builds for glibc do not run there
+libc="${HERDR_PLUGINS_LIBC:-}"
+if [ -z "$libc" ]; then
+  if [ "$os" = linux ] && ls /lib/ld-musl-* >/dev/null 2>&1; then libc=musl; else libc=glibc; fi
+fi
+
 refused=""
 if [ -n "$tools" ]; then
   bin="${HERDR_PLUGINS_BIN:-$HOME/.local/bin}"
   mkdir -p "$bin"
   say ""
   say "Tools (into $bin):"
-  for name in procs oxker dua yazi lazysql; do
+  for name in procs oxker dua yazi lazysql nvim; do
     if command -v "$name" >/dev/null 2>&1; then
       say "  $name: already installed ($(command -v "$name"))"
       continue
@@ -196,6 +211,18 @@ if [ -n "$tools" ]; then
     url=$3
     want=$4
     shift 4
+    members=""
+    needs=""
+    for field in "$@"; do
+      case "$field" in
+        needs=*) needs=${field#needs=} ;;
+        *) members="$members $field" ;;
+      esac
+    done
+    if [ "$needs" = glibc ] && [ "$libc" = musl ]; then
+      say "  $name: its release build needs glibc, which this system lacks; install it with your package manager (e.g. apk add neovim)"
+      continue
+    fi
     file="$tmp/$(basename "$url")"
     if ! fetch "$url" "$file"; then
       say "  $name: could not get $(basename "$url")${from:+ from $from}"
@@ -209,13 +236,30 @@ if [ -n "$tools" ]; then
     fi
     unpacked="$tmp/unpacked-$name"
     mkdir -p "$unpacked"
-    for member in "$@"; do
-      case "$file" in
-        *.zip) unzip_member "$file" "$member" "$unpacked" ;;
-        *) tar -xzf "$file" -C "$unpacked" "$member" ;;
-      esac || { say "  $name: could not unpack $member"; refused="$refused $name"; continue 2; }
-      cp "$unpacked/$member" "$bin/$(basename "$member")"
-      chmod 755 "$bin/$(basename "$member")"
+    for member in $members; do
+      case "$member" in
+        dir=*)
+          # a whole folder, kept beside the plugins, with its program linked
+          spec=${member#dir=}
+          folder=${spec%%:*}
+          program=${spec#*:}
+          home="$dir/vendor/$name"
+          tar -xzf "$file" -C "$unpacked" "$folder" ||
+            { say "  $name: could not unpack $folder"; refused="$refused $name"; continue 2; }
+          rm -rf "$home"
+          mkdir -p "$home"
+          mv "$unpacked/$folder" "$home/"
+          ln -sf "$home/$folder/$program" "$bin/$(basename "$program")"
+          ;;
+        *)
+          case "$file" in
+            *.zip) unzip_member "$file" "$member" "$unpacked" ;;
+            *) tar -xzf "$file" -C "$unpacked" "$member" ;;
+          esac || { say "  $name: could not unpack $member"; refused="$refused $name"; continue 2; }
+          cp "$unpacked/$member" "$bin/$(basename "$member")"
+          chmod 755 "$bin/$(basename "$member")"
+          ;;
+      esac
     done
     say "  $name: installed"
   done
@@ -252,6 +296,25 @@ EOF
       say "  Added the Usage tool (▤) to $config/tools.toml"
     else
       say "  Usage tool not added: it needs procs, oxker and dua"
+    fi
+    # the Editor tool: Neovim in a pane, listening so files can be opened in it
+    if grep -q '^id *= *"editor"' "$config/tools.toml"; then
+      :
+    elif have nvim; then
+      cat >> "$config/tools.toml" <<'EOF'
+
+# Added by the herdr-plugins installer: Neovim in a pane beside the work pane,
+# listening on a socket named after the workspace, so files can be opened in
+# it from outside:
+#   nvim --server "$HOME/.cache/nvim-editor-<workspace id>.sock" --remote <file>
+[[tool]]
+id      = "editor"
+name    = "Editor"
+icon    = "◫"
+command = ["sh", "-c", "d=${XDG_CACHE_HOME:-$HOME/.cache}; mkdir -p \"$d\"; s=\"$d/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\"; rm -f \"$s\"; exec nvim --listen \"$s\""]
+open    = "pane"
+EOF
+      say "  Added the Editor tool (◫) to $config/tools.toml"
     fi
   fi
 
