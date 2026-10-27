@@ -51,7 +51,7 @@ pub struct BarLayout {
 /// fit above the marker row.
 pub fn bar_layout(size: BarSize, count: usize, rule: bool, height: u16) -> BarLayout {
     let small = BarLayout { width: 3, rows: 1 };
-    let needed = count * 2 + usize::from(rule);
+    let needed = count * 2 + if rule { usize::from(rule_rows(2)) } else { 0 };
     match size {
         BarSize::Small => small,
         BarSize::Large if needed <= usize::from(height.saturating_sub(1)) => {
@@ -59,6 +59,12 @@ pub fn bar_layout(size: BarSize, count: usize, rule: bool, height: u16) -> BarLa
         }
         BarSize::Large => small,
     }
+}
+
+/// Rows the rule takes: with large buttons a blank row and then the line, so
+/// it has one blank row on each side like the icons; with small ones the line.
+fn rule_rows(button_rows: u16) -> u16 {
+    if button_rows >= 2 { 2 } else { 1 }
 }
 
 /// Where the rule goes: before the first tool that opens a pane, when tools
@@ -154,9 +160,13 @@ fn render_content(frame: &Frame, area: Rect, buf: &mut Buffer) {
 }
 
 /// Where button `i` sits in the bar, if it fits above the marker row. Buttons
-/// from the rule on sit one row lower.
+/// from the rule on sit below it.
 fn button(bar: Rect, rows: u16, i: usize, rule: Option<usize>) -> Option<Rect> {
-    let below_rule = u16::from(rule.is_some_and(|r| i >= r));
+    let below_rule = if rule.is_some_and(|r| i >= r) {
+        rule_rows(rows)
+    } else {
+        0
+    };
     let y = bar.y + (i as u16).checked_mul(rows)? + below_rule;
     // keep the last row for the reload/armed marker
     (y + rows <= bar.y + bar.height.saturating_sub(1)).then_some(Rect {
@@ -172,7 +182,7 @@ fn render_bar(frame: &Frame, area: Rect, rows: u16, rule: Option<usize>, buf: &m
     }
     // a dim line between the tools that run here and those that open a pane
     if let Some(r) = rule {
-        let y = area.y + r as u16 * rows;
+        let y = area.y + r as u16 * rows + rule_rows(rows) - 1;
         if y < area.y + area.height.saturating_sub(1) {
             let line = Rect {
                 y,
@@ -435,29 +445,31 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_with_large_buttons_shifts_the_pane_tools_down_one_row() {
+    fn a_rule_between_large_buttons_has_one_blank_row_on_each_side() {
         let t = draw_at(&bare(grouped(&RUNNING, 2, 1), BarSize::Large, None), 40, 12);
         let buf = t.backend().buffer();
         assert_eq!(buf[(37, 1)].symbol(), "◉");
-        assert_eq!(row(buf, 2, 40)[35..].to_string(), "─────", "the rule row");
-        assert_eq!(buf[(37, 4)].symbol(), "☑");
-        assert_eq!(buf[(37, 6)].symbol(), "▤");
+        assert_eq!(row(buf, 2, 40)[35..].trim(), "", "blank above the rule");
+        assert_eq!(row(buf, 3, 40)[35..].to_string(), "─────", "the rule row");
+        assert_eq!(row(buf, 4, 40)[35..].trim(), "", "blank below the rule");
+        assert_eq!(buf[(37, 5)].symbol(), "☑");
+        assert_eq!(buf[(37, 7)].symbol(), "▤");
         assert!(
-            buf[(35, 5)].modifier.contains(Modifier::REVERSED),
-            "selected, rows 5-6"
+            buf[(35, 6)].modifier.contains(Modifier::REVERSED),
+            "selected, rows 6-7"
         );
-        assert!(!buf[(35, 4)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(35, 5)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
     fn the_rule_counts_when_large_buttons_must_fit() {
-        // three tools and a rule need seven rows above the marker
+        // three tools and a rule with a blank row above it need eight rows above the marker
         assert_eq!(
-            bar_layout(BarSize::Large, 3, true, 8),
+            bar_layout(BarSize::Large, 3, true, 9),
             BarLayout { width: 5, rows: 2 }
         );
         assert_eq!(
-            bar_layout(BarSize::Large, 3, true, 7),
+            bar_layout(BarSize::Large, 3, true, 8),
             BarLayout { width: 3, rows: 1 }
         );
     }
@@ -467,11 +479,22 @@ mod tests {
         let bar = Rect::new(35, 0, 5, 12);
         let at = |y| button_at(bar, 2, 3, Some(1), y);
         assert_eq!((at(0), at(1)), (Some(0), Some(0)));
-        assert_eq!(at(2), None, "the rule row is no button");
-        assert_eq!((at(3), at(4)), (Some(1), Some(1)));
-        assert_eq!((at(5), at(6)), (Some(2), Some(2)));
-        assert_eq!(at(7), None, "below the buttons");
+        assert_eq!(
+            (at(2), at(3)),
+            (None, None),
+            "the gap and the rule are no button"
+        );
+        assert_eq!((at(4), at(5)), (Some(1), Some(1)));
+        assert_eq!((at(6), at(7)), (Some(2), Some(2)));
+        assert_eq!(at(8), None, "below the buttons");
         assert_eq!(at(11), None, "the marker row");
+        let small = Rect::new(37, 0, 3, 8);
+        assert_eq!(
+            button_at(small, 1, 3, Some(2), 2),
+            None,
+            "small: the rule only"
+        );
+        assert_eq!(button_at(small, 1, 3, Some(2), 3), Some(2));
     }
 
     #[test]
