@@ -1,6 +1,6 @@
 id = "jefelabs.toolbar"
 name = "Toolbar"
-version = "0.1.1"
+version = "0.1.2"
 min_herdr_version = "0.9.0"
 description = "Right-hand activity bar of tools, each hosted in its own terminal"
 platforms = ["macos", "linux"]
