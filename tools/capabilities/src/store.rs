@@ -200,6 +200,40 @@ pub struct Group {
     pub broken: Vec<(PathBuf, String)>,
 }
 
+impl Group {
+    /// The tree a workspace sees: only the top-level group named `scope`
+    /// (matched whatever its case), or an empty one at `<root>/<scope>` until
+    /// something is captured there. Nothing else at the top level shows.
+    /// `None` keeps the whole tree.
+    pub fn scoped(self, scope: Option<&str>) -> Group {
+        let Some(name) = scope else {
+            return self;
+        };
+        let mut groups: Vec<Group> = self
+            .groups
+            .into_iter()
+            .filter(|g| g.name.eq_ignore_ascii_case(name))
+            .take(1)
+            .collect();
+        if groups.is_empty() {
+            groups.push(Group {
+                path: self.path.join(name),
+                name: name.to_string(),
+                groups: Vec::new(),
+                intents: Vec::new(),
+                broken: Vec::new(),
+            });
+        }
+        Group {
+            path: self.path,
+            name: self.name,
+            groups,
+            intents: Vec::new(),
+            broken: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SaveError {
     /// The file's `updated` on disk differs from the one we loaded.
@@ -231,6 +265,21 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The group (relative to the root) captures for workspace `scope` go
+    /// to: an existing top-level folder of that name in any case, so they
+    /// land where the tree shows them, else `scope` as written.
+    pub fn scope_group(&self, scope: &str) -> PathBuf {
+        std::fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n.eq_ignore_ascii_case(scope))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(scope))
     }
 
     fn abs(&self, group: &Path) -> PathBuf {

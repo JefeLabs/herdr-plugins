@@ -21,6 +21,10 @@ herdr plugin config-dir jefelabs.capabilities      # ~/.config/herdr/plugins/con
 
 Standalone runs use the same directory, so the toolbar and a plain terminal always see one config and one root (`~/capabilities` by default). `CAPABILITIES_CONFIG_DIR` overrides the config dir and `CAPABILITIES_ROOT` the root, so a workspace can point at its own `capabilities/` folder through the toolbar's per-worktree config (`env = { CAPABILITIES_ROOT = "..." }`).
 
+## One workspace per project
+
+Inside Herdr the tree is scoped to the workspace: a workspace named `skoolscout` sees only the root's top-level `skoolscout` group, with its sub-groups as the tree, and nothing from other projects' groups. Name a workspace after its project's group (`herdr workspace rename <id> skoolscout`) and keep one workspace per project. The name matches the group's folder whatever its case. A workspace whose group does not exist yet shows it empty, and the first capture there creates it. Quick captures, `a` with nothing selected and an empty list all add at the top of the workspace's group. Paths are unchanged: areas and `m` still use paths from the root (`skoolscout/discover-schools/org/candidates`). The name is read from Herdr when the tool starts, so restart the tool after renaming a workspace. Outside Herdr the whole tree shows. `CAPABILITIES_SCOPE=<group>` chooses the group yourself, and `CAPABILITIES_SCOPE=` (empty) shows the whole tree inside Herdr too.
+
 ## In the toolbar
 
 Replace the Todo slot in the toolbar's `tools.toml`:
@@ -216,7 +220,7 @@ Keys in the list: `j`/`k` move, `PgUp`/`PgDn` move a screen of cards (less one, 
   skoolscout/applications/…
 ```
 
-There is no default group: quick captures (the `add` mode behind the toolbar's capture key) land at the top of the tree, and `a` in the tree adds to the selected group.
+There is no default group: quick captures (the `add` mode behind the toolbar's capture key) land at the top of the workspace's group (the top of the tree outside Herdr), and `a` in the tree adds to the selected group.
 
 Front matter: `title, kind, state (raw|refining|ready|sent), created, updated, repo, tags, polished_at, sent_to, conversations`. Hand edits are read leniently: unknown fields are preserved, a missing title falls back to the file name, dates may be `YYYY-MM-DD`, tags may be a scalar, states are case-insensitive, CRLF is fine. Every field change (state, kind, sent) reloads the file first, so two toolbars never clobber each other's text; a save or an apply over a file that changed since you opened it asks before overwriting.
 
