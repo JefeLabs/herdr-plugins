@@ -1,6 +1,6 @@
 [package]
 name = "herdr-capabilities"
-version = "0.1.2"
+version = "0.1.3"
 description = "Herdr plugin: capture, refine (with an agent) and send capabilities to agents"
 edition.workspace = true
 license.workspace = true
