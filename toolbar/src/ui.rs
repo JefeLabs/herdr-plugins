@@ -152,11 +152,15 @@ pub fn render(frame: &Frame, area: Rect, buf: &mut Buffer) {
     let buttons = frame.items.len() + usize::from(frame.toggle.is_some());
     let layout = bar_layout(frame.bar, buttons, rule.is_some(), area.height);
     let (content, bar) = split(area, layout.width);
-    if frame.toggle != Some(true) {
+    let compact = frame.toggle == Some(true);
+    if !compact {
         render_content(frame, content, buf);
     }
     render_bar(frame, bar, layout.rows, rule, buf);
-    render_hover(frame, content, bar, layout.rows, rule, buf);
+    // compact is just the icons: no names on hover
+    if !compact {
+        render_hover(frame, content, bar, layout.rows, rule, buf);
+    }
 }
 
 fn render_content(frame: &Frame, area: Rect, buf: &mut Buffer) {
@@ -618,12 +622,17 @@ mod tests {
             8,
         );
         assert!(row(t.backend().buffer(), 0, 37).ends_with(" Collapse "));
-        let t = draw_at(
-            &toggled(items(&RUNNING, 0), true, Some(Target::Toggle)),
-            40,
-            8,
-        );
-        assert!(row(t.backend().buffer(), 0, 37).ends_with(" Expand "));
+    }
+
+    #[test]
+    fn compact_shows_only_icons_and_no_hover_names() {
+        for hover in [Target::Toggle, Target::Tool(1)] {
+            let t = draw_at(&toggled(items(&RUNNING, 0), true, Some(hover)), 40, 8);
+            let buf = t.backend().buffer();
+            for y in 0..8 {
+                assert_eq!(row(buf, y, 37).trim(), "", "{hover:?}: row {y} stays blank");
+            }
+        }
     }
 
     #[test]
