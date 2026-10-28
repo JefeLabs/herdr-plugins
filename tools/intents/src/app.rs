@@ -2657,8 +2657,14 @@ impl App {
                     }
                     Awaiting::Confirm => {
                         st.input.clear();
-                        if text.is_empty() {
-                            self.next_question_or_write_up(&mut st, "That's right.".into());
+                        // a plain "yes" confirms; anything more is a correction
+                        if text.is_empty() || crate::interview::is_confirmation(&text) {
+                            let said = if text.is_empty() {
+                                "That's right.".to_string()
+                            } else {
+                                text
+                            };
+                            self.next_question_or_write_up(&mut st, said);
                         } else {
                             st.iv.corrections.push(text.clone());
                             self.start_interview_turn(&mut st, Step::Restate, text, true);
@@ -2962,7 +2968,7 @@ impl App {
                 let text = match &st.awaiting {
                     Awaiting::Words => "say it in your own words · Enter send · Esc cancel (nothing saved)".to_string(),
                     Awaiting::Turn => "waiting for the agent · Esc cancel".to_string(),
-                    Awaiting::Confirm => "Enter that's right · type a correction · Ctrl-d write it up now · Esc cancel".to_string(),
+                    Awaiting::Confirm => "Enter (or yes) that's right · type a correction · Ctrl-d write it up now · Esc cancel".to_string(),
                     Awaiting::Answer(_) => "Enter answer · Enter on empty skips · Ctrl-d write it up now · Esc cancel".to_string(),
                     Awaiting::Review => "Enter save · Tab change type · type to keep refining · Esc discard".to_string(),
                     Awaiting::Retry(reason) => {
@@ -7838,6 +7844,24 @@ mod tests {
             c[0]
         );
         assert!(!c[0].contains("question 1 of"), "{}", c[0]);
+    }
+
+    #[test]
+    fn yes_at_the_restatement_means_that_s_right() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[RESTATE, "question: Who sees it?"]);
+        start_bug_in_skoolscout(&mut fx);
+        type_str(&mut fx.app, "yes");
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        let c = calls(&fx);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(
+            c[1].contains("question 1 of at most 5"),
+            "asks, not restates: {}",
+            c[1]
+        );
+        assert_eq!(awaiting(&fx.app), "answer");
     }
 
     #[test]
