@@ -2647,7 +2647,7 @@ impl App {
             spec.extra.extend([spec.model_flag.clone(), m.clone()]);
         }
         // neutral per-intent directory: no repository in the provider's reach
-        let cwd = polish_cwd(self.store.root(), &intent.stem());
+        let cwd = polish_cwd(self.store.root(), &intent.polish_name());
         if let Err(e) = std::fs::create_dir_all(&cwd) {
             st.hint = Some(format!("cannot create {}: {e}", cwd.display()));
             return;
@@ -7423,6 +7423,31 @@ mod tests {
             "Saving twice duplicates the folder when offline"
         );
         assert_eq!(it.fm.kind, "issue", "polish judged it a bug");
+    }
+
+    #[test]
+    fn p_runs_in_the_remembered_polish_folder() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let it = fx.app.selected_intent().unwrap().clone();
+        // written through `extra` so this test compiles before the field exists
+        Store::update_fields(&it.path, |fm| {
+            fm.extra
+                .insert("polish_dir".into(), serde_yaml_ng::Value::from("new-x"));
+        })
+        .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('p'));
+        wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
+        let polish = fx.app.store.root().join(".polish");
+        assert!(
+            polish.join("new-x").is_dir(),
+            "runs in the remembered folder"
+        );
+        assert!(
+            !polish.join(it.stem()).exists(),
+            "not in a folder named after the file"
+        );
     }
 
     #[test]
