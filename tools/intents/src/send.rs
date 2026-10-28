@@ -10,7 +10,7 @@ use crate::config::{Config, Handoff};
 use crate::store::Intent;
 
 /// Handoffs that build code; planning handoffs never get the work-start preamble.
-const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec"];
+const BUILDING_HANDOFFS: &[&str] = &["issue-report", "enhancement-spec", "refactor-spec"];
 
 fn artifacts_preamble(intent: &Intent) -> String {
     format!(

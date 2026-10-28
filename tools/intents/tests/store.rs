@@ -782,3 +782,24 @@ fn captures_go_into_the_workspace_folder_as_it_is_spelled_on_disk() {
     assert_eq!(s.scope_group("SkoolScout"), Path::new("skoolscout"));
     assert_eq!(s.scope_group("tourneyseason"), Path::new("tourneyseason"));
 }
+
+#[test]
+fn polish_dir_round_trips_and_names_the_polish_folder() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("g"), "Split app", "refactor", "x\n", None)
+        .unwrap();
+    assert!(
+        !fs::read_to_string(&it.path).unwrap().contains("polish_dir"),
+        "absent until set"
+    );
+    assert_eq!(it.polish_name(), it.stem());
+    Store::update_fields(&it.path, |fm| fm.polish_dir = Some("new-ab12cd34".into())).unwrap();
+    let it = Store::load(&it.path).unwrap();
+    assert_eq!(it.polish_name(), "new-ab12cd34");
+    assert!(
+        fs::read_to_string(&it.path)
+            .unwrap()
+            .contains("polish_dir: new-ab12cd34")
+    );
+}

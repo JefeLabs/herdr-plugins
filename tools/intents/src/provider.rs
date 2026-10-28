@@ -120,8 +120,10 @@ pub struct Reply {
     /// A proposed title, from the reply's first line: `bug: …`,
     /// `capability: <who> can <what>` or `idea: …`.
     pub title: Option<String>,
-    /// The kind that line names (`issue`, `enhancement` or `idea`).
+    /// The kind that line names (`issue`, `refactor`, `enhancement` or `idea`).
     pub kind: Option<String>,
+    /// The home group a write-up names on its `group:` line.
+    pub group: Option<String>,
 }
 
 /// Find the fenced proposal block and the `questions:` list. Fences follow
@@ -174,6 +176,17 @@ pub fn parse_reply(text: &str) -> Reply {
             if !phrase.is_empty() {
                 reply.title = Some(phrase.to_string());
                 reply.kind = Some(kind.to_string());
+            }
+            continue;
+        }
+        if let Some(after) = header.strip_prefix("group:") {
+            let original = trimmed.trim_matches(|c| c == '*' || c == '_').trim();
+            let g = original[original.len() - after.len()..]
+                .trim()
+                .trim_matches(['`', '"', '\'', '*', '_'])
+                .trim();
+            if !g.is_empty() {
+                reply.group = Some(g.to_string());
             }
             continue;
         }

@@ -97,6 +97,11 @@ pub struct FrontMatter {
     /// `None` until first recorded; see `new_criteria` for how that is read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledged: Option<Vec<String>>,
+    /// The folder under `<root>/.polish/` its agent conversation runs in,
+    /// when that is not the file's stem (an intent added by conversation is
+    /// named only at the end; claude resumes only from the folder it began in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polish_dir: Option<String>,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -181,6 +186,10 @@ impl Intent {
     }
     pub fn assets_dir(&self) -> PathBuf {
         self.path.with_file_name(format!("{}.assets", self.stem()))
+    }
+    /// The folder name under `<root>/.polish/` this intent's agent runs in.
+    pub fn polish_name(&self) -> String {
+        self.fm.polish_dir.clone().unwrap_or_else(|| self.stem())
     }
     pub fn transcript_path(&self) -> PathBuf {
         self.path.with_file_name(format!("{}.chat.md", self.stem()))
@@ -364,6 +373,7 @@ impl Store {
             reconciled_for: Vec::new(),
             unread: false,
             acknowledged: None,
+            polish_dir: None,
             extra: BTreeMap::new(),
         };
         let mut it = Intent {

@@ -320,6 +320,7 @@ fn follow_up_prompts_always_carry_the_format_reminder() {
     assert!(resumed.starts_with("shorter please"), "{resumed}");
     for h in [
         "bug:",
+        "refactor:",
         "feature:",
         "idea:",
         "## Preconditions",

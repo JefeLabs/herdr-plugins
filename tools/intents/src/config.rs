@@ -9,7 +9,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 pub const PLUGIN_ID: &str = "jefelabs.intents";
-pub const KINDS: &[&str] = &["issue", "enhancement", "idea"];
+pub const KINDS: &[&str] = &["issue", "refactor", "enhancement", "idea"];
 
 /// How a kind is shown: an issue is a bug, an enhancement a feature.
 pub fn kind_label(kind: &str) -> &str {
@@ -25,6 +25,7 @@ pub fn kind_label(kind: &str) -> &str {
 pub fn kind_from_heading(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
         "bug" => Some("issue"),
+        "refactor" => Some("refactor"),
         "feature" | "capability" => Some("enhancement"),
         "idea" => Some("idea"),
         _ => None,
@@ -312,6 +313,30 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         include_str!("../defaults/issue.polish.md"),
     ),
     (
+        "templates/refactor.md",
+        include_str!("../defaults/refactor.md"),
+    ),
+    (
+        "templates/issue.interview.md",
+        include_str!("../defaults/issue.interview.md"),
+    ),
+    (
+        "templates/refactor.interview.md",
+        include_str!("../defaults/refactor.interview.md"),
+    ),
+    (
+        "templates/enhancement.interview.md",
+        include_str!("../defaults/enhancement.interview.md"),
+    ),
+    (
+        "templates/idea.interview.md",
+        include_str!("../defaults/idea.interview.md"),
+    ),
+    (
+        "templates/refactor.polish.md",
+        include_str!("../defaults/refactor.polish.md"),
+    ),
+    (
         "templates/enhancement.md",
         include_str!("../defaults/enhancement.md"),
     ),
@@ -372,6 +397,7 @@ fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
 fn old_polish_defaults(kind: &str) -> &'static [&'static str] {
     match kind {
         "issue" => &[
+            "20b7106aff84fd4b717831544a8f06854c38833ec267f0f58068174c6c2529a0",
             "cf7ac21cb266d2e0002d368fbe0fe96fa03ff8453c97b3a1652525468e7ce76f",
             "11e7b3af7e8908106dc33dc107b46886f9fcc55773bef2808cfbbad0d19b8b06",
             "2e6d4ad5ebfac608bf4ee1c75078d9a4212be580310d756b17144535599ddf37",
@@ -383,6 +409,7 @@ fn old_polish_defaults(kind: &str) -> &'static [&'static str] {
             "ffa2e9fa20d251d90f989ce7f6a805f992a31e318e4661d7ed3441d4a86b9588",
         ],
         "enhancement" => &[
+            "43b9f706e662b6d766a987e2f7211fc6f118941568b3bd1be70dcf202ac9d913",
             "27ffc89cbea7fcf80c2ae8da67716000803d66a6ff60e77f708536f31e3bab43",
             "17a497a254e4f121cf9dc8b5fec15f026a1199c5cfa9e687190bd87b4f42fad2",
             "54e77f65fe15a51ad42568636dff129f0c2cfd3600640b5996d6ef8a070aff15",
@@ -394,6 +421,7 @@ fn old_polish_defaults(kind: &str) -> &'static [&'static str] {
             "beafcfa500a95db86e7a7959792ed63af97d7f32ef5dd5fb979d8da058999955",
         ],
         "idea" => &[
+            "492bfbb1a517767aad1edfff50760b18337dcedb713ad687baec50740bc6676d",
             "7e002fbb1ec6ff488a4f458db4ccb03b810a5d576613cc80bd7126b093021cec",
             "0189d38bc264b506d1eff5ec5605a1de15ea48619b05206d4df77f9ea1c1e7a3",
             "07659af1a049460d5b8a336d2901a1a6e3d6c7d1ea19741659ad65e49068e4e4",
@@ -530,6 +558,16 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
 /// resume keeps working.
 pub fn polish_cwd(root: &Path, stem: &str) -> PathBuf {
     root.join(".polish").join(stem)
+}
+
+/// The kind's interview guide (`templates/<kind>.interview.md`): what an
+/// add-by-conversation agent asks about.
+pub fn interview_guide(dirs: &Dirs, kind: &str) -> anyhow::Result<String> {
+    let path = dirs
+        .config
+        .join("templates")
+        .join(format!("{kind}.interview.md"));
+    std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
 
 /// Body skeleton (`polish == false`) or polish prompt template for a kind.
@@ -767,6 +805,11 @@ pub fn builtin_handoffs() -> Vec<Handoff> {
             &["enhancement"],
             "Use the enhancement-spec skill to write this up as a GitHub issue. Show me the draft before posting.\n\n{intent}",
         ),
+        h(
+            "refactor-spec",
+            &["refactor"],
+            "Use the enhancement-spec skill to write this up as a refactor GitHub issue with the `refactor` label. Show me the draft before posting.\n\n{intent}",
+        ),
         h("grill", &["*"], "/grill-me\n\n{intent}"),
         h("wayfinder", &["*"], "/wayfinder\n\nDestination:\n{intent}"),
     ]
@@ -776,6 +819,61 @@ pub fn builtin_handoffs() -> Vec<Handoff> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn interview_guides_are_seeded_for_every_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        load_or_init(&dirs).unwrap();
+        for kind in KINDS {
+            let g = interview_guide(&dirs, kind).unwrap();
+            assert!(!g.trim().is_empty(), "{kind} has a guide");
+        }
+        assert!(
+            interview_guide(&dirs, "issue")
+                .unwrap()
+                .contains("expected")
+        );
+    }
+
+    #[test]
+    fn kinds_include_refactor_shown_as_refactor() {
+        assert_eq!(KINDS, ["issue", "refactor", "enhancement", "idea"]);
+        assert_eq!(kind_label("refactor"), "refactor");
+        assert_eq!(kind_from_heading("Refactor"), Some("refactor"));
+    }
+
+    #[test]
+    fn refactor_templates_are_seeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        load_or_init(&dirs).unwrap();
+        let t = dirs.config.join("templates");
+        assert!(t.join("refactor.md").is_file());
+        let polish = fs::read_to_string(t.join("refactor.polish.md")).unwrap();
+        assert!(
+            polish.contains("refactor: <what changes> in <where>"),
+            "{polish}"
+        );
+    }
+
+    #[test]
+    fn refactor_spec_handoff_applies_to_refactors() {
+        let all = builtin_handoffs();
+        let h = all
+            .iter()
+            .find(|h| h.name == "refactor-spec")
+            .expect("a refactor-spec hand-off");
+        assert_eq!(h.kinds, ["refactor"]);
+        assert!(h.prompt.contains("enhancement-spec"), "{}", h.prompt);
+        assert!(h.prompt.contains("`refactor` label"), "{}", h.prompt);
+    }
 
     #[test]
     fn kinds_are_shown_as_bug_feature_and_idea() {
@@ -1021,11 +1119,18 @@ mod tests {
         let names: Vec<&str> = cfg.handoffs.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(
             names,
-            ["issue-report", "enhancement-spec", "grill", "wayfinder"]
+            [
+                "issue-report",
+                "enhancement-spec",
+                "refactor-spec",
+                "grill",
+                "wayfinder"
+            ]
         );
         assert!(cfg.handoffs.iter().all(|h| h.provider == "claude"));
         assert_eq!(cfg.handoffs[0].kinds, ["issue"]);
-        assert_eq!(cfg.handoffs[2].kinds, ["*"]);
+        assert_eq!(cfg.handoffs[2].kinds, ["refactor"]);
+        assert_eq!(cfg.handoffs[3].kinds, ["*"]);
     }
 
     #[test]

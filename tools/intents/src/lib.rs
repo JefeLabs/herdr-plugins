@@ -5,6 +5,7 @@ pub mod config;
 pub mod conversation;
 pub mod demos;
 pub mod editor;
+pub mod interview;
 pub mod markdown;
 pub mod progress;
 pub mod provider;
