@@ -2585,6 +2585,16 @@ impl App {
                 self.discard_interview(st);
                 return Flow::Continue;
             }
+            (KeyCode::Enter, _)
+                if st.awaiting == Awaiting::Review && st.input.trim().is_empty() =>
+            {
+                self.save_interview(st, false);
+                return Flow::Continue;
+            }
+            (KeyCode::Tab, _) if st.awaiting == Awaiting::Review => {
+                let i = KINDS.iter().position(|k| *k == st.save_kind).unwrap_or(0);
+                st.save_kind = KINDS[(i + 1) % KINDS.len()].to_string();
+            }
             (KeyCode::Backspace, _) => {
                 st.input.pop();
             }
@@ -2636,6 +2646,11 @@ impl App {
                         let (step, message) = (st.step, st.message.clone());
                         self.start_interview_turn(&mut st, step, message, false);
                     }
+                    // typing at the write-up asks for a new one
+                    Awaiting::Review => {
+                        st.input.clear();
+                        self.start_interview_turn(&mut st, Step::WriteUp, text, true);
+                    }
                     _ => {}
                 }
             }
@@ -2644,6 +2659,69 @@ impl App {
         }
         self.screen = Screen::Interview(st);
         Flow::Continue
+    }
+
+    /// Files the interview as an intent: the write-up, or with `raw` the
+    /// owner's own words, in the group the reply names, else where `a` adds
+    /// today. The agent's folder is kept, so `p` resumes the conversation.
+    fn save_interview(&mut self, st: Box<InterviewScreen>, raw: bool) {
+        let (group, areas) = self.interview_target(&st);
+        let written = st
+            .write_up
+            .as_ref()
+            .and_then(|r| r.title.clone().zip(r.proposal.clone()));
+        let (title, body, areas) = match written {
+            Some((title, body)) if !raw => (title, body, areas),
+            _ => (st.iv.raw_title(), st.iv.raw_body(), Vec::new()),
+        };
+        let created = self.store.create(
+            Path::new(&group),
+            &title,
+            &st.save_kind,
+            &body,
+            crate::send::capture_repo(),
+        );
+        let it = match created {
+            Ok(it) => it,
+            Err(e) => {
+                self.message = Some(format!("save failed: {e:#}"));
+                self.screen = Screen::Interview(st);
+                return;
+            }
+        };
+        let folder = st
+            .folder
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string());
+        let (provider, conv) = (st.provider.clone(), st.conv_id.clone());
+        let _ = Store::update_fields(&it.path, |fm| {
+            fm.state = if raw { State::Raw } else { State::Refining };
+            fm.areas = areas;
+            fm.polish_dir = folder;
+            if let Some(c) = conv {
+                fm.conversations.insert(provider, c);
+            }
+        });
+        // the owner's own write-up: none of its criteria are someone else's news
+        let _ = crate::store::acknowledge_all_criteria(&it.path);
+        for (role, text) in &st.transcript {
+            let _ = Store::append_transcript(&it, role, text);
+        }
+        self.collapsed.remove(&self.store.root().join(&group));
+        self.rescan();
+        self.select_path(&it.path);
+        match self.list.iter().position(|i| i.path == it.path) {
+            Some(i) => self.list_selected = i,
+            None if self.layout == Layout::List => {
+                self.message = Some(format!(
+                    "added `{}`; the {} filter hides it (f changes it)",
+                    it.fm.title,
+                    self.filter.label()
+                ));
+            }
+            None => {}
+        }
+        self.screen = Screen::Browse;
     }
 
     /// Esc: nothing is kept, not even the agent's folder.
@@ -7896,6 +7974,194 @@ mod tests {
         assert_eq!(key(&mut fx.app, KeyCode::Char('b')), Flow::Continue);
         assert_eq!(fx.app.view().screen, "interview");
         assert_eq!(key(&mut fx.app, KeyCode::Esc), Flow::Quit);
+    }
+
+    /// After the kind is picked: the words, "that's right", then whatever the
+    /// queued replies lead to (RESTATE, "enough", a write-up → review).
+    fn talk_to_review(fx: &mut Fx, write_up: &str) {
+        agent_replies(fx, &[RESTATE, "enough", write_up]);
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review", "{:?}", fx.app.view().hint);
+    }
+
+    fn global_group(fx: &mut Fx) {
+        fx.app
+            .store
+            .create_group(Path::new("skoolscout"), "global")
+            .unwrap();
+        fx.app.rescan();
+    }
+
+    #[test]
+    fn enter_saves_the_write_up_as_a_refining_intent() {
+        let mut fx = setup("agy.jsonl");
+        global_group(&mut fx);
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        talk_to_review(&mut fx, WRITE_UP);
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "browse");
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert_eq!(
+            it.fm.title,
+            "Tenant admins are emailed when anyone accepts a team invite"
+        );
+        assert_eq!(
+            it.path.parent().unwrap(),
+            fx.app.store.root().join("skoolscout")
+        );
+        assert_eq!(
+            (it.fm.kind.as_str(), it.fm.state),
+            ("issue", State::Refining)
+        );
+        assert_eq!(it.fm.areas, ["skoolscout/global"]);
+        assert!(
+            it.fm
+                .polish_dir
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("new-"),
+            "{:?}",
+            it.fm.polish_dir
+        );
+        assert_eq!(
+            it.fm.conversations.get("fake").map(String::as_str),
+            Some("conv-int")
+        );
+        let chat = fs::read_to_string(it.transcript_path()).unwrap();
+        assert!(chat.contains(WORDS), "{chat}");
+        assert!(
+            crate::store::new_criteria(&it).is_empty(),
+            "the owner's own write-up has no unseen criteria"
+        );
+    }
+
+    #[test]
+    fn tab_changes_the_type_before_saving() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        talk_to_review(&mut fx, WRITE_UP);
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().interview.unwrap().save_kind, "refactor");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.selected_intent().unwrap().fm.kind, "refactor");
+    }
+
+    #[test]
+    fn typing_at_the_write_up_refines_it() {
+        let mut fx = setup("agy.jsonl");
+        global_group(&mut fx);
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        talk_to_review(&mut fx, WRITE_UP);
+        let moved = WRITE_UP.replace("group: skoolscout\n", "group: skoolscout/global\n");
+        agent_replies(&mut fx, &[&moved]);
+        type_str(&mut fx.app, "file it under skoolscout/global");
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        let c = calls(&fx);
+        let last = c.last().unwrap();
+        assert!(last.contains("file it under skoolscout/global"), "{last}");
+        assert!(last.contains(crate::interview::WRITE_UP_MARKER), "{last}");
+        assert_eq!(awaiting(&fx.app), "review");
+        key(&mut fx.app, KeyCode::Enter);
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert_eq!(
+            it.path.parent().unwrap(),
+            fx.app.store.root().join("skoolscout/global")
+        );
+        assert!(it.fm.areas.is_empty(), "{:?}", it.fm.areas);
+    }
+
+    #[test]
+    fn an_unknown_group_falls_back_to_where_a_adds_today() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        list_goto(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('i'));
+        talk_to_review(
+            &mut fx,
+            &WRITE_UP.replace("group: skoolscout\n", "group: nowhere\n"),
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert_eq!(
+            it.path.parent().unwrap(),
+            fx.app.store.root().join("skoolscout")
+        );
+        assert_eq!(it.fm.kind, "idea");
+    }
+
+    #[test]
+    fn p_after_saving_resumes_the_interview_conversation() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        talk_to_review(&mut fx, WRITE_UP);
+        key(&mut fx.app, KeyCode::Enter);
+        let it = fx.app.selected_intent().unwrap().clone();
+        key(&mut fx.app, KeyCode::Char('p'));
+        wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        let i = log.rfind("--prompt=").unwrap();
+        assert!(
+            log[..i].trim_end().ends_with("--resume=conv-int"),
+            "p resumes the interview's conversation"
+        );
+        assert!(
+            !fx.app.store.root().join(".polish").join(it.stem()).exists(),
+            "and runs in the interview's folder"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_falls_back_to_the_workspace_group() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        fx.app.reload_tree();
+        key(&mut fx.app, KeyCode::Char('v'));
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('i'));
+        talk_to_review(&mut fx, &WRITE_UP.replace("group: skoolscout\n", ""));
+        key(&mut fx.app, KeyCode::Enter);
+        let dir = fx.app.store.root().join("tourneyseason");
+        assert_eq!(md_files(&dir), 1, "saved in {}", dir.display());
+    }
+
+    #[test]
+    fn adding_in_a_new_workspace_creates_its_group() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        fx.app.reload_tree();
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('f'));
+        talk_to_review(&mut fx, &WRITE_UP.replace("group: skoolscout\n", ""));
+        key(&mut fx.app, KeyCode::Enter);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        assert!(
+            path.starts_with(fx.app.store.root().join("tourneyseason")),
+            "{}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn the_popup_closes_after_saving() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.start_capture();
+        key(&mut fx.app, KeyCode::Char('b'));
+        talk_to_review(&mut fx, WRITE_UP);
+        assert_eq!(key(&mut fx.app, KeyCode::Enter), Flow::Quit);
     }
 
     #[test]
