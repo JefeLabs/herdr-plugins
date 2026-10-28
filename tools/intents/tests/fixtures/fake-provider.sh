@@ -8,10 +8,16 @@ if [ "${FAKE_MODE:-}" = garbage ]; then
   echo "warning: model warming up"
   echo "not json at all"
 fi
+if [ -n "${FAKE_EVENTS_DIR:-}" ]; then
+  # a queue of replies: 1.jsonl, 2.jsonl, …; the last one repeats
+  n=$(cat "$FAKE_EVENTS_DIR/next" 2>/dev/null || echo 1)
+  FAKE_EVENTS="$FAKE_EVENTS_DIR/$n.jsonl"
+  [ -f "$FAKE_EVENTS_DIR/$((n + 1)).jsonl" ] && echo $((n + 1)) > "$FAKE_EVENTS_DIR/next"
+fi
 if [ -n "${FAKE_EVENTS:-}" ]; then
   while IFS= read -r line; do
     if [ "${FAKE_MODE:-}" = midturn ]; then
-      case "$line" in *'"event": "result"'*) continue ;; esac
+      case "$line" in *'"event": "result"'*|*'"event":"result"'*) continue ;; esac
     fi
     printf '%s\n' "$line"
     sleep 0.02

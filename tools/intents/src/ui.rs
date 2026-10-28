@@ -56,6 +56,15 @@ pub fn split(area: Rect) -> (Rect, Rect, Rect) {
     (h[0], h[1], v[1])
 }
 
+/// `(body, status line)` for a view that takes the whole tool area.
+pub fn split_status(area: Rect) -> (Rect, Rect) {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+    (v[0], v[1])
+}
+
 /// Right pane when the chat is open: `(intent above, chat below)`.
 pub fn split_chat(area: Rect) -> (Rect, Rect) {
     let v = Layout::default()
@@ -236,6 +245,19 @@ pub fn render_chat(
         height: 1,
         ..inner
     };
+    render_transcript(transcript, running, provider, scroll, body, buf);
+    render_input(input, hint, input_row, buf);
+}
+
+/// The conversation so far, Markdown for the agent's turns, tail kept in view.
+pub fn render_transcript(
+    transcript: &[(String, String)],
+    running: bool,
+    provider: &str,
+    scroll: u16,
+    body: Rect,
+    buf: &mut Buffer,
+) {
     let mut lines: Vec<Line> = Vec::new();
     let mut wrapped_total = 0usize;
     let width = body.width as usize;
@@ -276,12 +298,108 @@ pub fn render_chat(
         .wrap(Wrap { trim: false })
         .scroll((offset as u16, 0))
         .render(body, buf);
+}
+
+/// One reversed input line: `› text`, with an optional hint after it.
+pub fn render_input(input: &str, hint: Option<&str>, input_row: Rect, buf: &mut Buffer) {
     let prompt = sanitize(&match hint {
         Some(h) => format!("› {input}   [{h}]"),
         None => format!("› {input}"),
     });
     buf.set_style(input_row, Style::default().add_modifier(Modifier::REVERSED));
     Line::from(prompt).render(input_row, buf);
+}
+
+/// The add view's first screen: what kind of intent is this?
+pub fn render_kind_question(header: &str, area: Rect, buf: &mut Buffer) {
+    const TYPES: [(&str, &str, &str, &str); 4] = [
+        (
+            "b",
+            "bug",
+            "something goes wrong",
+            "asks what happens, what you expected, where, who sees it",
+        ),
+        (
+            "r",
+            "refactor",
+            "code that should change shape",
+            "asks which code, what hurts, what must not change",
+        ),
+        (
+            "f",
+            "feature",
+            "something new to build",
+            "asks who, what they can do, where, what success looks like",
+        ),
+        (
+            "i",
+            "idea",
+            "something to explore",
+            "asks what sparked it, who it is for, what makes it worth doing",
+        ),
+    ];
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = vec![
+        Line::from(Span::styled(header.to_string(), bold)),
+        Line::from(""),
+        Line::from("What is it?"),
+        Line::from(""),
+    ];
+    for (key, name, what, asks) in TYPES {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key} {name:<9}"), bold),
+            Span::raw(format!(" {what}")),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("              {asks}"),
+            dim,
+        )));
+    }
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(area, buf);
+}
+
+/// At the write-up: the type to save as, where it is filed, other areas.
+pub fn render_save_rows(
+    save_kind: &str,
+    suggested: Option<&str>,
+    group: &str,
+    areas: &[String],
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let mut chips: Vec<Span> = vec![Span::raw("save as:  ")];
+    for kind in crate::config::KINDS {
+        let label = crate::config::kind_label(kind);
+        if *kind == save_kind {
+            chips.push(Span::styled(
+                format!(" {label} "),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        } else {
+            chips.push(Span::raw(format!(" {label} ")));
+        }
+        chips.push(Span::raw(" "));
+    }
+    if let Some(s) = suggested.filter(|s| *s != save_kind) {
+        chips.push(Span::styled(
+            format!("  agent: this reads as a {}", crate::config::kind_label(s)),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    let also = if areas.is_empty() {
+        "-".to_string()
+    } else {
+        areas.join(" · ")
+    };
+    let lines = vec![
+        Line::from(chips),
+        Line::from(format!("in:       {group}")),
+        Line::from(format!("also:     {also}")),
+    ];
+    Paragraph::new(lines).render(area, buf);
 }
 
 /// Unified diff with context folding; `scroll` is the first visible line.

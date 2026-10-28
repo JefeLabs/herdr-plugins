@@ -1,0 +1,24 @@
+---
+source: tools/intents/src/app.rs
+expression: "render(&fx.app, 80, 20)"
+---
+bug · in skoolscout
+Tenant admins are emailed when anyone accepts a team invite
+
+Description
+
+x
+
+Acceptance criteria
+
+[ ] only the inviter
+
+skoolscout/global
+
+[ ] no email to others
+
+save as:   bug   refactor   feature   idea
+in:       skoolscout
+also:     skoolscout/global
+›
+Enter save · Tab change type · type to keep refining · Esc discard

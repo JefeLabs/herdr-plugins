@@ -238,6 +238,59 @@ pub fn parse_ask(text: &str) -> Asked {
     Asked::Question(text.trim().to_string())
 }
 
+/// What the add screen is waiting for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Awaiting {
+    /// The owner's own words.
+    Words,
+    /// The agent's turn is running.
+    Turn,
+    /// "Is that right?" after a restatement.
+    Confirm,
+    /// An answer to this question.
+    Answer(String),
+    /// The write-up is on screen.
+    Review,
+    /// The last turn failed, for this reason.
+    Retry(String),
+}
+
+impl Awaiting {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Awaiting::Words => "words",
+            Awaiting::Turn => "turn",
+            Awaiting::Confirm => "confirm",
+            Awaiting::Answer(_) => "answer",
+            Awaiting::Review => "review",
+            Awaiting::Retry(_) => "retry",
+        }
+    }
+}
+
+/// The add screen's state: the interview plus the turn machinery around it.
+pub struct InterviewScreen {
+    pub iv: Interview,
+    pub awaiting: Awaiting,
+    /// The running or last turn's step.
+    pub step: Step,
+    /// The input that turn was sent with (a retry re-sends it).
+    pub message: String,
+    pub turn: Option<crate::conversation::Turn>,
+    pub transcript: Vec<(String, String)>,
+    pub input: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub conv_id: Option<String>,
+    /// `<root>/.polish/new-xxxxxxxx`, where the agent runs.
+    pub folder: std::path::PathBuf,
+    /// Where `a` would add today: the group a save falls back to.
+    pub fallback: std::path::PathBuf,
+    pub write_up: Option<crate::provider::Reply>,
+    pub save_kind: String,
+    pub scroll: u16,
+}
+
 /// A fresh folder name under `<root>/.polish/` for one conversation.
 pub fn polish_folder_name() -> String {
     let id: String = uuid::Uuid::new_v4()
