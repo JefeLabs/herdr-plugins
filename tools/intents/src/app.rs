@@ -156,6 +156,9 @@ pub enum Screen {
         step: PickStep,
         items: Vec<String>,
         selected: usize,
+        /// Where to return after choosing or Esc (the add view after a
+        /// failure); `None` returns to the browser.
+        back: Option<Box<Screen>>,
     },
     /// Typing an answer for question `index` inline in the questions pane.
     Answer {
@@ -1676,7 +1679,8 @@ impl App {
                 step,
                 items,
                 selected,
-            } => self.key_agent_pick(step, items, selected, k),
+                back,
+            } => self.key_agent_pick(step, items, selected, back, k),
             Screen::Answer { index, text } => self.key_answer(index, text, k),
             Screen::Reader {
                 title,
@@ -1827,7 +1831,7 @@ impl App {
                     action: InputAction::NewGroup { parent },
                 };
             }
-            KeyCode::Char('m') => self.open_agent_pick(),
+            KeyCode::Char('m') => self.open_agent_pick(None),
             KeyCode::Char('M') => match self.rows.get(self.selected) {
                 Some(Row::Intent { .. }) => {
                     self.screen = Screen::Input {
@@ -2579,8 +2583,26 @@ impl App {
         match (k.code, ctrl) {
             (KeyCode::PageUp, _) => st.scroll = st.scroll.saturating_add(5),
             (KeyCode::PageDown, _) => st.scroll = st.scroll.saturating_sub(5),
+            // Esc stops the agent; the words stay, ready to retry or save raw
+            (KeyCode::Esc, _) if st.awaiting == Awaiting::Turn => {
+                if let Some(mut t) = st.turn.take() {
+                    t.cancel();
+                }
+                if let Some(last) = st.transcript.last_mut() {
+                    last.1.push_str("\n[cancelled]");
+                }
+                st.awaiting = Awaiting::Retry("cancelled".into());
+            }
             // the agent is working: nothing else until it answers
             _ if st.awaiting == Awaiting::Turn => {}
+            (KeyCode::Char('m'), false) if matches!(st.awaiting, Awaiting::Retry(_)) => {
+                self.open_agent_pick(Some(Box::new(Screen::Interview(st))));
+                return Flow::Continue;
+            }
+            (KeyCode::Char('s'), true) if matches!(st.awaiting, Awaiting::Retry(_)) => {
+                self.save_interview(st, true);
+                return Flow::Continue;
+            }
             (KeyCode::Esc, _) => {
                 self.discard_interview(st);
                 return Flow::Continue;
@@ -2905,9 +2927,24 @@ impl App {
                     Awaiting::Confirm => "Enter that's right · type a correction · Ctrl-d write it up now · Esc cancel".to_string(),
                     Awaiting::Answer(_) => "Enter answer · Enter on empty skips · Ctrl-d write it up now · Esc cancel".to_string(),
                     Awaiting::Review => "Enter save · Tab change type · type to keep refining · Esc discard".to_string(),
-                    Awaiting::Retry(reason) => format!("{reason} · Enter retry · Esc discard"),
+                    Awaiting::Retry(reason) => {
+                        format!("{reason} · Enter retry · m agent · Ctrl-s save raw · Esc discard")
+                    }
                 };
                 ui::render_status(&text, status, buf);
+            }
+            Screen::AgentPick {
+                step,
+                items,
+                selected,
+                ..
+            } => {
+                let title = match step {
+                    PickStep::Provider => "retry with which agent?".to_string(),
+                    PickStep::Model { provider } => format!("{provider}: which model?"),
+                };
+                ui::render_list(&title, items, *selected, body, buf);
+                ui::render_status("j/k choose · Enter select · Esc back", status, buf);
             }
             _ => {}
         }
@@ -2921,7 +2958,7 @@ impl App {
     }
 
     /// `m`: choose the agent, then its model, for every polish from now on.
-    fn open_agent_pick(&mut self) {
+    fn open_agent_pick(&mut self, back: Option<Box<Screen>>) {
         let items: Vec<String> = self.cfg.providers.keys().cloned().collect();
         let last = last_used(&self.dirs, &self.cfg);
         let selected = items.iter().position(|p| *p == last.provider).unwrap_or(0);
@@ -2929,6 +2966,7 @@ impl App {
             step: PickStep::Provider,
             items,
             selected,
+            back,
         };
     }
 
@@ -2937,16 +2975,18 @@ impl App {
         step: PickStep,
         items: Vec<String>,
         mut selected: usize,
+        back: Option<Box<Screen>>,
         k: KeyEvent,
     ) -> Flow {
         match k.code {
-            KeyCode::Esc => self.screen = Screen::Browse,
+            KeyCode::Esc => self.screen = back.map(|b| *b).unwrap_or(Screen::Browse),
             KeyCode::Char('j') | KeyCode::Down => {
                 selected = (selected + 1).min(items.len().saturating_sub(1));
                 self.screen = Screen::AgentPick {
                     step,
                     items,
                     selected,
+                    back,
                 };
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -2955,11 +2995,12 @@ impl App {
                     step,
                     items,
                     selected,
+                    back,
                 };
             }
             KeyCode::Enter => {
                 let Some(choice) = items.get(selected).cloned() else {
-                    self.screen = Screen::Browse;
+                    self.screen = back.map(|b| *b).unwrap_or(Screen::Browse);
                     return Flow::Continue;
                 };
                 match step {
@@ -2971,7 +3012,7 @@ impl App {
                             .map(|p| p.models.clone())
                             .unwrap_or_default();
                         if models.is_empty() {
-                            self.choose_agent(&choice, None);
+                            self.choose_agent(&choice, None, back);
                         } else {
                             let last = last_used(&self.dirs, &self.cfg);
                             let msel = if last.provider == choice {
@@ -2985,10 +3026,13 @@ impl App {
                                 step: PickStep::Model { provider: choice },
                                 items: models,
                                 selected: msel,
+                                back,
                             };
                         }
                     }
-                    PickStep::Model { provider } => self.choose_agent(&provider, Some(choice)),
+                    PickStep::Model { provider } => {
+                        self.choose_agent(&provider, Some(choice), back)
+                    }
                 }
             }
             _ => {
@@ -2996,15 +3040,26 @@ impl App {
                     step,
                     items,
                     selected,
+                    back,
                 }
             }
         }
         Flow::Continue
     }
 
-    /// Remembers the choice for every later polish and goes back to the tree.
-    fn choose_agent(&mut self, provider: &str, model: Option<String>) {
+    /// Remembers the choice for every later polish and goes back to the tree,
+    /// or to the add view the picker was opened from, which uses it at once.
+    fn choose_agent(&mut self, provider: &str, model: Option<String>, back: Option<Box<Screen>>) {
         self.remember_agent(provider, model.clone());
+        if let Some(back) = back {
+            let mut screen = *back;
+            if let Screen::Interview(st) = &mut screen {
+                st.provider = provider.to_string();
+                st.model = model;
+            }
+            self.screen = screen;
+            return;
+        }
         self.message = Some(match model {
             Some(m) => format!("polish will use {provider} · {m}   (m to change)"),
             None => format!("polish will use {provider}   (m to change)"),
@@ -4137,7 +4192,12 @@ impl App {
 
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
         self.last_area.set(area);
-        if matches!(self.screen, Screen::KindPick { .. } | Screen::Interview(_)) {
+        if matches!(
+            self.screen,
+            Screen::KindPick { .. }
+                | Screen::Interview(_)
+                | Screen::AgentPick { back: Some(_), .. }
+        ) {
             self.draw_adding(area, buf);
             return;
         }
@@ -8162,6 +8222,105 @@ mod tests {
         key(&mut fx.app, KeyCode::Char('b'));
         talk_to_review(&mut fx, WRITE_UP);
         assert_eq!(key(&mut fx.app, KeyCode::Enter), Flow::Quit);
+    }
+
+    /// Make reply `n` (1-based) of the queued replies an empty, failing one.
+    fn reply_fails(fx: &Fx, n: usize) {
+        let dir = fx
+            .app
+            .provider_env
+            .iter()
+            .find(|(k, _)| k == "FAKE_EVENTS_DIR")
+            .map(|(_, v)| PathBuf::from(v))
+            .unwrap();
+        fs::write(dir.join(format!("{n}.jsonl")), "").unwrap();
+    }
+
+    #[test]
+    fn ctrl_s_after_a_failure_saves_the_words_raw() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[RESTATE, "question: Which notification?", ""]);
+        reply_fails(&fx, 3);
+        start_bug_in_skoolscout(&mut fx);
+        key(&mut fx.app, KeyCode::Enter); // that's right
+        wait_turn(&mut fx.app);
+        type_str(&mut fx.app, "both");
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "retry");
+        fx.app
+            .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(fx.app.view().screen, "browse");
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert_eq!(it.fm.title, WORDS);
+        assert_eq!((it.fm.kind.as_str(), it.fm.state), ("issue", State::Raw));
+        assert!(it.body.contains(WORDS), "{}", it.body);
+        assert!(it.body.contains("→ both"), "{}", it.body);
+        assert_eq!(
+            it.path.parent().unwrap(),
+            fx.app.store.root().join("skoolscout")
+        );
+    }
+
+    #[test]
+    fn esc_on_a_running_turn_cancels_into_retry_and_keeps_the_words() {
+        let mut fx = setup("agy.jsonl");
+        let before = md_files(fx.app.store.root());
+        agent_replies(&mut fx, &[RESTATE]);
+        // a turn still in progress: the fake never sends its result line
+        fx.app
+            .provider_env
+            .push(("FAKE_MODE".into(), "midturn".into()));
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(awaiting(&fx.app), "turn");
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(awaiting(&fx.app), "retry");
+        assert!(
+            fx.app.view().hint.unwrap_or_default().contains("cancelled"),
+            "{:?}",
+            fx.app.view().hint
+        );
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().screen, "browse");
+        assert_eq!(md_files(fx.app.store.root()), before);
+        assert!(new_folders(fx.app.store.root()).is_empty());
+    }
+
+    #[test]
+    fn m_after_a_failure_picks_another_agent_and_returns() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &["", RESTATE]);
+        reply_fails(&fx, 1);
+        start_bug_in_skoolscout(&mut fx);
+        assert_eq!(awaiting(&fx.app), "retry");
+        key(&mut fx.app, KeyCode::Char('m'));
+        assert_eq!(fx.app.view().screen, "agent-pick");
+        let shown = render(&fx.app, 80, 20);
+        assert!(
+            !shown.contains("In the inbox") && !shown.contains("Alpha"),
+            "still its own view: {shown}"
+        );
+        key(&mut fx.app, KeyCode::Enter); // fake, preselected
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Enter); // model-b
+        assert_eq!(fx.app.view().screen, "interview");
+        assert_eq!(awaiting(&fx.app), "retry");
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        let i = log.rfind("--prompt=").unwrap();
+        let head = &log[..i];
+        let start = head.rfind('\n').map(|j| j + 1).unwrap_or(0);
+        assert!(
+            head[start..].contains("--model model-b"),
+            "the retry runs on the chosen model: {}",
+            &head[start..]
+        );
+        assert_eq!(awaiting(&fx.app), "confirm");
     }
 
     #[test]

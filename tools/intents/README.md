@@ -60,7 +60,9 @@ Adding is a conversation with the agent chosen by `m`, in its own view: the tree
 
 Where it is filed: pressing `a` on a group in the tree files it there unless you ask otherwise. From the card view or the popup the group is not known, so the agent proposes one from your existing groups, asking you if it cannot tell. A group the agent names that does not exist is ignored; the intent then goes where `a` would put it without a conversation (the selected card's group, or the top of the workspace's group).
 
-Nothing is written until you save: `Esc` at any point cancels and leaves no file behind. The saved intent starts as refining, with any skipped question under Open questions, and keeps the conversation, so a later `p` carries on with the same agent where the interview left off.
+Nothing is written until you save: `Esc` at any point cancels and leaves no file behind.
+
+When the agent fails (an error, no reply, a write-up with nothing to save) or you stop it with `Esc` while it works, your words stay on screen with the reason. `Enter` tries the same step again; `m` picks another agent and model and comes back to retry with it; `Ctrl-s` saves what you have so far as a raw intent, titled by the first line you typed, with your answers under Open questions, to polish later with `p`; `Esc` discards. The saved intent starts as refining, with any skipped question under Open questions, and keeps the conversation, so a later `p` carries on with the same agent where the interview left off.
 
 ## Shape of an intent
 
