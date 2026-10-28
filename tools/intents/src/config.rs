@@ -257,6 +257,9 @@ struct ProviderOverride {
     model: Option<String>,
     models: Option<Vec<String>>,
     model_flag: Option<String>,
+    /// Pass `--strict-mcp-config` (no MCP servers in polish turns). Unset:
+    /// yes, unless an organization-managed MCP config forbids it.
+    strict_mcp: Option<bool>,
 }
 
 fn default_send_kind() -> String {
@@ -480,6 +483,11 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
     };
 
     let mut providers = builtin_providers();
+    let strict_settings: BTreeMap<String, bool> = raw
+        .providers
+        .iter()
+        .filter_map(|(name, o)| o.strict_mcp.map(|b| (name.clone(), b)))
+        .collect();
     for (name, o) in raw.providers {
         let mut extra = o.extra.clone();
         if let Some(m) = &o.model {
@@ -527,6 +535,12 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
             }
         }
     }
+    let managed: Vec<&Path> = MANAGED_MCP_CONFIGS.iter().map(Path::new).collect();
+    apply_strict_mcp(
+        &mut providers,
+        &strict_settings,
+        managed_mcp_present(&managed),
+    );
     let mut handoffs = builtin_handoffs();
     for h in raw.handoff {
         match handoffs.iter_mut().find(|x| x.name == h.name) {
@@ -610,6 +624,35 @@ fn jsonl(
 /// event shapes come from real captures; codex and copilot follow their
 /// documented shapes and are unverified (codex account 402, copilot denied by
 /// policy on the capture machine).
+/// Where Claude Code looks for an organization-managed MCP config (macOS,
+/// then Linux). With one present it refuses `--strict-mcp-config`.
+pub const MANAGED_MCP_CONFIGS: &[&str] = &[
+    "/Library/Application Support/ClaudeCode/managed-mcp.json",
+    "/etc/claude-code/managed-mcp.json",
+];
+
+pub fn managed_mcp_present(paths: &[&Path]) -> bool {
+    paths.iter().any(|p| p.is_file())
+}
+
+/// Drops `--strict-mcp-config` from a provider's command lines where it must
+/// not go: `strict_mcp = false` in its `[providers.<name>]` table, or, with
+/// no setting, an organization-managed MCP config on this machine (claude
+/// refuses the flag then, and only the organization's servers load anyway).
+fn apply_strict_mcp(
+    providers: &mut BTreeMap<String, ProviderSpec>,
+    settings: &BTreeMap<String, bool>,
+    managed: bool,
+) {
+    for (name, spec) in providers.iter_mut() {
+        let keep = settings.get(name).copied().unwrap_or(!managed);
+        if !keep {
+            spec.polish.retain(|a| a != "--strict-mcp-config");
+            spec.resume.retain(|a| a != "--strict-mcp-config");
+        }
+    }
+}
+
 pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
     let mut m = BTreeMap::new();
     m.insert(
@@ -819,6 +862,77 @@ pub fn builtin_handoffs() -> Vec<Handoff> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn strict(p: &ProviderSpec) -> (bool, bool) {
+        let has = |argv: &[String]| argv.iter().any(|a| a == "--strict-mcp-config");
+        (has(&p.polish), has(&p.resume))
+    }
+
+    #[test]
+    fn strict_mcp_is_left_off_when_an_enterprise_mcp_config_is_present() {
+        let mut providers = builtin_providers();
+        apply_strict_mcp(&mut providers, &BTreeMap::new(), true);
+        assert_eq!(strict(&providers["claude"]), (false, false));
+        let mut providers = builtin_providers();
+        apply_strict_mcp(&mut providers, &BTreeMap::new(), false);
+        assert_eq!(
+            strict(&providers["claude"]),
+            (true, true),
+            "kept without one"
+        );
+    }
+
+    #[test]
+    fn the_strict_mcp_setting_wins_either_way() {
+        let off = BTreeMap::from([("claude".to_string(), false)]);
+        let mut providers = builtin_providers();
+        apply_strict_mcp(&mut providers, &off, false);
+        assert_eq!(strict(&providers["claude"]), (false, false));
+        let on = BTreeMap::from([("claude".to_string(), true)]);
+        let mut providers = builtin_providers();
+        apply_strict_mcp(&mut providers, &on, true);
+        assert_eq!(strict(&providers["claude"]), (true, true));
+    }
+
+    #[test]
+    fn a_managed_mcp_config_is_found_where_claude_looks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("managed-mcp.json");
+        assert!(!managed_mcp_present(&[file.as_path()]));
+        fs::write(&file, "{}").unwrap();
+        assert!(managed_mcp_present(&[
+            tmp.path().join("nope").as_path(),
+            file.as_path()
+        ]));
+        assert!(MANAGED_MCP_CONFIGS.contains(&"/etc/claude-code/managed-mcp.json"));
+        assert!(
+            MANAGED_MCP_CONFIGS
+                .contains(&"/Library/Application Support/ClaudeCode/managed-mcp.json")
+        );
+    }
+
+    #[test]
+    fn strict_mcp_false_in_intents_toml_drops_the_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        load_or_init(&dirs).unwrap();
+        let path = dirs.config.join("intents.toml");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("\n[providers.claude]\nstrict_mcp = false\n");
+        fs::write(&path, text).unwrap();
+        let cfg = load_or_init(&dirs).unwrap();
+        assert_eq!(strict(&cfg.providers["claude"]), (false, false));
+        assert!(
+            cfg.providers["claude"]
+                .polish
+                .iter()
+                .any(|a| a == "--permission-mode"),
+            "the rest of the built-in argv stays"
+        );
+    }
 
     #[test]
     fn interview_guides_are_seeded_for_every_kind() {
@@ -1167,9 +1281,10 @@ mod tests {
         let has = |p: &ProviderSpec, flag: &str| {
             p.polish.iter().any(|a| a == flag) && p.resume.iter().any(|a| a == flag)
         };
+        assert!(has(&cfg.providers["claude"], "--permission-mode"));
         assert!(
-            has(&cfg.providers["claude"], "--permission-mode")
-                && has(&cfg.providers["claude"], "--strict-mcp-config")
+            has(&builtin_providers()["claude"], "--strict-mcp-config"),
+            "the built-in claude loads no MCP servers (unless the machine forbids the flag)"
         );
         let claude = &cfg.providers["claude"];
         let i = claude.polish.iter().position(|a| a == "--tools").unwrap();

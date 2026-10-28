@@ -7,6 +7,12 @@ polish_provider = "agy"        # agy | claude | codex | copilot | <custom>
 send_provider = "claude"       # fallback for handoffs that name no provider
 # workbrokr = true             # force on/off; default detects helmsmith.config.ts
 
+# claude polishes with `--strict-mcp-config` (no MCP servers), left off
+# automatically when your organization manages MCP servers on this machine
+# (claude refuses the flag then). Force it either way:
+# [providers.claude]
+# strict_mcp = false
+
 # Custom provider example:
 # [providers.mine]
 # polish = ["my-cli", "--prompt", "{prompt}"]
