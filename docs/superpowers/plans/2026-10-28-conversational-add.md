@@ -345,7 +345,13 @@ View.interview: Option<InterviewView>          // set when screen == "interview"
   - Esc in Words, Confirm, Answer, Review or Retry discards: delete `folder` and go to Browse.
   - Esc in Turn: Task 6.
 - **Resumable** means `conv_id.is_some()` and the provider has a `resume` argv, as in `key_chat`.
-- **Draw:** the interview has its own view (owner, 2026-10-28). `Screen::Interview` takes the whole tool area in both layouts, with no tree and no cards drawn beside it. From top to bottom:
+- **Draw:** adding has its own view (owner, 2026-10-28). `Screen::KindPick` and `Screen::Interview` take the whole tool area in both layouts and in the popup, with no tree and no cards drawn beside or behind them.
+  - The type question is the view's first screen:
+    - the header `new intent · in <home>`;
+    - the four types, one per line with what each one asks about, using the mockup's wording;
+    - the status line `b/r/f/i choose · Esc cancel`.
+  - It is no longer a status-line prompt over the tree.
+  - The conversation screen, from top to bottom:
   - the header `<kind label> · in <home>`, plus `· question N of up to 5` while asking;
   - the transcript, reusing the chat's transcript rendering;
   - at Review, the save rows;
@@ -391,6 +397,9 @@ View.interview: Option<InterviewView>          // set when screen == "interview"
       - the log has 2 calls carrying the same words.
     - `esc_discards_and_leaves_no_file_or_folder`: Esc at confirm. The screen is `browse`, no new `.md` file exists, and no `<root>/.polish/new-*` folder exists.
     - `in_the_card_view_the_home_group_is_unknown`: `v`, `a`, `i` gives home `group to be decided`. After restate and confirm, the ask prompt contains `Home group: unknown`.
+    - `adding_starts_in_its_own_view`:
+      - in the tree, select `skoolscout`, press `a`; an 80×20 render's first line contains `new intent · in skoolscout`, the render contains `r refactor`, and it contains neither `In the inbox` nor `Alpha`;
+      - `start_capture()` on a fresh app renders the type question with no tree rows.
     - `the_interview_has_its_own_view`:
       - in the tree, select `skoolscout`, press `a`, `b`; an 80×20 render's first line contains `bug · in skoolscout`, and the render contains neither `In the inbox` nor `Alpha`;
       - in the card view, `v`, `a`, `i` renders with neither `Alpha` nor `Beta`.
