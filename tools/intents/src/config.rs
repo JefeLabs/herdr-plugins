@@ -711,6 +711,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "claude",
                 "--output-format",
                 "stream-json",
+                "--verbose",
                 "--include-partial-messages",
                 "--session-id",
                 "{conv}",
@@ -728,6 +729,7 @@ pub fn builtin_providers() -> BTreeMap<String, ProviderSpec> {
                 "{conv}",
                 "--output-format",
                 "stream-json",
+                "--verbose",
                 "--include-partial-messages",
                 "--permission-mode",
                 "plan",
@@ -866,6 +868,22 @@ mod tests {
     fn strict(p: &ProviderSpec) -> (bool, bool) {
         let has = |argv: &[String]| argv.iter().any(|a| a == "--strict-mcp-config");
         (has(&p.polish), has(&p.resume))
+    }
+
+    #[test]
+    fn claude_streams_with_verbose_so_every_version_accepts_it() {
+        // older claude refuses `-p --output-format stream-json` without --verbose
+        let claude = &builtin_providers()["claude"];
+        assert!(
+            claude.polish.iter().any(|a| a == "--verbose"),
+            "{:?}",
+            claude.polish
+        );
+        assert!(
+            claude.resume.iter().any(|a| a == "--verbose"),
+            "{:?}",
+            claude.resume
+        );
     }
 
     #[test]
