@@ -803,3 +803,22 @@ fn polish_dir_round_trips_and_names_the_polish_folder() {
             .contains("polish_dir: new-ab12cd34")
     );
 }
+
+#[test]
+fn a_polish_dir_that_is_not_one_plain_folder_is_ignored() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("g"), "Split app", "refactor", "x\n", None)
+        .unwrap();
+    for bad in ["../../elsewhere", "/abs/path", "a/b", "..", ".", "", "x\\y"] {
+        Store::update_fields(&it.path, |fm| fm.polish_dir = Some(bad.into())).unwrap();
+        let it = Store::load(&it.path).unwrap();
+        assert_eq!(
+            it.polish_name(),
+            it.stem(),
+            "{bad:?} must not leave .polish/"
+        );
+    }
+    Store::update_fields(&it.path, |fm| fm.polish_dir = Some("new-ab12cd34".into())).unwrap();
+    assert_eq!(Store::load(&it.path).unwrap().polish_name(), "new-ab12cd34");
+}

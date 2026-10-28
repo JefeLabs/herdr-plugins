@@ -188,8 +188,13 @@ impl Intent {
         self.path.with_file_name(format!("{}.assets", self.stem()))
     }
     /// The folder name under `<root>/.polish/` this intent's agent runs in.
+    /// `polish_dir` counts only as one plain folder name: anything that could
+    /// point outside `.polish/` (a path, `..`, an absolute path) is ignored.
     pub fn polish_name(&self) -> String {
-        self.fm.polish_dir.clone().unwrap_or_else(|| self.stem())
+        match self.fm.polish_dir.as_deref() {
+            Some(d) if is_plain_folder(d) => d.to_string(),
+            _ => self.stem(),
+        }
     }
     pub fn transcript_path(&self) -> PathBuf {
         self.path.with_file_name(format!("{}.chat.md", self.stem()))
@@ -525,6 +530,14 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// One ordinary folder name: no separators, not `.` or `..`, not empty.
+fn is_plain_folder(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    !name.contains(['/', '\\'])
+        && matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        && parts.next().is_none()
 }
 
 /// The change stamp used for conflict detection: `updated` when present, else
