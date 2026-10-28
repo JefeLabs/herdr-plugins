@@ -2623,13 +2623,24 @@ impl App {
             (KeyCode::Char('d'), true)
                 if matches!(st.awaiting, Awaiting::Confirm | Awaiting::Answer(_)) =>
             {
+                // what is typed counts: an answer, or a correction
+                let typed = st.input.trim().to_string();
                 let message = match &st.awaiting {
                     Awaiting::Answer(q) => {
+                        let answer = (!typed.is_empty()).then(|| typed.clone());
                         st.iv.qas.push(Qa {
                             question: q.clone(),
-                            answer: None,
+                            answer,
                         });
-                        "(skipped)".to_string()
+                        if typed.is_empty() {
+                            "(skipped)".to_string()
+                        } else {
+                            typed
+                        }
+                    }
+                    _ if !typed.is_empty() => {
+                        st.iv.corrections.push(typed.clone());
+                        typed
                     }
                     _ => String::new(),
                 };
@@ -2671,6 +2682,7 @@ impl App {
                     // typing at the write-up asks for a new one
                     Awaiting::Review => {
                         st.input.clear();
+                        st.iv.refinements.push(text.clone());
                         self.start_interview_turn(&mut st, Step::WriteUp, text, true);
                     }
                     _ => {}
@@ -2688,13 +2700,13 @@ impl App {
     /// today. The agent's folder is kept, so `p` resumes the conversation.
     fn save_interview(&mut self, st: Box<InterviewScreen>, raw: bool) {
         let (group, areas) = self.interview_target(&st);
-        let written = st
-            .write_up
-            .as_ref()
-            .and_then(|r| r.title.clone().zip(r.proposal.clone()));
-        let (title, body, areas) = match written {
-            Some((title, body)) if !raw => (title, body, areas),
-            _ => (st.iv.raw_title(), st.iv.raw_body(), Vec::new()),
+        // Ctrl-s after a failed refinement keeps the write-up that was on
+        // screen, with the request it did not get to under Open questions
+        let pending = (raw && st.step == Step::WriteUp && !st.message.trim().is_empty())
+            .then(|| st.message.clone());
+        let (title, body, areas, raw) = match written_intent(&st, pending.as_deref()) {
+            Some((title, body)) => (title, body, areas, false),
+            None => (st.iv.raw_title(), st.iv.raw_body(), Vec::new(), true),
         };
         let created = self.store.create(
             Path::new(&group),
@@ -2744,6 +2756,33 @@ impl App {
             None => {}
         }
         self.screen = Screen::Browse;
+    }
+
+    /// Before the process exits (process::exit skips destructors): stop every
+    /// agent this tool started, and leave no unsaved interview's folder behind.
+    pub fn shutdown(&mut self) {
+        if let Screen::Chat(st) = &mut self.screen
+            && let Some(t) = st.turn.as_mut()
+        {
+            t.cancel();
+        }
+        let interview = match &mut self.screen {
+            Screen::Interview(st) => Some(st),
+            Screen::AgentPick { back: Some(b), .. } => match b.as_mut() {
+                Screen::Interview(st) => Some(st),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(st) = interview {
+            if let Some(mut t) = st.turn.take() {
+                t.cancel();
+            }
+            let _ = std::fs::remove_dir_all(&st.folder);
+        }
+        for (_, turn, _) in self.reconcile_jobs.values_mut() {
+            turn.cancel();
+        }
     }
 
     /// Esc: nothing is kept, not even the agent's folder.
@@ -2885,7 +2924,7 @@ impl App {
                         ratatui::layout::Constraint::Length(1),
                         ratatui::layout::Constraint::Min(1),
                         ratatui::layout::Constraint::Length(if review { 3 } else { 0 }),
-                        ratatui::layout::Constraint::Length(1),
+                        ratatui::layout::Constraint::Length(ui::input_rows(&st.input, body.width)),
                     ])
                     .split(body);
                 ratatui::text::Line::from(ratatui::text::Span::styled(
@@ -2896,9 +2935,8 @@ impl App {
                 // at the write-up, its last turn reads as the intent: the
                 // title, then the body, without the reply's markers
                 let mut shown = st.transcript.clone();
-                if let (true, Some(w), Some(last)) =
-                    (review, st.write_up.as_ref(), shown.last_mut())
-                    && let (Some(title), Some(body)) = (w.title.as_deref(), w.proposal.as_deref())
+                if let (true, Some(last)) = (review, shown.last_mut())
+                    && let Some((title, body)) = written_intent(st, None)
                 {
                     last.1 = format!("**{title}**\n\n{}", body.trim_end());
                 }
@@ -2920,7 +2958,7 @@ impl App {
                         buf,
                     );
                 }
-                ui::render_input(&st.input, None, rows[3], buf);
+                ui::render_input_box(&st.input, rows[3], buf);
                 let text = match &st.awaiting {
                     Awaiting::Words => "say it in your own words · Enter send · Esc cancel (nothing saved)".to_string(),
                     Awaiting::Turn => "waiting for the agent · Esc cancel".to_string(),
@@ -3054,6 +3092,11 @@ impl App {
         if let Some(back) = back {
             let mut screen = *back;
             if let Screen::Interview(st) = &mut screen {
+                if st.provider != provider {
+                    // its conversation id means nothing to another agent:
+                    // the next turn starts fresh and carries everything
+                    st.conv_id = None;
+                }
                 st.provider = provider.to_string();
                 st.model = model;
             }
@@ -4666,16 +4709,9 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
         }
     })();
 
-    if let Screen::Chat(st) = &mut app.screen
-        && let Some(t) = st.turn.as_mut()
-    {
-        t.cancel();
-    }
-    // stop running reconciles: process::exit below skips destructors, and an
-    // agent left running outlives this slot
-    for (_, turn, _) in app.reconcile_jobs.values_mut() {
-        turn.cancel();
-    }
+    // process::exit below skips destructors, and an agent left running
+    // outlives this slot
+    app.shutdown();
     restore_terminal();
     match outcome {
         Ok(()) => std::process::exit(0),
@@ -4685,6 +4721,26 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
             std::process::exit(1)
         }
     }
+}
+
+/// The write-up as it would be saved: its title, and its body with the
+/// agent's remaining questions, any skipped question it left out, and
+/// `pending` (a change asked for but not applied) under Open questions.
+fn written_intent(st: &InterviewScreen, pending: Option<&str>) -> Option<(String, String)> {
+    let r = st.write_up.as_ref()?;
+    let title = r.title.clone()?;
+    let proposal = r.proposal.clone()?;
+    let mut qs = r.questions.clone();
+    for qa in st.iv.qas.iter().filter(|qa| qa.answer.is_none()) {
+        let q = qa.question.trim();
+        if !q.is_empty() && !proposal.contains(q) && !qs.iter().any(|x| x.trim() == q) {
+            qs.push(q.to_string());
+        }
+    }
+    if let Some(p) = pending.map(str::trim).filter(|p| !p.is_empty()) {
+        qs.push(format!("Not applied yet: {p}"));
+    }
+    Some((title, merge_questions(&proposal, &qs)))
 }
 
 /// The question that starts an add.
@@ -7886,10 +7942,16 @@ mod tests {
         type_str(&mut fx.app, WORDS);
         key(&mut fx.app, KeyCode::Enter);
         assert_eq!(awaiting(&fx.app), "turn");
+        type_str(&mut fx.app, "more"); // a non-empty box: Enter would send it
         key(&mut fx.app, KeyCode::Enter);
         std::thread::sleep(Duration::from_millis(200));
         fx.app.tick();
         assert_eq!(calls(&fx).len(), 1, "no second turn");
+        assert_eq!(
+            fx.app.view().transcript_len,
+            2,
+            "the words and the agent's turn, nothing more"
+        );
         assert_eq!(awaiting(&fx.app), "turn");
     }
 
@@ -8321,6 +8383,169 @@ mod tests {
             &head[start..]
         );
         assert_eq!(awaiting(&fx.app), "confirm");
+    }
+
+    #[test]
+    fn switching_agent_after_a_turn_starts_a_fresh_conversation() {
+        let mut fx = setup("agy.jsonl");
+        let mut other = fake_spec();
+        other.name = "fake2".into();
+        fx.app.cfg.providers.insert("fake2".into(), other);
+        agent_replies(&mut fx, &[RESTATE, "", RESTATE]);
+        reply_fails(&fx, 2);
+        start_bug_in_skoolscout(&mut fx); // conv-int from the first agent
+        key(&mut fx.app, KeyCode::Enter); // that's right → the ask fails
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "retry");
+        key(&mut fx.app, KeyCode::Char('m'));
+        key(&mut fx.app, KeyCode::Char('j')); // fake → fake2
+        key(&mut fx.app, KeyCode::Enter);
+        key(&mut fx.app, KeyCode::Enter); // its first model
+        assert_eq!(fx.app.view().screen, "interview");
+        key(&mut fx.app, KeyCode::Enter); // retry on fake2
+        wait_turn(&mut fx.app);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        let i = log.rfind("--prompt=").unwrap();
+        let head = &log[..i];
+        let start = head.rfind('\n').map(|j| j + 1).unwrap_or(0);
+        assert!(
+            !head[start..].contains("--resume="),
+            "another agent cannot resume the first one's conversation: {}",
+            &head[start..]
+        );
+        assert!(
+            calls(&fx).last().unwrap().contains(WORDS),
+            "so it gets everything"
+        );
+    }
+
+    #[test]
+    fn the_agents_open_questions_are_kept() {
+        let mut fx = setup("agy.jsonl");
+        let write_up =
+            WRITE_UP.replace("questions: none\n", "questions:\n- Which email template?\n");
+        agent_replies(&mut fx, &[RESTATE, "question: Who gets it?", &write_up]);
+        start_bug_in_skoolscout(&mut fx);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        fx.app
+            .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)); // skip it, write up
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+        let shown = render(&fx.app, 100, 40);
+        assert!(
+            shown.contains("Which email template?"),
+            "shown at review: {shown}"
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert!(it.body.contains("Which email template?"), "{}", it.body);
+        assert!(
+            it.body.contains("Who gets it?"),
+            "the skipped one too: {}",
+            it.body
+        );
+        assert_eq!(it.open_questions(), 2, "{}", it.body);
+    }
+
+    #[test]
+    fn ctrl_s_after_a_failed_refinement_keeps_the_write_up() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        talk_to_review(&mut fx, WRITE_UP);
+        agent_replies(&mut fx, &[""]);
+        reply_fails(&fx, 1);
+        type_str(&mut fx.app, "shorten it");
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "retry");
+        fx.app
+            .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let it = fx.app.selected_intent().unwrap().clone();
+        assert_eq!(
+            it.fm.title,
+            "Tenant admins are emailed when anyone accepts a team invite"
+        );
+        assert!(it.body.contains("only the inviter"), "{}", it.body);
+        assert!(
+            it.body.contains("shorten it"),
+            "the unsent request is kept: {}",
+            it.body
+        );
+        assert_eq!(it.fm.state, State::Refining);
+    }
+
+    #[test]
+    fn quitting_mid_interview_stops_the_agent_and_leaves_no_folder() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[RESTATE]);
+        fx.app
+            .provider_env
+            .push(("FAKE_MODE".into(), "midturn".into()));
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(awaiting(&fx.app), "turn");
+        assert_eq!(new_folders(fx.app.store.root()).len(), 1);
+        fx.app.shutdown();
+        assert!(new_folders(fx.app.store.root()).is_empty());
+        if let Screen::Interview(st) = &fx.app.screen {
+            assert!(st.turn.is_none(), "the agent is stopped");
+        }
+    }
+
+    #[test]
+    fn ctrl_d_keeps_a_typed_answer_or_correction() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[RESTATE, "question: Who?", WRITE_UP]);
+        start_bug_in_skoolscout(&mut fx);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        type_str(&mut fx.app, "only the inviter");
+        fx.app
+            .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        wait_turn(&mut fx.app);
+        let c = calls(&fx);
+        assert!(
+            c.last().unwrap().contains("only the inviter"),
+            "{}",
+            c.last().unwrap()
+        );
+
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[RESTATE, WRITE_UP]);
+        start_bug_in_skoolscout(&mut fx);
+        type_str(&mut fx.app, "only admins");
+        fx.app
+            .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        wait_turn(&mut fx.app);
+        let c = calls(&fx);
+        assert!(
+            c.last().unwrap().contains("only admins"),
+            "{}",
+            c.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn long_words_wrap_in_the_input_box() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        let words: String =
+            (0..30).map(|i| format!("word{i} ")).collect::<String>() + "the-very-end";
+        type_str(&mut fx.app, &words);
+        let shown = render(&fx.app, 80, 20);
+        assert!(shown.contains("word0"), "{shown}");
+        assert!(
+            shown.contains("the-very-end"),
+            "the whole text shows, wrapped: {shown}"
+        );
     }
 
     #[test]

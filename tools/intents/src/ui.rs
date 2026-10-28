@@ -300,6 +300,33 @@ pub fn render_transcript(
         .render(body, buf);
 }
 
+/// Rows a wrapped input box needs for `input` at `width`, from 1 to 6.
+pub fn input_rows(input: &str, width: u16) -> u16 {
+    let w = width.max(1) as usize;
+    let rows: usize = format!("› {input}")
+        .split('\n')
+        .map(|l| l.chars().count().max(1).div_ceil(w))
+        .sum();
+    rows.clamp(1, 6) as u16
+}
+
+/// A reversed input box that wraps, keeping the end of the text in view.
+pub fn render_input_box(input: &str, area: Rect, buf: &mut Buffer) {
+    let text = format!("› {input}");
+    let w = area.width.max(1) as usize;
+    let lines: Vec<Line> = text.split('\n').map(|l| Line::from(sanitize(l))).collect();
+    let total: usize = text
+        .split('\n')
+        .map(|l| l.chars().count().max(1).div_ceil(w))
+        .sum();
+    let offset = total.saturating_sub(area.height as usize);
+    buf.set_style(area, Style::default().add_modifier(Modifier::REVERSED));
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((offset as u16, 0))
+        .render(area, buf);
+}
+
 /// One reversed input line: `› text`, with an optional hint after it.
 pub fn render_input(input: &str, hint: Option<&str>, input_row: Rect, buf: &mut Buffer) {
     let prompt = sanitize(&match hint {

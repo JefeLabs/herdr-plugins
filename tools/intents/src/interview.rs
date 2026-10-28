@@ -46,6 +46,8 @@ pub struct Interview {
     pub words: String,
     pub corrections: Vec<String>,
     pub qas: Vec<Qa>,
+    /// What the owner asked to change at the write-up, in order.
+    pub refinements: Vec<String>,
 }
 
 impl Interview {
@@ -58,6 +60,7 @@ impl Interview {
             words: String::new(),
             corrections: Vec::new(),
             qas: Vec::new(),
+            refinements: Vec::new(),
         }
     }
 
@@ -117,6 +120,12 @@ impl Interview {
                 p.push_str(&format!("- {}\n", c.trim()));
             }
         }
+        if !self.refinements.is_empty() {
+            p.push_str("\nChanges the author asked for at the write-up:\n");
+            for r in &self.refinements {
+                p.push_str(&format!("- {}\n", r.trim()));
+            }
+        }
         if !self.qas.is_empty() {
             p.push_str("\nQuestions so far:\n");
             for qa in &self.qas {
@@ -132,15 +141,14 @@ impl Interview {
 
     /// The prompt for one turn. `message` is the owner's latest input (the
     /// words, a correction, an answer, `(skipped)`, a refinement, or empty);
-    /// it is assumed already recorded in `self` where it belongs there.
+    /// it must already be recorded in `self`: a resumed prompt sends only
+    /// `message`, a full one only what `self` holds.
     pub fn prompt(&self, step: Step, resumable: bool, message: &str) -> String {
         let first = step == Step::Restate && self.corrections.is_empty();
+        // everything the owner said is recorded in `self`, so a full prompt
+        // never needs `message` on top
         let mut p = if !resumable || first {
-            let mut p = self.context(step);
-            if step == Step::WriteUp && !message.trim().is_empty() {
-                p.push_str(&format!("\nThe author adds:\n{}\n", message.trim()));
-            }
-            p
+            self.context(step)
         } else {
             let mut p = String::new();
             if !message.trim().is_empty() {
@@ -185,7 +193,7 @@ impl Interview {
         let mut b = String::from("## Description\n\n");
         b.push_str(self.words.trim());
         b.push('\n');
-        for c in &self.corrections {
+        for c in self.corrections.iter().chain(&self.refinements) {
             b.push('\n');
             b.push_str(c.trim());
             b.push('\n');
@@ -473,6 +481,25 @@ mod tests {
         assert!(a.starts_with("new-"), "{a}");
         assert_eq!(a.len(), 12, "{a}");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn refinements_are_kept_for_an_agent_that_cannot_resume() {
+        let mut iv = interview(Some("skoolscout"));
+        iv.qas = vec![qa("Q1?", Some("a5"))];
+        iv.refinements = vec![
+            "file it under skoolscout/global".into(),
+            "shorten it".into(),
+        ];
+        let p = iv.prompt(Step::WriteUp, false, "shorten it");
+        assert!(p.contains("file it under skoolscout/global"), "{p}");
+        assert_eq!(p.matches("shorten it").count(), 1, "{p}");
+        assert!(
+            !p.contains("The author adds"),
+            "the last answer is not re-sent: {p}"
+        );
+        let b = iv.raw_body();
+        assert!(b.contains("shorten it"), "{b}");
     }
 
     #[test]
