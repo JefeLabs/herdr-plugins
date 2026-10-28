@@ -22,8 +22,15 @@ Decided by the owner, shown in the mockups (`.superpowers/brainstorm/…/add-int
 4. **Up to 5 questions, one at a time.** Each question builds on the last answer. The status shows `question 2 of up to 5`. The agent may stop early when it has enough. The owner can skip a question or end the questions at any time.
 5. **Write-up.** The agent writes the title and the full intent body (Description, Preconditions, Acceptance criteria, Open questions). The acceptance criteria are grouped by area group (owner, 2026-10-28): criteria for the group the intent is filed in come first, ungrouped, then one `### <area path>` sub-heading per other group the work touches. This is the same shape refinement and reconcile already produce. Below it, a `save as:` row shows the four types, with the chosen one selected and the agent's suggestion noted ("agent: this reads as a bug"). Tab changes the type; typing keeps refining; Enter saves; Esc discards.
 6. **The home group.** Where the intent is filed is not always known when the conversation starts (owner, 2026-10-28). It is known when `a` is pressed on a group in the tree. It is not known in the card view, where the selected card is incidental, nor from the popup or an empty list. When it is not known, the agent proposes the home group along with the other areas, from the workspace's existing groups. If it cannot tell, it asks, and that counts as one of the 5 questions. The write-up shows `in: <home group>` and `also shows under: <areas>` above the save row. The owner corrects either by typing ("file it under admin/team-invites"). When it is known, the agent keeps it unless the owner says otherwise.
-7. **Nothing is written until save.** Esc at any step discards the conversation; the owner accepted losing an unfinished one (no drafts).
-8. **When the agent fails** (owner, 2026-10-28: "retry plus save raw with ctrl-s"). A turn that errors, is cancelled or times out, or a write-up with no proposal to save, keeps the conversation on screen with the failure named. The owner can:
+7. **Its own view** (owner, 2026-10-28). Once the type is picked, the conversation takes the whole tool area, in the tree layout and in the card view alike. It does not sit in the tree's right-hand pane or beside the cards. From top to bottom:
+   - a header with the type, the home group (or "group to be decided") and, while asking, the question count;
+   - the transcript;
+   - at the write-up, the save rows;
+   - the input box.
+
+   The tree or the cards come back after save or discard.
+8. **Nothing is written until save.** Esc at any step discards the conversation; the owner accepted losing an unfinished one (no drafts).
+9. **When the agent fails** (owner, 2026-10-28: "retry plus save raw with ctrl-s"). A turn that errors, is cancelled or times out, or a write-up with no proposal to save, keeps the conversation on screen with the failure named. The owner can:
    - press Enter to retry the same phase's prompt with the same agent;
    - press `m` to pick another agent and model, then retry;
    - press Ctrl-s to save their own words as a raw intent;

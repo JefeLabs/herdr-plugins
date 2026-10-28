@@ -345,7 +345,13 @@ View.interview: Option<InterviewView>          // set when screen == "interview"
   - Esc in Words, Confirm, Answer, Review or Retry discards: delete `folder` and go to Browse.
   - Esc in Turn: Task 6.
 - **Resumable** means `conv_id.is_some()` and the provider has a `resume` argv, as in `key_chat`.
-- **Draw:** reuse the chat transcript and input rendering. The header is `<kind label> · in <home>`, plus `· question N of up to 5` while asking. At Review, `ui::render_save_rows` draws `save as:` with the four chips (the chosen one highlighted, `agent: this reads as a <label>` when the suggestion differs), `in: <group>` and `also: <areas>`.
+- **Draw:** the interview has its own view (owner, 2026-10-28). `Screen::Interview` takes the whole tool area in both layouts, with no tree and no cards drawn beside it. From top to bottom:
+  - the header `<kind label> · in <home>`, plus `· question N of up to 5` while asking;
+  - the transcript, reusing the chat's transcript rendering;
+  - at Review, the save rows;
+  - the input box, reusing the chat's input rendering.
+
+  At Review, `ui::render_save_rows` draws `save as:` with the four chips (the chosen one highlighted, `agent: this reads as a <label>` when the suggestion differs), `in: <group>` and `also: <areas>`.
 - **Status lines, exact:**
   - words: `say it in your own words · Enter send · Esc cancel (nothing saved)`
   - turn: `waiting for the agent · Esc cancel`
@@ -385,6 +391,9 @@ View.interview: Option<InterviewView>          // set when screen == "interview"
       - the log has 2 calls carrying the same words.
     - `esc_discards_and_leaves_no_file_or_folder`: Esc at confirm. The screen is `browse`, no new `.md` file exists, and no `<root>/.polish/new-*` folder exists.
     - `in_the_card_view_the_home_group_is_unknown`: `v`, `a`, `i` gives home `group to be decided`. After restate and confirm, the ask prompt contains `Home group: unknown`.
+    - `the_interview_has_its_own_view`:
+      - in the tree, select `skoolscout`, press `a`, `b`; an 80×20 render's first line contains `bug · in skoolscout`, and the render contains neither `In the inbox` nor `Alpha`;
+      - in the card view, `v`, `a`, `i` renders with neither `Alpha` nor `Beta`.
     - `interview_review_snapshot`: 80×20 render at review (the spec's narrowest terminal).
     - `capture_mode_closes_when_the_interview_is_discarded` replaces `capture_mode_closes_once_back_from_the_chat`: `start_capture()`, `b`, Esc returns `Flow::Quit`.
   - Delete the old add tests for the title prompt this task removes. Task 5 covers again where intents land and the popup closing after a save:
