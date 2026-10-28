@@ -151,7 +151,7 @@ pub fn render_detail(intent: &Intent, attachments: &[(String, u64)], area: Rect,
         Line::from(Span::styled(
             format!(
                 "kind: {}   state: {}{}{}",
-                sanitize(&intent.fm.kind),
+                sanitize(crate::config::kind_label(&intent.fm.kind)),
                 intent.fm.state.label(),
                 if intent.open_questions() > 0 {
                     format!("   ?{}", intent.open_questions())
@@ -659,6 +659,26 @@ mod tests {
             .unwrap();
         assert!(!text_of(&t).contains('\u{1b}'), "raw ESC in status");
     }
+    #[test]
+    fn the_detail_names_the_kind_as_bug_capability_or_idea() {
+        for (kind, shown) in [
+            ("issue", "kind: bug"),
+            ("enhancement", "kind: capability"),
+            ("idea", "kind: idea"),
+        ] {
+            let it = crate::store::Intent {
+                path: std::path::PathBuf::from("/x/a.md"),
+                fm: serde_yaml_ng::from_str(&format!("title: T\nkind: {kind}\n")).unwrap(),
+                body: String::new(),
+                loaded_updated: chrono::Local::now(),
+            };
+            let mut t = Terminal::new(TestBackend::new(60, 6)).unwrap();
+            t.draw(|f| render_detail(&it, &[], f.area(), f.buffer_mut()))
+                .unwrap();
+            assert!(text_of(&t).contains(shown), "{kind}: {}", text_of(&t));
+        }
+    }
+
     const SECTIONS_BODY: &str = "## Description\nThe description.\n\n## Preconditions\n- [x] pre one\n- [ ] pre two\n\n## Acceptance criteria\n- [x] crit one\n- [ ] crit two\n- [ ] crit three\n\n## Open questions\n- q one?\n  → yes\n- q two?\n\n## Artifacts\n- spec: docs/spec.md\n";
 
     fn intent_with(body: &str) -> crate::store::Intent {
@@ -1221,7 +1241,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         Line::from(Span::styled(
             format!(
                 "kind: {}   state: {}{}{}{}",
-                sanitize(&it.fm.kind),
+                sanitize(crate::config::kind_label(&it.fm.kind)),
                 it.fm.state.label(),
                 if open > 0 {
                     format!("   ?{open}")

@@ -217,3 +217,35 @@ fn reply_may_carry_a_capability_phrase_as_the_new_title() {
     let r = parse_reply("```proposal\nx\n```\n");
     assert!(r.title.is_none());
 }
+
+#[test]
+fn a_bug_line_names_the_kind_and_the_title() {
+    let r = parse_reply(
+        "bug: Saving drops the last line when the file has no newline\n\n```proposal\n## Description\nx\n```\nquestions: none\n",
+    );
+    assert_eq!(
+        r.title.as_deref(),
+        Some("Saving drops the last line when the file has no newline")
+    );
+    assert_eq!(r.kind.as_deref(), Some("issue"));
+    assert!(!r.prose.contains("bug:"), "{}", r.prose);
+}
+
+#[test]
+fn capability_and_idea_lines_name_their_kinds() {
+    let r =
+        parse_reply("capability: Parents can book a tour\n\n```proposal\n## Description\nx\n```\n");
+    assert_eq!(r.kind.as_deref(), Some("enhancement"));
+    assert_eq!(r.title.as_deref(), Some("Parents can book a tour"));
+    let r = parse_reply(
+        "**idea:** A weekly digest of new schools\n\n```proposal\n## Description\nx\n```\n",
+    );
+    assert_eq!(r.kind.as_deref(), Some("idea"));
+    assert_eq!(r.title.as_deref(), Some("A weekly digest of new schools"));
+}
+
+#[test]
+fn a_reply_without_a_heading_line_changes_neither_title_nor_kind() {
+    let r = parse_reply("Here is a tighter version.\n\n```proposal\n## Description\nx\n```\n");
+    assert_eq!((r.title, r.kind), (None, None));
+}

@@ -412,3 +412,12 @@ fn every_turn_asks_to_polish_what_the_author_wrote_answers_included() {
         );
     }
 }
+
+// every turn lets the agent say what the intent is, and ask when it cannot tell
+#[test]
+fn every_turn_offers_bug_capability_or_idea_and_asks_when_unsure() {
+    let resumed = follow_up_prompt("SEED", &[], "again", true);
+    for h in ["`bug:", "`capability:", "`idea:", "Is this a bug"] {
+        assert!(resumed.contains(h), "turn lacks {h}: {resumed}");
+    }
+}

@@ -3,11 +3,32 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 pub const PLUGIN_ID: &str = "jefelabs.intents";
 pub const KINDS: &[&str] = &["issue", "enhancement", "idea"];
+
+/// How a kind is shown: an issue is a bug, an enhancement a capability.
+pub fn kind_label(kind: &str) -> &str {
+    match kind {
+        "issue" => "bug",
+        "enhancement" => "capability",
+        other => other,
+    }
+}
+
+/// The kind an agent's first line names: `bug:`, `capability:` or `idea:`.
+pub fn kind_from_heading(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "bug" => Some("issue"),
+        "capability" => Some("enhancement"),
+        "idea" => Some("idea"),
+        _ => None,
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -344,6 +365,59 @@ fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SHA-256 of every earlier default of a kind's polish template. A template
+/// that still matches one was never edited, so it is brought up to the
+/// current default; an edited one is left alone.
+fn old_polish_defaults(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "issue" => &[
+            "11e7b3af7e8908106dc33dc107b46886f9fcc55773bef2808cfbbad0d19b8b06",
+            "2e6d4ad5ebfac608bf4ee1c75078d9a4212be580310d756b17144535599ddf37",
+            "4a490a416cb8d007f38192e07e9e5e7d57389aac730daf62fa6691bf6f74bcd7",
+            "5f017e2972f22d7b5ceff33a77eeeca0b760d464871422555159e6ccb14ddb46",
+            "65b3bb0a548aa6bb6731233215daf5e4964648369fe5582dd83e4ee7d1781f68",
+            "749adf96a3fc58f5fdb4c7087c900ca3794d06d25840be9da7af5414152d723f",
+            "b49c28cdae786486f6cca3972eaa90bda603b5bf193dfe5db55e74d79b52009a",
+            "ffa2e9fa20d251d90f989ce7f6a805f992a31e318e4661d7ed3441d4a86b9588",
+        ],
+        "enhancement" => &[
+            "17a497a254e4f121cf9dc8b5fec15f026a1199c5cfa9e687190bd87b4f42fad2",
+            "54e77f65fe15a51ad42568636dff129f0c2cfd3600640b5996d6ef8a070aff15",
+            "5a77b7e1b87fc786d22007bbc880700221ce44283b29f162ac9abd62439fff46",
+            "6e002d1d24d299f0666b3b59f16aa998bf398b5773eef5346b0886fcdeb1cf32",
+            "8ff8895478caa5cbe3ce263d127b6e9018e960e32abf94f55ec452bed6f1bb9e",
+            "9f35ee9e1792b915a5cbee6e91f341af9faa18ea1a908ec206ee11f34f7b9a8c",
+            "af2ce3d227385fd1df0311f244bb82bbdebf3825dda96468c5bdf098d4d97166",
+            "beafcfa500a95db86e7a7959792ed63af97d7f32ef5dd5fb979d8da058999955",
+        ],
+        "idea" => &[
+            "0189d38bc264b506d1eff5ec5605a1de15ea48619b05206d4df77f9ea1c1e7a3",
+            "07659af1a049460d5b8a336d2901a1a6e3d6c7d1ea19741659ad65e49068e4e4",
+            "110a9197430b4c4164f14e62d7c90e0c2da6d59dcd8daed93201223b04f4255e",
+            "54df2bd92157a8ab51afde79066d98c8a9a3834e1ffe442b16874ae5ef4304a4",
+            "7d50b89a465dbf62e4bd7eed77b9167f06d7134261faf664ccd34b536879d820",
+            "a36eac4c759d2ce768c1de12a7bb1ff0d8bfabb2c1549758be1e82788ef6fe45",
+            "eda55154ef00774c40673a034a50dca17e37af26bfcef01f7ebfa62d5c20c0d3",
+            "f93c7c7f0c12b3ba3b5fd080654f548e98c2ca8bf9fcc9dda39862dcc8c798d9",
+        ],
+        _ => &[],
+    }
+}
+
+/// Replace `path` with `new` when its content hashes to one of `old`: an
+/// untouched earlier default. Returns whether it was replaced.
+pub fn upgrade_untouched(path: &Path, new: &str, old: &[&str]) -> anyhow::Result<bool> {
+    let Ok(current) = std::fs::read(path) else {
+        return Ok(false);
+    };
+    let hash = format!("{:x}", Sha256::digest(&current));
+    if current == new.as_bytes() || !old.contains(&hash.as_str()) {
+        return Ok(false);
+    }
+    std::fs::write(path, new).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
 pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
     for (rel, text) in DEFAULT_FILES {
         let path = dirs.config.join(rel);
@@ -352,6 +426,12 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        }
+    }
+    for kind in KINDS {
+        let rel = format!("templates/{kind}.polish.md");
+        if let Some((_, text)) = DEFAULT_FILES.iter().find(|(r, _)| *r == rel) {
+            upgrade_untouched(&dirs.config.join(&rel), text, old_polish_defaults(kind))?;
         }
     }
     let path = dirs.config.join("intents.toml");
@@ -692,6 +772,56 @@ pub fn builtin_handoffs() -> Vec<Handoff> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn kinds_are_shown_as_bug_capability_and_idea() {
+        assert_eq!(kind_label("issue"), "bug");
+        assert_eq!(kind_label("enhancement"), "capability");
+        assert_eq!(kind_label("idea"), "idea");
+        assert_eq!(
+            kind_label("custom"),
+            "custom",
+            "an unknown kind shows as written"
+        );
+        assert_eq!(kind_from_heading("bug"), Some("issue"));
+        assert_eq!(kind_from_heading("Capability"), Some("enhancement"));
+        assert_eq!(kind_from_heading("idea"), Some("idea"));
+        assert_eq!(kind_from_heading("chore"), None);
+    }
+
+    #[test]
+    fn an_untouched_old_template_is_upgraded_and_an_edited_one_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_text = "Start every reply with one line `capability: <who> can <what>`.\n";
+        let old_hash = format!("{:x}", Sha256::digest(old_text.as_bytes()));
+        let untouched = tmp.path().join("issue.polish.md");
+        fs::write(&untouched, old_text).unwrap();
+        assert!(upgrade_untouched(&untouched, "NEW\n", &[old_hash.as_str()]).unwrap());
+        assert_eq!(fs::read_to_string(&untouched).unwrap(), "NEW\n");
+        let edited = tmp.path().join("idea.polish.md");
+        fs::write(&edited, "my own words\n").unwrap();
+        assert!(!upgrade_untouched(&edited, "NEW\n", &[old_hash.as_str()]).unwrap());
+        assert_eq!(fs::read_to_string(&edited).unwrap(), "my own words\n");
+    }
+
+    #[test]
+    fn the_shipped_polish_templates_offer_all_three_headings() {
+        for kind in KINDS {
+            let text = DEFAULT_FILES
+                .iter()
+                .find(|(rel, _)| *rel == format!("templates/{kind}.polish.md"))
+                .map(|(_, t)| *t)
+                .unwrap();
+            for h in ["`bug:", "`capability:", "`idea:", "Is this a bug"] {
+                assert!(text.contains(h), "{kind}.polish.md lacks {h}");
+            }
+            let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+            assert!(
+                !old_polish_defaults(kind).contains(&hash.as_str()),
+                "the current {kind} default must not be listed as an old one"
+            );
+        }
+    }
 
     #[test]
     fn the_old_plugins_config_carries_over_once() {

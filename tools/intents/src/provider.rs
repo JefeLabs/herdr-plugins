@@ -117,8 +117,11 @@ pub struct Reply {
     pub prose: String,
     pub proposal: Option<String>,
     pub questions: Vec<String>,
-    /// A proposed title, phrased as an intent ("<who> can <what>"), from a `intent:` line.
+    /// A proposed title, from the reply's first line: `bug: …`,
+    /// `capability: <who> can <what>` or `idea: …`.
     pub title: Option<String>,
+    /// The kind that line names (`issue`, `enhancement` or `idea`).
+    pub kind: Option<String>,
 }
 
 /// Find the fenced proposal block and the `questions:` list. Fences follow
@@ -159,14 +162,18 @@ pub fn parse_reply(text: &str) -> Reply {
             .trim_matches(|c| c == '*' || c == '_')
             .trim()
             .to_ascii_lowercase();
-        if header.starts_with("capability:") {
+        if let Some((name, _)) = header.split_once(':')
+            && let Some(kind) = crate::config::kind_from_heading(name)
+        {
             let original = trimmed.trim_matches(|c| c == '*' || c == '_').trim();
-            let phrase = original["capability:".len()..]
+            let phrase = original[name.len() + 1..]
+                .trim_start_matches(['*', '_'])
                 .trim()
                 .trim_matches('"')
                 .trim();
             if !phrase.is_empty() {
                 reply.title = Some(phrase.to_string());
+                reply.kind = Some(kind.to_string());
             }
             continue;
         }

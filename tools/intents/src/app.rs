@@ -96,7 +96,11 @@ pub struct PendingChat {
 pub enum Pending {
     OverwriteSave,
     DiscardEdits,
-    OverwriteApply { body: String, title: Option<String> },
+    OverwriteApply {
+        body: String,
+        title: Option<String>,
+        kind: Option<String>,
+    },
 }
 
 pub enum InputAction {
@@ -157,6 +161,8 @@ pub enum Screen {
         proposal: String,
         questions: Vec<String>,
         title: Option<String>,
+        /// The kind the reply's first line named.
+        kind: Option<String>,
         scroll: u16,
     },
     SendPick {
@@ -1666,8 +1672,9 @@ impl App {
                 proposal,
                 questions,
                 title,
+                kind,
                 scroll,
-            } => self.key_diff(proposal, questions, title, scroll, k),
+            } => self.key_diff(proposal, questions, title, kind, scroll, k),
             Screen::SendPick { handoffs, selected } => self.key_send_pick(handoffs, selected, k),
             Screen::SendConfirm {
                 handoff,
@@ -1902,7 +1909,7 @@ impl App {
             KeyCode::Char('t') => {
                 if let Some(it) = self.selected_intent() {
                     self.screen = Screen::Input {
-                        label: "title (a capability phrase: who can what)".into(),
+                        label: title_label(&it.fm.kind).into(),
                         text: it.fm.title.clone(),
                         action: InputAction::Rename,
                     };
@@ -2670,11 +2677,13 @@ impl App {
                             .map(|r| r.questions.clone())
                             .unwrap_or_default();
                         let title = st.latest.as_ref().and_then(|r| r.title.clone());
+                        let kind = st.latest.as_ref().and_then(|r| r.kind.clone());
                         self.parked_chat = Some(st);
                         self.screen = Screen::Diff {
                             proposal,
                             questions,
                             title,
+                            kind,
                             scroll: 0,
                         };
                     }
@@ -2715,6 +2724,7 @@ impl App {
         proposal: String,
         questions: Vec<String>,
         title: Option<String>,
+        kind: Option<String>,
         scroll: u16,
         k: KeyEvent,
     ) -> Flow {
@@ -2722,6 +2732,7 @@ impl App {
             KeyCode::Enter => self.apply_proposal(
                 &merge_questions(&proposal, &questions),
                 title.as_deref(),
+                kind.as_deref(),
                 false,
             ),
             KeyCode::Esc => {
@@ -2735,6 +2746,7 @@ impl App {
                     proposal,
                     questions,
                     title,
+                    kind,
                     scroll: scroll.saturating_add(5),
                 }
             }
@@ -2743,6 +2755,7 @@ impl App {
                     proposal,
                     questions,
                     title,
+                    kind,
                     scroll: scroll.saturating_sub(5),
                 }
             }
@@ -2752,6 +2765,7 @@ impl App {
                     proposal,
                     questions,
                     title,
+                    kind,
                     scroll,
                 }
             }
@@ -2761,7 +2775,13 @@ impl App {
 
     /// Write `body` into the chat's intent. Unless forced, refuse when the file
     /// changed since the chat opened (another toolbar, another editor) and ask.
-    fn apply_proposal(&mut self, body: &str, new_title: Option<&str>, force: bool) {
+    fn apply_proposal(
+        &mut self,
+        body: &str,
+        new_title: Option<&str>,
+        new_kind: Option<&str>,
+        force: bool,
+    ) {
         let Some(st) = self.parked_chat.as_ref() else {
             self.screen = Screen::Browse;
             return;
@@ -2779,12 +2799,16 @@ impl App {
             }
         };
         if !force && it.loaded_updated.timestamp() != opened.timestamp() {
-            self.screen = Screen::Prompt { question: "File changed on disk since this chat opened. Overwrite with the proposal? (y/n)".into(), pending: Pending::OverwriteApply { body: body.to_string(), title: new_title.map(str::to_string) } };
+            self.screen = Screen::Prompt { question: "File changed on disk since this chat opened. Overwrite with the proposal? (y/n)".into(), pending: Pending::OverwriteApply { body: body.to_string(), title: new_title.map(str::to_string), kind: new_kind.map(str::to_string) } };
             return;
         }
         it.body = body.to_string();
         if let Some(t) = new_title.map(str::trim).filter(|t| !t.is_empty()) {
             it.fm.title = t.to_string();
+        }
+        // the agent judged what this intent is: a bug, a capability or an idea
+        if let Some(k) = new_kind.filter(|k| KINDS.contains(k)) {
+            it.fm.kind = k.to_string();
         }
         it.fm.polished_at = Some(chrono::Local::now());
         if it.fm.state == State::Raw {
@@ -3008,8 +3032,8 @@ impl App {
                     self.editing = None;
                     self.screen = Screen::Browse;
                 }
-                Pending::OverwriteApply { body, title } => {
-                    self.apply_proposal(&body, title.as_deref(), true)
+                Pending::OverwriteApply { body, title, kind } => {
+                    self.apply_proposal(&body, title.as_deref(), kind.as_deref(), true)
                 }
             },
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -3842,9 +3866,13 @@ impl App {
             Screen::Prompt { question, .. } => question.clone(),
             Screen::Edit => "Ctrl-s save · Ctrl-p polish · Ctrl-e $EDITOR · Esc back".to_string(),
             Screen::Chat(_) => "Enter send · Ctrl-a apply · Ctrl-d dismiss · PgUp/PgDn scroll · Esc cancel/back".to_string(),
-            Screen::Diff { title, .. } => match title {
-                Some(t) => format!("Enter apply (title → {t}) · Esc back · PgUp/PgDn scroll"),
-                None => "Enter apply · Esc back · PgUp/PgDn scroll".to_string(),
+            Screen::Diff { title, kind, .. } => match (title, kind) {
+                (Some(t), Some(k)) => format!(
+                    "Enter apply ({} · title → {t}) · Esc back · PgUp/PgDn scroll",
+                    crate::config::kind_label(k)
+                ),
+                (Some(t), None) => format!("Enter apply (title → {t}) · Esc back · PgUp/PgDn scroll"),
+                _ => "Enter apply · Esc back · PgUp/PgDn scroll".to_string(),
             },
             Screen::SendPick { .. } | Screen::AgentPick { .. } => "j/k choose · Enter select · Esc back".to_string(),
             Screen::Answer { .. } => "type the answer · Enter saves · Esc cancels".to_string(),
@@ -4098,6 +4126,15 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
             let _ = writeln!(std::io::stderr(), "herdr-intents: {e:#}");
             std::process::exit(1)
         }
+    }
+}
+
+/// The title prompt's hint for a kind: how a good title for it reads.
+fn title_label(kind: &str) -> &'static str {
+    match kind {
+        "issue" => "title (a bug: what goes wrong, and when)",
+        "idea" => "title (the idea, in a phrase)",
+        _ => "title (a capability: who can what)",
     }
 }
 
@@ -7180,6 +7217,41 @@ mod tests {
                 .iter()
                 .any(|r| r.label == "Advisors can request a meeting from Office Hours")
         );
+    }
+
+    #[test]
+    fn applying_a_bug_heading_files_the_intent_as_a_bug() {
+        let mut fx = setup("agy.jsonl");
+        let titled = fx._tmp.path().join("bug.jsonl");
+        fs::write(&titled, r#"{"event":"init","conversation_id":"c3"}
+{"event":"step_update","step_update":{"conversation_id":"c3","step_type":"agent_response","text_delta":"bug: Saving twice duplicates the folder when offline\n\n```proposal\n## Description\nnew body\n```\nquestions: none\n"}}
+{"event":"result","result":{"conversation_id":"c3","status":"SUCCESS"}}
+"#).unwrap();
+        fx.app.provider_env[0].1 = titled.display().to_string();
+        select(&mut fx.app, "Alpha");
+        polish(&mut fx.app);
+        wait_until(&mut fx.app, "turn", |a| {
+            !a.view().turn_running && a.view().can_apply
+        });
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert_eq!(
+            it.fm.title,
+            "Saving twice duplicates the folder when offline"
+        );
+        assert_eq!(it.fm.kind, "issue", "polish judged it a bug");
+    }
+
+    #[test]
+    fn the_title_prompt_matches_the_kind() {
+        assert!(
+            title_label("issue").contains("bug"),
+            "{}",
+            title_label("issue")
+        );
+        assert!(title_label("enhancement").contains("who can what"));
+        assert!(title_label("idea").contains("idea"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sha2 = "0.10"
 ratatui = "0.30"
 crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
