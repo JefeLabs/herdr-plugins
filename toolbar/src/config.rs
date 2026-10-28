@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(raw.tool.len(), 6);
         assert_eq!(raw.tool[2].id, "db");
         assert_eq!(raw.tool[4].env["JIRA_PROJECT"], "SKOOL");
-        let want: Vec<String> = ["issues", "capabilities", "db", "files", "jira", "browser"]
+        let want: Vec<String> = ["issues", "intents", "db", "files", "jira", "browser"]
             .map(String::from)
             .to_vec();
         assert_eq!(raw.order.as_deref(), Some(&want[..]));
@@ -480,10 +480,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let (t, g, w) = dirs(GLOBAL, Some(ws));
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
         let ids: Vec<&str> = cfg.tools.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["files", "db", "issues", "capabilities", "jira", "browser"]
-        );
+        assert_eq!(ids, ["files", "db", "issues", "intents", "jira", "browser"]);
     }
 
     #[test]

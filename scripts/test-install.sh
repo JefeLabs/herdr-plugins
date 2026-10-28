@@ -21,9 +21,13 @@ sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' 
 mkdir -p "$work/fakebin"
 cat > "$work/fakebin/herdr" <<'EOF'
 #!/bin/sh
+echo "$*" >> "$HOME/.fake-herdr-calls"
 case "$1 $2" in
   "plugin list") cat "$HOME/.fake-herdr-links" 2>/dev/null ;;
   "plugin link") echo "[local:$3]" >> "$HOME/.fake-herdr-links" ;;
+  "plugin unlink")
+    grep -v "^- $3 " "$HOME/.fake-herdr-links" > "$HOME/.fake-herdr-links.tmp" 2>/dev/null
+    mv "$HOME/.fake-herdr-links.tmp" "$HOME/.fake-herdr-links" ;;
   "plugin config-dir") echo "$HOME/.config/herdr/plugins/config/$3" ;;
 esac
 exit 0
@@ -33,12 +37,12 @@ chmod +x "$work/fakebin/herdr"
 # --- a fake plugin release for this machine
 rel="$work/release"
 stage="$work/stage/herdr-plugins"
-mkdir -p "$rel" "$stage/toolbar" "$stage/tools/capabilities" "$stage/target/release"
+mkdir -p "$rel" "$stage/toolbar" "$stage/tools/intents" "$stage/target/release"
 cp toolbar/tools.example.toml "$stage/toolbar/"
 echo 'id = "jefelabs.toolbar"' > "$stage/toolbar/herdr-plugin.toml"
-echo 'id = "jefelabs.capabilities"' > "$stage/tools/capabilities/herdr-plugin.toml"
+echo 'id = "jefelabs.intents"' > "$stage/tools/intents/herdr-plugin.toml"
 printf '#!/bin/sh\n' > "$stage/target/release/herdr-toolbar"
-printf '#!/bin/sh\n' > "$stage/target/release/herdr-capabilities"
+printf '#!/bin/sh\n' > "$stage/target/release/herdr-intents"
 asset="herdr-plugins-$platform.tar.gz"
 tar -czf "$rel/$asset" -C "$work/stage" herdr-plugins
 echo "$(sha "$rel/$asset")  $asset" > "$rel/SHA256SUMS"
@@ -276,6 +280,51 @@ if [ $status -eq 0 ] && [ ! -e "$h/.local/bin/nvim" ] && [ -x "$h/.local/bin/pro
   esac
 else
   flunk "musl: Neovim skipped with a hint" "exit $status: $out"
+fi
+
+# 14. an install from before the rename (jefelabs.capabilities) is migrated
+h="$work/h14"
+tb="$h/.config/herdr/plugins/config/jefelabs.toolbar"
+mkdir -p "$tb"
+echo "- jefelabs.capabilities (Capabilities) enabled [local:$h/.local/share/herdr-plugins/tools/capabilities]" > "$h/.fake-herdr-links"
+cat > "$tb/tools.toml" <<EOF
+order  = ["capabilities", "files"]
+
+[[tool]]
+id      = "capabilities"
+name    = "Capabilities"
+icon    = "✎"
+command = ["$h/.local/share/herdr-plugins/target/release/herdr-capabilities"]
+
+[[tool]]
+id      = "files"
+name    = "Files"
+icon    = "▭"
+command = ["yazi"]
+EOF
+printf '[[keys.command]]\nkey = "prefix+a"\ntype = "plugin_action"\ncommand = "jefelabs.capabilities.add"\n' > "$h/.config/herdr/config.toml"
+run "$h" - "$work/good"
+t14="$tb/tools.toml"
+if [ $status -eq 0 ] && grep -q "unlink jefelabs.capabilities" "$h/.fake-herdr-calls" &&
+  grep -q '^order  = \["intents", "files"\]' "$t14" && grep -q '^id      = "intents"' "$t14" &&
+  grep -q '^name    = "Intents"' "$t14" && grep -q 'target/release/herdr-intents"' "$t14" &&
+  ! grep -q 'capabilit' "$t14" && grep -q 'command = "jefelabs.intents.add"' "$h/.config/herdr/config.toml" &&
+  [ -f "$t14.before-intents" ] && [ -f "$h/.config/herdr/config.toml.before-intents" ]; then
+  pass "an old capabilities install is migrated, with backups"
+else
+  flunk "an old capabilities install is migrated, with backups" "exit $status: $out
+$(cat "$t14" 2>&1)
+$(cat "$h/.config/herdr/config.toml" 2>&1)
+calls: $(cat "$h/.fake-herdr-calls" 2>&1)"
+fi
+
+# 15. migrating twice changes nothing more
+cp "$t14" "$work/t14-after-first"
+run "$h" - "$work/good"
+if cmp -s "$t14" "$work/t14-after-first" && [ "$(grep -c 'unlink' "$h/.fake-herdr-calls")" = 1 ]; then
+  pass "a second run leaves a migrated install alone"
+else
+  flunk "a second run leaves a migrated install alone" "$(diff "$work/t14-after-first" "$t14" 2>&1): $out"
 fi
 
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"

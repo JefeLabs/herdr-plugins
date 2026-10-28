@@ -1,0 +1,32 @@
+id = "jefelabs.intents"
+name = "Intents"
+version = "0.2.0"
+min_herdr_version = "0.9.0"
+description = "Capture intents, refine them in a streaming conversation with an agent CLI, and send them to a new Herdr agent"
+platforms = ["macos", "linux"]
+
+# Runs on `herdr plugin install` only; a linked checkout is built by hand:
+#   cargo build --release -p herdr-intents
+# The workspace puts binaries in <repo>/target, two levels above this plugin.
+[[build]]
+command = ["cargo", "build", "--release", "-p", "herdr-intents"]
+
+[[panes]]
+id = "add"
+title = "New intent"
+placement = "popup"
+width = "85%"
+height = "85%"
+command = ["../../target/release/herdr-intents", "add", "--popup"]
+
+[[panes]]
+id = "intents"
+title = "Intents"
+placement = "split"
+command = ["../../target/release/herdr-intents"]
+
+[[actions]]
+id = "add"
+title = "Intents: capture"
+contexts = ["workspace"]
+command = ["../../target/release/herdr-intents", "add", "--popup"]

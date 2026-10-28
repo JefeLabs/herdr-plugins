@@ -4,7 +4,7 @@
 
 prefix = "ctrl-]"
 # bar  = "large"   # bigger buttons: five columns by two rows (default "small")
-order  = ["issues", "capabilities", "db", "files", "jira", "browser"]
+order  = ["issues", "intents", "db", "files", "jira", "browser"]
 
 [[tool]]
 id      = "issues"
@@ -13,10 +13,10 @@ icon    = "◉"
 command = ["gh", "dash"]
 
 [[tool]]
-id      = "capabilities"
-name    = "Capabilities"
+id      = "intents"
+name    = "Intents"
 icon    = "✎"
-command = ["/absolute/path/to/herdr-plugins/target/release/herdr-capabilities"]
+command = ["/absolute/path/to/herdr-plugins/target/release/herdr-intents"]
 
 [[tool]]
 id      = "db"

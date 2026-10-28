@@ -145,7 +145,7 @@ Trust is recorded as the file's path plus a hash of its content, so it has to be
 ## Known limits (v1)
 
 - **Text by default.** The embedded terminal advertises `TERM=xterm-256color` without graphics, so tools fall back to text: `yazi` lists files without thumbnails, `mdcat` prints markdown without pictures. A tool with `graphics = true` gets its Kitty images passed through (experimental, see above); the others stay text.
-- **Mouse.** Clicking an icon selects that tool. Clicks, drags and the wheel inside a tool reach it only when the tool has turned mouse reporting on (as `yazi`, `lazysql` and the capabilities tool do), in the mode and encoding it asked for. Because the toolbar captures the mouse, a plain drag no longer selects text in its pane; most terminals still select with Shift held.
+- **Mouse.** Clicking an icon selects that tool. Clicks, drags and the wheel inside a tool reach it only when the tool has turned mouse reporting on (as `yazi`, `lazysql` and the intents tool do), in the mode and encoding it asked for. Because the toolbar captures the mouse, a plain drag no longer selects text in its pane; most terminals still select with Shift held.
 - One toolbar per workspace, in the tab where it was opened. Closing it stops its tools.
 
 ## Troubleshooting
