@@ -228,6 +228,34 @@ impl Interview {
     }
 }
 
+/// A plain "yes" to "Is that right?": the owner confirms rather than corrects.
+pub fn is_confirmation(text: &str) -> bool {
+    const YES: &[&str] = &[
+        "yes",
+        "y",
+        "yep",
+        "yeah",
+        "yup",
+        "correct",
+        "right",
+        "that's right",
+        "thats right",
+        "that is right",
+        "yes that's right",
+        "yes, that's right",
+        "yes it is",
+        "ok",
+        "okay",
+        "sure",
+        "looks good",
+        "exactly",
+        "spot on",
+        "perfect",
+    ];
+    let t = text.trim().to_lowercase().replace('’', "'");
+    YES.contains(&t.trim_end_matches(['.', '!']).trim())
+}
+
 /// Read an ask turn's reply: the first `question:` line, or `enough`.
 pub fn parse_ask(text: &str) -> Asked {
     for line in text.lines() {
@@ -500,6 +528,39 @@ mod tests {
         );
         let b = iv.raw_body();
         assert!(b.contains("shorten it"), "{b}");
+    }
+
+    #[test]
+    fn plain_yes_confirms_and_anything_more_is_a_correction() {
+        for yes in [
+            "yes",
+            "Yes.",
+            "y",
+            "yep",
+            "yeah!",
+            "correct",
+            "right",
+            "that's right",
+            "That’s right",
+            "ok",
+            "okay",
+            "sure",
+            "looks good",
+            "exactly",
+            "yes it is",
+        ] {
+            assert!(is_confirmation(yes), "{yes:?} confirms");
+        }
+        for not in [
+            "",
+            "no",
+            "yes, but only for boarding schools",
+            "not quite",
+            "yes and also day students",
+            "partly",
+        ] {
+            assert!(!is_confirmation(not), "{not:?} is not a plain yes");
+        }
     }
 
     #[test]
