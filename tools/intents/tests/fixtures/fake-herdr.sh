@@ -4,6 +4,9 @@ printf '%s\n' "$*" >> "$FAKE_HERDR_LOG"
 case "$1 $2" in
   "workspace create")
     printf '{"id":"cli:workspace","result":{"workspace":{"workspace_id":"w9","label":"x"},"tab":{"tab_id":"w9:t1"},"root_pane":{"pane_id":"w9:p1"}}}\n' ;;
+  "tab create")
+    # tab create --workspace <id> …: a new tab in that workspace
+    printf '{"id":"cli:tab","result":{"tab":{"tab_id":"%s:t2","workspace_id":"%s"},"root_pane":{"pane_id":"%s:p7"}}}\n' "$4" "$4" "$4" ;;
   "agent start")
     [ "${FAKE_AGENT_START_FAILS:-0}" = 1 ] && { echo '{"error":{"code":"agent_not_ready","message":"agent did not become ready"}}' >&2; exit 1; }
     printf '{"id":"cli:agent","result":{"agent":{"name":"%s","kind":"claude","pane_id":"w9:p1"}}}\n' "$3" ;;

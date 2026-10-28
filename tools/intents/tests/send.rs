@@ -134,7 +134,7 @@ fn render_prompt_prefixes_work_start_only_for_building_handoffs_in_workbrokr_rep
 }
 
 #[test]
-fn send_runs_create_start_prompt_in_order() {
+fn a_send_opens_a_tab_in_the_current_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("herdr.log");
     let env = vec![("FAKE_HERDR_LOG".to_string(), log.display().to_string())];
@@ -143,6 +143,77 @@ fn send_runs_create_start_prompt_in_order() {
     let out = send(
         &fake_herdr(),
         &env,
+        Some("w5"),
+        &repo,
+        "Pending label",
+        "claude",
+        "do the thing",
+    )
+    .unwrap();
+    assert_eq!(out.workspace_id, "w5", "stays in the current workspace");
+    assert_eq!(out.tab_id, "w5:t2");
+    assert_eq!(out.pane_id, "w5:p7");
+    let l = fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = l.lines().collect();
+    assert!(!l.contains("workspace create"), "no new workspace: {l}");
+    assert!(
+        lines[0].starts_with(&format!(
+            "tab create --workspace w5 --cwd {}",
+            repo.display()
+        )) && lines[0].contains("--label Pending label")
+            && lines[0].contains("--no-focus"),
+        "{l}"
+    );
+    assert!(
+        lines[1].starts_with(&format!(
+            "agent start {} --kind claude --pane w5:p7",
+            out.agent
+        )),
+        "{l}"
+    );
+    assert!(
+        lines[2].starts_with(&format!("agent prompt {} do the thing", out.agent)),
+        "{l}"
+    );
+}
+
+#[test]
+fn a_failed_start_names_the_tab_left_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("herdr.log");
+    let env = vec![
+        ("FAKE_HERDR_LOG".to_string(), log.display().to_string()),
+        ("FAKE_AGENT_START_FAILS".to_string(), "1".to_string()),
+    ];
+    let e = send(
+        &fake_herdr(),
+        &env,
+        Some("w5"),
+        tmp.path(),
+        "t",
+        "claude",
+        "p",
+    )
+    .unwrap_err();
+    assert_eq!(e.step, "agent start");
+    assert!(
+        e.detail.contains("tab w5:t2") && !e.detail.contains("workspace"),
+        "names the tab left behind: {}",
+        e.detail
+    );
+}
+
+#[test]
+fn outside_herdr_a_send_creates_a_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("herdr.log");
+    let env = vec![("FAKE_HERDR_LOG".to_string(), log.display().to_string())];
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let out = send(
+        &fake_herdr(),
+        &env,
+        None,
         &repo,
         "Pending label",
         "claude",
@@ -182,7 +253,16 @@ fn send_failure_names_the_step_and_returns_err() {
         ("FAKE_HERDR_LOG".to_string(), log.display().to_string()),
         ("FAKE_AGENT_START_FAILS".to_string(), "1".to_string()),
     ];
-    let e = send(&fake_herdr(), &env, tmp.path(), "t", "claude", "p").unwrap_err();
+    let e = send(
+        &fake_herdr(),
+        &env,
+        Some("w5"),
+        tmp.path(),
+        "t",
+        "claude",
+        "p",
+    )
+    .unwrap_err();
     assert_eq!(e.step, "agent start");
     assert!(
         e.detail.contains("agent did not become ready"),
@@ -228,7 +308,7 @@ fn failed_start_reports_the_orphaned_workspace() {
         ("FAKE_HERDR_LOG".to_string(), log.display().to_string()),
         ("FAKE_AGENT_START_FAILS".to_string(), "1".to_string()),
     ];
-    let e = send(&fake_herdr(), &env, tmp.path(), "t", "claude", "p").unwrap_err();
+    let e = send(&fake_herdr(), &env, None, tmp.path(), "t", "claude", "p").unwrap_err();
     assert!(
         e.detail.contains("w9"),
         "names the workspace left behind: {}",

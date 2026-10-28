@@ -135,7 +135,7 @@ send_kind = "claude"
 | `grill` | any | `/grill-me` on the intent |
 | `wayfinder` | any | `/wayfinder` with the intent as the destination |
 
-Send runs `herdr workspace create` on the intent's repo (always the main checkout, never a worktree), `herdr agent start` with the handoff's provider, and `herdr agent prompt` with the rendered prompt. In repos that use workbrokr (`helmsmith.config.ts` present) the building handoffs get a `work start` instruction prefixed; planning handoffs do not. If a step fails the intent is left as it was and the message names the step.
+Send opens a new tab in the Herdr workspace the tool runs in (`herdr tab create --workspace <current> --no-focus`, labelled with the intent's title) on the intent's repo (always the main checkout, never a worktree), then runs `herdr agent start` with the handoff's provider in that tab and `herdr agent prompt` with the rendered prompt. Your focus stays where it is; `g` focuses the agent. Outside Herdr (no `HERDR_WORKSPACE_ID` and no plugin context) it creates a new workspace instead. If the agent fails to start, the message names the tab (or workspace) left open. In repos that use workbrokr (`helmsmith.config.ts` present) the building handoffs get a `work start` instruction prefixed; planning handoffs do not. If a step fails the intent is left as it was and the message names the step.
 
 ## Affected areas
 
