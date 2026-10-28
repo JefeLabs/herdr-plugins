@@ -26,12 +26,25 @@ pub fn resolve(
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
-    let id = get("HERDR_WORKSPACE_ID").or_else(|| from_context("workspace_id"));
+    let id = current_workspace(&get);
     let label = id
         .as_deref()
         .and_then(&label_of)
         .or_else(|| from_context("workspace_label"))?;
     group_name(&label)
+}
+
+/// The id of the Herdr workspace the tool runs in: `HERDR_WORKSPACE_ID`,
+/// else the plugin context Herdr passed at start; none outside Herdr (an
+/// empty id counts as outside).
+pub fn current_workspace(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let id = match get("HERDR_WORKSPACE_ID") {
+        Some(id) => id,
+        None => get("HERDR_PLUGIN_CONTEXT_JSON")
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|c| c.get("workspace_id")?.as_str().map(str::to_string))?,
+    };
+    (!id.trim().is_empty()).then_some(id)
 }
 
 /// A workspace name usable as one folder name: trimmed, not empty, no path
@@ -63,6 +76,28 @@ pub fn herdr_label(bin: &Path, id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_current_workspace_comes_from_herdr_then_the_plugin_context() {
+        assert_eq!(
+            current_workspace(env(&[("HERDR_WORKSPACE_ID", "w5")])).as_deref(),
+            Some("w5")
+        );
+        let ctx = r#"{"workspace_id":"w7","workspace_label":"jefelabs"}"#;
+        assert_eq!(
+            current_workspace(env(&[("HERDR_PLUGIN_CONTEXT_JSON", ctx)])).as_deref(),
+            Some("w7")
+        );
+        assert_eq!(current_workspace(env(&[])), None, "outside Herdr");
+        assert_eq!(
+            current_workspace(env(&[
+                ("HERDR_WORKSPACE_ID", ""),
+                ("HERDR_PLUGIN_CONTEXT_JSON", ctx)
+            ])),
+            None,
+            "an empty id means outside Herdr"
+        );
+    }
 
     fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| {

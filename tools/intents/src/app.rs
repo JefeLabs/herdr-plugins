@@ -3033,6 +3033,11 @@ impl App {
             .unwrap_or_else(|| provider.to_string());
         match crate::send::send_intent(&self.herdr_env, repo, &it, &kind, prompt) {
             Ok(outcome) => {
+                let place = if outcome.tab_id.is_empty() {
+                    format!("new workspace {}", outcome.workspace_id)
+                } else {
+                    format!("a new tab {}", outcome.tab_id)
+                };
                 let record = crate::store::SentTo {
                     handoff: handoff.name.clone(),
                     workspace_id: outcome.workspace_id.clone(),
@@ -3047,14 +3052,14 @@ impl App {
                         // what is sent is the owner's: every criterion counts as seen
                         let _ = crate::store::acknowledge_all_criteria(&path);
                         self.message = Some(format!(
-                            "sent to {} in workspace {} (agent {})",
-                            handoff.name, outcome.workspace_id, outcome.agent
+                            "sent to {} in {} (agent {}; g focuses it)",
+                            handoff.name, place, outcome.agent
                         ))
                     }
                     Err(e) => {
                         self.message = Some(format!(
-                            "sent to {} in workspace {}, but recording it failed: {e:#}",
-                            handoff.name, outcome.workspace_id
+                            "sent to {} in {place}, but recording it failed: {e:#}",
+                            handoff.name
                         ))
                     }
                 }
@@ -5302,6 +5307,8 @@ mod tests {
                 tmp.path().join("herdr.log").display().to_string(),
             ),
             ("FAKE_AGENT_LIST".into(), agents.display().to_string()),
+            // the same workspace in every shell, inside Herdr or not
+            ("HERDR_WORKSPACE_ID".into(), "w5".into()),
             (
                 "GH_BIN_PATH".into(),
                 fixtures().join("fake-gh.sh").display().to_string(),
@@ -6195,7 +6202,10 @@ mod tests {
         key(&mut fx.app, KeyCode::Enter);
         assert!(refused(&fx.app), "{:?}", fx.app.view().message);
         let calls = fs::read_to_string(fx.tmp.path().join("herdr.log")).unwrap_or_default();
-        assert!(!calls.contains("workspace create"), "nothing sent: {calls}");
+        assert!(
+            !calls.contains("tab create") && !calls.contains("workspace create"),
+            "nothing sent: {calls}"
+        );
         assert_ne!(Store::load(&path).unwrap().fm.state, State::Sent);
     }
 
@@ -6571,6 +6581,7 @@ mod tests {
                 fixtures().join("fake-herdr.sh").display().to_string(),
             ),
             ("FAKE_HERDR_LOG".into(), log.display().to_string()),
+            ("HERDR_WORKSPACE_ID".into(), "w5".into()),
         ];
         select(&mut fx.app, "Alpha");
         let repo = fx._tmp.path().to_path_buf();
@@ -6589,8 +6600,13 @@ mod tests {
         );
         let sent = it.fm.sent_to.unwrap();
         assert_eq!(sent.handoff, "grill");
-        assert_eq!(sent.workspace_id, "w9");
-        assert!(fs::read_to_string(&log).unwrap().contains("agent prompt"));
+        assert_eq!(sent.workspace_id, "w5", "the agent runs in this workspace");
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("tab create --workspace w5"), "{calls}");
+        assert!(!calls.contains("workspace create"), "{calls}");
+        assert!(calls.contains("agent prompt"));
+        let msg = fx.app.view().message.unwrap_or_default();
+        assert!(msg.contains("new tab"), "{msg}");
 
         // a failing herdr call leaves the intent as it was
         let mut fx2 = setup("agy.jsonl");
@@ -6604,6 +6620,7 @@ mod tests {
                 fx2._tmp.path().join("h.log").display().to_string(),
             ),
             ("FAKE_AGENT_START_FAILS".into(), "1".into()),
+            ("HERDR_WORKSPACE_ID".into(), "w5".into()),
         ];
         select(&mut fx2.app, "Beta");
         let repo2 = fx2._tmp.path().to_path_buf();

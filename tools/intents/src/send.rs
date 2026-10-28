@@ -1,6 +1,7 @@
 //! Send an intent to a new Herdr agent: resolve the repo, render the handoff
 //! prompt (with the workbrokr preamble where it applies), and drive the Herdr
-//! CLI: workspace create → agent start → agent prompt.
+//! CLI: tab create in the current workspace (workspace create outside Herdr)
+//! → agent start → agent prompt.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +29,8 @@ const WORKBROKR_PREAMBLE: &str = "This repo uses workbrokr. Before touching code
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendOutcome {
     pub workspace_id: String,
+    /// The tab the agent runs in; empty when a new workspace was created.
+    pub tab_id: String,
     pub pane_id: String,
     pub agent: String,
 }
@@ -262,50 +265,51 @@ fn herdr(
     )
 }
 
-/// workspace create → agent start → agent prompt. Any failure names its step;
-/// the caller leaves the intent untouched on `Err`.
+/// tab create (in `workspace`) or, outside Herdr, workspace create → agent
+/// start → agent prompt. Any failure names its step; the caller leaves the
+/// intent untouched on `Err`.
 pub fn send(
     herdr_bin: &Path,
     env: &[(String, String)],
+    workspace: Option<&str>,
     repo: &Path,
     title: &str,
     provider_kind: &str,
     prompt: &str,
 ) -> Result<SendOutcome, SendError> {
     let cwd = repo.display().to_string();
-    let created = herdr(
-        herdr_bin,
-        env,
-        &[
-            "workspace",
-            "create",
-            "--cwd",
-            &cwd,
-            "--label",
-            title,
-            "--no-focus",
-        ],
-        "workspace create",
-    )?;
-    let workspace_id = created
-        .pointer("/result/workspace/workspace_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let (step, head) = match workspace {
+        Some(ws) => ("tab create", vec!["tab", "create", "--workspace", ws]),
+        None => ("workspace create", vec!["workspace", "create"]),
+    };
+    let args = [head, vec!["--cwd", &cwd, "--label", title, "--no-focus"]].concat();
+    let created = herdr(herdr_bin, env, &args, step)?;
+    let text = |ptr: &str| {
+        created
+            .pointer(ptr)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (workspace_id, tab_id) = match workspace {
+        Some(ws) => (ws.to_string(), text("/result/tab/tab_id")),
+        None => (text("/result/workspace/workspace_id"), String::new()),
+    };
     let pane_id = created
         .pointer("/result/root_pane/pane_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| SendError {
-            step: "workspace create",
+            step,
             detail: "no root pane in reply".into(),
         })?
         .to_string();
     let agent = agent_name(&crate::store::slugify(title));
+    let left_open = match workspace {
+        Some(_) => format!("tab {tab_id}"),
+        None => format!("workspace {workspace_id}"),
+    };
     let orphan = |mut e: SendError| {
-        e.detail = format!(
-            "{} (workspace {workspace_id} was created and is left open)",
-            e.detail
-        );
+        e.detail = format!("{} ({left_open} was created and is left open)", e.detail);
         e
     };
     herdr(
@@ -332,13 +336,15 @@ pub fn send(
     .map_err(orphan)?;
     Ok(SendOutcome {
         workspace_id,
+        tab_id,
         pane_id,
         agent,
     })
 }
 
-/// App entry point: finds the `herdr` binary from `HERDR_BIN_PATH` (the env
-/// list first, then the process environment), else fails before any call.
+/// App entry point: finds the `herdr` binary from `HERDR_BIN_PATH`, else
+/// fails before any call, and sends into the workspace the tool runs in.
+/// Each variable is read from the env list first, then the process.
 pub fn send_intent(
     env: &[(String, String)],
     repo: &Path,
@@ -346,16 +352,20 @@ pub fn send_intent(
     provider_kind: &str,
     prompt: &str,
 ) -> Result<SendOutcome, SendError> {
-    let bin = env
-        .iter()
-        .find(|(k, _)| k == "HERDR_BIN_PATH")
-        .map(|(_, v)| v.clone())
-        .or_else(|| std::env::var("HERDR_BIN_PATH").ok())
+    let get = |key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(key).ok())
+    };
+    let workspace = crate::scope::current_workspace(get);
+    let bin = get("HERDR_BIN_PATH")
         .filter(|b| !b.is_empty())
         .ok_or_else(|| SendError { step: "herdr", detail: "Herdr is required to send: HERDR_BIN_PATH is not set (run inside a Herdr pane or the toolbar)".into() })?;
     send(
         Path::new(&bin),
         env,
+        workspace.as_deref(),
         repo,
         &it.fm.title,
         provider_kind,
