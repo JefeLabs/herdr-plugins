@@ -249,3 +249,11 @@ fn a_reply_without_a_heading_line_changes_neither_title_nor_kind() {
     let r = parse_reply("Here is a tighter version.\n\n```proposal\n## Description\nx\n```\n");
     assert_eq!((r.title, r.kind), (None, None));
 }
+
+#[test]
+fn a_feature_line_names_the_feature_kind() {
+    let r =
+        parse_reply("feature: Parents can book a tour\n\n```proposal\n## Description\nx\n```\n");
+    assert_eq!(r.kind.as_deref(), Some("enhancement"));
+    assert_eq!(r.title.as_deref(), Some("Parents can book a tour"));
+}

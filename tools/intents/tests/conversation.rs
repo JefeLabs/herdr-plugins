@@ -319,7 +319,9 @@ fn follow_up_prompts_always_carry_the_format_reminder() {
     let resumed = follow_up_prompt("SEED", &[], "shorter please", true);
     assert!(resumed.starts_with("shorter please"), "{resumed}");
     for h in [
-        "capability:",
+        "bug:",
+        "feature:",
+        "idea:",
         "## Preconditions",
         "## Acceptance criteria",
         "## Open questions",
@@ -415,9 +417,9 @@ fn every_turn_asks_to_polish_what_the_author_wrote_answers_included() {
 
 // every turn lets the agent say what the intent is, and ask when it cannot tell
 #[test]
-fn every_turn_offers_bug_capability_or_idea_and_asks_when_unsure() {
+fn every_turn_offers_bug_feature_or_idea_and_asks_when_unsure() {
     let resumed = follow_up_prompt("SEED", &[], "again", true);
-    for h in ["`bug:", "`capability:", "`idea:", "Is this a bug"] {
+    for h in ["`bug:", "`feature:", "`idea:", "Is this a bug"] {
         assert!(resumed.contains(h), "turn lacks {h}: {resumed}");
     }
 }

@@ -23,7 +23,7 @@ Standalone runs use the same directory, so the toolbar and a plain terminal alwa
 
 ## One workspace per project
 
-Inside Herdr the tree is scoped to the workspace: a workspace named `skoolscout` sees only the root's top-level `skoolscout` group, with its sub-groups as the tree, and nothing from other projects' groups. Name a workspace after its project's group (`herdr workspace rename <id> skoolscout`) and keep one workspace per project. The name matches the group's folder whatever its case. A workspace whose group does not exist yet shows it empty, and the first capture there creates it. Quick captures, `a` with nothing selected and an empty list all add at the top of the workspace's group. Paths are unchanged: areas and `m` still use paths from the root (`skoolscout/discover-schools/org/candidates`). The name is read from Herdr when the tool starts, so restart the tool after renaming a workspace. Outside Herdr the whole tree shows. `INTENTS_SCOPE=<group>` chooses the group yourself, and `INTENTS_SCOPE=` (empty) shows the whole tree inside Herdr too.
+Inside Herdr the tree is scoped to the workspace: a workspace named `skoolscout` sees only the root's top-level `skoolscout` group, with its sub-groups as the tree, and nothing from other projects' groups. Name a workspace after its project's group (`herdr workspace rename <id> skoolscout`) and keep one workspace per project. The name matches the group's folder whatever its case. A workspace whose group does not exist yet shows it empty, and the first capture there creates it. Quick captures, `a` with nothing selected and an empty list all add at the top of the workspace's group. Paths are unchanged: areas and `M` still use paths from the root (`skoolscout/discover-schools/org/candidates`). The name is read from Herdr when the tool starts, so restart the tool after renaming a workspace. Outside Herdr the whole tree shows. `INTENTS_SCOPE=<group>` chooses the group yourself, and `INTENTS_SCOPE=` (empty) shows the whole tree inside Herdr too.
 
 ## In the toolbar
 
@@ -45,6 +45,8 @@ key = "prefix+a"
 type = "plugin_action"
 command = "jefelabs.intents.add"
 ```
+
+The popup asks the same as `a` in the tree: bug, feature or idea first, then the title, and the polish starts as soon as you press `Enter`. Leaving the chat closes the popup; the intent is saved either way.
 
 ## Shape of an intent
 
@@ -80,11 +82,11 @@ The Artifacts pane (`V`) lists what the agents produced for the intent: specs, p
 
 The Pull requests section lists each `pr:` line with its state from `gh` (`merged`, `open`, `closed`, or `…` until `gh` has answered) and its title, and counts them in its title (`Pull requests (6/7 merged)`). Pull requests the repo search found by the intent's spec and plan names, but no `pr:` line names, follow dimmed as found (`merged? #5840 …`); `L` links one, and it keeps the state and title the search gave until `gh` is asked about it. `Enter` or `o` opens a pull request in the browser. In Pull requests and Demo Videos, `a` adds a line of that kind without typing it (`#123`, or `story-id (criteria: 1, 4)`).
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group, `n` new group, `m` move the selected intent or group (type the target group path), `K` cycle kind (bug, capability, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` refine with the agent, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a capability's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error. With the mouse, a click selects a row in the tree, a click on the selected group opens or closes it, and the wheel moves the selection.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group (asks bug, feature or idea first, then the title, then polishes it straight away), `n` new group, `M` move the selected intent or group (type the target group path), `K` cycle kind (bug, feature, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` polish with the agent, `m` choose the agent and model, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a feature's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error. With the mouse, a click selects a row in the tree, a click on the selected group opens or closes it, and the wheel moves the selection.
 
-Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` refine (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
+Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` polish (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 
-`p` (or `Ctrl-p` in the editor) first asks which agent: a provider list, then that provider's models if it has any, with your last choice preselected, so `Enter` `Enter` repeats it. The choice is saved in `last-used.toml` in the config dir.
+`p` (or `Ctrl-p` in the editor) polishes at once with the agent and model you chose last. `m` changes them: a provider list, then that provider's models if it has any (for agy the model names carry the thinking level: high, medium, low), with the current choice preselected. The choice is saved in `last-used.toml` in the config dir and used for every polish, and for reconciles, until you change it; before the first `m`, polish uses `polish_provider` from the config.
 
 Refine (chat): type and `Enter` to send the next message, `Esc` cancels a running turn or leaves, `Ctrl-a` shows a diff of the latest proposal, `Ctrl-d` dismisses it, `PgUp`/`PgDn` scroll the transcript. Plain letters are always typed, so a message may start with "a" or "d". In the diff, only `Enter` applies; `Esc` goes back; `PgUp`/`PgDn` scroll.
 
@@ -92,7 +94,7 @@ Send: pick a handoff, then on the confirm screen `Tab` cycles the provider, `j`/
 
 ## Refining with an agent
 
-Refinement is a conversation, not a one-shot rewrite. The first turn is seeded by the kind's polish template (`templates/<kind>.polish.md`), the intent text and, when opened on a selection, a focus line. Replies stream in as they are written. Every reply is asked to start with a line saying what the intent is, judged from what you wrote rather than from the kind it is filed under: `bug: <what goes wrong> when <condition>`, `capability: <who> can <what>` or `idea: <the idea>`. When the agent cannot tell, it keeps the filed kind and asks "Is this a bug, a capability, or an idea?" among its questions. When you apply, the phrase becomes the title and the line sets the kind (bug is stored as `issue`, capability as `enhancement`; the screen shows bug, capability or idea), so a bug captured as an idea is handed off as a bug; `K` still changes the kind by hand. Every reply is also asked to end with a fenced ```` ```proposal ```` block holding the complete rewritten intent and a `questions:` list; `a` applies the latest proposal after a diff and merges the questions into `## Open questions`. A reply without a proposal cannot be applied, so chat text never lands in an intent. Your text changes only when you apply.
+Refinement is a conversation, not a one-shot rewrite. The first turn is seeded by the kind's polish template (`templates/<kind>.polish.md`), the intent text and, when opened on a selection, a focus line. Replies stream in as they are written. Every reply is asked to start with a line saying what the intent is, judged from what you wrote rather than from the kind it is filed under: `bug: <what goes wrong> when <condition>`, `feature: <who> can <what>` or `idea: <the idea>`. When the agent cannot tell, it keeps the filed kind and asks "Is this a bug, a feature, or an idea?" among its questions. When you apply, the phrase becomes the title and the line sets the kind (bug is stored as `issue`, feature as `enhancement`; the screen shows bug, feature or idea; an older `capability:` line still reads as a feature), so a bug captured as an idea is handed off as a bug; `K` still changes the kind by hand. Every reply is also asked to end with a fenced ```` ```proposal ```` block holding the complete rewritten intent and a `questions:` list; `a` applies the latest proposal after a diff and merges the questions into `## Open questions`. A reply without a proposal cannot be applied, so chat text never lands in an intent. Your text changes only when you apply.
 
 The conversation id is stored per provider in the intent's front matter and resumed on later turns, and a transcript is appended to `<intent>.chat.md`.
 
@@ -112,8 +114,8 @@ polish_provider = "agy"
 
 # tune a built-in without restating it
 [providers.agy]
-model  = "gemini-4-argon-high"          # or extra = ["--model", "…"]; the picker still lets you change it
-models = ["gemini-4-argon-high", "gemini-4-argon-medium", "claude-opus-5-5-high"]   # what the picker offers
+model  = "gemini-4-argon-high"          # or extra = ["--model", "…"]; `m` still lets you change it
+models = ["gemini-4-argon-high", "gemini-4-argon-medium", "claude-opus-5-5-high"]   # what `m` offers
 
 [providers.mine]
 polish = ["my-cli", "--prompt", "{prompt}"]
@@ -214,7 +216,7 @@ Keys in the list: `j`/`k` move, `PgUp`/`PgDn` move a screen of cards (less one, 
 
 ```
 ~/intents/
-  2026-10-24-pending-label.md            ← a quick capture, at the top until you move it (m)
+  2026-10-24-pending-label.md            ← a quick capture, at the top until you move it (M)
   2026-10-24-pending-label.assets/screen.png
   2026-10-24-pending-label.chat.md
   skoolscout/applications/…

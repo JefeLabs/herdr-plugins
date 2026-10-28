@@ -106,6 +106,7 @@ pub enum Pending {
 pub enum InputAction {
     AddIntent {
         group: PathBuf,
+        kind: &'static str,
     },
     NewGroup {
         parent: PathBuf,
@@ -143,7 +144,6 @@ pub enum Screen {
         step: PickStep,
         items: Vec<String>,
         selected: usize,
-        pending: PendingChat,
     },
     /// Typing an answer for question `index` inline in the questions pane.
     Answer {
@@ -179,6 +179,10 @@ pub enum Screen {
     Prompt {
         question: String,
         pending: Pending,
+    },
+    /// Adding: is it a bug, a feature or an idea? Then the title.
+    KindPick {
+        group: PathBuf,
     },
     Input {
         label: String,
@@ -349,6 +353,8 @@ pub struct View {
 }
 
 pub struct App {
+    /// Capture mode (the `add --popup` pane): quit once back on the browser.
+    pub exit_on_browse: bool,
     pub store: Store,
     pub cfg: Config,
     pub dirs: Dirs,
@@ -453,6 +459,7 @@ impl App {
         let store = Store::open(&cfg.root)?;
         let tree = store.scan()?.scoped(cfg.scope.as_deref());
         let mut app = Self {
+            exit_on_browse: false,
             store,
             cfg,
             dirs,
@@ -1348,15 +1355,7 @@ impl App {
             KeyCode::Char('u') => self.undo_reconcile(),
             KeyCode::Char('a') => {
                 let group = self.selected_group_dir();
-                let place = match group.strip_prefix(self.store.root()) {
-                    Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
-                    _ => "the top level".to_string(),
-                };
-                self.screen = Screen::Input {
-                    label: format!("new intent in {place}: title"),
-                    text: String::new(),
-                    action: InputAction::AddIntent { group },
-                };
+                self.screen = Screen::KindPick { group };
             }
             _ => {}
         }
@@ -1622,6 +1621,9 @@ impl App {
 
     pub fn key(&mut self, k: KeyEvent) -> Flow {
         let flow = self.key_inner(k);
+        if self.exit_on_browse && matches!(self.screen, Screen::Browse) {
+            return Flow::Quit;
+        }
         // the accordion: a section that gets focus opens, and stays open
         // while focus is on the tree or the description
         if matches!(
@@ -1659,8 +1661,7 @@ impl App {
                 step,
                 items,
                 selected,
-                pending,
-            } => self.key_agent_pick(step, items, selected, pending, k),
+            } => self.key_agent_pick(step, items, selected, k),
             Screen::Answer { index, text } => self.key_answer(index, text, k),
             Screen::Reader {
                 title,
@@ -1684,6 +1685,7 @@ impl App {
                 scroll,
             } => self.key_send_confirm(handoff, provider, repo, prompt, scroll, k),
             Screen::Prompt { question, pending } => self.key_prompt(question, pending, k),
+            Screen::KindPick { group } => self.key_kind_pick(group, k),
             Screen::Input {
                 label,
                 text,
@@ -1799,11 +1801,7 @@ impl App {
             },
             KeyCode::Char('a') => {
                 let group = self.selected_group_dir();
-                self.screen = Screen::Input {
-                    label: "title".into(),
-                    text: String::new(),
-                    action: InputAction::AddIntent { group },
-                };
+                self.screen = Screen::KindPick { group };
             }
             KeyCode::Char('n') => {
                 let parent = self.selected_group_dir();
@@ -1813,7 +1811,8 @@ impl App {
                     action: InputAction::NewGroup { parent },
                 };
             }
-            KeyCode::Char('m') => match self.rows.get(self.selected) {
+            KeyCode::Char('m') => self.open_agent_pick(),
+            KeyCode::Char('M') => match self.rows.get(self.selected) {
                 Some(Row::Intent { .. }) => {
                     self.screen = Screen::Input {
                         label: "move to group".into(),
@@ -1896,7 +1895,7 @@ impl App {
             KeyCode::Char('U') => self.update_selected_fields(|fm| fm.state = State::Refining),
             KeyCode::Char('p') => {
                 if let Some(it) = self.selected_intent().cloned() {
-                    self.open_agent_pick(PendingChat {
+                    self.polish(PendingChat {
                         intent: it,
                         selection: None,
                         from_editor: false,
@@ -1909,7 +1908,7 @@ impl App {
             KeyCode::Char('t') => {
                 if let Some(it) = self.selected_intent() {
                     self.screen = Screen::Input {
-                        label: title_label(&it.fm.kind).into(),
+                        label: title_label(&it.fm.kind),
                         text: it.fm.title.clone(),
                         action: InputAction::Rename,
                     };
@@ -2361,7 +2360,7 @@ impl App {
                 let sel = self.editor.selection();
                 if let Some(mut it) = self.editing.clone() {
                     it.body = self.editor.text();
-                    self.open_agent_pick(PendingChat {
+                    self.polish(PendingChat {
                         intent: it,
                         selection: sel,
                         from_editor: true,
@@ -2445,7 +2444,53 @@ impl App {
     // ---- chat -------------------------------------------------------------
 
     /// Step one of the picker: providers, with the last used one preselected.
-    fn open_agent_pick(&mut self, pending: PendingChat) {
+    /// Capture mode: ask the kind, then the title, polish, and close.
+    pub fn start_capture(&mut self) {
+        self.exit_on_browse = true;
+        self.screen = Screen::KindPick {
+            group: self.home_dir(),
+        };
+    }
+
+    fn key_kind_pick(&mut self, group: PathBuf, k: KeyEvent) -> Flow {
+        let kind = match k.code {
+            KeyCode::Char('b') => "issue",
+            KeyCode::Char('f') => "enhancement",
+            KeyCode::Char('i') => "idea",
+            KeyCode::Esc => {
+                self.screen = Screen::Browse;
+                return Flow::Continue;
+            }
+            _ => {
+                self.screen = Screen::KindPick { group };
+                return Flow::Continue;
+            }
+        };
+        let place = match group.strip_prefix(self.store.root()) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+            _ => "the top level".to_string(),
+        };
+        self.screen = Screen::Input {
+            label: format!(
+                "new {} in {place}: title ({})",
+                crate::config::kind_label(kind),
+                title_hint(kind)
+            ),
+            text: String::new(),
+            action: InputAction::AddIntent { group, kind },
+        };
+        Flow::Continue
+    }
+
+    /// Polishes with the agent and model last chosen with `m` (or the
+    /// configured polish provider), without asking.
+    fn polish(&mut self, pending: PendingChat) {
+        let last = last_used(&self.dirs, &self.cfg);
+        self.open_chat(pending, &last.provider, last.model);
+    }
+
+    /// `m`: choose the agent, then its model, for every polish from now on.
+    fn open_agent_pick(&mut self) {
         let items: Vec<String> = self.cfg.providers.keys().cloned().collect();
         let last = last_used(&self.dirs, &self.cfg);
         let selected = items.iter().position(|p| *p == last.provider).unwrap_or(0);
@@ -2453,7 +2498,6 @@ impl App {
             step: PickStep::Provider,
             items,
             selected,
-            pending,
         };
     }
 
@@ -2462,24 +2506,16 @@ impl App {
         step: PickStep,
         items: Vec<String>,
         mut selected: usize,
-        pending: PendingChat,
         k: KeyEvent,
     ) -> Flow {
         match k.code {
-            KeyCode::Esc => {
-                self.screen = if pending.from_editor && self.editing.is_some() {
-                    Screen::Edit
-                } else {
-                    Screen::Browse
-                };
-            }
+            KeyCode::Esc => self.screen = Screen::Browse,
             KeyCode::Char('j') | KeyCode::Down => {
                 selected = (selected + 1).min(items.len().saturating_sub(1));
                 self.screen = Screen::AgentPick {
                     step,
                     items,
                     selected,
-                    pending,
                 };
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -2488,7 +2524,6 @@ impl App {
                     step,
                     items,
                     selected,
-                    pending,
                 };
             }
             KeyCode::Enter => {
@@ -2505,7 +2540,7 @@ impl App {
                             .map(|p| p.models.clone())
                             .unwrap_or_default();
                         if models.is_empty() {
-                            self.open_chat(pending, &choice, None);
+                            self.choose_agent(&choice, None);
                         } else {
                             let last = last_used(&self.dirs, &self.cfg);
                             let msel = if last.provider == choice {
@@ -2519,13 +2554,10 @@ impl App {
                                 step: PickStep::Model { provider: choice },
                                 items: models,
                                 selected: msel,
-                                pending,
                             };
                         }
                     }
-                    PickStep::Model { provider } => {
-                        self.open_chat(pending, &provider, Some(choice))
-                    }
+                    PickStep::Model { provider } => self.choose_agent(&provider, Some(choice)),
                 }
             }
             _ => {
@@ -2533,11 +2565,33 @@ impl App {
                     step,
                     items,
                     selected,
-                    pending,
                 }
             }
         }
         Flow::Continue
+    }
+
+    /// Remembers the choice for every later polish and goes back to the tree.
+    fn choose_agent(&mut self, provider: &str, model: Option<String>) {
+        self.remember_agent(provider, model.clone());
+        self.message = Some(match model {
+            Some(m) => format!("polish will use {provider} · {m}   (m to change)"),
+            None => format!("polish will use {provider}   (m to change)"),
+        });
+        self.screen = Screen::Browse;
+    }
+
+    fn remember_agent(&mut self, provider: &str, model: Option<String>) {
+        let _ = save_last_used(
+            &self.dirs,
+            &LastUsed {
+                provider: provider.to_string(),
+                model,
+                layout: Some(self.layout.label().to_string()),
+                sort: Some(self.sort.label().to_string()),
+                filter: Some(self.filter.label().to_string()),
+            },
+        );
     }
 
     fn open_chat(&mut self, pending: PendingChat, provider: &str, model: Option<String>) {
@@ -2546,16 +2600,7 @@ impl App {
             selection,
             from_editor,
         } = pending;
-        let _ = save_last_used(
-            &self.dirs,
-            &LastUsed {
-                provider: provider.to_string(),
-                model: model.clone(),
-                layout: Some(self.layout.label().to_string()),
-                sort: Some(self.sort.label().to_string()),
-                filter: Some(self.filter.label().to_string()),
-            },
-        );
+        self.remember_agent(provider, model.clone());
         let conv_id = intent.fm.conversations.get(provider).cloned();
         let tpl = template(&self.dirs, &intent.fm.kind, true)
             .unwrap_or_else(|_| "Refine this intent.".to_string());
@@ -3097,9 +3142,8 @@ impl App {
 
     fn run_input_action(&mut self, action: InputAction, value: &str) {
         match action {
-            InputAction::AddIntent { group } => {
+            InputAction::AddIntent { group, kind } => {
                 let rel = self.rel(&group);
-                let kind = "idea";
                 let body = template(&self.dirs, kind, false).unwrap_or_default();
                 match self
                     .store
@@ -3120,6 +3164,12 @@ impl App {
                             }
                             None => {}
                         }
+                        // polish the new intent straight away, with the agent chosen by `m`
+                        self.polish(PendingChat {
+                            intent: it,
+                            selection: None,
+                            from_editor: false,
+                        });
                     }
                     Err(e) => self.message = Some(format!("create failed: {e:#}")),
                 }
@@ -3484,6 +3534,10 @@ impl App {
                 v.screen = "prompt";
                 v.hint = Some(question.clone());
             }
+            Screen::KindPick { .. } => {
+                v.screen = "kind";
+                v.hint = Some(KIND_QUESTION.to_string());
+            }
             Screen::Input { label, text, .. } => {
                 v.screen = "input";
                 v.hint = Some(label.clone());
@@ -3649,6 +3703,7 @@ impl App {
         *self.card_hits.borrow_mut() = hits;
         let text = match &self.screen {
             Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
+            Screen::KindPick { .. } => KIND_QUESTION.to_string(),
             Screen::Prompt { question, .. } => question.clone(),
             _ => self.message.clone().or_else(|| self.reconcile_note()).unwrap_or_else(|| {
                 "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
@@ -3755,7 +3810,9 @@ impl App {
                 ..
             } => {
                 let title = match step {
-                    PickStep::Provider => "refine with which agent?".to_string(),
+                    PickStep::Provider => {
+                        "polish with which agent? (kept for every polish)".to_string()
+                    }
                     PickStep::Model { provider } => format!("{provider}: which model?"),
                 };
                 ui::render_list(&title, items, *selected, right, buf);
@@ -3863,6 +3920,7 @@ impl App {
 
         let status_text = match &self.screen {
             Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
+            Screen::KindPick { .. } => KIND_QUESTION.to_string(),
             Screen::Prompt { question, .. } => question.clone(),
             Screen::Edit => "Ctrl-s save · Ctrl-p polish · Ctrl-e $EDITOR · Esc back".to_string(),
             Screen::Chat(_) => "Enter send · Ctrl-a apply · Ctrl-d dismiss · PgUp/PgDn scroll · Esc cancel/back".to_string(),
@@ -3883,7 +3941,7 @@ impl App {
                 (None, _) if self.reconcile_note().is_some() => {
                     self.reconcile_note().unwrap_or_default()
                 }
-                (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  m move  A attach  r rescan  q quit".to_string(),
+                (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  m model  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  M move  A attach  r rescan  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
@@ -4039,6 +4097,16 @@ fn external_edit(cfg: &Config, path: &Path) {
 }
 
 pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
+    run_with(cfg, dirs, false)
+}
+
+/// The capture popup: the full tool, starting at the kind question and
+/// closing once the new intent's chat is done.
+pub fn run_capture(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
+    run_with(cfg, dirs, true)
+}
+
+fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
     install_signal_handlers();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -4046,6 +4114,9 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
         default_hook(info);
     }));
     let mut app = App::new(cfg, dirs)?;
+    if capture {
+        app.start_capture();
+    }
     let mut terminal = init_terminal();
 
     let (events_tx, events_rx) = channel::<Event>();
@@ -4129,12 +4200,26 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
     }
 }
 
+/// The question that starts an add.
+const KIND_QUESTION: &str =
+    "new intent: is it a bug, a feature or an idea?   b bug · f feature · i idea · Esc cancel";
+
 /// The title prompt's hint for a kind: how a good title for it reads.
-fn title_label(kind: &str) -> &'static str {
+/// The retitle prompt (`t`), e.g. `title (a bug: what goes wrong, and when)`.
+fn title_label(kind: &str) -> String {
+    format!(
+        "title (a {}: {})",
+        crate::config::kind_label(kind),
+        title_hint(kind)
+    )
+}
+
+/// What a good title says, for each kind.
+fn title_hint(kind: &str) -> &'static str {
     match kind {
-        "issue" => "title (a bug: what goes wrong, and when)",
-        "idea" => "title (the idea, in a phrase)",
-        _ => "title (a capability: who can what)",
+        "issue" => "what goes wrong, and when",
+        "idea" => "the idea, in a phrase",
+        _ => "who can do what",
     }
 }
 
@@ -4158,40 +4243,8 @@ pub fn add(
     let repo = crate::send::capture_repo();
     let body = template(&dirs, "idea", false).unwrap_or_default();
     if popup {
-        let mut terminal = init_terminal();
-        let mut text = title.unwrap_or_default();
-        let result: anyhow::Result<Option<String>> = (|| loop {
-            terminal.draw(|f| {
-                let area = f.area();
-                let p = ratatui::widgets::Paragraph::new(format!(
-                    "New intent\n\ntitle: {text}▏\n\nEnter = save, Esc or Ctrl-c = cancel"
-                ));
-                p.render(area, f.buffer_mut());
-            })?;
-            match crossterm::event::read()? {
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
-                        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => return Ok(None),
-                        (KeyCode::Enter, _) => return Ok(Some(text.clone())),
-                        (KeyCode::Backspace, _) => {
-                            text.pop();
-                        }
-                        (KeyCode::Char(c), false) => text.push(c),
-                        _ => {}
-                    }
-                }
-                Event::Paste(p) => text.push_str(p.replace(['\r', '\n'], " ").trim()),
-                _ => {}
-            }
-        })();
-        restore_terminal();
-        if let Some(t) = result? {
-            let t = t.trim();
-            if !t.is_empty() {
-                store.create(&group, t, "idea", &body, repo)?;
-            }
-        }
-        return Ok(());
+        // the capture pane: kind, title, then the polish chat, in the full tool
+        return run_capture(cfg, dirs);
     }
     if title.is_none() && piped.is_none() {
         anyhow::bail!(
@@ -4752,6 +4805,7 @@ mod tests {
         fx.app.reload_tree();
         key(&mut fx.app, KeyCode::Char('v'));
         key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('i'));
         type_str(&mut fx.app, "From the list");
         key(&mut fx.app, KeyCode::Enter);
         let dir = fx.app.store.root().join("tourneyseason");
@@ -4814,11 +4868,14 @@ mod tests {
         sort_by(&mut fx.app, "Title");
         list_goto(&mut fx.app, "Beta");
         key(&mut fx.app, KeyCode::Char('a'));
+        assert_eq!(fx.app.view().screen, "kind", "asks the kind first");
+        key(&mut fx.app, KeyCode::Char('f'));
         let v = fx.app.view();
         assert_eq!(v.screen, "input");
         type_text(&mut fx.app, "Gamma");
         key(&mut fx.app, KeyCode::Enter);
         let v = fx.app.view();
+        assert_eq!(v.screen, "chat", "polish starts at once");
         assert_eq!(v.layout, "list", "stays in the card view");
         assert_eq!(list_title(&fx.app), "Gamma", "the new card is selected");
         let it = fx.app.selected_intent().unwrap();
@@ -4834,6 +4891,7 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         key(&mut fx.app, KeyCode::Char('v'));
         key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
         type_text(&mut fx.app, "Gam");
         let shown = render(&fx.app, 100, 20);
         assert!(
@@ -4842,7 +4900,7 @@ mod tests {
         );
         let status = shown.lines().last().unwrap_or_default();
         assert!(
-            status.contains("new intent in") && status.contains("Gam"),
+            status.contains("new bug in") && status.contains("Gam"),
             "the prompt is on the status line: {status}"
         );
         // the areas prompt too
@@ -4870,6 +4928,7 @@ mod tests {
         let mut app = App::new(cfg, dirs.clone()).unwrap();
         key(&mut app, KeyCode::Char('v'));
         key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('i'));
         type_text(&mut app, "First one");
         key(&mut app, KeyCode::Enter);
         assert_eq!(list_title(&app), "First one");
@@ -6211,11 +6270,12 @@ mod tests {
     /// `p` opens the agent picker; accept the preselected provider and model.
     fn polish(app: &mut App) {
         key(app, KeyCode::Char('p'));
-        assert_eq!(app.view().screen, "agent-pick", "{:?}", app.view());
-        key(app, KeyCode::Enter);
-        if app.view().screen == "agent-pick" {
-            key(app, KeyCode::Enter);
-        }
+        assert_eq!(
+            app.view().screen,
+            "chat",
+            "p polishes at once: {:?}",
+            app.view()
+        );
     }
     fn ctrl(app: &mut App, c: char) -> Flow {
         app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
@@ -6289,8 +6349,12 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "skoolscout");
         key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
         type_str(&mut fx.app, "Gamma thing");
         key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "chat", "polish starts at once");
+        wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
+        key(&mut fx.app, KeyCode::Esc);
         let v = fx.app.view();
         assert!(
             v.rows
@@ -6304,8 +6368,8 @@ mod tests {
         assert_eq!(Store::load(&path).unwrap().fm.state, State::Raw);
         assert_eq!(
             fx.app.selected_intent().unwrap().fm.kind,
-            "idea",
-            "default kind"
+            "issue",
+            "the kind chosen before the title"
         );
     }
 
@@ -6763,9 +6827,7 @@ mod tests {
         key(&mut fx.app, KeyCode::End);
         type_str(&mut fx.app, " unsaved");
         ctrl(&mut fx.app, 'p');
-        assert_eq!(fx.app.view().screen, "agent-pick");
-        key(&mut fx.app, KeyCode::Enter);
-        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "chat", "polish starts at once");
         wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
         key(&mut fx.app, KeyCode::Esc);
         assert_eq!(fx.app.view().screen, "edit");
@@ -6842,7 +6904,7 @@ mod tests {
         fs::create_dir_all(root.join("archive")).unwrap();
         fx.app.rescan();
         select(&mut fx.app, "skoolscout");
-        key(&mut fx.app, KeyCode::Char('m'));
+        key(&mut fx.app, KeyCode::Char('M'));
         type_str(&mut fx.app, "archive");
         key(&mut fx.app, KeyCode::Enter);
         assert!(root.join("archive/skoolscout/").is_dir(), "group moved");
@@ -6870,10 +6932,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_picker_offers_provider_then_model_and_remembers_the_choice() {
+    fn m_chooses_provider_then_model_and_polish_uses_it_from_then_on() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        key(&mut fx.app, KeyCode::Char('m'));
         let v = fx.app.view();
         assert_eq!(v.screen, "agent-pick");
         assert_eq!(
@@ -6886,6 +6948,18 @@ mod tests {
         assert_eq!(v.pick_items, ["model-a", "model-b"]);
         key(&mut fx.app, KeyCode::Char('j'));
         key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(
+            fx.app.view().screen,
+            "browse",
+            "choosing does not start a chat"
+        );
+        let last = last_used(&fx.app.dirs, &fx.app.cfg);
+        assert_eq!(
+            (last.provider.as_str(), last.model.as_deref()),
+            ("fake", Some("model-b"))
+        );
+        // p uses it without asking
+        key(&mut fx.app, KeyCode::Char('p'));
         assert_eq!(fx.app.view().screen, "chat");
         wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
         let log = fs::read_to_string(&fx.log).unwrap();
@@ -6895,11 +6969,10 @@ mod tests {
         );
         key(&mut fx.app, KeyCode::Esc);
         // next time, the last choice is preselected
-        key(&mut fx.app, KeyCode::Char('p'));
+        key(&mut fx.app, KeyCode::Char('m'));
         key(&mut fx.app, KeyCode::Enter);
         let v = fx.app.view();
         assert_eq!(v.pick_items[v.pick_selected], "model-b");
-        key(&mut fx.app, KeyCode::Esc);
         key(&mut fx.app, KeyCode::Esc);
         assert_eq!(fx.app.view().screen, "browse");
     }
@@ -6909,9 +6982,11 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         fx.app.cfg.providers.get_mut("fake").unwrap().models.clear();
         select(&mut fx.app, "Alpha");
-        key(&mut fx.app, KeyCode::Char('p'));
+        key(&mut fx.app, KeyCode::Char('m'));
         key(&mut fx.app, KeyCode::Enter);
-        assert_eq!(fx.app.view().screen, "chat");
+        assert_eq!(fx.app.view().screen, "browse");
+        let last = last_used(&fx.app.dirs, &fx.app.cfg);
+        assert_eq!((last.provider.as_str(), last.model), ("fake", None));
     }
 
     #[test]
@@ -7220,6 +7295,95 @@ mod tests {
     }
 
     #[test]
+    fn adding_asks_the_kind_first_then_the_title_then_polishes() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "kind");
+        assert!(
+            v.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("a bug, a feature or an idea"),
+            "{:?}",
+            v.hint
+        );
+        key(&mut fx.app, KeyCode::Char('b'));
+        assert_eq!(fx.app.view().screen, "input");
+        type_str(&mut fx.app, "Saving twice duplicates the folder");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(fx.app.view().screen, "chat", "polish starts at once");
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert_eq!(it.fm.kind, "issue");
+        assert_eq!(it.fm.title, "Saving twice duplicates the folder");
+        assert!(
+            it.body.contains("What was observed"),
+            "the bug template: {}",
+            it.body
+        );
+    }
+
+    #[test]
+    fn f_and_i_choose_feature_and_idea() {
+        for (k, kind) in [('f', "enhancement"), ('i', "idea")] {
+            let mut fx = setup("agy.jsonl");
+            select(&mut fx.app, "skoolscout");
+            key(&mut fx.app, KeyCode::Char('a'));
+            key(&mut fx.app, KeyCode::Char(k));
+            type_str(&mut fx.app, "Something new");
+            key(&mut fx.app, KeyCode::Enter);
+            let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+            assert_eq!(it.fm.kind, kind, "{k}");
+        }
+    }
+
+    #[test]
+    fn esc_at_the_kind_question_adds_nothing() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        let count = |app: &App| app.view().rows.len();
+        let before = count(&fx.app);
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Esc);
+        assert_eq!(fx.app.view().screen, "browse");
+        assert_eq!(count(&fx.app), before);
+    }
+
+    #[test]
+    fn capture_mode_closes_once_back_from_the_chat() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.start_capture();
+        assert_eq!(fx.app.view().screen, "kind");
+        assert_eq!(key(&mut fx.app, KeyCode::Char('i')), Flow::Continue);
+        type_str(&mut fx.app, "A quick thought");
+        assert_eq!(
+            key(&mut fx.app, KeyCode::Enter),
+            Flow::Continue,
+            "into the chat"
+        );
+        assert_eq!(fx.app.view().screen, "chat");
+        wait_until(&mut fx.app, "turn", |a| !a.view().turn_running);
+        assert_eq!(
+            key(&mut fx.app, KeyCode::Esc),
+            Flow::Quit,
+            "back from the chat closes"
+        );
+        let it = Store::load(&fx.app.selected_intent().unwrap().path).unwrap();
+        assert_eq!(
+            (it.fm.title.as_str(), it.fm.kind.as_str()),
+            ("A quick thought", "idea")
+        );
+    }
+
+    #[test]
+    fn capture_mode_cancelled_at_the_kind_question_closes() {
+        let mut fx = setup("agy.jsonl");
+        fx.app.start_capture();
+        assert_eq!(key(&mut fx.app, KeyCode::Esc), Flow::Quit);
+    }
+
+    #[test]
     fn applying_a_bug_heading_files_the_intent_as_a_bug() {
         let mut fx = setup("agy.jsonl");
         let titled = fx._tmp.path().join("bug.jsonl");
@@ -7250,7 +7414,8 @@ mod tests {
             "{}",
             title_label("issue")
         );
-        assert!(title_label("enhancement").contains("who can what"));
+        assert!(title_label("enhancement").contains("feature"));
+        assert!(title_label("enhancement").contains("who can do what"));
         assert!(title_label("idea").contains("idea"));
     }
 

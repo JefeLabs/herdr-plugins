@@ -1,6 +1,5 @@
 ---
 source: tools/intents/src/app.rs
-assertion_line: 6247
 expression: t.backend()
 ---
 "▾ Inbox (1)               │a add intent · n new group · ? help                            "
@@ -18,4 +17,4 @@ expression: t.backend()
 "                          │                                                               "
 "                          │                                                               "
 "                          │                                                               "
-"v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s "
+"v list  Tab panes  a add  t title  e edit  p polish  m model  Q answer  C criteria  V arti"

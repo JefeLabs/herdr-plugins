@@ -660,10 +660,10 @@ mod tests {
         assert!(!text_of(&t).contains('\u{1b}'), "raw ESC in status");
     }
     #[test]
-    fn the_detail_names_the_kind_as_bug_capability_or_idea() {
+    fn the_detail_names_the_kind_as_bug_feature_or_idea() {
         for (kind, shown) in [
             ("issue", "kind: bug"),
-            ("enhancement", "kind: capability"),
+            ("enhancement", "kind: feature"),
             ("idea", "kind: idea"),
         ] {
             let it = crate::store::Intent {

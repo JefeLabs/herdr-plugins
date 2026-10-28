@@ -15,8 +15,8 @@ command = ["cargo", "build", "--release", "-p", "herdr-intents"]
 id = "add"
 title = "New intent"
 placement = "popup"
-width = "60%"
-height = 12
+width = "85%"
+height = "85%"
 command = ["../../target/release/herdr-intents", "add", "--popup"]
 
 [[panes]]

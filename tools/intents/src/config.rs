@@ -11,20 +11,21 @@ use serde::{Deserialize, Serialize};
 pub const PLUGIN_ID: &str = "jefelabs.intents";
 pub const KINDS: &[&str] = &["issue", "enhancement", "idea"];
 
-/// How a kind is shown: an issue is a bug, an enhancement a capability.
+/// How a kind is shown: an issue is a bug, an enhancement a feature.
 pub fn kind_label(kind: &str) -> &str {
     match kind {
         "issue" => "bug",
-        "enhancement" => "capability",
+        "enhancement" => "feature",
         other => other,
     }
 }
 
-/// The kind an agent's first line names: `bug:`, `capability:` or `idea:`.
+/// The kind an agent's first line names: `bug:`, `feature:` or `idea:`
+/// (`capability:` from older chats is a feature).
 pub fn kind_from_heading(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
         "bug" => Some("issue"),
-        "capability" => Some("enhancement"),
+        "feature" | "capability" => Some("enhancement"),
         "idea" => Some("idea"),
         _ => None,
     }
@@ -371,6 +372,7 @@ fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
 fn old_polish_defaults(kind: &str) -> &'static [&'static str] {
     match kind {
         "issue" => &[
+            "cf7ac21cb266d2e0002d368fbe0fe96fa03ff8453c97b3a1652525468e7ce76f",
             "11e7b3af7e8908106dc33dc107b46886f9fcc55773bef2808cfbbad0d19b8b06",
             "2e6d4ad5ebfac608bf4ee1c75078d9a4212be580310d756b17144535599ddf37",
             "4a490a416cb8d007f38192e07e9e5e7d57389aac730daf62fa6691bf6f74bcd7",
@@ -381,6 +383,7 @@ fn old_polish_defaults(kind: &str) -> &'static [&'static str] {
             "ffa2e9fa20d251d90f989ce7f6a805f992a31e318e4661d7ed3441d4a86b9588",
         ],
         "enhancement" => &[
+            "27ffc89cbea7fcf80c2ae8da67716000803d66a6ff60e77f708536f31e3bab43",
             "17a497a254e4f121cf9dc8b5fec15f026a1199c5cfa9e687190bd87b4f42fad2",
             "54e77f65fe15a51ad42568636dff129f0c2cfd3600640b5996d6ef8a070aff15",
             "5a77b7e1b87fc786d22007bbc880700221ce44283b29f162ac9abd62439fff46",
@@ -391,6 +394,7 @@ fn old_polish_defaults(kind: &str) -> &'static [&'static str] {
             "beafcfa500a95db86e7a7959792ed63af97d7f32ef5dd5fb979d8da058999955",
         ],
         "idea" => &[
+            "7e002fbb1ec6ff488a4f458db4ccb03b810a5d576613cc80bd7126b093021cec",
             "0189d38bc264b506d1eff5ec5605a1de15ea48619b05206d4df77f9ea1c1e7a3",
             "07659af1a049460d5b8a336d2901a1a6e3d6c7d1ea19741659ad65e49068e4e4",
             "110a9197430b4c4164f14e62d7c90e0c2da6d59dcd8daed93201223b04f4255e",
@@ -774,9 +778,9 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn kinds_are_shown_as_bug_capability_and_idea() {
+    fn kinds_are_shown_as_bug_feature_and_idea() {
         assert_eq!(kind_label("issue"), "bug");
-        assert_eq!(kind_label("enhancement"), "capability");
+        assert_eq!(kind_label("enhancement"), "feature");
         assert_eq!(kind_label("idea"), "idea");
         assert_eq!(
             kind_label("custom"),
@@ -784,7 +788,12 @@ mod tests {
             "an unknown kind shows as written"
         );
         assert_eq!(kind_from_heading("bug"), Some("issue"));
-        assert_eq!(kind_from_heading("Capability"), Some("enhancement"));
+        assert_eq!(kind_from_heading("feature"), Some("enhancement"));
+        assert_eq!(
+            kind_from_heading("Capability"),
+            Some("enhancement"),
+            "older chats"
+        );
         assert_eq!(kind_from_heading("idea"), Some("idea"));
         assert_eq!(kind_from_heading("chore"), None);
     }
@@ -812,7 +821,7 @@ mod tests {
                 .find(|(rel, _)| *rel == format!("templates/{kind}.polish.md"))
                 .map(|(_, t)| *t)
                 .unwrap();
-            for h in ["`bug:", "`capability:", "`idea:", "Is this a bug"] {
+            for h in ["`bug:", "`feature:", "`idea:", "Is this a bug"] {
                 assert!(text.contains(h), "{kind}.polish.md lacks {h}");
             }
             let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
