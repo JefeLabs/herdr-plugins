@@ -2455,6 +2455,7 @@ impl App {
     fn key_kind_pick(&mut self, group: PathBuf, k: KeyEvent) -> Flow {
         let kind = match k.code {
             KeyCode::Char('b') => "issue",
+            KeyCode::Char('r') => "refactor",
             KeyCode::Char('f') => "enhancement",
             KeyCode::Char('i') => "idea",
             KeyCode::Esc => {
@@ -4206,8 +4207,7 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
 }
 
 /// The question that starts an add.
-const KIND_QUESTION: &str =
-    "new intent: is it a bug, a feature or an idea?   b bug · f feature · i idea · Esc cancel";
+const KIND_QUESTION: &str = "new intent: is it a bug, a refactor, a feature or an idea?   b bug · r refactor · f feature · i idea · Esc cancel";
 
 /// The title prompt's hint for a kind: how a good title for it reads.
 /// The retitle prompt (`t`), e.g. `title (a bug: what goes wrong, and when)`.
@@ -4223,6 +4223,7 @@ fn title_label(kind: &str) -> String {
 fn title_hint(kind: &str) -> &'static str {
     match kind {
         "issue" => "what goes wrong, and when",
+        "refactor" => "what changes, and where",
         "idea" => "the idea, in a phrase",
         _ => "who can do what",
     }
@@ -7322,7 +7323,7 @@ mod tests {
             v.hint
                 .as_deref()
                 .unwrap_or("")
-                .contains("a bug, a feature or an idea"),
+                .contains("a bug, a refactor, a feature or an idea"),
             "{:?}",
             v.hint
         );
@@ -7422,6 +7423,27 @@ mod tests {
             "Saving twice duplicates the folder when offline"
         );
         assert_eq!(it.fm.kind, "issue", "polish judged it a bug");
+    }
+
+    #[test]
+    fn k_cycles_bug_refactor_feature_idea() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox"); // an issue
+        key(&mut fx.app, KeyCode::Char('K'));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.kind, "refactor");
+        key(&mut fx.app, KeyCode::Char('K'));
+        assert_eq!(fx.app.selected_intent().unwrap().fm.kind, "enhancement");
+    }
+
+    #[test]
+    fn r_in_the_kind_question_starts_a_refactor() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('r'));
+        let shown = render(&fx.app, 100, 20);
+        let status = shown.lines().last().unwrap_or_default();
+        assert!(status.contains("new refactor in"), "{status}");
     }
 
     #[test]

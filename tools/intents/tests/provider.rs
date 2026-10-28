@@ -245,6 +245,18 @@ fn capability_and_idea_lines_name_their_kinds() {
 }
 
 #[test]
+fn a_refactor_heading_sets_kind_and_title() {
+    let r = parse_reply(
+        "refactor: Split app.rs into modules in tools/intents\n\n```proposal\n## Description\nx\n```\n",
+    );
+    assert_eq!(r.kind.as_deref(), Some("refactor"));
+    assert_eq!(
+        r.title.as_deref(),
+        Some("Split app.rs into modules in tools/intents")
+    );
+}
+
+#[test]
 fn a_reply_without_a_heading_line_changes_neither_title_nor_kind() {
     let r = parse_reply("Here is a tighter version.\n\n```proposal\n## Description\nx\n```\n");
     assert_eq!((r.title, r.kind), (None, None));

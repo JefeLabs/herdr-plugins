@@ -83,6 +83,36 @@ fn workbrokr_detected_by_file_and_overridable() {
 }
 
 #[test]
+fn refactor_spec_gets_the_work_start_preamble_in_workbrokr_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        config: tmp.path().join("cfg"),
+        root: tmp.path().join("root"),
+    };
+    let cfg = load_or_init(&dirs).unwrap();
+    let store = Store::open(&dirs.root).unwrap();
+    let it = store
+        .create(
+            Path::new("Inbox"),
+            "Split app.rs",
+            "refactor",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    let h = cfg
+        .handoffs
+        .iter()
+        .find(|h| h.name == "refactor-spec")
+        .unwrap();
+    let p = render_prompt(h, &it, &[], true);
+    assert!(p.starts_with("This repo uses workbrokr."), "{p}");
+    assert!(p.contains("`refactor` label"), "{p}");
+    let p = render_prompt(h, &it, &[], false);
+    assert!(!p.contains("work start"), "non-workbrokr repo: {p}");
+}
+
+#[test]
 fn render_prompt_prefixes_work_start_only_for_building_handoffs_in_workbrokr_repos() {
     let tmp = tempfile::tempdir().unwrap();
     let dirs = Dirs {

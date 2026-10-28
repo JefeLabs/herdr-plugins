@@ -120,7 +120,7 @@ pub struct Reply {
     /// A proposed title, from the reply's first line: `bug: …`,
     /// `capability: <who> can <what>` or `idea: …`.
     pub title: Option<String>,
-    /// The kind that line names (`issue`, `enhancement` or `idea`).
+    /// The kind that line names (`issue`, `refactor`, `enhancement` or `idea`).
     pub kind: Option<String>,
 }
 

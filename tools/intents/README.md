@@ -46,7 +46,7 @@ type = "plugin_action"
 command = "jefelabs.intents.add"
 ```
 
-The popup asks the same as `a` in the tree: bug, feature or idea first, then the title, and the polish starts as soon as you press `Enter`. Leaving the chat closes the popup; the intent is saved either way.
+The popup asks the same as `a` in the tree: bug, refactor, feature or idea first, then the title, and the polish starts as soon as you press `Enter`. Leaving the chat closes the popup; the intent is saved either way.
 
 ## Shape of an intent
 
@@ -82,7 +82,7 @@ The Artifacts pane (`V`) lists what the agents produced for the intent: specs, p
 
 The Pull requests section lists each `pr:` line with its state from `gh` (`merged`, `open`, `closed`, or `…` until `gh` has answered) and its title, and counts them in its title (`Pull requests (6/7 merged)`). Pull requests the repo search found by the intent's spec and plan names, but no `pr:` line names, follow dimmed as found (`merged? #5840 …`); `L` links one, and it keeps the state and title the search gave until `gh` is asked about it. `Enter` or `o` opens a pull request in the browser. In Pull requests and Demo Videos, `a` adds a line of that kind without typing it (`#123`, or `story-id (criteria: 1, 4)`).
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group (asks bug, feature or idea first, then the title, then polishes it straight away), `n` new group, `M` move the selected intent or group (type the target group path), `K` cycle kind (bug, feature, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` polish with the agent, `m` choose the agent and model, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a feature's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error. With the mouse, a click selects a row in the tree, a click on the selected group opens or closes it, and the wheel moves the selection.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent in the selected group (asks bug, refactor, feature or idea first, then the title, then polishes it straight away), `n` new group, `M` move the selected intent or group (type the target group path), `K` cycle kind (bug, refactor, feature, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` polish with the agent, `m` choose the agent and model, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a feature's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error. With the mouse, a click selects a row in the tree, a click on the selected group opens or closes it, and the wheel moves the selection.
 
 Editor: type, `Shift+arrows` select, `Ctrl-s` save, `Ctrl-p` polish (on the selection if any), `Ctrl-e` open in `$EDITOR`, `Esc` back.
 
@@ -94,7 +94,7 @@ Send: pick a handoff, then on the confirm screen `Tab` cycles the provider, `j`/
 
 ## Refining with an agent
 
-Refinement is a conversation, not a one-shot rewrite. The first turn is seeded by the kind's polish template (`templates/<kind>.polish.md`), the intent text and, when opened on a selection, a focus line. Replies stream in as they are written. Every reply is asked to start with a line saying what the intent is, judged from what you wrote rather than from the kind it is filed under: `bug: <what goes wrong> when <condition>`, `feature: <who> can <what>` or `idea: <the idea>`. When the agent cannot tell, it keeps the filed kind and asks "Is this a bug, a feature, or an idea?" among its questions. When you apply, the phrase becomes the title and the line sets the kind (bug is stored as `issue`, feature as `enhancement`; the screen shows bug, feature or idea; an older `capability:` line still reads as a feature), so a bug captured as an idea is handed off as a bug; `K` still changes the kind by hand. Every reply is also asked to end with a fenced ```` ```proposal ```` block holding the complete rewritten intent and a `questions:` list; `a` applies the latest proposal after a diff and merges the questions into `## Open questions`. A reply without a proposal cannot be applied, so chat text never lands in an intent. Your text changes only when you apply.
+Refinement is a conversation, not a one-shot rewrite. The first turn is seeded by the kind's polish template (`templates/<kind>.polish.md`), the intent text and, when opened on a selection, a focus line. Replies stream in as they are written. Every reply is asked to start with a line saying what the intent is, judged from what you wrote rather than from the kind it is filed under: `bug: <what goes wrong> when <condition>`, `refactor: <what changes> in <where>`, `feature: <who> can <what>` or `idea: <the idea>`. When the agent cannot tell, it keeps the filed kind and asks "Is this a bug, a refactor, a feature, or an idea?" among its questions. When you apply, the phrase becomes the title and the line sets the kind (bug is stored as `issue`, feature as `enhancement`, refactor and idea as themselves; the screen shows bug, refactor, feature or idea; an older `capability:` line still reads as a feature), so a bug captured as an idea is handed off as a bug; `K` still changes the kind by hand. Every reply is also asked to end with a fenced ```` ```proposal ```` block holding the complete rewritten intent and a `questions:` list; `a` applies the latest proposal after a diff and merges the questions into `## Open questions`. A reply without a proposal cannot be applied, so chat text never lands in an intent. Your text changes only when you apply.
 
 The conversation id is stored per provider in the intent's front matter and resumed on later turns, and a transcript is appended to `<intent>.chat.md`.
 
@@ -132,6 +132,7 @@ send_kind = "claude"
 |---|---|---|
 | `issue-report` | issue | the repo's `issue-report` skill, confirms the root cause before filing |
 | `enhancement-spec` | enhancement | the repo's `enhancement-spec` skill, shows the draft before posting |
+| `refactor-spec` | refactor | the repo's `enhancement-spec` skill, filed as an issue with the `refactor` label, shows the draft before posting |
 | `grill` | any | `/grill-me` on the intent |
 | `wayfinder` | any | `/wayfinder` with the intent as the destination |
 
