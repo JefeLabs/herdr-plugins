@@ -245,6 +245,16 @@ fn capability_and_idea_lines_name_their_kinds() {
 }
 
 #[test]
+fn a_group_line_names_the_home_group() {
+    let r = parse_reply(
+        "bug: X when Y\ngroup: skoolscout/admin\n```proposal\n## Description\ngroup: kept\n```\n",
+    );
+    assert_eq!(r.group.as_deref(), Some("skoolscout/admin"));
+    assert!(!r.prose.contains("group:"), "{}", r.prose);
+    assert!(r.proposal.unwrap().contains("group: kept"));
+}
+
+#[test]
 fn a_refactor_heading_sets_kind_and_title() {
     let r = parse_reply(
         "refactor: Split app.rs into modules in tools/intents\n\n```proposal\n## Description\nx\n```\n",

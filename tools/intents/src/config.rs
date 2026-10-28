@@ -317,6 +317,22 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         include_str!("../defaults/refactor.md"),
     ),
     (
+        "templates/issue.interview.md",
+        include_str!("../defaults/issue.interview.md"),
+    ),
+    (
+        "templates/refactor.interview.md",
+        include_str!("../defaults/refactor.interview.md"),
+    ),
+    (
+        "templates/enhancement.interview.md",
+        include_str!("../defaults/enhancement.interview.md"),
+    ),
+    (
+        "templates/idea.interview.md",
+        include_str!("../defaults/idea.interview.md"),
+    ),
+    (
         "templates/refactor.polish.md",
         include_str!("../defaults/refactor.polish.md"),
     ),
@@ -542,6 +558,16 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
 /// resume keeps working.
 pub fn polish_cwd(root: &Path, stem: &str) -> PathBuf {
     root.join(".polish").join(stem)
+}
+
+/// The kind's interview guide (`templates/<kind>.interview.md`): what an
+/// add-by-conversation agent asks about.
+pub fn interview_guide(dirs: &Dirs, kind: &str) -> anyhow::Result<String> {
+    let path = dirs
+        .config
+        .join("templates")
+        .join(format!("{kind}.interview.md"));
+    std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
 
 /// Body skeleton (`polish == false`) or polish prompt template for a kind.
@@ -793,6 +819,25 @@ pub fn builtin_handoffs() -> Vec<Handoff> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn interview_guides_are_seeded_for_every_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        load_or_init(&dirs).unwrap();
+        for kind in KINDS {
+            let g = interview_guide(&dirs, kind).unwrap();
+            assert!(!g.trim().is_empty(), "{kind} has a guide");
+        }
+        assert!(
+            interview_guide(&dirs, "issue")
+                .unwrap()
+                .contains("expected")
+        );
+    }
 
     #[test]
     fn kinds_include_refactor_shown_as_refactor() {
