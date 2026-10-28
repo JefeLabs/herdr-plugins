@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds release archives of the Herdr plugins (toolbar and capabilities) for
+# Builds release archives of the Herdr plugins (toolbar and intents) for
 # every supported platform, plus SHA256SUMS and install.sh, into dist/.
 # Run from anywhere: scripts/dist.sh
 #
@@ -38,18 +38,18 @@ build() { # <rust target> <asset name>
     *-linux-musl)
       var="CARGO_TARGET_$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')_LINKER"
       env "$var=rust-lld" RUSTFLAGS="-C linker-flavor=ld.lld" \
-        cargo build --release --target "$target" -p herdr-toolbar -p herdr-capabilities
+        cargo build --release --target "$target" -p herdr-toolbar -p herdr-intents
       ;;
     *)
-      cargo build --release --target "$target" -p herdr-toolbar -p herdr-capabilities
+      cargo build --release --target "$target" -p herdr-toolbar -p herdr-intents
       ;;
   esac
   stage=$(mktemp -d)
   root="$stage/herdr-plugins"
-  mkdir -p "$root/toolbar" "$root/tools/capabilities" "$root/target/release"
+  mkdir -p "$root/toolbar" "$root/tools/intents" "$root/target/release"
   cp toolbar/herdr-plugin.toml toolbar/README.md toolbar/tools.example.toml "$root/toolbar/"
-  cp tools/capabilities/herdr-plugin.toml tools/capabilities/README.md "$root/tools/capabilities/"
-  cp "target/$target/release/herdr-toolbar" "target/$target/release/herdr-capabilities" \
+  cp tools/intents/herdr-plugin.toml tools/intents/README.md "$root/tools/intents/"
+  cp "target/$target/release/herdr-toolbar" "target/$target/release/herdr-intents" \
     "$root/target/release/"
   pack "dist/herdr-plugins-$name.tar.gz" "$stage" herdr-plugins
   rm -rf "$stage"

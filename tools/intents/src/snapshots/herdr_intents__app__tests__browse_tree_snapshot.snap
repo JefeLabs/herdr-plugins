@@ -1,0 +1,21 @@
+---
+source: tools/intents/src/app.rs
+assertion_line: 6247
+expression: t.backend()
+---
+"▾ Inbox (1)               │a add intent · n new group · ? help                            "
+"  ○ In the inbox ?2       │                                                               "
+"▾ skoolscout (2)          │                                                               "
+"  ○ Alpha                 │                                                               "
+"  ○ Beta                  │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"                          │                                                               "
+"v list  Tab panes  a add  t title  e edit  p polish  Q answer  C criteria  V artifacts  s "

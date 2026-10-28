@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs the Herdr toolbar and capabilities plugins from a GitHub release:
+# Installs the Herdr toolbar and intents plugins from a GitHub release:
 #
 #   curl -fsSL https://github.com/JefeLabs/herdr-plugins/releases/latest/download/install.sh | sh
 #
@@ -116,7 +116,7 @@ rm -rf "$dir/toolbar" "$dir/tools" "$dir/target"
 cp -R "$tmp/herdr-plugins/." "$dir/"
 say "Installed into $dir"
 
-for plugin in toolbar tools/capabilities; do
+for plugin in toolbar tools/intents; do
   if herdr plugin list 2>/dev/null | grep -q "local:$dir/$plugin\]"; then
     say "  $plugin: already linked, updated in place"
   elif herdr plugin link "$dir/$plugin" >/dev/null 2>&1; then
@@ -126,13 +126,40 @@ for plugin in toolbar tools/capabilities; do
   fi
 done
 
-# a first toolbar config, pointing at this install's capabilities tool
+# a first toolbar config, pointing at this install's intents tool
 config=$(herdr plugin config-dir jefelabs.toolbar 2>/dev/null || true)
 if [ -n "$config" ] && [ ! -f "$config/tools.toml" ]; then
   mkdir -p "$config"
   sed "s|/absolute/path/to/herdr-plugins|$dir|" "$dir/toolbar/tools.example.toml" > "$config/tools.toml"
   say "Wrote $config/tools.toml (edit it to choose your tools)"
 fi
+
+# The intents plugin used to be jefelabs.capabilities (folder tools/capabilities,
+# program herdr-capabilities). Unlink the old plugin, whose folder is gone now,
+# and point the toolbar and Herdr's key binding at the new names, keeping a
+# `.before-intents` copy of each file changed. The plugin carries its own
+# settings over the first time it runs.
+if herdr plugin list 2>/dev/null | grep -q 'jefelabs\.capabilities'; then
+  if herdr plugin unlink jefelabs.capabilities >/dev/null 2>&1; then
+    say "  Unlinked the old jefelabs.capabilities plugin (it is jefelabs.intents now)"
+  fi
+fi
+rename_in() { # <file> <grep pattern of old names> <sed program>
+  if [ -f "$1" ] && grep -q "$2" "$1"; then
+    cp "$1" "$1.before-intents"
+    sed -e "$3" "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+    say "  Updated $1 for the new name (old copy: $1.before-intents)"
+  fi
+}
+if [ -n "$config" ]; then
+  rename_in "$config/tools.toml" 'herdr-capabilities\|^id *= *"capabilities"' \
+    's#/herdr-capabilities"#/herdr-intents"#g
+     s/^\(id[[:space:]]*=[[:space:]]*\)"capabilities"/\1"intents"/
+     s/^\(name[[:space:]]*=[[:space:]]*\)"Capabilities"/\1"Intents"/
+     /^order/s/"capabilities"/"intents"/'
+fi
+rename_in "${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}" 'jefelabs\.capabilities\.add' \
+  's/jefelabs\.capabilities\.add/jefelabs.intents.add/g'
 
 # Third-party tools for --tools: name, platform, download, the SHA-256 it
 # must match (GitHub's recorded digest of that upload), and the programs
@@ -352,7 +379,7 @@ command = "jefelabs.toolbar.focus"
 [[keys.command]]
 key = "prefix+a"
 type = "plugin_action"
-command = "jefelabs.capabilities.add"
+command = "jefelabs.intents.add"
 
 Run this installer again to update.
 KEYS
