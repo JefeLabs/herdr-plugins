@@ -262,7 +262,10 @@ pub fn parse_ask(text: &str) -> Asked {
         let t = line.trim().trim_matches(['*', '_']).trim();
         let lower = t.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("question:") {
-            let q = t[t.len() - rest.len()..].trim();
+            let q = t[t.len() - rest.len()..]
+                .trim()
+                .trim_start_matches(['*', '_'])
+                .trim();
             if !q.is_empty() {
                 return Asked::Question(q.to_string());
             }
@@ -437,6 +440,11 @@ mod tests {
         assert_eq!(
             parse_ask("question: A?\nquestion: B?"),
             Asked::Question("A?".into())
+        );
+        assert_eq!(
+            parse_ask("**question:** Which page?"),
+            Asked::Question("Which page?".into()),
+            "markdown bold around the marker"
         );
         assert_eq!(parse_ask("enough"), Asked::Enough);
         assert_eq!(parse_ask("Enough."), Asked::Enough);

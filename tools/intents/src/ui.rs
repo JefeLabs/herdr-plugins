@@ -388,7 +388,7 @@ pub fn render_kind_question(header: &str, area: Rect, buf: &mut Buffer) {
         .render(area, buf);
 }
 
-/// At the write-up: the type to save as, where it is filed, other areas.
+/// At the write-up: where it is filed, the other areas, then the type to save as.
 pub fn render_save_rows(
     save_kind: &str,
     suggested: Option<&str>,
@@ -408,11 +408,10 @@ pub fn render_save_rows(
         } else {
             chips.push(Span::raw(format!(" {label} ")));
         }
-        chips.push(Span::raw(" "));
     }
     if let Some(s) = suggested.filter(|s| *s != save_kind) {
         chips.push(Span::styled(
-            format!("  agent: this reads as a {}", crate::config::kind_label(s)),
+            format!(" (agent: {})", crate::config::kind_label(s)),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
@@ -422,9 +421,9 @@ pub fn render_save_rows(
         areas.join(" · ")
     };
     let lines = vec![
-        Line::from(chips),
         Line::from(format!("in:       {group}")),
         Line::from(format!("also:     {also}")),
+        Line::from(chips),
     ];
     Paragraph::new(lines).render(area, buf);
 }
@@ -504,6 +503,37 @@ mod tests {
 
     fn text_of(t: &Terminal<TestBackend>) -> String {
         format!("{:?}", t.backend().buffer())
+    }
+
+    #[test]
+    fn save_rows_name_the_group_first_and_fit_a_popup() {
+        // the 85% popup on an 80-column terminal is 68 columns wide
+        let mut t = Terminal::new(TestBackend::new(68, 3)).unwrap();
+        t.draw(|f| {
+            render_save_rows(
+                "issue",
+                Some("refactor"),
+                "skoolscout",
+                &["skoolscout/global".to_string()],
+                f.area(),
+                f.buffer_mut(),
+            )
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        let row = |y: u16| {
+            (0..68)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert!(row(0).starts_with("in:"), "{:?}", row(0));
+        assert!(row(1).starts_with("also:"), "{:?}", row(1));
+        assert!(row(2).starts_with("save as:"), "{:?}", row(2));
+        assert!(
+            row(2).contains("(agent: refactor)"),
+            "the suggestion fits: {:?}",
+            row(2)
+        );
     }
 
     fn checklist_text(items: &[crate::store::Criterion], selected: usize, h: u16) -> String {
