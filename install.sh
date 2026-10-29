@@ -201,11 +201,16 @@ tool_rows() {
     builtin_tools
   fi
 }
+# procs and yazi ship only as .zip: unzip, else python3, else the toolbar
+# binary this script just installed (`herdr-toolbar unzip`), so a minimal
+# system with neither still gets them
 unzip_member() { # <zip> <member> <folder>
   if command -v unzip >/dev/null 2>&1; then
     unzip -o -q "$1" "$2" -d "$3"
   elif command -v python3 >/dev/null 2>&1; then
     python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract(sys.argv[2], sys.argv[3])' "$1" "$2" "$3"
+  elif [ -x "$dir/target/release/herdr-toolbar" ]; then
+    "$dir/target/release/herdr-toolbar" unzip "$1" "$2" "$3"
   else
     return 1
   fi
@@ -282,7 +287,11 @@ if [ -n "$tools" ]; then
           case "$file" in
             *.zip) unzip_member "$file" "$member" "$unpacked" ;;
             *) tar -xzf "$file" -C "$unpacked" "$member" ;;
-          esac || { say "  $name: could not unpack $member"; refused="$refused $name"; continue 2; }
+          esac || {
+            say "  $name: could not unpack $member (from $(basename "$file"))"
+            refused="$refused $name"
+            continue 2
+          }
           cp "$unpacked/$member" "$bin/$(basename "$member")"
           chmod 755 "$bin/$(basename "$member")"
           ;;

@@ -18,6 +18,8 @@ enum Mode {
     Select(String),
     Trust,
     Focus,
+    /// `unzip <zip> <member> <folder>`, for the installer.
+    Unzip(String, String, String),
     Usage(String),
 }
 
@@ -31,6 +33,10 @@ fn parse_mode(args: &[String]) -> Mode {
         [a] if a == "trust" => Mode::Trust,
         [a] if a == "focus" => Mode::Focus,
         [a, tool] if a == "select" => Mode::Select(tool.clone()),
+        // the installer's fallback for .zip tools; not in the usage line
+        [a, zip, member, folder] if a == "unzip" => {
+            Mode::Unzip(zip.clone(), member.clone(), folder.clone())
+        }
         [a] if a == "--version" || a == "-V" => {
             Mode::Usage(format!("herdr-toolbar {}", env!("CARGO_PKG_VERSION")))
         }
@@ -46,6 +52,12 @@ fn main() -> ExitCode {
         Mode::Select(tool) => run_select(&tool),
         Mode::Trust => run_trust(),
         Mode::Focus => HerdrContext::from_env().and_then(|ctx| herdr::focus(&ctx)),
+        Mode::Unzip(zip, member, folder) => herdr_toolbar::unzip::extract_member(
+            std::path::Path::new(&zip),
+            &member,
+            std::path::Path::new(&folder),
+        )
+        .map(|_| ()),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-toolbar ");
             println!("{text}");
@@ -137,6 +149,10 @@ mod tests {
             Mode::Select("db".into())
         );
         assert_eq!(parse_mode(&["trust".into()]), Mode::Trust);
+        assert_eq!(
+            parse_mode(&["unzip".into(), "a.zip".into(), "dir/x".into(), "out".into()]),
+            Mode::Unzip("a.zip".into(), "dir/x".into(), "out".into())
+        );
         assert_eq!(parse_mode(&["focus".into()]), Mode::Focus);
         assert!(matches!(parse_mode(&["bogus".into()]), Mode::Usage(_)));
     }

@@ -8,3 +8,4 @@ pub mod herdr;
 pub mod keys;
 pub mod pty;
 pub mod ui;
+pub mod unzip;
