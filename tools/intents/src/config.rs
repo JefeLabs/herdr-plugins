@@ -35,7 +35,14 @@ pub fn kind_from_heading(name: &str) -> Option<&'static str> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mode {
     Tui,
-    Add { title: Option<String>, popup: bool },
+    Add {
+        title: Option<String>,
+        popup: bool,
+    },
+    /// The capture agent's browser tools, over MCP on stdin/stdout.
+    CaptureMcp(PathBuf),
+    /// One capture, detached from the tool that started it.
+    CaptureRun(PathBuf),
     Usage(String),
 }
 
@@ -66,6 +73,8 @@ pub fn parse_mode(args: &[String]) -> Mode {
                 popup,
             }
         }
+        Some("capture-mcp") if args.len() == 2 => Mode::CaptureMcp(PathBuf::from(&args[1])),
+        Some("capture-run") if args.len() == 2 => Mode::CaptureRun(PathBuf::from(&args[1])),
         Some(_) => Mode::Usage(USAGE.to_string()),
     }
 }

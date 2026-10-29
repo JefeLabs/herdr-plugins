@@ -87,6 +87,16 @@ pub enum PickStep {
     Model { provider: String },
 }
 
+/// One capture of the selected intent, as the Evidence section lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRow {
+    /// `before · video · <the agent's line or the stage>`
+    pub label: String,
+    pub file: Option<PathBuf>,
+    /// `…` running, `✓` reproduced or fixed, `✗` still broken, `!` failed, `·` not reproduced
+    pub mark: &'static str,
+}
+
 /// What tests (and the status line) can read about the add conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterviewView {
@@ -374,6 +384,8 @@ pub struct View {
     pub filter: &'static str,
     /// The add-by-conversation screen, when it shows.
     pub interview: Option<InterviewView>,
+    /// The selected intent's captures (Evidence section).
+    pub evidence: Vec<EvidenceRow>,
 }
 
 pub struct App {
@@ -414,6 +426,7 @@ pub struct App {
     criteria_selected: usize,
     question_selected: usize,
     artifacts_selected: usize,
+    evidence_selected: usize,
     prs_selected: usize,
     demos_selected: usize,
     /// PR titles from `gh`, keyed like `pr_states`.
@@ -452,10 +465,16 @@ pub struct App {
     /// Reconciles running: per intent, the merged set it covers, the
     /// agent turn, and when it started.
     reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant)>,
+    /// The env captures run with (`*_BIN_PATH` included); empty in production.
+    pub capture_env: Vec<(String, String)>,
+    /// The repo intents are captured for; `None` means `send::capture_repo()`.
+    pub capture_repo: Option<PathBuf>,
     /// How long a reconcile may run before it is stopped and reported.
     reconcile_limit: std::time::Duration,
     /// Merged sets already started this session, so a failure is not retried in a loop.
     reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
+    /// Bugs whose "after" was considered for a merged set (once per set).
+    capture_tried: HashSet<(PathBuf, Vec<u64>)>,
     /// Why the last reconcile of an intent failed; shown while it is
     /// selected until `r` retries it.
     reconcile_failed: HashMap<PathBuf, String>,
@@ -473,6 +492,7 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Criteria => "criteria",
         Pane::Questions => "questions",
         Pane::Artifacts => "artifacts",
+        Pane::Evidence => "evidence",
         Pane::Demos => "demos",
         Pane::PullRequests => "pull requests",
     }
@@ -509,6 +529,7 @@ impl App {
             criteria_selected: 0,
             question_selected: 0,
             artifacts_selected: 0,
+            evidence_selected: 0,
             prs_selected: 0,
             demos_selected: 0,
             pr_titles: HashMap::new(),
@@ -528,8 +549,11 @@ impl App {
             poll_ticks: 0,
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
+            capture_env: Vec::new(),
+            capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
             reconcile_tried: HashSet::new(),
+            capture_tried: HashSet::new(),
             reconcile_failed: HashMap::new(),
             last_area: std::cell::Cell::new(Rect::default()),
             card_hits: std::cell::RefCell::new(Vec::new()),
@@ -875,18 +899,27 @@ impl App {
         let mut intents = Vec::new();
         all(&self.tree, &mut intents);
         for it in intents {
-            if it.fm.repo.is_none() || self.reconcile_jobs.contains_key(&it.path) {
+            if it.fm.repo.is_none() {
                 continue;
             }
-            // wait for the pull-request search (it suggests the areas the work touched)
+            // wait for the pull-request search (it suggests the areas the work
+            // touched, and finds the pull requests that close the issue)
             let searched = crate::store::artifacts(&it.body).iter().any(|a| {
                 a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
-            });
+            }) || !crate::capture::issue_numbers(&it.body).is_empty();
             if searched && !self.found_prs.contains_key(&it.path) {
                 continue;
             }
-            let Some(merged) = crate::reconcile::needs_reconcile(&it, &self.evidence_for(&it))
-            else {
+            let ev = self.evidence_for(&it);
+            if it.fm.state == State::Sent
+                && let Some(set) = crate::reconcile::merged_set(&ev)
+            {
+                self.capture_after(&it, &set);
+            }
+            if self.reconcile_jobs.contains_key(&it.path) {
+                continue;
+            }
+            let Some(merged) = crate::reconcile::needs_reconcile(&it, &ev) else {
                 continue;
             };
             if self
@@ -1069,8 +1102,8 @@ impl App {
     }
 
     /// Search GitHub for pull requests mentioning each sent intent's spec
-    /// and plan file names (search is rate-limited, so this runs on entry, on
-    /// `r` and about every ten minutes).
+    /// and plan file names, and for those closing its issues (search is
+    /// rate-limited, so this runs on entry, on `r` and about every ten minutes).
     fn request_found_prs(&mut self) {
         let sent: Vec<(PathBuf, PathBuf, Vec<String>)> = self
             .all_intents()
@@ -1078,7 +1111,7 @@ impl App {
             .filter(|i| i.fm.state == State::Sent)
             .filter_map(|i| {
                 let repo = i.fm.repo.clone()?;
-                let names: Vec<String> = crate::store::artifacts(&i.body)
+                let mut names: Vec<String> = crate::store::artifacts(&i.body)
                     .into_iter()
                     .filter(|a| {
                         a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
@@ -1089,6 +1122,11 @@ impl App {
                             .map(|n| n.to_string_lossy().to_string())
                     })
                     .collect();
+                names.extend(
+                    crate::capture::issue_numbers(&i.body)
+                        .into_iter()
+                        .map(|n| format!("#{n}")),
+                );
                 (!names.is_empty()).then(|| (i.path.clone(), repo, names))
             })
             .collect();
@@ -1380,6 +1418,7 @@ impl App {
             // the card view says nothing about where an intent belongs
             KeyCode::Char('a') => self.screen = Screen::KindPick { group: None },
             KeyCode::Char('D') => self.ask_trash(),
+            KeyCode::Char('E') => self.capture_again(),
             _ => {}
         }
         Flow::Continue
@@ -1402,6 +1441,7 @@ impl App {
             Ok(t) => self.tree = t,
             Err(e) => self.message = Some(format!("rescan failed: {e:#}")),
         }
+        self.persist_evidence();
         self.rebuild_rows();
         if let Some(p) = keep {
             self.select_path(&p);
@@ -1657,6 +1697,7 @@ impl App {
                 | Pane::Questions
                 | Pane::PullRequests
                 | Pane::Artifacts
+                | Pane::Evidence
         ) {
             self.open = self.focus;
         }
@@ -1739,13 +1780,15 @@ impl App {
                     Pane::Demos => Pane::Questions,
                     Pane::Questions => Pane::PullRequests,
                     Pane::PullRequests => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Tree,
+                    Pane::Artifacts => Pane::Evidence,
+                    Pane::Evidence => Pane::Tree,
                 };
                 return Flow::Continue;
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Pane::Tree => Pane::Artifacts,
+                    Pane::Tree => Pane::Evidence,
+                    Pane::Evidence => Pane::Artifacts,
                     Pane::Artifacts => Pane::PullRequests,
                     Pane::PullRequests => Pane::Questions,
                     Pane::Questions => Pane::Demos,
@@ -1829,6 +1872,7 @@ impl App {
                 self.screen = Screen::KindPick { group };
             }
             KeyCode::Char('D') => self.ask_trash(),
+            KeyCode::Char('E') => self.capture_again(),
             KeyCode::Char('n') => {
                 let parent = self.selected_group_dir();
                 self.screen = Screen::Input {
@@ -2080,6 +2124,29 @@ impl App {
                             };
                         }
                     }
+                    _ => {}
+                }
+            }
+            Pane::Evidence => {
+                let rows = self.evidence_rows(&it);
+                let last = rows.len().saturating_sub(1);
+                let selected = self.evidence_selected.min(last);
+                let file = rows.get(selected).and_then(|r| r.file.clone());
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.evidence_selected = (selected + 1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.evidence_selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('Y') => match file {
+                        Some(f) if k.code == KeyCode::Enter => self.open_in_chrome(&f),
+                        Some(f) if k.code == KeyCode::Char('c') => self.copy_file(&f),
+                        Some(f) => self.copy_path(&f),
+                        None => self.message = Some("no file for this capture yet".into()),
+                    },
+                    KeyCode::Char('E') => self.capture_again(),
                     _ => {}
                 }
             }
@@ -2496,6 +2563,16 @@ impl App {
 
     fn trash(&mut self, path: &Path) {
         self.screen = Screen::Browse;
+        // a capture still running for it stops (and finishes its effort)
+        if let Ok(it) = Store::load(path) {
+            let scratch = polish_cwd(self.store.root(), &it.polish_name());
+            for dir in [
+                it.assets_dir().join("evidence"),
+                crate::capture::evidence_dir(&scratch),
+            ] {
+                crate::capture::cancel_running(&dir);
+            }
+        }
         let moved = Store::load(path).and_then(|it| self.store.trash(&it).map(|d| (it, d)));
         match moved {
             Ok((it, dest)) => {
@@ -2570,6 +2647,9 @@ impl App {
             write_up: None,
             save_kind: kind.to_string(),
             scroll: 0,
+            capture_asked: false,
+            pending_write_up: None,
+            capture_block: None,
         }));
     }
 
@@ -2620,12 +2700,417 @@ impl App {
 
     /// The next question, or the write-up once five have been asked.
     fn next_question_or_write_up(&mut self, st: &mut InterviewScreen, message: String) {
-        let step = if st.iv.budget_left() == 0 {
-            Step::WriteUp
+        if st.iv.budget_left() == 0 {
+            self.begin_write_up(st, message, true);
         } else {
-            Step::Ask
+            self.start_interview_turn(st, Step::Ask, message, true);
+        }
+    }
+
+    /// The write-up, but for a bug the evidence question comes first (once).
+    fn begin_write_up(&mut self, st: &mut InterviewScreen, message: String, show: bool) {
+        if st.iv.kind == "issue" && !st.capture_asked {
+            st.capture_asked = true;
+            st.pending_write_up = Some((message, show));
+            st.capture_block = self.capture_block();
+            st.awaiting = Awaiting::Capture;
+            return;
+        }
+        self.start_interview_turn(st, Step::WriteUp, message, show);
+    }
+
+    /// The repo intents are captured for: the test override, else the
+    /// repo the tool runs in (as a save records it).
+    fn current_repo(&self) -> Option<PathBuf> {
+        self.capture_repo.clone().or_else(crate::send::capture_repo)
+    }
+
+    /// Why capture cannot run here, if it cannot.
+    fn capture_block(&self) -> Option<String> {
+        self.capture_block_for(self.current_repo())
+    }
+
+    /// Why capture cannot run for this repo, if it cannot.
+    fn capture_block_for(&self, repo: Option<PathBuf>) -> Option<String> {
+        let Some(repo) = repo else {
+            return Some("capture needs the intent's repo, and none was found".into());
         };
-        self.start_interview_turn(st, step, message, true);
+        if crate::capture::read_guide(&repo).is_err() {
+            return Some(format!("no capture guide in {}", repo.display()));
+        }
+        let claude = match crate::progress::tool_bin(&self.capture_env, "CLAUDE_BIN_PATH", None) {
+            Some(p) => p.is_file(),
+            None => std::env::var_os("PATH")
+                .map(|paths| std::env::split_paths(&paths).any(|d| d.join("claude").is_file()))
+                .unwrap_or(false),
+        };
+        if !claude {
+            return Some("capture needs claude, which is not installed".into());
+        }
+        None
+    }
+
+    /// Starts a "before" capture for the interview, in the background.
+    fn start_capture_job(&mut self, st: &InterviewScreen, shot: crate::capture::Shot) {
+        let Some(repo) = self.current_repo() else {
+            return;
+        };
+        let name = st
+            .folder
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let evidence = crate::capture::evidence_dir(&st.folder);
+        let req = crate::capture::CaptureRequest {
+            repo,
+            group_rel: st.iv.home.clone(),
+            stem: name.clone(),
+            phase: crate::capture::Phase::Before,
+            shot,
+            intent: st.iv.raw_body(),
+            evidence: evidence.clone(),
+            before: None,
+            // unique across intents capturing in the same area at once
+            n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
+            merged: Vec::new(),
+        };
+        if let Err(e) = self.launch_capture(req) {
+            self.message = Some(format!("capture: {e}"));
+        }
+    }
+
+    /// Starts a capture in its own process: it outlives this one.
+    fn launch_capture(&self, req: crate::capture::CaptureRequest) -> Result<(), String> {
+        crate::capture::launch(&crate::capture::CaptureOrder {
+            req,
+            env: self.capture_env.clone(),
+            managed_mcp: managed_mcp(),
+        })
+    }
+
+    /// `E`: captures the selected bug again: the "before" until one reproduced
+    /// it, then an "after" (also run on its own once every PR merges).
+    fn capture_again(&mut self) {
+        use crate::capture::{Outcome, Phase, Shot};
+        let Some(it) = self.selected_intent().cloned() else {
+            return;
+        };
+        if it.fm.kind != "issue" {
+            self.message = Some("evidence is for bugs".into());
+            return;
+        }
+        if crate::capture::is_running(&self.evidence_home(&it)) {
+            self.message =
+                Some("capturing already: the Evidence section shows how far it got".into());
+            return;
+        }
+        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
+        if let Some(why) = self.capture_block_for(repo.clone()) {
+            self.message = Some(why);
+            return;
+        }
+        let Some(repo) = repo else {
+            return;
+        };
+        let evidence = self.evidence_home(&it);
+        let recs = crate::capture::read_records(&evidence);
+        let before = recs
+            .iter()
+            .find(|r| r.phase == Phase::Before && matches!(r.outcome, Outcome::Reproduced(_)))
+            .cloned();
+        let (phase, shot) = match &before {
+            Some(b) => (Phase::After, b.shot),
+            None => (
+                Phase::Before,
+                recs.first().map(|r| r.shot).unwrap_or(Shot::Video),
+            ),
+        };
+        self.message = Some(
+            match self.start_capture_for(&it, repo, evidence, phase, shot, before, Vec::new()) {
+                Ok(()) => "capturing: the Evidence section shows how far it got".into(),
+                Err(e) => format!("capture: {e}"),
+            },
+        );
+    }
+
+    /// Once every pull request of a sent bug has merged, runs the steps that
+    /// reproduced it again (an "after"): once per merged set.
+    fn capture_after(&mut self, it: &Intent, set: &[u64]) {
+        use crate::capture::{Outcome, Phase};
+        if it.fm.kind != "issue" {
+            return;
+        }
+        let evidence = self.evidence_home(it);
+        if crate::capture::is_running(&evidence) {
+            return;
+        }
+        let recs = crate::capture::read_records_live(&evidence);
+        let Some(before) = recs
+            .iter()
+            .find(|r| r.phase == Phase::Before && matches!(r.outcome, Outcome::Reproduced(_)))
+            .cloned()
+        else {
+            return;
+        };
+        if recs.iter().any(|r| {
+            r.phase == Phase::After && r.merged == set && !crate::capture::is_interrupted(r)
+        }) {
+            return;
+        }
+        // no guide or no claude is not asked again for the same set
+        if !self.capture_tried.insert((it.path.clone(), set.to_vec())) {
+            return;
+        }
+        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
+        if self.capture_block_for(repo.clone()).is_some() {
+            return;
+        }
+        let Some(repo) = repo else {
+            return;
+        };
+        let shot = before.shot;
+        let _ = self.start_capture_for(
+            it,
+            repo,
+            evidence,
+            Phase::After,
+            shot,
+            Some(before),
+            set.to_vec(),
+        );
+    }
+
+    /// Where an intent's captures live: its attachments once kept there,
+    /// else its agent folder.
+    fn evidence_home(&self, it: &Intent) -> PathBuf {
+        let kept = it.assets_dir().join("evidence");
+        if crate::capture::read_records(&kept).is_empty() {
+            crate::capture::evidence_dir(&polish_cwd(self.store.root(), &it.polish_name()))
+        } else {
+            kept
+        }
+    }
+
+    /// Starts a capture of a saved intent in the background.
+    #[allow(clippy::too_many_arguments)]
+    fn start_capture_for(
+        &mut self,
+        it: &Intent,
+        repo: PathBuf,
+        evidence: PathBuf,
+        phase: crate::capture::Phase,
+        shot: crate::capture::Shot,
+        before: Option<crate::capture::CaptureRecord>,
+        merged: Vec<u64>,
+    ) -> Result<(), String> {
+        let name = it.polish_name();
+        let group_rel = it
+            .path
+            .parent()
+            .and_then(|p| p.strip_prefix(self.store.root()).ok())
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty());
+        let req = crate::capture::CaptureRequest {
+            repo,
+            group_rel,
+            stem: name.clone(),
+            phase,
+            shot,
+            intent: format!("{}\n\n{}", it.fm.title, it.body),
+            evidence: evidence.clone(),
+            before,
+            n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
+            merged,
+        };
+        self.launch_capture(req)
+    }
+
+    /// A sent bug's captures move from its agent folder into its attachments
+    /// (`<stem>.assets/evidence/`) once an `issue:` line names the issue they
+    /// prove. A capture still writing there is left until it finishes.
+    fn persist_evidence(&self) {
+        for it in self.all_intents() {
+            let filed = crate::store::artifacts(&it.body)
+                .iter()
+                .any(|a| a.kind.eq_ignore_ascii_case("issue"));
+            if it.fm.state != State::Sent || !filed {
+                continue;
+            }
+            let name = it.polish_name();
+            let scratch = crate::capture::evidence_dir(&polish_cwd(self.store.root(), &name));
+            if crate::capture::is_running(&scratch) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&scratch) else {
+                continue;
+            };
+            let kept = it.assets_dir().join("evidence");
+            if std::fs::create_dir_all(&kept).is_err() {
+                continue;
+            }
+            for e in entries.flatten() {
+                let _ = std::fs::rename(e.path(), kept.join(e.file_name()));
+            }
+            let _ = std::fs::remove_dir(&scratch);
+        }
+    }
+
+    /// Over SSH there is no local pasteboard: copies go to the terminal.
+    fn over_ssh(&self) -> bool {
+        ["SSH_CONNECTION", "SSH_TTY"].iter().any(|k| {
+            self.capture_env
+                .iter()
+                .any(|(n, v)| n == k && !v.is_empty())
+                || std::env::var(k).is_ok_and(|v| !v.is_empty())
+        })
+    }
+
+    /// Runs a helper (open, osascript, pbcopy) without waiting for it; `stdin`
+    /// is written to it when given. False when it could not start.
+    fn launch(
+        &self,
+        key: &str,
+        default: &str,
+        args: &[&std::ffi::OsStr],
+        stdin: Option<String>,
+    ) -> bool {
+        use std::io::Write;
+        let Some(bin) = crate::progress::tool_bin(&self.capture_env, key, Some(default)) else {
+            return false;
+        };
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args)
+            .envs(
+                self.capture_env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            });
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let (Some(text), Some(mut input)) = (stdin, child.stdin.take()) {
+                    let _ = input.write_all(text.as_bytes());
+                }
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Enter on a capture: opens it in Chrome.
+    fn open_in_chrome(&mut self, file: &Path) {
+        let f = file.as_os_str();
+        let ok = if cfg!(target_os = "macos") {
+            self.launch(
+                "OPEN_BIN_PATH",
+                "open",
+                &["-a".as_ref(), "Google Chrome".as_ref(), f],
+                None,
+            )
+        } else {
+            self.launch("OPEN_BIN_PATH", "xdg-open", &[f], None)
+        };
+        self.message = Some(if ok {
+            format!("opening {} in Chrome", file.display())
+        } else {
+            format!("could not open {}", file.display())
+        });
+    }
+
+    /// `c`: puts the file itself on the macOS pasteboard (⌘V into a GitHub
+    /// comment uploads it); over SSH or off macOS, its path instead.
+    fn copy_file(&mut self, file: &Path) {
+        if self.over_ssh() || !cfg!(target_os = "macos") {
+            self.copy_path(file);
+            return;
+        }
+        let script = [
+            "-e",
+            "on run argv",
+            "-e",
+            "set the clipboard to (POSIX file (item 1 of argv))",
+            "-e",
+            "end run",
+        ];
+        let mut args: Vec<&std::ffi::OsStr> = script.iter().map(|a| a.as_ref()).collect();
+        args.push(file.as_os_str());
+        self.message = Some(
+            if self.launch("OSASCRIPT_BIN_PATH", "osascript", &args, None) {
+                "copied the file: ⌘V pastes it into the issue".to_string()
+            } else {
+                "could not copy the file".to_string()
+            },
+        );
+    }
+
+    /// `Y`: copies the path (pbcopy on macOS; the terminal's clipboard over SSH).
+    fn copy_path(&mut self, file: &Path) {
+        let path = file.display().to_string();
+        let ok = if cfg!(target_os = "macos") && !self.over_ssh() {
+            self.launch("PBCOPY_BIN_PATH", "pbcopy", &[], Some(path.clone()))
+        } else {
+            osc52(&path);
+            true
+        };
+        self.message = Some(if ok {
+            format!("copied the path: {path}")
+        } else {
+            "could not copy the path".to_string()
+        });
+    }
+
+    /// The selected intent's captures: from its attachments once kept there,
+    /// else from its agent folder.
+    fn evidence_rows(&self, it: &Intent) -> Vec<EvidenceRow> {
+        use crate::capture::{Outcome, Phase, Shot};
+        let dirs = [
+            it.assets_dir().join("evidence"),
+            crate::capture::evidence_dir(&polish_cwd(self.store.root(), &it.polish_name())),
+        ];
+        for dir in dirs {
+            let recs = crate::capture::read_records_live(&dir);
+            if recs.is_empty() {
+                continue;
+            }
+            return recs
+                .iter()
+                .map(|r| {
+                    let (mark, text) = match &r.outcome {
+                        Outcome::Running(t) => ("…", t),
+                        Outcome::Reproduced(t) | Outcome::Fixed(t) => ("✓", t),
+                        Outcome::StillBroken(t) => ("✗", t),
+                        Outcome::Failed(t) => ("!", t),
+                        Outcome::NotReproduced(t) => ("·", t),
+                    };
+                    let phase = match r.phase {
+                        Phase::Before => "before",
+                        Phase::After => "after",
+                    };
+                    let shot = match r.shot {
+                        Shot::Video => "video",
+                        Shot::Screenshot => "screenshot",
+                    };
+                    EvidenceRow {
+                        label: match &r.warning {
+                            Some(w) => format!("{phase} · {shot} · {text} · ⚠ {w}"),
+                            None => format!("{phase} · {shot} · {text}"),
+                        },
+                        file: r.file.as_ref().map(|f| dir.join(f)),
+                        mark,
+                    }
+                })
+                .collect();
+        }
+        Vec::new()
     }
 
     fn key_interview(&mut self, mut st: Box<InterviewScreen>, k: KeyEvent) -> Flow {
@@ -2656,6 +3141,26 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.discard_interview(st);
                 return Flow::Continue;
+            }
+            // the evidence question: s / v start a capture (unless blocked), Enter skips
+            _ if st.awaiting == Awaiting::Capture => {
+                let choice = match k.code {
+                    KeyCode::Char('s') if st.capture_block.is_none() => {
+                        Some(Some(crate::capture::Shot::Screenshot))
+                    }
+                    KeyCode::Char('v') if st.capture_block.is_none() => {
+                        Some(Some(crate::capture::Shot::Video))
+                    }
+                    KeyCode::Enter => Some(None),
+                    _ => None,
+                };
+                if let Some(shot) = choice {
+                    if let Some(shot) = shot {
+                        self.start_capture_job(&st, shot);
+                    }
+                    let (message, show) = st.pending_write_up.take().unwrap_or_default();
+                    self.start_interview_turn(&mut st, Step::WriteUp, message, show);
+                }
             }
             (KeyCode::Enter, _)
                 if st.awaiting == Awaiting::Review && st.input.trim().is_empty() =>
@@ -2695,7 +3200,7 @@ impl App {
                     _ => String::new(),
                 };
                 st.input.clear();
-                self.start_interview_turn(&mut st, Step::WriteUp, message, true);
+                self.begin_write_up(&mut st, message, true);
             }
             (KeyCode::Enter, _) => {
                 let text = st.input.trim().to_string();
@@ -2772,7 +3277,7 @@ impl App {
             &title,
             &st.save_kind,
             &body,
-            crate::send::capture_repo(),
+            self.current_repo(),
         );
         let it = match created {
             Ok(it) => it,
@@ -2842,6 +3347,7 @@ impl App {
         for (_, turn, _) in self.reconcile_jobs.values_mut() {
             turn.cancel();
         }
+        // captures run in their own processes and finish on their own
     }
 
     /// Esc: nothing is kept, not even the agent's folder.
@@ -2849,6 +3355,7 @@ impl App {
         if let Some(mut t) = st.turn.take() {
             t.cancel();
         }
+        crate::capture::cancel_running(&crate::capture::evidence_dir(&st.folder));
         let _ = std::fs::remove_dir_all(&st.folder);
         self.screen = Screen::Browse;
     }
@@ -2909,7 +3416,7 @@ impl App {
             Step::Restate => st.awaiting = Awaiting::Confirm,
             Step::Ask => match crate::interview::parse_ask(&text) {
                 Asked::Question(q) => st.awaiting = Awaiting::Answer(q),
-                Asked::Enough => self.start_interview_turn(st, Step::WriteUp, String::new(), false),
+                Asked::Enough => self.begin_write_up(st, String::new(), false),
             },
             Step::WriteUp => {
                 if reply.proposal.is_some() && reply.title.is_some() {
@@ -3030,6 +3537,10 @@ impl App {
                 ui::render_input_box(&st.input, rows[3], buf);
                 let text = match &st.awaiting {
                     Awaiting::Words => "say it in your own words · Enter send · Esc cancel (nothing saved)".to_string(),
+                    Awaiting::Capture => match &st.capture_block {
+                        Some(why) => format!("{why} · Enter continue"),
+                        None => "Capture evidence? s screenshot · v video · Enter skip".to_string(),
+                    },
                     Awaiting::Turn => "waiting for the agent · Esc cancel".to_string(),
                     Awaiting::Confirm => "Enter (or yes) that's right · type a correction · Ctrl-d write it up now · Esc cancel".to_string(),
                     Awaiting::Answer(_) => "Enter answer · Enter on empty skips · Ctrl-d write it up now · Esc cancel".to_string(),
@@ -3533,6 +4044,11 @@ impl App {
                         &Store::attachments(&it),
                     ) {
                         Ok((repo, prompt)) => {
+                            let prompt =
+                                match crate::capture::handoff_note(&self.evidence_home(&it)) {
+                                    Some(note) => format!("{prompt}\n\n{note}"),
+                                    None => prompt,
+                                };
                             self.screen = Screen::SendConfirm {
                                 handoff,
                                 provider,
@@ -4068,7 +4584,11 @@ impl App {
             sort: self.sort.label(),
             filter: self.filter.label(),
             interview: None,
+            evidence: Vec::new(),
         };
+        if let Some(it) = self.selected_intent() {
+            v.evidence = self.evidence_rows(it);
+        }
         match &self.screen {
             Screen::Browse => {}
             Screen::Edit => v.screen = "edit",
@@ -4488,6 +5008,11 @@ impl App {
                     };
                     let attachments = Store::attachments(intent);
                     let prs = self.pr_rows(intent);
+                    let evidence: Vec<(String, String)> = self
+                        .evidence_rows(intent)
+                        .into_iter()
+                        .map(|r| (r.mark.to_string(), r.label))
+                        .collect();
                     ui::render_intent(
                         &ui::DetailView {
                             intent,
@@ -4504,6 +5029,8 @@ impl App {
                             prs: &prs,
                             prs_selected: self.prs_selected,
                             demos_selected: self.demos_selected,
+                            evidence: &evidence,
+                            evidence_selected: self.evidence_selected,
                         },
                         right,
                         buf,
@@ -4548,6 +5075,7 @@ impl App {
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::PullRequests) => "Pull requests: j/k choose · Enter/o open in the browser · L link a found one · a add · Esc tree".to_string(),
@@ -4793,6 +5321,51 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
             std::process::exit(1)
         }
     }
+}
+
+/// Copies text to the terminal's clipboard (OSC 52), for SSH sessions.
+fn osc52(text: &str) {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let _ = write!(
+        std::io::stdout(),
+        "\x1b]52;c;{}\x07",
+        base64(text.as_bytes())
+    );
+    let _ = std::io::stdout().flush();
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Whether an organization-managed MCP config is on this machine (claude
+/// then refuses --strict-mcp-config).
+fn managed_mcp() -> bool {
+    let paths: Vec<&Path> = crate::config::MANAGED_MCP_CONFIGS
+        .iter()
+        .map(Path::new)
+        .collect();
+    crate::config::managed_mcp_present(&paths)
 }
 
 /// The write-up as it would be saved: its title, and its body with the
@@ -7488,6 +8061,7 @@ mod tests {
             "questions",
             "pull requests",
             "artifacts",
+            "evidence",
         ] {
             key(&mut fx.app, KeyCode::Tab);
             assert_eq!(fx.app.view().focus, pane);
@@ -7495,17 +8069,17 @@ mod tests {
         }
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
-        assert_eq!(fx.app.view().open, "artifacts", "the last one stays open");
+        assert_eq!(fx.app.view().open, "evidence", "the last one stays open");
         select(&mut fx.app, "Alpha");
         assert_eq!(
             fx.app.view().open,
-            "artifacts",
+            "evidence",
             "and stays open on the next intent"
         );
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "artifacts");
+        assert_eq!(fx.app.view().open, "evidence");
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "pull requests");
+        assert_eq!(fx.app.view().open, "artifacts");
     }
 
     /// Tab from the tree to the named section.
@@ -7633,7 +8207,11 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "evidence");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "evidence");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::BackTab);
@@ -7843,6 +8421,14 @@ mod tests {
         wait_until(app, "the agent's turn", |a| awaiting(a) != "turn");
     }
 
+    /// Skips the evidence question (Enter) when a bug's conversation reaches it.
+    fn past_capture(app: &mut App) {
+        if awaiting(app) == "capture" {
+            key(app, KeyCode::Enter);
+            wait_turn(app);
+        }
+    }
+
     fn md_files(dir: &Path) -> usize {
         let mut n = 0;
         for e in fs::read_dir(dir).unwrap().flatten() {
@@ -7951,12 +8537,14 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter); // that's right
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         for i in 1..=5 {
             let iv = fx.app.view().interview.unwrap();
             assert_eq!((iv.awaiting, iv.question_no), ("answer", i));
             type_str(&mut fx.app, &format!("a{i}"));
             key(&mut fx.app, KeyCode::Enter);
             wait_turn(&mut fx.app);
+            past_capture(&mut fx.app);
         }
         let c = calls(&fx);
         assert_eq!(c.len(), 7, "restate, five asks, a write-up: {c:?}");
@@ -7970,6 +8558,7 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert_eq!(c.len(), 3, "{c:?}");
         assert!(c[2].contains(crate::interview::WRITE_UP_MARKER), "{}", c[2]);
@@ -7983,14 +8572,17 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         key(&mut fx.app, KeyCode::Enter); // skip question 1
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(c[2].contains("(skipped)"), "{}", c[2]);
         assert_eq!(fx.app.view().interview.unwrap().question_no, 2);
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(
             c.last()
@@ -8012,6 +8604,7 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let iv = fx.app.view().interview.unwrap();
         assert_eq!(iv.awaiting, "review");
         assert_eq!(iv.save_kind, "issue");
@@ -8175,6 +8768,7 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "review");
         insta::assert_snapshot!(render(&fx.app, 80, 20));
     }
@@ -8195,8 +8789,10 @@ mod tests {
         type_str(&mut fx.app, WORDS);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "review", "{:?}", fx.app.view().hint);
     }
 
@@ -8279,6 +8875,7 @@ mod tests {
         type_str(&mut fx.app, "file it under skoolscout/global");
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         let last = c.last().unwrap();
         assert!(last.contains("file it under skoolscout/global"), "{last}");
@@ -8518,9 +9115,11 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)); // skip it, write up
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "review");
         let shown = render(&fx.app, 100, 40);
         assert!(
@@ -8550,6 +9149,7 @@ mod tests {
         type_str(&mut fx.app, "shorten it");
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "retry");
         fx.app
             .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
@@ -8595,10 +9195,12 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         type_str(&mut fx.app, "only the inviter");
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(
             c.last().unwrap().contains("only the inviter"),
@@ -8613,6 +9215,7 @@ mod tests {
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(
             c.last().unwrap().contains("only admins"),
@@ -8781,6 +9384,770 @@ mod tests {
         key(&mut fx.app, KeyCode::Char('y'));
         assert_eq!(fx.app.view().layout, "list", "stays in the card view");
         assert!(!fx.app.list.iter().any(|i| i.fm.title == "Beta"));
+    }
+
+    // ---- evidence capture ----------------------------------------------------
+
+    const CAPTURE_GUIDE: &str = "---\ndefault_area: org/social\nseed: [kathia-signup]\nurl: https://demo-org.skoolscout.com.local:{port}\n---\nSign in with Cmd+U.\n";
+    const CAPTURE_EVENTS: &str = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"agent-browser open https://x\"}}]}}\n{\"type\":\"result\",\"result\":\"reproduced: the email goes to every admin\"}\n";
+
+    /// Points the app's captures at the fakes and a repo with (or without) a guide.
+    fn with_capture(fx: &mut Fx, guide: bool, claude: bool) {
+        capture_setup(fx._tmp.path(), &mut fx.app, guide, claude);
+    }
+
+    /// The built `herdr-intents`, which runs each capture in its own process.
+    fn intents_bin() -> String {
+        let exe = std::env::current_exe().unwrap();
+        let bin = exe
+            .parent()
+            .and_then(|deps| deps.parent())
+            .unwrap()
+            .join("herdr-intents");
+        assert!(
+            bin.is_file(),
+            "build the binary first (cargo test builds it): {}",
+            bin.display()
+        );
+        bin.display().to_string()
+    }
+
+    /// Stops every capture still running under the intents root.
+    fn stop_captures(app: &App) {
+        let polish = app.store.root().join(".polish");
+        for e in fs::read_dir(&polish).into_iter().flatten().flatten() {
+            let ev = e.path().join("evidence");
+            if crate::capture::cancel_running(&ev) {
+                let start = Instant::now();
+                while crate::capture::is_running(&ev) && start.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    fn capture_setup(t: &Path, app: &mut App, guide: bool, claude: bool) {
+        let t = t.to_path_buf();
+        let repo = t.join("capture-repo");
+        fs::create_dir_all(repo.join(".helmsmith")).unwrap();
+        if guide {
+            fs::write(repo.join(".helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        }
+        fs::create_dir_all(t.join("worktree")).unwrap();
+        fs::write(t.join("capture-events.jsonl"), CAPTURE_EVENTS).unwrap();
+        let fx_path = |n: &str| fixtures().join(n).display().to_string();
+        let p = |n: &str| t.join(n).display().to_string();
+        app.capture_repo = Some(repo);
+        app.capture_env = vec![
+            ("WORK_BIN_PATH".into(), fx_path("fake-work.sh")),
+            ("MAKE_BIN_PATH".into(), fx_path("fake-make.sh")),
+            (
+                "CLAUDE_BIN_PATH".into(),
+                if claude {
+                    fx_path("fake-claude.sh")
+                } else {
+                    p("no-claude-here")
+                },
+            ),
+            ("FAKE_WORK_LOG".into(), p("work.log")),
+            ("FAKE_MAKE_LOG".into(), p("make.log")),
+            ("FAKE_CLAUDE_LOG".into(), p("claude.log")),
+            ("FAKE_WORK_TREE".into(), p("worktree")),
+            ("FAKE_CLAUDE_EVENTS".into(), p("capture-events.jsonl")),
+            (
+                "AGENT_BROWSER_BIN_PATH".into(),
+                fx_path("fake-agent-browser.sh"),
+            ),
+            ("FAKE_AB_LOG".into(), p("ab.log")),
+            ("INTENTS_BIN_PATH".into(), intents_bin()),
+        ];
+    }
+
+    fn work_log(fx: &Fx) -> String {
+        fs::read_to_string(fx._tmp.path().join("work.log")).unwrap_or_default()
+    }
+
+    fn status_line(app: &App) -> String {
+        render(app, 100, 20)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A bug through the restatement to the moment the write-up would start.
+    fn bug_to_the_evidence_question(fx: &mut Fx) {
+        agent_replies(fx, &[RESTATE, "enough", WRITE_UP]);
+        start_bug_in_skoolscout(fx);
+        key(&mut fx.app, KeyCode::Enter); // that's right → the agent says enough
+        wait_turn(&mut fx.app);
+    }
+
+    #[test]
+    fn a_bug_is_asked_about_evidence_before_the_write_up() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        bug_to_the_evidence_question(&mut fx);
+        assert_eq!(awaiting(&fx.app), "capture");
+        assert!(
+            status_line(&fx.app).contains("Capture evidence?"),
+            "{}",
+            status_line(&fx.app)
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review", "the write-up went ahead");
+        assert!(
+            calls(&fx)
+                .last()
+                .unwrap()
+                .contains(crate::interview::WRITE_UP_MARKER)
+        );
+        let start = Instant::now();
+        while !work_log(&fx).contains("start --area") {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "no capture started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_feature_is_never_asked() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('f'));
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+    }
+
+    #[test]
+    fn enter_skips_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(work_log(&fx), "", "nothing started");
+    }
+
+    #[test]
+    fn no_capture_guide_means_no_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, false, true);
+        bug_to_the_evidence_question(&mut fx);
+        assert!(
+            status_line(&fx.app).contains("no capture guide in"),
+            "{}",
+            status_line(&fx.app)
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(
+            awaiting(&fx.app),
+            "capture",
+            "v does nothing without a guide"
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+        assert_eq!(work_log(&fx), "");
+    }
+
+    #[test]
+    fn no_claude_means_no_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, false);
+        bug_to_the_evidence_question(&mut fx);
+        assert!(
+            status_line(&fx.app).contains("capture needs claude"),
+            "{}",
+            status_line(&fx.app)
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(awaiting(&fx.app), "capture");
+    }
+
+    #[test]
+    fn the_saved_bug_shows_its_capture_in_evidence() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        assert_eq!(fx.app.view().screen, "browse");
+        wait_until(&mut fx.app, "the capture's result", |a| {
+            a.view().evidence.first().is_some_and(|r| r.mark == "✓")
+        });
+        let row = fx.app.view().evidence[0].clone();
+        assert!(
+            row.label
+                .contains("before · video · the email goes to every admin"),
+            "{}",
+            row.label
+        );
+    }
+
+    fn wait_for_work(fx: &Fx, needle: &str) {
+        let start = Instant::now();
+        while !work_log(fx).contains(needle) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "never logged {needle}: {}",
+                work_log(fx)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn saving_from_the_popup_leaves_the_capture_running_to_its_end() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_WORK_SLOW".into(), "1".into()));
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        fx.app.start_capture(); // the popup
+        key(&mut fx.app, KeyCode::Char('b'));
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // that's right → enough
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "capture");
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        wait_for_work(&fx, "start --area");
+        assert_eq!(
+            key(&mut fx.app, KeyCode::Enter),
+            Flow::Quit,
+            "the popup closes on save"
+        );
+        fx.app.shutdown();
+        // the stack that was starting is used, then finished, by the capture's own process
+        wait_for_work(&fx, "finish --area");
+        assert!(
+            fs::read_to_string(fx._tmp.path().join("claude.log"))
+                .unwrap_or_default()
+                .contains("---"),
+            "the agent ran after the popup closed"
+        );
+    }
+
+    #[test]
+    fn trash_stops_a_running_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        let name = fx.app.selected_intent().unwrap().polish_name();
+        let claude_log = fx._tmp.path().join("claude.log");
+        let start = Instant::now();
+        while !fs::read_to_string(&claude_log)
+            .unwrap_or_default()
+            .contains("---")
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the agent never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        key(&mut fx.app, KeyCode::Char('D'));
+        key(&mut fx.app, KeyCode::Char('y'));
+        wait_for_work(&fx, "finish --area");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !fx.app.store.root().join(".polish").join(&name).exists(),
+            "nothing comes back after the trash"
+        );
+    }
+
+    /// A Running record whose runner is gone, as a crash or a reboot leaves it.
+    fn running_without_a_runner(dir: &Path, phase: crate::capture::Phase, merged: Vec<u64>) {
+        use crate::capture::{CaptureRecord, Outcome, Shot, VIEWPORT, write_record};
+        let rec = CaptureRecord {
+            phase,
+            shot: Shot::Video,
+            outcome: Outcome::Running("the agent is reproducing it".into()),
+            file: None,
+            steps: Vec::new(),
+            viewport: VIEWPORT,
+            at: chrono::Local::now(),
+            merged,
+            warning: None,
+        };
+        write_record(dir, &rec).unwrap();
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        fs::write(dir.join(".capture.lock"), pid.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_capture_whose_runner_died_reads_as_interrupted() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox");
+        let it = fx.app.selected_intent().unwrap().clone();
+        Store::update_fields(&it.path, |fm| fm.polish_dir = Some("new-ev9".into())).unwrap();
+        let dir = fx.app.store.root().join(".polish/new-ev9/evidence");
+        running_without_a_runner(&dir, crate::capture::Phase::Before, Vec::new());
+        fx.app.rescan();
+        select(&mut fx.app, "In the inbox");
+        let row = fx.app.view().evidence[0].clone();
+        assert_eq!(row.mark, "!", "{row:?}");
+        assert!(row.label.contains("interrupted"), "{row:?}");
+    }
+
+    #[test]
+    fn a_warning_shows_on_its_capture() {
+        use crate::capture::{Phase, read_records, write_record};
+        let mut fx = setup("agy.jsonl");
+        bug_with_evidence(&mut fx, "new-ev8", false);
+        let dir = fx.app.store.root().join(".polish/new-ev8/evidence");
+        let mut rec = read_records(&dir).remove(0);
+        assert_eq!(rec.phase, Phase::Before);
+        rec.warning =
+            Some("work finish: DIRTY_WORKTREE; run `work finish --area a --task t`".into());
+        write_record(&dir, &rec).unwrap();
+        let row = fx.app.view().evidence[0].clone();
+        assert!(
+            row.label.contains("⚠ work finish: DIRTY_WORKTREE"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_after_runs_again() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        capture_setup(&t, &mut fx.app, true, true);
+        fs::create_dir_all(t.join("repo/.helmsmith")).unwrap();
+        fs::write(t.join("repo/.helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        let (_path, dir) = notify_bug_with_a_before(&mut fx);
+        running_without_a_runner(&dir, crate::capture::Phase::After, vec![42]);
+        fs::write(t.join("prs/42"), "MERGED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        let start = Instant::now();
+        while !fs::read_to_string(t.join("work.log"))
+            .unwrap_or_default()
+            .contains("start --area")
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the after never ran again"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            fx.app.tick();
+        }
+        stop_captures(&fx.app);
+    }
+
+    // ---- keeping evidence, the after, finding the fix ------------------------
+
+    /// The list fixture's Notify intent as a bug, with a reproduced "before"
+    /// in its agent folder; returns (intent path, evidence dir).
+    fn notify_bug_with_a_before(fx: &mut ListFx) -> (PathBuf, PathBuf) {
+        use crate::capture::{CaptureRecord, Outcome, Phase, Shot, VIEWPORT, write_record};
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        Store::update_fields(&path, |fm| fm.kind = "issue".into()).unwrap();
+        let it = Store::load(&path).unwrap();
+        let dir = polish_cwd(fx.app.store.root(), &it.polish_name()).join("evidence");
+        let rec = CaptureRecord {
+            phase: Phase::Before,
+            shot: Shot::Video,
+            outcome: Outcome::Reproduced("every admin gets the email".into()),
+            file: Some("before.mp4".into()),
+            steps: vec!["agent-browser open https://x".into()],
+            viewport: VIEWPORT,
+            at: chrono::Local::now(),
+            merged: Vec::new(),
+            warning: None,
+        };
+        write_record(&dir, &rec).unwrap();
+        fs::write(dir.join("before.mp4"), "video").unwrap();
+        (path, dir)
+    }
+
+    fn add_issue_line(path: &Path, n: u64) {
+        let text = fs::read_to_string(path).unwrap();
+        fs::write(
+            path,
+            text.replace("- pr: #42\n", &format!("- pr: #42\n- issue: #{n}\n")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn evidence_moves_into_the_attachments_once_the_issue_exists() {
+        let mut fx = list_fixture(true);
+        let (path, scratch) = notify_bug_with_a_before(&mut fx);
+        fx.app.rescan();
+        assert!(
+            scratch.join("before.json").is_file(),
+            "no issue yet: it stays put"
+        );
+        add_issue_line(&path, 123);
+        fx.app.rescan();
+        let kept = Store::load(&path).unwrap().assets_dir().join("evidence");
+        assert!(kept.join("before.json").is_file(), "kept with the issue");
+        assert!(kept.join("before.mp4").is_file());
+        assert!(!scratch.join("before.json").exists(), "moved, not copied");
+        let it = Store::load(&path).unwrap();
+        let rows = fx.app.evidence_rows(&it);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].file.as_deref(),
+            Some(kept.join("before.mp4").as_path())
+        );
+    }
+
+    #[test]
+    fn the_after_runs_once_every_pr_merged() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        capture_setup(&t, &mut fx.app, true, true);
+        // the guide lives in the repo the intent was sent to
+        fs::create_dir_all(t.join("repo/.helmsmith")).unwrap();
+        fs::write(t.join("repo/.helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        fs::write(
+            t.join("capture-events.jsonl"),
+            "{\"type\":\"result\",\"result\":\"fixed: only the primary contact gets it\"}\n",
+        )
+        .unwrap();
+        let (_path, dir) = notify_bug_with_a_before(&mut fx);
+        fx.app.rescan();
+        settle(&mut fx.app);
+        let starts = |t: &Path| {
+            fs::read_to_string(t.join("work.log"))
+                .unwrap_or_default()
+                .matches("start --area")
+                .count()
+        };
+        assert_eq!(starts(&t), 0, "PR #42 is still open");
+        fs::write(t.join("prs/42"), "MERGED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        let after = |dir: &Path| {
+            crate::capture::read_records(dir)
+                .into_iter()
+                .find(|r| r.phase == crate::capture::Phase::After)
+        };
+        wait_until(&mut fx.app, "the after's result", |_| {
+            after(&dir).is_some_and(|r| !matches!(r.outcome, crate::capture::Outcome::Running(_)))
+        });
+        let rec = after(&dir).unwrap();
+        assert_eq!(rec.merged, vec![42]);
+        assert_eq!(
+            rec.outcome,
+            crate::capture::Outcome::Fixed("only the primary contact gets it".into())
+        );
+        assert_eq!(starts(&t), 1);
+        // the same merged set never runs it again
+        for _ in 0..3 {
+            fx.app.rescan();
+            settle(&mut fx.app);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            starts(&t),
+            1,
+            "{}",
+            fs::read_to_string(t.join("work.log")).unwrap()
+        );
+    }
+
+    #[test]
+    fn issue_numbers_join_the_pr_search() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        fx.app
+            .herdr_env
+            .push(("FAKE_GH_LOG".into(), t.join("gh.log").display().to_string()));
+        let (path, _) = notify_bug_with_a_before(&mut fx);
+        add_issue_line(&path, 123);
+        // the issue names the pull request that closes it
+        fs::write(
+            t.join("prs/issue-123.json"),
+            r#"{"closedByPullRequestsReferences":[{"number":77,"url":"https://github.com/o/r/pull/77"}]}"#,
+        )
+        .unwrap();
+        fs::write(t.join("prs/77"), "MERGED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let log = fs::read_to_string(t.join("gh.log")).unwrap_or_default();
+        assert!(log.contains("issue view 123"), "{log}");
+        let found = fx.app.found_prs.get(&path).cloned().unwrap_or_default();
+        let by_issue = found
+            .iter()
+            .find(|(q, _)| q == "#123")
+            .map(|(_, p)| p.clone());
+        assert_eq!(
+            by_issue
+                .unwrap_or_default()
+                .iter()
+                .map(|p| (p.number, p.state))
+                .collect::<Vec<_>>(),
+            vec![(77, crate::progress::PrState::Merged)],
+            "{found:?}"
+        );
+    }
+
+    // ---- the Evidence section --------------------------------------------------
+
+    /// Gives the inbox bug a "before" capture (and, with `after`, an "after"),
+    /// in an agent folder named `folder`; returns the video's path.
+    fn bug_with_evidence(fx: &mut Fx, folder: &str, after: bool) -> PathBuf {
+        use crate::capture::{CaptureRecord, Outcome, Phase, Shot, VIEWPORT, write_record};
+        select(&mut fx.app, "In the inbox");
+        let it = fx.app.selected_intent().unwrap().clone();
+        Store::update_fields(&it.path, |fm| fm.polish_dir = Some(folder.into())).unwrap();
+        let dir = fx
+            .app
+            .store
+            .root()
+            .join(".polish")
+            .join(folder)
+            .join("evidence");
+        let rec = |phase, outcome, file: &str| CaptureRecord {
+            phase,
+            shot: Shot::Video,
+            outcome,
+            file: Some(file.into()),
+            steps: vec!["agent-browser open https://x".into()],
+            viewport: VIEWPORT,
+            at: chrono::Local::now(),
+            merged: Vec::new(),
+            warning: None,
+        };
+        write_record(
+            &dir,
+            &rec(
+                Phase::Before,
+                Outcome::Reproduced("the email goes to every admin".into()),
+                "before.mp4",
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("before.mp4"), "video").unwrap();
+        if after {
+            write_record(
+                &dir,
+                &rec(
+                    Phase::After,
+                    Outcome::StillBroken("admins still get it".into()),
+                    "after.mp4",
+                ),
+            )
+            .unwrap();
+        }
+        fx.app.rescan();
+        select(&mut fx.app, "In the inbox");
+        dir.join("before.mp4")
+    }
+
+    fn focus_evidence(app: &mut App) {
+        for _ in 0..12 {
+            if app.view().focus == "evidence" {
+                return;
+            }
+            key(app, KeyCode::Tab);
+        }
+        panic!(
+            "Tab never reached the Evidence section: {:?}",
+            app.view().focus
+        );
+    }
+
+    /// Points open / osascript / pbcopy at a fake that logs what it is given.
+    fn log_launchers(fx: &mut Fx) -> PathBuf {
+        let log = fx._tmp.path().join("args.log");
+        let fake = fixtures().join("fake-args.sh").display().to_string();
+        for k in ["OPEN_BIN_PATH", "OSASCRIPT_BIN_PATH", "PBCOPY_BIN_PATH"] {
+            fx.app.capture_env.push((k.into(), fake.clone()));
+        }
+        fx.app
+            .capture_env
+            .push(("FAKE_ARGS_LOG".into(), log.display().to_string()));
+        log
+    }
+
+    fn wait_for_log(log: &Path, needle: &str) -> String {
+        let start = Instant::now();
+        loop {
+            let text = fs::read_to_string(log).unwrap_or_default();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "never logged {needle:?}: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn the_hand_off_names_the_captures() {
+        let mut fx = setup("agy.jsonl");
+        let video = bug_with_evidence(&mut fx, "new-ev5", false);
+        make_refining(&mut fx.app);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(fx._tmp.path().to_path_buf());
+        // no open questions, so it can be sent
+        it.body = "## Description\nEvery admin gets the email.\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('s'));
+        key(&mut fx.app, KeyCode::Enter);
+        let prompt = fx.app.view().send_prompt.unwrap_or_default();
+        assert!(
+            prompt.contains(&format!(
+                "- before, reproduced: the email goes to every admin: {}",
+                video.display()
+            )),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_evidence_in_chrome() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = bug_with_evidence(&mut fx, "new-ev1", false);
+        focus_evidence(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        let path = video.display().to_string();
+        let text = wait_for_log(&log, &path);
+        if cfg!(target_os = "macos") {
+            assert!(
+                text.contains(&format!("-a\nGoogle Chrome\n{path}\n")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_copies_the_file_and_y_the_path() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = bug_with_evidence(&mut fx, "new-ev2", false);
+        let path = video.display().to_string();
+        focus_evidence(&mut fx.app);
+        if cfg!(target_os = "macos") {
+            key(&mut fx.app, KeyCode::Char('c'));
+            let text = wait_for_log(&log, &path);
+            assert!(
+                text.contains("set the clipboard to"),
+                "osascript, the file itself: {text}"
+            );
+            // the osascript stand-in's whole entry first, so the two never interleave
+            wait_for_log(&log, "---");
+            key(&mut fx.app, KeyCode::Char('Y'));
+            wait_for_log(&log, &format!("stdin:{path}"));
+        }
+        // over SSH there is no pasteboard to put a file on: c copies the path
+        fs::write(&log, "").unwrap();
+        fx.app
+            .capture_env
+            .push(("SSH_CONNECTION".into(), "10.0.0.1 1 10.0.0.2 22".into()));
+        key(&mut fx.app, KeyCode::Char('c'));
+        std::thread::sleep(Duration::from_millis(200));
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        assert!(!text.contains("set the clipboard to"), "{text}");
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("copied the path"),
+            "{:?}",
+            fx.app.view().message
+        );
+    }
+
+    #[test]
+    fn evidence_paths_with_spaces_reach_the_opener_whole() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = bug_with_evidence(&mut fx, "new with spaces", false);
+        focus_evidence(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        let path = video.display().to_string();
+        let text = wait_for_log(&log, &path);
+        assert!(text.lines().any(|l| l == path), "one argument: {text}");
+    }
+
+    #[test]
+    fn e_refuses_a_second_capture_while_one_runs() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        assert_eq!(fx.app.view().screen, "browse");
+        key(&mut fx.app, KeyCode::Char('E'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("capturing already"),
+            "{:?}",
+            fx.app.view().message
+        );
+        stop_captures(&fx.app);
+        assert_eq!(
+            work_log(&fx).matches("start --area").count(),
+            1,
+            "{}",
+            work_log(&fx)
+        );
+    }
+
+    #[test]
+    fn e_is_only_for_bugs() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha"); // an idea
+        key(&mut fx.app, KeyCode::Char('E'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("evidence is for bugs")
+        );
+    }
+
+    #[test]
+    fn evidence_section_snapshot() {
+        let mut fx = setup("agy.jsonl");
+        bug_with_evidence(&mut fx, "new-ev3", true);
+        focus_evidence(&mut fx.app);
+        insta::assert_snapshot!(render(&fx.app, 80, 24));
     }
 
     #[test]

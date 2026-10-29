@@ -1,6 +1,8 @@
 //! herdr-intents: capture intents, refine them with an agent, send them to agents.
 
 pub mod app;
+pub mod capture;
+pub mod capture_mcp;
 pub mod config;
 pub mod conversation;
 pub mod demos;
