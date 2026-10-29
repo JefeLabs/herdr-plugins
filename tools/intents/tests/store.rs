@@ -822,3 +822,70 @@ fn a_polish_dir_that_is_not_one_plain_folder_is_ignored() {
     Store::update_fields(&it.path, |fm| fm.polish_dir = Some("new-ab12cd34".into())).unwrap();
     assert_eq!(Store::load(&it.path).unwrap().polish_name(), "new-ab12cd34");
 }
+
+#[test]
+fn trash_moves_an_intent_and_everything_it_owns_out_of_the_tree() {
+    let (tmp, s) = store();
+    let it = s
+        .create(
+            Path::new("skoolscout/admin"),
+            "Gone soon",
+            "idea",
+            "x\n",
+            None,
+        )
+        .unwrap();
+    Store::append_transcript(&it, "user", "hello").unwrap();
+    let shot = tmp.path().join("s.png");
+    fs::write(&shot, b"png").unwrap();
+    Store::attach(&it, &shot).unwrap();
+    let polish = s.root().join(".polish").join(it.stem());
+    fs::create_dir_all(&polish).unwrap();
+    fs::write(polish.join("note.txt"), "x").unwrap();
+
+    let dest = s.trash(&it).unwrap();
+
+    assert!(
+        dest.starts_with(s.root().join(".trash")),
+        "{}",
+        dest.display()
+    );
+    assert!(!it.path.exists() && !it.transcript_path().exists() && !it.assets_dir().exists());
+    assert!(!polish.exists(), "the agent's folder goes too");
+    let name = |n: &str| dest.join(n);
+    assert!(name(&format!("{}.md", it.stem())).is_file());
+    assert!(name(&format!("{}.chat.md", it.stem())).is_file());
+    assert!(
+        name(&format!("{}.assets", it.stem()))
+            .join("s.png")
+            .is_file()
+    );
+    assert!(name("polish").join("note.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(name("from.txt")).unwrap().trim(),
+        "skoolscout/admin",
+        "where it came from, to put it back"
+    );
+    let tree = s.scan().unwrap();
+    let mut titles = Vec::new();
+    fn walk(g: &herdr_intents::store::Group, out: &mut Vec<String>) {
+        out.extend(g.intents.iter().map(|i| i.fm.title.clone()));
+        for sub in &g.groups {
+            walk(sub, out);
+        }
+    }
+    walk(&tree, &mut titles);
+    assert!(!titles.contains(&"Gone soon".to_string()), "{titles:?}");
+    // a second trash of the same stem does not collide
+    let again = s
+        .create(
+            Path::new("skoolscout/admin"),
+            "Gone soon",
+            "idea",
+            "x\n",
+            None,
+        )
+        .unwrap();
+    let dest2 = s.trash(&again).unwrap();
+    assert_ne!(dest, dest2);
+}
