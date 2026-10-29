@@ -41,7 +41,10 @@ mkdir -p "$rel" "$stage/toolbar" "$stage/tools/intents" "$stage/target/release"
 cp toolbar/tools.example.toml "$stage/toolbar/"
 echo 'id = "jefelabs.toolbar"' > "$stage/toolbar/herdr-plugin.toml"
 echo 'id = "jefelabs.intents"' > "$stage/tools/intents/herdr-plugin.toml"
-printf '#!/bin/sh\n' > "$stage/target/release/herdr-toolbar"
+# the real toolbar binary: install.sh runs `herdr-toolbar unzip` where no unzip
+# or python3 exists
+[ -x target/release/herdr-toolbar ] || cargo build -q --release -p herdr-toolbar || exit 1
+cp target/release/herdr-toolbar "$stage/target/release/herdr-toolbar"
 printf '#!/bin/sh\n' > "$stage/target/release/herdr-intents"
 asset="herdr-plugins-$platform.tar.gz"
 tar -czf "$rel/$asset" -C "$work/stage" herdr-plugins
@@ -325,6 +328,29 @@ if cmp -s "$t14" "$work/t14-after-first" && [ "$(grep -c 'unlink' "$h/.fake-herd
   pass "a second run leaves a migrated install alone"
 else
   flunk "a second run leaves a migrated install alone" "$(diff "$work/t14-after-first" "$t14" 2>&1): $out"
+fi
+
+# 16. no unzip and no python3 (minimal Debian): the zip tools still install,
+# unpacked by the toolbar's own `herdr-toolbar unzip`
+minbin="$work/minbin"
+mkdir -p "$minbin"
+for c in sh uname mktemp mkdir rm rmdir tar gzip cp mv ln chmod cat awk sed grep cut head tail \
+  basename dirname ls tr sort uniq wc sha256sum shasum touch date find readlink id env sleep xargs expr; do
+  p=$(command -v "$c" 2>/dev/null) || continue
+  case "$p" in /*) ln -sf "$p" "$minbin/$c" ;; esac
+done
+h="$work/h16"
+mkdir -p "$h"
+out=$(env -i HOME="$h" PATH="$work/fakebin:$minbin" HERDR_PLUGINS_TOOLS_MANIFEST="$work/good" \
+  sh "$rel/install.sh" --from "$rel" --tools 2>&1)
+status=$?
+if [ -e "$minbin/unzip" ] || [ -e "$minbin/python3" ]; then
+  flunk "zip tools without unzip or python3" "the test PATH still has unzip or python3"
+elif [ $status -eq 0 ] && [ "$("$h/.local/bin/procs")" = "procs fake" ] &&
+  [ "$("$h/.local/bin/yazi")" = "yazi fake" ] && [ "$("$h/.local/bin/ya")" = "ya fake" ]; then
+  pass "zip tools without unzip or python3"
+else
+  flunk "zip tools without unzip or python3" "exit $status: $out"
 fi
 
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"
