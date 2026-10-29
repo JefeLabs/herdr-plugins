@@ -677,9 +677,75 @@ fn run(
     record(parse_outcome(req.phase, &result), file, steps)
 }
 
+/// For the hand-off: each capture with a file, its result and where it is.
+/// Until the issue is filed they live in the agent folder, which the
+/// hand-off's attachment list does not cover.
+pub fn handoff_note(dir: &Path) -> Option<String> {
+    let lines: Vec<String> = read_records(dir)
+        .iter()
+        .filter_map(|r| {
+            let file = dir.join(r.file.as_deref()?);
+            if !file.is_file() {
+                return None;
+            }
+            let phase = match r.phase {
+                Phase::Before => "before",
+                Phase::After => "after",
+            };
+            let result = match &r.outcome {
+                Outcome::Reproduced(t) => format!("reproduced: {t}"),
+                Outcome::NotReproduced(t) => format!("couldn't reproduce: {t}"),
+                Outcome::Fixed(t) => format!("fixed: {t}"),
+                Outcome::StillBroken(t) => format!("still broken: {t}"),
+                Outcome::Failed(t) | Outcome::Running(t) => t.clone(),
+            };
+            Some(format!(
+                "- {phase}, {result}: {}\n  (the steps: {})",
+                file.display(),
+                dir.join(format!("{phase}.json")).display()
+            ))
+        })
+        .collect();
+    (!lines.is_empty()).then(|| {
+        format!(
+            "Captured evidence (recorded on a local stack by the Intents tool):\n{}",
+            lines.join("\n")
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_note_lists_each_capture_with_its_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("with space/evidence");
+        assert_eq!(handoff_note(&dir), None, "no captures, no note");
+        write_record(&dir, &record(Phase::Before)).unwrap();
+        std::fs::write(dir.join("before.mp4"), "video").unwrap();
+        let mut running = record(Phase::After);
+        running.outcome = Outcome::Running("seeding: kathia-signup".into());
+        running.file = None;
+        write_record(&dir, &running).unwrap();
+        let note = handoff_note(&dir).unwrap();
+        assert!(
+            note.contains(&format!(
+                "- before, reproduced: the email goes to every admin: {}",
+                dir.join("before.mp4").display()
+            )),
+            "{note}"
+        );
+        assert!(
+            note.contains(&dir.join("before.json").display().to_string()),
+            "the steps: {note}"
+        );
+        assert!(
+            !note.contains("after"),
+            "a capture without a file is left out: {note}"
+        );
+    }
 
     const GUIDE: &str = "---\ndefault_area: org/social\nseed: [kathia-signup]\nurl: https://demo-org.skoolscout.com.local:{port}\n---\nSign in with Cmd+U.\n";
 

@@ -4057,6 +4057,11 @@ impl App {
                         &Store::attachments(&it),
                     ) {
                         Ok((repo, prompt)) => {
+                            let prompt =
+                                match crate::capture::handoff_note(&self.evidence_home(&it)) {
+                                    Some(note) => format!("{prompt}\n\n{note}"),
+                                    None => prompt,
+                                };
                             self.screen = Screen::SendConfirm {
                                 handoff,
                                 provider,
@@ -9858,6 +9863,30 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn the_hand_off_names_the_captures() {
+        let mut fx = setup("agy.jsonl");
+        let video = bug_with_evidence(&mut fx, "new-ev5", false);
+        make_refining(&mut fx.app);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(fx._tmp.path().to_path_buf());
+        // no open questions, so it can be sent
+        it.body = "## Description\nEvery admin gets the email.\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('s'));
+        key(&mut fx.app, KeyCode::Enter);
+        let prompt = fx.app.view().send_prompt.unwrap_or_default();
+        assert!(
+            prompt.contains(&format!(
+                "- before, reproduced: the email goes to every admin: {}",
+                video.display()
+            )),
+            "{prompt}"
+        );
     }
 
     #[test]
