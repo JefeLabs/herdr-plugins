@@ -186,16 +186,18 @@ The rewrite is applied straight away; the previous version is kept beside the fi
 
 ## Evidence for bugs
 
-A bug can carry proof: a screenshot or a video of it happening on a local stack, recorded by an agent, and the same steps again once the fix has merged. It needs `work` (workbrokr), `claude` and `agent-browser` (`npm i -g agent-browser` or `brew install agent-browser`, then `agent-browser install` for its browser).
+A bug can carry proof: a screenshot or a video of it happening on a local stack, recorded by an agent, and the same steps again once the fix has merged. It needs `work` (workbrokr), a `claude` recent enough to have `--restricted` and `--permission-mode dontAsk` (an older one is refused before any stack starts), and `agent-browser` (`npm i -g agent-browser` or `brew install agent-browser`, then `agent-browser install` for its browser).
 
 **The question.** After the last question about a bug, before the write-up, the add view asks `Capture evidence? s screenshot · v video · Enter skip`. It asks once, and only for bugs. When the repo has no capture guide, or `claude` is not installed, the line says why instead and `Enter` continues.
 
-**In the background.** The capture runs while you finish: the write-up goes ahead and you can save. The intent's Evidence section shows how far it got (`starting a stack in org/social`, `seeding: kathia-signup`, `the agent is reproducing it`), then the result. In order, the capture:
+**In the background.** Each capture runs in its own process (`herdr-intents capture-run`), so the write-up goes ahead, you can save, and closing the popup or quitting the tool leaves it running to its end. The intent's Evidence section shows how far it got (`starting a stack in org/social`, `seeding: kathia-signup`, `the agent is reproducing it`), then the result. In order, the capture:
 
 1. starts its own task effort, `work start --area <area> --task evidence-<n> --type fix --mode fullstack` with `WORK_SESSION=capture-<name>`, trying the area the intent's group ends with (its last two path segments), then the guide's `default_area`. It never joins an effort or merges into one;
-2. runs the guide's seed stories (`make -C <worktree>/app-test-e2e-runner e2e-story STORY=<story> FAST=1`);
-3. runs `claude` with the guide, the report and the app's address. The agent may run only `agent-browser`: `open` on the stack's own address, `set viewport`, `screenshot` or `record` into the evidence folder, and the commands that drive a page (click, fill, type, press, select, scroll, wait, snapshot and the like). The report reaches it as data between markers, never as instructions. An agent still running after 20 minutes is stopped;
-4. ends with `work finish` for its effort whatever happened, also when you cancel the conversation or quit.
+2. runs the guide's seed stories on its own slot (`make -C <worktree>/app-test-e2e-runner e2e-story STORY=<story> FAST=1`, with `SLOT` from `work env`);
+3. runs `claude` with the guide, the report and the app's address, and no shell: `--restricted --permission-mode dontAsk --tools ""`, with one MCP server (`herdr-intents capture-mcp`). Its tools are `browser` plus `record_start`/`record_stop` (video) or `screenshot`. `browser` takes one agent-browser command from a fixed list (open, snapshot, click, fill, type, press, select, scroll, wait, get, find and the like) with only the flags each needs; `open` goes only to the stack's own address, and `eval`, `wait --fn`, `read`, `tab`, `connect` and every global flag (`--session`, `--profile`, `--executable-path`…) are refused. Everything runs in the capture's own agent-browser session, closed when the agent ends, and the files go only to the evidence folder. The report reaches the agent as data between markers, never as instructions. An agent still running after 20 minutes is stopped;
+4. ends with `work finish` for its effort whatever happened. When `work finish` refuses (a dirty worktree, say), the capture's row says so with the command to run.
+
+Deleting the intent (`D`) or cancelling the conversation (`Esc`) stops its capture, which still finishes its effort. A capture whose process ended early (a crash, a restart) shows as `! … interrupted`; an interrupted "after" runs again.
 
 The agent's last line is `reproduced: …` or `couldn't reproduce: …`; a capture without one counts as failed. Captures are 1280×800.
 
@@ -212,11 +214,11 @@ Sign in at /auth/sign-in: press Meta+U and pick the person…
 
 Keep passwords out of it: the agent signs in the way a person does on a local stack.
 
-**The Evidence section.** It follows Artifacts in every intent's detail pane (`Tab` reaches it). One row per capture: `before` or `after`, `video` or `screenshot`, and the agent's line, marked `…` running, `✓` reproduced or fixed, `✗` still broken, `·` couldn't reproduce, `!` failed. `Enter` opens the file in Chrome (on Linux, with `xdg-open`). `c` copies the file itself: on macOS, ⌘V into a GitHub comment uploads it; over SSH, or off macOS, it copies the path. `Y` copies the path. `E` (here, in the tree or on a card) captures the selected bug again: a "before" until one reproduced it, then an "after". It refuses while a capture of that intent is running.
+**The Evidence section.** It follows Artifacts in every intent's detail pane (`Tab` reaches it). One row per capture: `before` or `after`, `video` or `screenshot`, and the agent's line, marked `…` running, `✓` reproduced or fixed, `✗` still broken, `·` couldn't reproduce, `!` failed or interrupted; `⚠` adds anything to act on, such as a `work finish` that failed. `Enter` opens the file in Chrome (on Linux, with `xdg-open`). `c` copies the file itself: on macOS, ⌘V into a GitHub comment uploads it; over SSH, or off macOS, it copies the path. `Y` copies the path. `E` (here, in the tree or on a card) captures the selected bug again: a "before" until one reproduced it, then an "after". It refuses while a capture of that intent is running.
 
 **After the fix.** When every pull request of a sent bug has merged and its "before" reproduced the bug, the tool runs the same steps on a fresh stack: an "after", once per merged set of pull requests. Its row reads `✓ after · … · fixed: …` or `✗ after · … · still broken: …`. Besides `pr:` lines and the spec and plan names, pull requests are found through the intent's `issue:` lines: the ones GitHub links as closing the issue ("Fixes #n").
 
-**Where the files are.** Until the bug has an issue, its captures sit in its agent folder, `.polish/<name>/evidence/`: `before.mp4` or `before.png`, and `before.json` with the result and the exact steps (the same for `after`). Once an `issue:` line names the filed issue, they move into the intent's attachments, `<name>.assets/evidence/`. A hand-off lists the captures wherever they are, so the agent filing the issue can use the screenshot as the issue's picture and ask you to paste the video. `D` takes them to the trash with the intent.
+**Where the files are.** Until the bug has an issue, its captures sit in its agent folder, `.polish/<name>/evidence/`: `before.mp4` or `before.png`, and `before.json` with the result and the `browser` calls the agent made (the same for `after`). Once an `issue:` line names the filed issue, they move into the intent's attachments, `<name>.assets/evidence/`. A hand-off lists the captures wherever they are, so the agent filing the issue can use the screenshot as the issue's picture and ask you to paste the video. `D` takes them to the trash with the intent.
 
 ## List view
 
