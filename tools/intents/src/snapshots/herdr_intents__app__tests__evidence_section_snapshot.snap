@@ -1,0 +1,28 @@
+---
+source: tools/intents/src/app.rs
+expression: "render(&fx.app, 80, 24)"
+---
+▾ Inbox (1)            │# In the inbox
+  ○ In the inbox ?2    │kind: bug   state: raw   ?2
+▾ skoolscout (2)       │ Description ───────────────────────────────────────────
+  ○ Alpha              │Observed
+  ○ Beta               │
+                       │ ▸ Preconditions (0/0) ─────────────────────────────────
+                       │ ▸ Acceptance criteria (0/0) ───────────────────────────
+                       │ ▸ Demo Videos (0) ─────────────────────────────────────
+                       │ ▸ Open questions (2 open) ─────────────────────────────
+                       │ ▸ Pull requests (0) ───────────────────────────────────
+                       │ ▸ Artifacts (0) ───────────────────────────────────────
+                       │ ▾ Evidence (2) ────────────────────────────────────────
+                       │✓ before · video · the email goes to every admin
+                       │✗ after · video · admins still get it
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again

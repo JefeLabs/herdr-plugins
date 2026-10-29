@@ -888,6 +888,8 @@ mod tests {
             prs: &[],
             prs_selected: 0,
             demos_selected: 0,
+            evidence: &[],
+            evidence_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render_intent(&view, f.area(), f.buffer_mut()))
@@ -969,6 +971,8 @@ mod tests {
             prs: &prs,
             prs_selected: selected,
             demos_selected: selected,
+            evidence: &[],
+            evidence_selected: 0,
         };
         let (w, h) = (80u16, 30u16);
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -1082,6 +1086,7 @@ mod tests {
             "▾ Acceptance criteria (1/3)",
             "▸ Open questions (1 open)",
             "▸ Artifacts (1)",
+            "▸ Evidence (0)",
         ] {
             assert!(all.contains(title), "missing {title:?}:\n{all}");
         }
@@ -1097,10 +1102,11 @@ mod tests {
         let desc = row_of(&rows, "The description.");
         assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 1, "{all}");
         assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 1);
-        assert_eq!(row_of(&rows, "▸ Demo Videos"), 20, "{all}");
-        assert_eq!(row_of(&rows, "▸ Open questions"), 21, "{all}");
-        assert_eq!(row_of(&rows, "▸ Pull requests"), 22, "{all}");
-        assert_eq!(row_of(&rows, "▸ Artifacts"), 23, "{all}");
+        assert_eq!(row_of(&rows, "▸ Demo Videos"), 19, "{all}");
+        assert_eq!(row_of(&rows, "▸ Open questions"), 20, "{all}");
+        assert_eq!(row_of(&rows, "▸ Pull requests"), 21, "{all}");
+        assert_eq!(row_of(&rows, "▸ Artifacts"), 22, "{all}");
+        assert_eq!(row_of(&rows, "▸ Evidence"), 23, "{all}");
 
         let (_t, rows) = detail(&it, Pane::Tree, Pane::Artifacts, 80, 24);
         let all = rows.join("\n");
@@ -1169,6 +1175,8 @@ mod tests {
             prs: &[],
             prs_selected: 0,
             demos_selected: 0,
+            evidence: &[],
+            evidence_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
         t.draw(|f| render_intent(&view, f.area(), f.buffer_mut()))
@@ -1223,6 +1231,8 @@ pub enum Pane {
     Questions,
     PullRequests,
     Artifacts,
+    /// A bug's captures: before and after the fix.
+    Evidence,
 }
 
 /// `wrap_text` for styled spans: the same greedy wrap, with each word keeping
@@ -1346,6 +1356,9 @@ pub struct DetailView<'a> {
     pub prs: &'a [PrRow],
     pub prs_selected: usize,
     pub demos_selected: usize,
+    /// The captures, as `(mark, label)`: before first, then after.
+    pub evidence: &'a [(String, String)],
+    pub evidence_selected: usize,
 }
 
 /// A pull request in the detail view: linked by a `pr:` line or found by the
@@ -1392,6 +1405,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         Pane::Questions,
         Pane::PullRequests,
         Pane::Artifacts,
+        Pane::Evidence,
     ];
     let mut constraints = vec![Constraint::Length(2), Constraint::Length(desc_h)];
     constraints.extend(sections.iter().map(|s| {
@@ -1546,7 +1560,17 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             marker(Pane::Artifacts),
             count_title("Artifacts", &artifact_rows)
         ),
+        format!("{} Evidence ({})", marker(Pane::Evidence), v.evidence.len()),
     ];
+    let evidence_rows: Vec<ItemRow> = v
+        .evidence
+        .iter()
+        .map(|(mark, label)| ItemRow {
+            tag: mark.clone(),
+            text: label.clone(),
+            found: false,
+        })
+        .collect();
     for (i, section) in sections.into_iter().enumerate() {
         let rect = layout[2 + i];
         if section != v.open {
@@ -1605,6 +1629,16 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 &pr_rows,
                 8,
                 "none yet — agents add a `pr:` line for each pull request they open (a adds one by hand)",
+                rect,
+                buf,
+            ),
+            Pane::Evidence => render_items(
+                &titles[i],
+                v.focus == Pane::Evidence,
+                v.evidence_selected,
+                &evidence_rows,
+                2,
+                "none yet — on a bug, s or v after the last question (or E) captures it",
                 rect,
                 buf,
             ),

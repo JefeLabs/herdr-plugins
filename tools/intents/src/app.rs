@@ -426,6 +426,7 @@ pub struct App {
     criteria_selected: usize,
     question_selected: usize,
     artifacts_selected: usize,
+    evidence_selected: usize,
     prs_selected: usize,
     demos_selected: usize,
     /// PR titles from `gh`, keyed like `pr_states`.
@@ -491,6 +492,7 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Criteria => "criteria",
         Pane::Questions => "questions",
         Pane::Artifacts => "artifacts",
+        Pane::Evidence => "evidence",
         Pane::Demos => "demos",
         Pane::PullRequests => "pull requests",
     }
@@ -527,6 +529,7 @@ impl App {
             criteria_selected: 0,
             question_selected: 0,
             artifacts_selected: 0,
+            evidence_selected: 0,
             prs_selected: 0,
             demos_selected: 0,
             pr_titles: HashMap::new(),
@@ -1401,6 +1404,7 @@ impl App {
             // the card view says nothing about where an intent belongs
             KeyCode::Char('a') => self.screen = Screen::KindPick { group: None },
             KeyCode::Char('D') => self.ask_trash(),
+            KeyCode::Char('E') => self.capture_again(),
             _ => {}
         }
         Flow::Continue
@@ -1678,6 +1682,7 @@ impl App {
                 | Pane::Questions
                 | Pane::PullRequests
                 | Pane::Artifacts
+                | Pane::Evidence
         ) {
             self.open = self.focus;
         }
@@ -1760,13 +1765,15 @@ impl App {
                     Pane::Demos => Pane::Questions,
                     Pane::Questions => Pane::PullRequests,
                     Pane::PullRequests => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Tree,
+                    Pane::Artifacts => Pane::Evidence,
+                    Pane::Evidence => Pane::Tree,
                 };
                 return Flow::Continue;
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Pane::Tree => Pane::Artifacts,
+                    Pane::Tree => Pane::Evidence,
+                    Pane::Evidence => Pane::Artifacts,
                     Pane::Artifacts => Pane::PullRequests,
                     Pane::PullRequests => Pane::Questions,
                     Pane::Questions => Pane::Demos,
@@ -1850,6 +1857,7 @@ impl App {
                 self.screen = Screen::KindPick { group };
             }
             KeyCode::Char('D') => self.ask_trash(),
+            KeyCode::Char('E') => self.capture_again(),
             KeyCode::Char('n') => {
                 let parent = self.selected_group_dir();
                 self.screen = Screen::Input {
@@ -2101,6 +2109,29 @@ impl App {
                             };
                         }
                     }
+                    _ => {}
+                }
+            }
+            Pane::Evidence => {
+                let rows = self.evidence_rows(&it);
+                let last = rows.len().saturating_sub(1);
+                let selected = self.evidence_selected.min(last);
+                let file = rows.get(selected).and_then(|r| r.file.clone());
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.evidence_selected = (selected + 1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.evidence_selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('Y') => match file {
+                        Some(f) if k.code == KeyCode::Enter => self.open_in_chrome(&f),
+                        Some(f) if k.code == KeyCode::Char('c') => self.copy_file(&f),
+                        Some(f) => self.copy_path(&f),
+                        None => self.message = Some("no file for this capture yet".into()),
+                    },
+                    KeyCode::Char('E') => self.capture_again(),
                     _ => {}
                 }
             }
@@ -2671,7 +2702,12 @@ impl App {
 
     /// Why capture cannot run here, if it cannot.
     fn capture_block(&self) -> Option<String> {
-        let Some(repo) = self.current_repo() else {
+        self.capture_block_for(self.current_repo())
+    }
+
+    /// Why capture cannot run for this repo, if it cannot.
+    fn capture_block_for(&self, repo: Option<PathBuf>) -> Option<String> {
+        let Some(repo) = repo else {
             return Some("capture needs the intent's repo, and none was found".into());
         };
         if crate::capture::read_guide(&repo).is_err() {
@@ -2720,6 +2756,187 @@ impl App {
         let job =
             crate::capture::CaptureJob::spawn(req.clone(), self.capture_env.clone(), managed_mcp());
         self.capture_jobs.insert(name, (job, req));
+    }
+
+    /// `E`: captures the selected bug again: the "before" until one reproduced
+    /// it, then an "after" (also run on its own once every PR merges).
+    fn capture_again(&mut self) {
+        use crate::capture::{Outcome, Phase, Shot};
+        let Some(it) = self.selected_intent().cloned() else {
+            return;
+        };
+        if it.fm.kind != "issue" {
+            self.message = Some("evidence is for bugs".into());
+            return;
+        }
+        let name = it.polish_name();
+        if self.capture_jobs.contains_key(&name) {
+            self.message =
+                Some("capturing already: the Evidence section shows how far it got".into());
+            return;
+        }
+        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
+        if let Some(why) = self.capture_block_for(repo.clone()) {
+            self.message = Some(why);
+            return;
+        }
+        let Some(repo) = repo else {
+            return;
+        };
+        let kept = it.assets_dir().join("evidence");
+        let evidence = if crate::capture::read_records(&kept).is_empty() {
+            crate::capture::evidence_dir(&polish_cwd(self.store.root(), &name))
+        } else {
+            kept
+        };
+        let recs = crate::capture::read_records(&evidence);
+        let before = recs
+            .iter()
+            .find(|r| r.phase == Phase::Before && matches!(r.outcome, Outcome::Reproduced(_)))
+            .cloned();
+        let (phase, shot) = match &before {
+            Some(b) => (Phase::After, b.shot),
+            None => (
+                Phase::Before,
+                recs.first().map(|r| r.shot).unwrap_or(Shot::Video),
+            ),
+        };
+        let group_rel = it
+            .path
+            .parent()
+            .and_then(|p| p.strip_prefix(self.store.root()).ok())
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty());
+        let req = crate::capture::CaptureRequest {
+            repo,
+            group_rel,
+            stem: name.clone(),
+            phase,
+            shot,
+            intent: format!("{}\n\n{}", it.fm.title, it.body),
+            evidence: evidence.clone(),
+            before,
+            n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
+            merged: Vec::new(),
+        };
+        let _ = crate::capture::write_record(&evidence, &running_record(&req, "starting"));
+        let job =
+            crate::capture::CaptureJob::spawn(req.clone(), self.capture_env.clone(), managed_mcp());
+        self.capture_jobs.insert(name, (job, req));
+        self.message = Some("capturing: the Evidence section shows how far it got".into());
+    }
+
+    /// Over SSH there is no local pasteboard: copies go to the terminal.
+    fn over_ssh(&self) -> bool {
+        ["SSH_CONNECTION", "SSH_TTY"].iter().any(|k| {
+            self.capture_env
+                .iter()
+                .any(|(n, v)| n == k && !v.is_empty())
+                || std::env::var(k).is_ok_and(|v| !v.is_empty())
+        })
+    }
+
+    /// Runs a helper (open, osascript, pbcopy) without waiting for it; `stdin`
+    /// is written to it when given. False when it could not start.
+    fn launch(
+        &self,
+        key: &str,
+        default: &str,
+        args: &[&std::ffi::OsStr],
+        stdin: Option<String>,
+    ) -> bool {
+        use std::io::Write;
+        let Some(bin) = crate::progress::tool_bin(&self.capture_env, key, Some(default)) else {
+            return false;
+        };
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args)
+            .envs(
+                self.capture_env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            });
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let (Some(text), Some(mut input)) = (stdin, child.stdin.take()) {
+                    let _ = input.write_all(text.as_bytes());
+                }
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Enter on a capture: opens it in Chrome.
+    fn open_in_chrome(&mut self, file: &Path) {
+        let f = file.as_os_str();
+        let ok = if cfg!(target_os = "macos") {
+            self.launch(
+                "OPEN_BIN_PATH",
+                "open",
+                &["-a".as_ref(), "Google Chrome".as_ref(), f],
+                None,
+            )
+        } else {
+            self.launch("OPEN_BIN_PATH", "xdg-open", &[f], None)
+        };
+        self.message = Some(if ok {
+            format!("opening {} in Chrome", file.display())
+        } else {
+            format!("could not open {}", file.display())
+        });
+    }
+
+    /// `c`: puts the file itself on the macOS pasteboard (⌘V into a GitHub
+    /// comment uploads it); over SSH or off macOS, its path instead.
+    fn copy_file(&mut self, file: &Path) {
+        if self.over_ssh() || !cfg!(target_os = "macos") {
+            self.copy_path(file);
+            return;
+        }
+        let script = [
+            "-e",
+            "on run argv",
+            "-e",
+            "set the clipboard to (POSIX file (item 1 of argv))",
+            "-e",
+            "end run",
+        ];
+        let mut args: Vec<&std::ffi::OsStr> = script.iter().map(|a| a.as_ref()).collect();
+        args.push(file.as_os_str());
+        self.message = Some(
+            if self.launch("OSASCRIPT_BIN_PATH", "osascript", &args, None) {
+                "copied the file: ⌘V pastes it into the issue".to_string()
+            } else {
+                "could not copy the file".to_string()
+            },
+        );
+    }
+
+    /// `Y`: copies the path (pbcopy on macOS; the terminal's clipboard over SSH).
+    fn copy_path(&mut self, file: &Path) {
+        let path = file.display().to_string();
+        let ok = if cfg!(target_os = "macos") && !self.over_ssh() {
+            self.launch("PBCOPY_BIN_PATH", "pbcopy", &[], Some(path.clone()))
+        } else {
+            osc52(&path);
+            true
+        };
+        self.message = Some(if ok {
+            format!("copied the path: {path}")
+        } else {
+            "could not copy the path".to_string()
+        });
     }
 
     /// Records what the running captures report, beside their evidence.
@@ -4686,6 +4903,11 @@ impl App {
                     };
                     let attachments = Store::attachments(intent);
                     let prs = self.pr_rows(intent);
+                    let evidence: Vec<(String, String)> = self
+                        .evidence_rows(intent)
+                        .into_iter()
+                        .map(|r| (r.mark.to_string(), r.label))
+                        .collect();
                     ui::render_intent(
                         &ui::DetailView {
                             intent,
@@ -4702,6 +4924,8 @@ impl App {
                             prs: &prs,
                             prs_selected: self.prs_selected,
                             demos_selected: self.demos_selected,
+                            evidence: &evidence,
+                            evidence_selected: self.evidence_selected,
                         },
                         right,
                         buf,
@@ -4746,6 +4970,7 @@ impl App {
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::PullRequests) => "Pull requests: j/k choose · Enter/o open in the browser · L link a found one · a add · Esc tree".to_string(),
@@ -4991,6 +5216,41 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
             std::process::exit(1)
         }
     }
+}
+
+/// Copies text to the terminal's clipboard (OSC 52), for SSH sessions.
+fn osc52(text: &str) {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let _ = write!(
+        std::io::stdout(),
+        "\x1b]52;c;{}\x07",
+        base64(text.as_bytes())
+    );
+    let _ = std::io::stdout().flush();
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// A capture still running, as its record reads until it is done.
@@ -7713,6 +7973,7 @@ mod tests {
             "questions",
             "pull requests",
             "artifacts",
+            "evidence",
         ] {
             key(&mut fx.app, KeyCode::Tab);
             assert_eq!(fx.app.view().focus, pane);
@@ -7720,17 +7981,17 @@ mod tests {
         }
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
-        assert_eq!(fx.app.view().open, "artifacts", "the last one stays open");
+        assert_eq!(fx.app.view().open, "evidence", "the last one stays open");
         select(&mut fx.app, "Alpha");
         assert_eq!(
             fx.app.view().open,
-            "artifacts",
+            "evidence",
             "and stays open on the next intent"
         );
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "artifacts");
+        assert_eq!(fx.app.view().open, "evidence");
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "pull requests");
+        assert_eq!(fx.app.view().open, "artifacts");
     }
 
     /// Tab from the tree to the named section.
@@ -7858,7 +8119,11 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "evidence");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "evidence");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::BackTab);
@@ -9232,6 +9497,218 @@ mod tests {
             work.lines().last().unwrap_or("").contains("finish --area"),
             "{work}"
         );
+    }
+
+    // ---- the Evidence section --------------------------------------------------
+
+    /// Gives the inbox bug a "before" capture (and, with `after`, an "after"),
+    /// in an agent folder named `folder`; returns the video's path.
+    fn bug_with_evidence(fx: &mut Fx, folder: &str, after: bool) -> PathBuf {
+        use crate::capture::{CaptureRecord, Outcome, Phase, Shot, VIEWPORT, write_record};
+        select(&mut fx.app, "In the inbox");
+        let it = fx.app.selected_intent().unwrap().clone();
+        Store::update_fields(&it.path, |fm| fm.polish_dir = Some(folder.into())).unwrap();
+        let dir = fx
+            .app
+            .store
+            .root()
+            .join(".polish")
+            .join(folder)
+            .join("evidence");
+        let rec = |phase, outcome, file: &str| CaptureRecord {
+            phase,
+            shot: Shot::Video,
+            outcome,
+            file: Some(file.into()),
+            steps: vec!["agent-browser open https://x".into()],
+            viewport: VIEWPORT,
+            at: chrono::Local::now(),
+            merged: Vec::new(),
+        };
+        write_record(
+            &dir,
+            &rec(
+                Phase::Before,
+                Outcome::Reproduced("the email goes to every admin".into()),
+                "before.mp4",
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("before.mp4"), "video").unwrap();
+        if after {
+            write_record(
+                &dir,
+                &rec(
+                    Phase::After,
+                    Outcome::StillBroken("admins still get it".into()),
+                    "after.mp4",
+                ),
+            )
+            .unwrap();
+        }
+        fx.app.rescan();
+        select(&mut fx.app, "In the inbox");
+        dir.join("before.mp4")
+    }
+
+    fn focus_evidence(app: &mut App) {
+        for _ in 0..12 {
+            if app.view().focus == "evidence" {
+                return;
+            }
+            key(app, KeyCode::Tab);
+        }
+        panic!(
+            "Tab never reached the Evidence section: {:?}",
+            app.view().focus
+        );
+    }
+
+    /// Points open / osascript / pbcopy at a fake that logs what it is given.
+    fn log_launchers(fx: &mut Fx) -> PathBuf {
+        let log = fx._tmp.path().join("args.log");
+        let fake = fixtures().join("fake-args.sh").display().to_string();
+        for k in ["OPEN_BIN_PATH", "OSASCRIPT_BIN_PATH", "PBCOPY_BIN_PATH"] {
+            fx.app.capture_env.push((k.into(), fake.clone()));
+        }
+        fx.app
+            .capture_env
+            .push(("FAKE_ARGS_LOG".into(), log.display().to_string()));
+        log
+    }
+
+    fn wait_for_log(log: &Path, needle: &str) -> String {
+        let start = Instant::now();
+        loop {
+            let text = fs::read_to_string(log).unwrap_or_default();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "never logged {needle:?}: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn enter_opens_the_evidence_in_chrome() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = bug_with_evidence(&mut fx, "new-ev1", false);
+        focus_evidence(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        let path = video.display().to_string();
+        let text = wait_for_log(&log, &path);
+        if cfg!(target_os = "macos") {
+            assert!(
+                text.contains(&format!("-a\nGoogle Chrome\n{path}\n")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_copies_the_file_and_y_the_path() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = bug_with_evidence(&mut fx, "new-ev2", false);
+        let path = video.display().to_string();
+        focus_evidence(&mut fx.app);
+        if cfg!(target_os = "macos") {
+            key(&mut fx.app, KeyCode::Char('c'));
+            let text = wait_for_log(&log, &path);
+            assert!(
+                text.contains("set the clipboard to"),
+                "osascript, the file itself: {text}"
+            );
+            key(&mut fx.app, KeyCode::Char('Y'));
+            wait_for_log(&log, &format!("stdin:{path}"));
+        }
+        // over SSH there is no pasteboard to put a file on: c copies the path
+        fs::write(&log, "").unwrap();
+        fx.app
+            .capture_env
+            .push(("SSH_CONNECTION".into(), "10.0.0.1 1 10.0.0.2 22".into()));
+        key(&mut fx.app, KeyCode::Char('c'));
+        std::thread::sleep(Duration::from_millis(200));
+        let text = fs::read_to_string(&log).unwrap_or_default();
+        assert!(!text.contains("set the clipboard to"), "{text}");
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("copied the path"),
+            "{:?}",
+            fx.app.view().message
+        );
+    }
+
+    #[test]
+    fn evidence_paths_with_spaces_reach_the_opener_whole() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = bug_with_evidence(&mut fx, "new with spaces", false);
+        focus_evidence(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        let path = video.display().to_string();
+        let text = wait_for_log(&log, &path);
+        assert!(text.lines().any(|l| l == path), "one argument: {text}");
+    }
+
+    #[test]
+    fn e_refuses_a_second_capture_while_one_runs() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        assert_eq!(fx.app.view().screen, "browse");
+        key(&mut fx.app, KeyCode::Char('E'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("capturing already"),
+            "{:?}",
+            fx.app.view().message
+        );
+        fx.app.shutdown();
+        assert_eq!(
+            work_log(&fx).matches("start --area").count(),
+            1,
+            "{}",
+            work_log(&fx)
+        );
+    }
+
+    #[test]
+    fn e_is_only_for_bugs() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha"); // an idea
+        key(&mut fx.app, KeyCode::Char('E'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("evidence is for bugs")
+        );
+    }
+
+    #[test]
+    fn evidence_section_snapshot() {
+        let mut fx = setup("agy.jsonl");
+        bug_with_evidence(&mut fx, "new-ev3", true);
+        focus_evidence(&mut fx.app);
+        insta::assert_snapshot!(render(&fx.app, 80, 24));
     }
 
     #[test]
