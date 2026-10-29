@@ -474,6 +474,44 @@ impl Store {
         Store::load(&dest)
     }
 
+    /// Moves an intent and everything it owns (its file, conversation,
+    /// attachments and agent folder) into `<root>/.trash/<stamp>-<stem>/`,
+    /// with `from.txt` naming the group it came from, so it can be put back.
+    /// `.trash` starts with a dot, so the tree never shows it.
+    pub fn trash(&self, intent: &Intent) -> anyhow::Result<PathBuf> {
+        let base = self.root().join(".trash");
+        let stamp = Local::now().format("%Y%m%d-%H%M%S");
+        let stem = intent.stem();
+        let mut dest = base.join(format!("{stamp}-{stem}"));
+        let mut n = 2;
+        while dest.exists() {
+            dest = base.join(format!("{stamp}-{stem}-{n}"));
+            n += 1;
+        }
+        std::fs::create_dir_all(&dest)?;
+        let from = intent
+            .path
+            .parent()
+            .and_then(|p| p.strip_prefix(self.root()).ok())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        std::fs::write(dest.join("from.txt"), format!("{from}\n"))?;
+        for src in [
+            intent.path.clone(),
+            intent.transcript_path(),
+            intent.assets_dir(),
+        ] {
+            if let (true, Some(name)) = (src.exists(), src.file_name()) {
+                std::fs::rename(&src, dest.join(name))?;
+            }
+        }
+        let polish = self.root().join(".polish").join(intent.polish_name());
+        if polish.is_dir() {
+            std::fs::rename(&polish, dest.join("polish"))?;
+        }
+        Ok(dest)
+    }
+
     pub fn create_group(&self, parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
         let dir = self.abs(parent).join(name);
         std::fs::create_dir_all(&dir)?;

@@ -112,6 +112,10 @@ pub struct PendingChat {
 pub enum Pending {
     OverwriteSave,
     DiscardEdits,
+    /// `D`: move this intent to `.trash`.
+    Trash {
+        path: PathBuf,
+    },
     OverwriteApply {
         body: String,
         title: Option<String>,
@@ -1375,6 +1379,7 @@ impl App {
             KeyCode::Char('u') => self.undo_reconcile(),
             // the card view says nothing about where an intent belongs
             KeyCode::Char('a') => self.screen = Screen::KindPick { group: None },
+            KeyCode::Char('D') => self.ask_trash(),
             _ => {}
         }
         Flow::Continue
@@ -1823,6 +1828,7 @@ impl App {
                 let group = (!self.rows.is_empty()).then(|| self.selected_group_dir());
                 self.screen = Screen::KindPick { group };
             }
+            KeyCode::Char('D') => self.ask_trash(),
             KeyCode::Char('n') => {
                 let parent = self.selected_group_dir();
                 self.screen = Screen::Input {
@@ -2458,6 +2464,49 @@ impl App {
                 };
             }
             Err(SaveError::Io(e)) => self.message = Some(format!("save failed: {e:#}")),
+        }
+    }
+
+    /// `D`: asks before moving the selected intent to `.trash`. A sent intent
+    /// stays: an agent is working from it.
+    fn ask_trash(&mut self) {
+        let Some(it) = self.selected_intent().cloned() else {
+            self.message = Some("select an intent to delete".into());
+            return;
+        };
+        if let Some(sent) = &it.fm.sent_to {
+            self.message = Some(format!(
+                "sent to {} (agent {}): an agent is working from it, so it stays",
+                sent.handoff, sent.agent
+            ));
+            return;
+        }
+        if it.fm.state == State::Sent {
+            self.message = Some("already sent: an agent is working from it, so it stays".into());
+            return;
+        }
+        self.screen = Screen::Prompt {
+            question: format!(
+                "Delete \"{}\"? It moves to .trash in the intents folder. y deletes, n keeps",
+                it.fm.title
+            ),
+            pending: Pending::Trash { path: it.path },
+        };
+    }
+
+    fn trash(&mut self, path: &Path) {
+        self.screen = Screen::Browse;
+        let moved = Store::load(path).and_then(|it| self.store.trash(&it).map(|d| (it, d)));
+        match moved {
+            Ok((it, dest)) => {
+                self.message = Some(format!(
+                    "deleted \"{}\": moved to {}",
+                    it.fm.title,
+                    self.rel(&dest).display()
+                ));
+                self.rescan();
+            }
+            Err(e) => self.message = Some(format!("delete failed: {e:#}")),
         }
     }
 
@@ -3636,10 +3685,12 @@ impl App {
                 Pending::OverwriteApply { body, title, kind } => {
                     self.apply_proposal(&body, title.as_deref(), kind.as_deref(), true)
                 }
+                Pending::Trash { path } => self.trash(&path),
             },
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.screen = match pending {
                     Pending::OverwriteSave | Pending::DiscardEdits => Screen::Edit,
+                    Pending::Trash { .. } => Screen::Browse,
                     Pending::OverwriteApply { .. } => match self.parked_chat.take() {
                         Some(st) => Screen::Chat(st),
                         None => Screen::Browse,
@@ -4247,7 +4298,7 @@ impl App {
             Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
             Screen::Prompt { question, .. } => question.clone(),
             _ => self.message.clone().or_else(|| self.reconcile_note()).unwrap_or_else(|| {
-                "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
+                "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  D delete  r rescan  q quit"
                     .to_string()
             }),
         };
@@ -4492,7 +4543,7 @@ impl App {
                 (None, _) if self.reconcile_note().is_some() => {
                     self.reconcile_note().unwrap_or_default()
                 }
-                (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  m model  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  M move  A attach  r rescan  q quit".to_string(),
+                (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  m model  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  M move  A attach  r rescan  D delete  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
@@ -8665,6 +8716,71 @@ mod tests {
             "the ask, not the restatement: {}",
             c[1]
         );
+    }
+
+    #[test]
+    fn capital_d_trashes_an_unsent_intent_after_asking() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('D'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "prompt");
+        assert!(v.hint.unwrap_or_default().contains("Delete \"Alpha\"?"));
+        key(&mut fx.app, KeyCode::Char('y'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "browse");
+        assert!(!v.rows.iter().any(|r| r.label == "Alpha"), "{:?}", v.rows);
+        assert!(v.message.unwrap_or_default().contains(".trash"));
+        let trashed = fs::read_dir(fx.app.store.root().join(".trash"))
+            .unwrap()
+            .count();
+        assert_eq!(trashed, 1);
+    }
+
+    #[test]
+    fn anything_but_y_keeps_the_intent() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('D'));
+        key(&mut fx.app, KeyCode::Char('n'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert!(fx.app.view().rows.iter().any(|r| r.label == "Alpha"));
+        assert!(!fx.app.store.root().join(".trash").exists());
+    }
+
+    #[test]
+    fn a_sent_intent_is_not_deleted() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&path, |fm| {
+            fm.state = State::Sent;
+            fm.sent_to = Some(crate::store::SentTo {
+                handoff: "grill".into(),
+                workspace_id: "w5".into(),
+                agent: "intent-alpha-x1".into(),
+                at: chrono::Local::now(),
+            });
+        })
+        .unwrap();
+        fx.app.rescan();
+        key(&mut fx.app, KeyCode::Char('D'));
+        let v = fx.app.view();
+        assert_eq!(v.screen, "browse", "no question asked");
+        assert!(v.message.unwrap_or_default().contains("intent-alpha-x1"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn capital_d_works_in_the_card_view_too() {
+        let mut fx = setup("agy.jsonl");
+        key(&mut fx.app, KeyCode::Char('v'));
+        list_goto(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('D'));
+        assert_eq!(fx.app.view().screen, "prompt");
+        key(&mut fx.app, KeyCode::Char('y'));
+        assert_eq!(fx.app.view().layout, "list", "stays in the card view");
+        assert!(!fx.app.list.iter().any(|i| i.fm.title == "Beta"));
     }
 
     #[test]

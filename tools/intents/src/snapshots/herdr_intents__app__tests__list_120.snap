@@ -1,6 +1,5 @@
 ---
 source: tools/intents/src/app.rs
-assertion_line: 5273
 expression: wide
 ---
 Intents · 7 · sorted by Updated                                            v tree · S sort · f filter · s send · g agent
@@ -62,4 +61,4 @@ Intents · 7 · sorted by Updated                                            v t
 
 
 
-j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit
+j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  D delete  r rescan  q quit
