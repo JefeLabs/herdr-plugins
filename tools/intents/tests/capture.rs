@@ -126,7 +126,9 @@ fn a_capture_runs_start_env_seed_agent_finish_in_order() {
     assert!(make.contains("app-test-e2e-runner"), "{make}");
     let claude = fx.log("claude.log");
     assert!(
-        claude.lines().any(|l| l == "Bash(agent-browser:*)"),
+        claude
+            .lines()
+            .any(|l| l == "Bash(agent-browser open https://demo-org.skoolscout.com.local:3004:*)"),
         "{claude}"
     );
     assert!(!claude.contains("dangerously"), "{claude}");
@@ -140,6 +142,50 @@ fn a_capture_runs_start_env_seed_agent_finish_in_order() {
     );
     assert_eq!(rec.file.as_deref(), Some("before.mp4"));
     assert_eq!(rec.steps.len(), 2, "{:?}", rec.steps);
+}
+
+#[test]
+fn the_agent_may_run_only_the_browser_commands_it_needs() {
+    let fx = Fx::new();
+    fx.run(false);
+    let claude = fx.log("claude.log");
+    let rules: Vec<&str> = claude.lines().filter(|l| l.starts_with("Bash(")).collect();
+    assert!(
+        !rules.contains(&"Bash(agent-browser:*)"),
+        "no blanket agent-browser: {rules:?}"
+    );
+    assert!(
+        rules.contains(&"Bash(agent-browser open https://demo-org.skoolscout.com.local:3004:*)"),
+        "open only on the stack: {rules:?}"
+    );
+    let out = fx
+        .tmp
+        .path()
+        .join("evidence/before.mp4")
+        .display()
+        .to_string();
+    assert!(
+        rules.contains(&format!("Bash(agent-browser record start {out}:*)").as_str()),
+        "record only into the evidence file: {rules:?}"
+    );
+    for banned in [
+        "eval",
+        "upload",
+        "download",
+        "cookies",
+        "storage",
+        "network",
+        "auth",
+        "profiles",
+        "pushstate",
+    ] {
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.contains(&format!("agent-browser {banned}"))),
+            "{banned}: {rules:?}"
+        );
+    }
 }
 
 #[test]
