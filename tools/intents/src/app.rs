@@ -2463,8 +2463,8 @@ impl App {
 
     // ---- chat -------------------------------------------------------------
 
-    /// Step one of the picker: providers, with the last used one preselected.
-    /// Capture mode: ask the kind, then the title, polish, and close.
+    /// Capture mode (the popup): the add conversation, closing once the intent
+    /// is saved or the conversation is cancelled.
     pub fn start_capture(&mut self) {
         self.exit_on_browse = true;
         self.screen = Screen::KindPick { group: None };
@@ -2533,6 +2533,9 @@ impl App {
         message: String,
         show: bool,
     ) {
+        // recorded first: a turn that cannot start is retried as this step
+        st.step = step;
+        st.message = message.clone();
         let Some(mut spec) = self.cfg.providers.get(&st.provider).cloned() else {
             st.awaiting = Awaiting::Retry(format!("unknown provider `{}`", st.provider));
             return;
@@ -2546,8 +2549,6 @@ impl App {
         }
         let resumable = st.conv_id.is_some() && !spec.resume.is_empty();
         let prompt = st.iv.prompt(step, resumable, &message);
-        st.step = step;
-        st.message = message.clone();
         match Turn::start(
             &spec,
             &prompt,
@@ -2694,6 +2695,9 @@ impl App {
                     _ => {}
                 }
             }
+            // after a failure there is nothing to type into: only the keys
+            // the status line names act
+            (KeyCode::Char(_), false) if matches!(st.awaiting, Awaiting::Retry(_)) => {}
             (KeyCode::Char(c), false) => st.input.push(c),
             _ => {}
         }
@@ -2842,6 +2846,16 @@ impl App {
             .last()
             .map(|(_, t)| t.clone())
             .unwrap_or_default();
+        if text.trim().is_empty() {
+            st.awaiting = Awaiting::Retry("no reply".into());
+            return;
+        }
+        // an agent that jumps ahead and writes it up at a question is taken at its word
+        if st.step == Step::Ask && reply.proposal.is_some() && reply.title.is_some() {
+            st.write_up = Some(reply);
+            st.awaiting = Awaiting::Review;
+            return;
+        }
         match st.step {
             Step::Restate => st.awaiting = Awaiting::Confirm,
             Step::Ask => match crate::interview::parse_ask(&text) {
@@ -2975,6 +2989,8 @@ impl App {
                         format!("{reason} · Enter retry · m agent · Ctrl-s save raw · Esc discard")
                     }
                 };
+                // a message (a failed save) shows until the next key
+                let text = self.message.clone().unwrap_or(text);
                 ui::render_status(&text, status, buf);
             }
             Screen::AgentPick {
@@ -4229,7 +4245,6 @@ impl App {
         *self.card_hits.borrow_mut() = hits;
         let text = match &self.screen {
             Screen::Input { label, text, .. } => format!("{label}: {text}▏"),
-            Screen::KindPick { .. } => KIND_QUESTION.to_string(),
             Screen::Prompt { question, .. } => question.clone(),
             _ => self.message.clone().or_else(|| self.reconcile_note()).unwrap_or_else(|| {
                 "j/k move  Enter open in tree  a add  v tree  S sort  f filter  s send  g agent  r rescan  q quit"
@@ -4636,8 +4651,8 @@ pub fn run(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
     run_with(cfg, dirs, false)
 }
 
-/// The capture popup: the full tool, starting at the kind question and
-/// closing once the new intent's chat is done.
+/// The capture popup: the full tool, starting at the add conversation and
+/// closing once the intent is saved or the conversation is cancelled.
 pub fn run_capture(cfg: Config, dirs: Dirs) -> anyhow::Result<()> {
     run_with(cfg, dirs, true)
 }
@@ -4792,7 +4807,7 @@ pub fn add(
     let repo = crate::send::capture_repo();
     let body = template(&dirs, "idea", false).unwrap_or_default();
     if popup {
-        // the capture pane: kind, title, then the polish chat, in the full tool
+        // the capture pane: the add conversation, in the full tool
         return run_capture(cfg, dirs);
     }
     if title.is_none() && piped.is_none() {
@@ -8569,6 +8584,86 @@ mod tests {
         assert!(
             shown.contains("the-very-end"),
             "the whole text shows, wrapped: {shown}"
+        );
+    }
+
+    #[test]
+    fn retry_ignores_typing_so_the_next_enter_does_what_it_says() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &["", RESTATE]);
+        reply_fails(&fx, 1);
+        start_bug_in_skoolscout(&mut fx);
+        assert_eq!(awaiting(&fx.app), "retry");
+        type_str(&mut fx.app, "shorter");
+        assert_eq!(
+            fx.app.view().chat_input,
+            "",
+            "nothing to type into after a failure"
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "confirm", "Enter retried");
+    }
+
+    #[test]
+    fn a_save_failure_is_shown_in_the_add_view() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('b'));
+        talk_to_review(&mut fx, WRITE_UP);
+        let dir = fx.app.store.root().join("skoolscout");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        key(&mut fx.app, KeyCode::Enter);
+        let shown = render(&fx.app, 100, 20);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(awaiting(&fx.app), "review", "still at the write-up");
+        let status = shown.lines().last().unwrap_or_default().to_string();
+        assert!(status.contains("save failed"), "{status}");
+    }
+
+    #[test]
+    fn an_empty_reply_is_a_failure_not_a_blank_turn() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[""]); // a result line, but no text
+        start_bug_in_skoolscout(&mut fx);
+        assert_eq!(awaiting(&fx.app), "retry");
+        assert!(
+            fx.app.view().hint.unwrap_or_default().contains("no reply"),
+            "{:?}",
+            fx.app.view().hint
+        );
+    }
+
+    #[test]
+    fn an_ask_reply_that_is_already_the_write_up_goes_to_review() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[RESTATE, WRITE_UP]);
+        start_bug_in_skoolscout(&mut fx);
+        key(&mut fx.app, KeyCode::Enter); // that's right → the agent jumps ahead
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+        assert_eq!(calls(&fx).len(), 2, "no extra write-up turn");
+    }
+
+    #[test]
+    fn a_retry_after_an_unknown_provider_resends_the_step_it_failed() {
+        let mut fx = setup("agy.jsonl");
+        agent_replies(&mut fx, &[RESTATE, "question: Q?"]);
+        start_bug_in_skoolscout(&mut fx);
+        let spec = fx.app.cfg.providers.remove("fake").unwrap();
+        key(&mut fx.app, KeyCode::Enter); // that's right → the ask cannot start
+        assert_eq!(awaiting(&fx.app), "retry");
+        fx.app.cfg.providers.insert("fake".into(), spec);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        let c = calls(&fx);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(
+            c[1].contains("question 1 of at most 5"),
+            "the ask, not the restatement: {}",
+            c[1]
         );
     }
 
