@@ -148,9 +148,20 @@ fn shape(command: &str) -> Option<Shape> {
     }
 }
 
-/// A flag-looking argument: starts with `-` and is not a number (`-300`).
+/// A plain number, the only argument that may start with `-` (`-300`, `-2.5`).
+fn is_number(arg: &str) -> bool {
+    let digits = arg.strip_prefix('-').unwrap_or(arg);
+    let mut parts = digits.splitn(2, '.');
+    let whole = parts.next().unwrap_or("");
+    let frac = parts.next();
+    !whole.is_empty()
+        && whole.chars().all(|c| c.is_ascii_digit())
+        && frac.is_none_or(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// A flag-looking argument: starts with `-` and is not a plain number.
 fn is_flag(arg: &str) -> bool {
-    arg.starts_with('-') && arg[1..].parse::<f64>().is_err()
+    arg.starts_with('-') && !is_number(arg)
 }
 
 /// The address `open` goes to: a path on the app, or an address on it.
@@ -193,8 +204,13 @@ pub fn check_browser(command: &str, args: &[String], base: &str) -> Result<Vec<S
                 return Err(format!("`{command}` does not take `{a}`"));
             };
             if *takes_value {
-                if i + 1 >= args.len() {
-                    return Err(format!("`{a}` needs a value"));
+                // a value that looks like a flag could be read as one by agent-browser
+                match args.get(i + 1) {
+                    None => return Err(format!("`{a}` needs a value")),
+                    Some(v) if is_flag(v) => {
+                        return Err(format!("the value of `{a}` cannot start with `-`"));
+                    }
+                    Some(_) => {}
                 }
                 i += 1;
             }
@@ -526,6 +542,24 @@ mod tests {
         assert_eq!(ok("fill", &["@e3", "a b"]), ["fill", "@e3", "a b"]);
         assert_eq!(ok("press", &["Meta+u"]), ["press", "Meta+u"]);
         assert_eq!(ok("back", &[]), ["back"]);
+    }
+
+    #[test]
+    fn a_flag_value_is_never_another_flag() {
+        // agent-browser could read these values as its own global flags
+        assert!(check("wait", &["--text", "--auto-connect"]).is_err());
+        assert!(check("snapshot", &["-s", "--session", "-d", "x"]).is_err());
+        assert!(check("find", &["role", "button", "--name", "--profile"]).is_err());
+        assert!(check("wait", &["--url", "-x"]).is_err());
+        // only plain numbers pass as numbers
+        assert!(check("mouse", &["wheel", "-inf"]).is_err());
+        assert!(check("mouse", &["wheel", "-1e5"]).is_err());
+        assert!(check("mouse", &["wheel", "-NaN"]).is_err());
+        assert_eq!(
+            ok("mouse", &["wheel", "-300.5"]),
+            ["mouse", "wheel", "-300.5"]
+        );
+        assert_eq!(ok("snapshot", &["-d", "3"]), ["snapshot", "-d", "3"]);
     }
 
     #[test]
