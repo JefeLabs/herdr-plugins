@@ -5,7 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use herdr_intents::capture::{
-    CaptureJob, CaptureRecord, CaptureRequest, CaptureUpdate, Outcome, Phase, Shot,
+    CaptureJob, CaptureOrder, CaptureRecord, CaptureRequest, CaptureUpdate, Outcome, Phase, Shot,
+    cancel_running, is_running, launch, read_records,
 };
 
 fn fixture(name: &str) -> String {
@@ -376,5 +377,137 @@ fn cancel_stops_the_agent_and_finishes_the_effort() {
         fx.log("ab.log")
             .contains("[--session][capture-new-ab12cd34-1][close]"),
         "the browser goes too"
+    );
+}
+
+// ---- a capture in its own process --------------------------------------------
+
+impl Fx {
+    fn order(&self) -> CaptureOrder {
+        CaptureOrder {
+            req: self.request(),
+            env: self.env.clone(),
+            managed_mcp: false,
+        }
+    }
+
+    fn evidence(&self) -> std::path::PathBuf {
+        self.tmp.path().join("evidence")
+    }
+
+    fn wait(&self, what: &str, f: impl Fn(&Fx) -> bool) {
+        let start = Instant::now();
+        while !f(self) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "timed out: {what}; work log: {}",
+                self.log("work.log")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn a_launched_capture_runs_on_its_own_and_finishes() {
+    let fx = Fx::new();
+    launch(&fx.order()).unwrap();
+    assert!(is_running(&fx.evidence()), "running once launched");
+    fx.wait("the result", |f| {
+        read_records(&f.evidence())
+            .first()
+            .is_some_and(|r| !matches!(r.outcome, Outcome::Running(_)))
+    });
+    let rec = read_records(&fx.evidence()).remove(0);
+    assert_eq!(
+        rec.outcome,
+        Outcome::Reproduced("the email goes to every admin".into())
+    );
+    assert!(
+        fx.log("work.log")
+            .lines()
+            .last()
+            .unwrap()
+            .contains("finish --area org/team")
+    );
+    fx.wait("the runner to end", |f| !is_running(&f.evidence()));
+}
+
+#[test]
+fn a_second_launch_is_refused_while_one_runs() {
+    let mut fx = Fx::new();
+    fx.set("FAKE_CLAUDE_HANG", "1");
+    launch(&fx.order()).unwrap();
+    let again = launch(&fx.order());
+    assert!(
+        again
+            .as_ref()
+            .is_err_and(|e| e.contains("capturing already")),
+        "{again:?}"
+    );
+    fx.wait("the first capture's stack", |f| {
+        f.log("work.log").contains("start --area")
+    });
+    assert!(cancel_running(&fx.evidence()));
+    fx.wait("the runner to end", |f| !is_running(&f.evidence()));
+    assert_eq!(fx.log("work.log").matches("start --area").count(), 1);
+}
+
+#[test]
+fn cancelling_a_launched_capture_finishes_its_effort() {
+    let mut fx = Fx::new();
+    fx.set("FAKE_CLAUDE_HANG", "1");
+    launch(&fx.order()).unwrap();
+    fx.wait("the agent to start", |f| {
+        f.log("claude.log").contains("---")
+    });
+    assert!(cancel_running(&fx.evidence()));
+    fx.wait("the runner to end", |f| !is_running(&f.evidence()));
+    assert!(
+        fx.log("work.log")
+            .lines()
+            .last()
+            .unwrap()
+            .contains("finish --area org/team")
+    );
+    let rec = read_records(&fx.evidence()).remove(0);
+    assert_eq!(rec.outcome, Outcome::Failed("cancelled".into()));
+}
+
+#[test]
+fn a_capture_cancelled_while_its_stack_starts_still_finishes_it() {
+    let mut fx = Fx::new();
+    fx.set("FAKE_WORK_SLOW", "1");
+    launch(&fx.order()).unwrap();
+    fx.wait("work start", |f| f.log("work.log").contains("start --area"));
+    assert!(cancel_running(&fx.evidence()));
+    fx.wait("the runner to end", |f| !is_running(&f.evidence()));
+    assert!(
+        fx.log("work.log")
+            .lines()
+            .last()
+            .unwrap()
+            .contains("finish --area org/team"),
+        "the stack that was starting is finished: {}",
+        fx.log("work.log")
+    );
+    assert_eq!(fx.log("claude.log"), "", "no agent after a cancel");
+}
+
+#[test]
+fn a_capture_cancelled_while_seeding_never_starts_the_agent() {
+    let mut fx = Fx::new();
+    fx.set("FAKE_MAKE_SLOW", "1");
+    launch(&fx.order()).unwrap();
+    fx.wait("the seed", |f| f.log("make.log").contains("e2e-story"));
+    assert!(cancel_running(&fx.evidence()));
+    fx.wait("the runner to end", |f| !is_running(&f.evidence()));
+    assert_eq!(fx.log("claude.log"), "", "no agent once cancelled");
+    assert!(
+        fx.log("work.log")
+            .lines()
+            .last()
+            .unwrap()
+            .contains("finish --area org/team")
     );
 }

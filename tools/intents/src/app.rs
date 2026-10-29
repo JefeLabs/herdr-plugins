@@ -465,8 +465,6 @@ pub struct App {
     /// Reconciles running: per intent, the merged set it covers, the
     /// agent turn, and when it started.
     reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant)>,
-    /// Running captures, by the intent's agent folder name.
-    capture_jobs: HashMap<String, (crate::capture::CaptureJob, crate::capture::CaptureRequest)>,
     /// The env captures run with (`*_BIN_PATH` included); empty in production.
     pub capture_env: Vec<(String, String)>,
     /// The repo intents are captured for; `None` means `send::capture_repo()`.
@@ -551,7 +549,6 @@ impl App {
             poll_ticks: 0,
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
-            capture_jobs: HashMap::new(),
             capture_env: Vec::new(),
             capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
@@ -2566,6 +2563,16 @@ impl App {
 
     fn trash(&mut self, path: &Path) {
         self.screen = Screen::Browse;
+        // a capture still running for it stops (and finishes its effort)
+        if let Ok(it) = Store::load(path) {
+            let scratch = polish_cwd(self.store.root(), &it.polish_name());
+            for dir in [
+                it.assets_dir().join("evidence"),
+                crate::capture::evidence_dir(&scratch),
+            ] {
+                crate::capture::cancel_running(&dir);
+            }
+        }
         let moved = Store::load(path).and_then(|it| self.store.trash(&it).map(|d| (it, d)));
         match moved {
             Ok((it, dest)) => {
@@ -2753,9 +2760,6 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if self.capture_jobs.contains_key(&name) {
-            return;
-        }
         let evidence = crate::capture::evidence_dir(&st.folder);
         let req = crate::capture::CaptureRequest {
             repo,
@@ -2770,10 +2774,18 @@ impl App {
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
             merged: Vec::new(),
         };
-        let _ = crate::capture::write_record(&evidence, &running_record(&req, "starting"));
-        let job =
-            crate::capture::CaptureJob::spawn(req.clone(), self.capture_env.clone(), managed_mcp());
-        self.capture_jobs.insert(name, (job, req));
+        if let Err(e) = self.launch_capture(req) {
+            self.message = Some(format!("capture: {e}"));
+        }
+    }
+
+    /// Starts a capture in its own process: it outlives this one.
+    fn launch_capture(&self, req: crate::capture::CaptureRequest) -> Result<(), String> {
+        crate::capture::launch(&crate::capture::CaptureOrder {
+            req,
+            env: self.capture_env.clone(),
+            managed_mcp: managed_mcp(),
+        })
     }
 
     /// `E`: captures the selected bug again: the "before" until one reproduced
@@ -2787,7 +2799,7 @@ impl App {
             self.message = Some("evidence is for bugs".into());
             return;
         }
-        if self.capture_jobs.contains_key(&it.polish_name()) {
+        if crate::capture::is_running(&self.evidence_home(&it)) {
             self.message =
                 Some("capturing already: the Evidence section shows how far it got".into());
             return;
@@ -2813,19 +2825,26 @@ impl App {
                 recs.first().map(|r| r.shot).unwrap_or(Shot::Video),
             ),
         };
-        self.start_capture_for(&it, repo, evidence, phase, shot, before, Vec::new());
-        self.message = Some("capturing: the Evidence section shows how far it got".into());
+        self.message = Some(
+            match self.start_capture_for(&it, repo, evidence, phase, shot, before, Vec::new()) {
+                Ok(()) => "capturing: the Evidence section shows how far it got".into(),
+                Err(e) => format!("capture: {e}"),
+            },
+        );
     }
 
     /// Once every pull request of a sent bug has merged, runs the steps that
     /// reproduced it again (an "after"): once per merged set.
     fn capture_after(&mut self, it: &Intent, set: &[u64]) {
         use crate::capture::{Outcome, Phase};
-        if it.fm.kind != "issue" || self.capture_jobs.contains_key(&it.polish_name()) {
+        if it.fm.kind != "issue" {
             return;
         }
         let evidence = self.evidence_home(it);
-        let recs = crate::capture::read_records(&evidence);
+        if crate::capture::is_running(&evidence) {
+            return;
+        }
+        let recs = crate::capture::read_records_live(&evidence);
         let Some(before) = recs
             .iter()
             .find(|r| r.phase == Phase::Before && matches!(r.outcome, Outcome::Reproduced(_)))
@@ -2833,10 +2852,9 @@ impl App {
         else {
             return;
         };
-        if recs
-            .iter()
-            .any(|r| r.phase == Phase::After && r.merged == set)
-        {
+        if recs.iter().any(|r| {
+            r.phase == Phase::After && r.merged == set && !crate::capture::is_interrupted(r)
+        }) {
             return;
         }
         // no guide or no claude is not asked again for the same set
@@ -2851,7 +2869,7 @@ impl App {
             return;
         };
         let shot = before.shot;
-        self.start_capture_for(
+        let _ = self.start_capture_for(
             it,
             repo,
             evidence,
@@ -2884,7 +2902,7 @@ impl App {
         shot: crate::capture::Shot,
         before: Option<crate::capture::CaptureRecord>,
         merged: Vec<u64>,
-    ) {
+    ) -> Result<(), String> {
         let name = it.polish_name();
         let group_rel = it
             .path
@@ -2904,10 +2922,7 @@ impl App {
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
             merged,
         };
-        let _ = crate::capture::write_record(&evidence, &running_record(&req, "starting"));
-        let job =
-            crate::capture::CaptureJob::spawn(req.clone(), self.capture_env.clone(), managed_mcp());
-        self.capture_jobs.insert(name, (job, req));
+        self.launch_capture(req)
     }
 
     /// A sent bug's captures move from its agent folder into its attachments
@@ -2922,10 +2937,10 @@ impl App {
                 continue;
             }
             let name = it.polish_name();
-            if self.capture_jobs.contains_key(&name) {
+            let scratch = crate::capture::evidence_dir(&polish_cwd(self.store.root(), &name));
+            if crate::capture::is_running(&scratch) {
                 continue;
             }
-            let scratch = crate::capture::evidence_dir(&polish_cwd(self.store.root(), &name));
             let Ok(entries) = std::fs::read_dir(&scratch) else {
                 continue;
             };
@@ -3053,28 +3068,6 @@ impl App {
         });
     }
 
-    /// Records what the running captures report, beside their evidence.
-    fn poll_captures(&mut self) {
-        let mut finished = Vec::new();
-        for (key, (job, req)) in &self.capture_jobs {
-            while let Some(update) = job.try_recv() {
-                match update {
-                    crate::capture::CaptureUpdate::Progress(m) => {
-                        let _ =
-                            crate::capture::write_record(&req.evidence, &running_record(req, &m));
-                    }
-                    crate::capture::CaptureUpdate::Done(rec) => {
-                        let _ = crate::capture::write_record(&req.evidence, &rec);
-                        finished.push(key.clone());
-                    }
-                }
-            }
-        }
-        for key in finished {
-            self.capture_jobs.remove(&key);
-        }
-    }
-
     /// The selected intent's captures: from its attachments once kept there,
     /// else from its agent folder.
     fn evidence_rows(&self, it: &Intent) -> Vec<EvidenceRow> {
@@ -3084,7 +3077,7 @@ impl App {
             crate::capture::evidence_dir(&polish_cwd(self.store.root(), &it.polish_name())),
         ];
         for dir in dirs {
-            let recs = crate::capture::read_records(&dir);
+            let recs = crate::capture::read_records_live(&dir);
             if recs.is_empty() {
                 continue;
             }
@@ -3107,7 +3100,10 @@ impl App {
                         Shot::Screenshot => "screenshot",
                     };
                     EvidenceRow {
-                        label: format!("{phase} · {shot} · {text}"),
+                        label: match &r.warning {
+                            Some(w) => format!("{phase} · {shot} · {text} · ⚠ {w}"),
+                            None => format!("{phase} · {shot} · {text}"),
+                        },
                         file: r.file.as_ref().map(|f| dir.join(f)),
                         mark,
                     }
@@ -3351,9 +3347,7 @@ impl App {
         for (_, turn, _) in self.reconcile_jobs.values_mut() {
             turn.cancel();
         }
-        for (job, _) in self.capture_jobs.values_mut() {
-            job.cancel();
-        }
+        // captures run in their own processes and finish on their own
     }
 
     /// Esc: nothing is kept, not even the agent's folder.
@@ -3361,14 +3355,7 @@ impl App {
         if let Some(mut t) = st.turn.take() {
             t.cancel();
         }
-        let name = st
-            .folder
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if let Some((mut job, _)) = self.capture_jobs.remove(&name) {
-            job.cancel();
-        }
+        crate::capture::cancel_running(&crate::capture::evidence_dir(&st.folder));
         let _ = std::fs::remove_dir_all(&st.folder);
         self.screen = Screen::Browse;
     }
@@ -4442,7 +4429,6 @@ impl App {
         // every ~60 s; all on background threads
         self.drain_polls();
         self.poll_reconciles();
-        self.poll_captures();
         // pull requests, plans and searches are checked in either layout (a
         // merge must reconcile from the tree too); agent states only matter
         // to the cards, so they poll only while the list shows
@@ -5370,24 +5356,6 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
-}
-
-/// A capture still running, as its record reads until it is done.
-fn running_record(
-    req: &crate::capture::CaptureRequest,
-    stage: &str,
-) -> crate::capture::CaptureRecord {
-    crate::capture::CaptureRecord {
-        phase: req.phase,
-        shot: req.shot,
-        outcome: crate::capture::Outcome::Running(stage.to_string()),
-        file: None,
-        steps: Vec::new(),
-        viewport: crate::capture::VIEWPORT,
-        at: chrono::Local::now(),
-        merged: req.merged.clone(),
-        warning: None,
-    }
 }
 
 /// Whether an organization-managed MCP config is on this machine (claude
@@ -9428,6 +9396,36 @@ mod tests {
         capture_setup(fx._tmp.path(), &mut fx.app, guide, claude);
     }
 
+    /// The built `herdr-intents`, which runs each capture in its own process.
+    fn intents_bin() -> String {
+        let exe = std::env::current_exe().unwrap();
+        let bin = exe
+            .parent()
+            .and_then(|deps| deps.parent())
+            .unwrap()
+            .join("herdr-intents");
+        assert!(
+            bin.is_file(),
+            "build the binary first (cargo test builds it): {}",
+            bin.display()
+        );
+        bin.display().to_string()
+    }
+
+    /// Stops every capture still running under the intents root.
+    fn stop_captures(app: &App) {
+        let polish = app.store.root().join(".polish");
+        for e in fs::read_dir(&polish).into_iter().flatten().flatten() {
+            let ev = e.path().join("evidence");
+            if crate::capture::cancel_running(&ev) {
+                let start = Instant::now();
+                while crate::capture::is_running(&ev) && start.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
     fn capture_setup(t: &Path, app: &mut App, guide: bool, claude: bool) {
         let t = t.to_path_buf();
         let repo = t.join("capture-repo");
@@ -9461,6 +9459,7 @@ mod tests {
                 fx_path("fake-agent-browser.sh"),
             ),
             ("FAKE_AB_LOG".into(), p("ab.log")),
+            ("INTENTS_BIN_PATH".into(), intents_bin()),
         ];
     }
 
@@ -9599,8 +9598,55 @@ mod tests {
         );
     }
 
+    fn wait_for_work(fx: &Fx, needle: &str) {
+        let start = Instant::now();
+        while !work_log(fx).contains(needle) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "never logged {needle}: {}",
+                work_log(fx)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
-    fn shutdown_finishes_a_running_capture() {
+    fn saving_from_the_popup_leaves_the_capture_running_to_its_end() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_WORK_SLOW".into(), "1".into()));
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        fx.app.start_capture(); // the popup
+        key(&mut fx.app, KeyCode::Char('b'));
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // that's right → enough
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "capture");
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        wait_for_work(&fx, "start --area");
+        assert_eq!(
+            key(&mut fx.app, KeyCode::Enter),
+            Flow::Quit,
+            "the popup closes on save"
+        );
+        fx.app.shutdown();
+        // the stack that was starting is used, then finished, by the capture's own process
+        wait_for_work(&fx, "finish --area");
+        assert!(
+            fs::read_to_string(fx._tmp.path().join("claude.log"))
+                .unwrap_or_default()
+                .contains("---"),
+            "the agent ran after the popup closed"
+        );
+    }
+
+    #[test]
+    fn trash_stops_a_running_capture() {
         let mut fx = setup("agy.jsonl");
         with_capture(&mut fx, true, true);
         fx.app
@@ -9608,6 +9654,9 @@ mod tests {
             .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
         bug_to_the_evidence_question(&mut fx);
         key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        let name = fx.app.selected_intent().unwrap().polish_name();
         let claude_log = fx._tmp.path().join("claude.log");
         let start = Instant::now();
         while !fs::read_to_string(&claude_log)
@@ -9620,12 +9669,95 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        fx.app.shutdown();
-        let work = work_log(&fx);
+        key(&mut fx.app, KeyCode::Char('D'));
+        key(&mut fx.app, KeyCode::Char('y'));
+        wait_for_work(&fx, "finish --area");
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
-            work.lines().last().unwrap_or("").contains("finish --area"),
-            "{work}"
+            !fx.app.store.root().join(".polish").join(&name).exists(),
+            "nothing comes back after the trash"
         );
+    }
+
+    /// A Running record whose runner is gone, as a crash or a reboot leaves it.
+    fn running_without_a_runner(dir: &Path, phase: crate::capture::Phase, merged: Vec<u64>) {
+        use crate::capture::{CaptureRecord, Outcome, Shot, VIEWPORT, write_record};
+        let rec = CaptureRecord {
+            phase,
+            shot: Shot::Video,
+            outcome: Outcome::Running("the agent is reproducing it".into()),
+            file: None,
+            steps: Vec::new(),
+            viewport: VIEWPORT,
+            at: chrono::Local::now(),
+            merged,
+            warning: None,
+        };
+        write_record(dir, &rec).unwrap();
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        fs::write(dir.join(".capture.lock"), pid.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_capture_whose_runner_died_reads_as_interrupted() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox");
+        let it = fx.app.selected_intent().unwrap().clone();
+        Store::update_fields(&it.path, |fm| fm.polish_dir = Some("new-ev9".into())).unwrap();
+        let dir = fx.app.store.root().join(".polish/new-ev9/evidence");
+        running_without_a_runner(&dir, crate::capture::Phase::Before, Vec::new());
+        fx.app.rescan();
+        select(&mut fx.app, "In the inbox");
+        let row = fx.app.view().evidence[0].clone();
+        assert_eq!(row.mark, "!", "{row:?}");
+        assert!(row.label.contains("interrupted"), "{row:?}");
+    }
+
+    #[test]
+    fn a_warning_shows_on_its_capture() {
+        use crate::capture::{Phase, read_records, write_record};
+        let mut fx = setup("agy.jsonl");
+        bug_with_evidence(&mut fx, "new-ev8", false);
+        let dir = fx.app.store.root().join(".polish/new-ev8/evidence");
+        let mut rec = read_records(&dir).remove(0);
+        assert_eq!(rec.phase, Phase::Before);
+        rec.warning =
+            Some("work finish: DIRTY_WORKTREE; run `work finish --area a --task t`".into());
+        write_record(&dir, &rec).unwrap();
+        let row = fx.app.view().evidence[0].clone();
+        assert!(
+            row.label.contains("⚠ work finish: DIRTY_WORKTREE"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_after_runs_again() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        capture_setup(&t, &mut fx.app, true, true);
+        fs::create_dir_all(t.join("repo/.helmsmith")).unwrap();
+        fs::write(t.join("repo/.helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        let (_path, dir) = notify_bug_with_a_before(&mut fx);
+        running_without_a_runner(&dir, crate::capture::Phase::After, vec![42]);
+        fs::write(t.join("prs/42"), "MERGED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        let start = Instant::now();
+        while !fs::read_to_string(t.join("work.log"))
+            .unwrap_or_default()
+            .contains("start --area")
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the after never ran again"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            fx.app.tick();
+        }
+        stop_captures(&fx.app);
     }
 
     // ---- keeping evidence, the after, finding the fix ------------------------
@@ -9987,7 +10119,7 @@ mod tests {
             "{:?}",
             fx.app.view().message
         );
-        fx.app.shutdown();
+        stop_captures(&fx.app);
         assert_eq!(
             work_log(&fx).matches("start --area").count(),
             1,

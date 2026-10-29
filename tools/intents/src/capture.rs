@@ -243,7 +243,7 @@ pub fn parse_outcome(phase: Phase, text: &str) -> Outcome {
 }
 
 /// What to capture, for which intent, and where the files go.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureRequest {
     /// The intent's repo: where `work` runs and the guide is read.
     pub repo: PathBuf,
@@ -663,6 +663,9 @@ fn run(
         args.push("--strict-mcp-config".into());
     }
     args.extend(["-p".to_string(), prompt]);
+    if cancelled(state) {
+        return failed("cancelled".into());
+    }
     progress("the agent is reproducing it".into());
     let mut cmd = r.cmd(&r.claude);
     {
@@ -678,8 +681,15 @@ fn run(
         Err(e) => return failed(format!("claude: {e}")),
     };
     let pgid = child.id() as i32;
-    if let Ok(mut s) = state.lock() {
+    // registered under the lock cancel() reads: either it sees the agent and
+    // stops it, or this sees the cancel and stops it here
+    let cancelled_meanwhile = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.agent_pgid = Some(pgid);
+        s.cancelled
+    };
+    if cancelled_meanwhile {
+        stop_group(pgid);
     }
     // a watchdog: an agent that never finishes is stopped
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -731,8 +741,235 @@ fn run(
     record(parse_outcome(req.phase, &result), file, steps)
 }
 
-/// Runs one capture to its end in this process (`herdr-intents capture-run`).
-pub fn run_order(_order: &Path) -> anyhow::Result<()> {
+/// What `herdr-intents capture-run` is handed: the request, the env its tools
+/// run with (`*_BIN_PATH` in tests; empty in use), and whether claude must
+/// skip `--strict-mcp-config`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CaptureOrder {
+    pub req: CaptureRequest,
+    pub env: Vec<(String, String)>,
+    pub managed_mcp: bool,
+}
+
+/// The lock a capture's runner holds in its evidence folder: its pid.
+const LOCK: &str = ".capture.lock";
+
+/// What a runner was handed, kept beside the evidence until it ends.
+const ORDER: &str = ".capture-order.json";
+
+/// The reason an interrupted capture shows.
+pub const INTERRUPTED: &str = "interrupted: its process ended before the capture did";
+
+fn pid_alive(pid: i32) -> bool {
+    use nix::errno::Errno;
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+/// The runner's pid from the lock, when it is alive.
+fn runner_pid(evidence: &Path) -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(evidence.join(LOCK))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (pid > 0 && pid_alive(pid)).then_some(pid)
+}
+
+/// Whether a capture is running for this evidence folder: its runner is
+/// alive, or it was claimed a moment ago and its pid is not written yet.
+pub fn is_running(evidence: &Path) -> bool {
+    let lock = evidence.join(LOCK);
+    let Ok(text) = std::fs::read_to_string(&lock) else {
+        return false;
+    };
+    if text.trim().is_empty() {
+        return std::fs::metadata(&lock)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_secs(10));
+    }
+    runner_pid(evidence).is_some()
+}
+
+/// Asks the capture running for this evidence folder to stop (SIGTERM to
+/// its runner, which stops the agent and finishes the effort); false when
+/// none runs.
+pub fn cancel_running(evidence: &Path) -> bool {
+    let Some(pid) = runner_pid(evidence) else {
+        return false;
+    };
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .is_ok()
+}
+
+/// The records, with a "running" one whose runner is gone read as interrupted.
+pub fn read_records_live(dir: &Path) -> Vec<CaptureRecord> {
+    let running = is_running(dir);
+    read_records(dir)
+        .into_iter()
+        .map(|mut r| {
+            if matches!(r.outcome, Outcome::Running(_)) && !running {
+                r.outcome = Outcome::Failed(INTERRUPTED.into());
+            }
+            r
+        })
+        .collect()
+}
+
+/// Whether a record is one `read_records_live` marked interrupted.
+pub fn is_interrupted(r: &CaptureRecord) -> bool {
+    matches!(&r.outcome, Outcome::Failed(t) if t == INTERRUPTED)
+}
+
+/// Starts a capture in its own process (`herdr-intents capture-run`),
+/// detached from this one, so it runs to its end (and finishes its effort)
+/// even when the tool quits, as the popup does on save. Refused while a
+/// capture for the same evidence folder runs.
+pub fn launch(order: &CaptureOrder) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    let dir = &order.req.evidence;
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    if is_running(dir) {
+        return Err("capturing already".into());
+    }
+    let lock = dir.join(LOCK);
+    let _ = std::fs::remove_file(&lock); // a stale one
+    let mut claim = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .map_err(|_| "capturing already".to_string())?;
+    let order_file = dir.join(ORDER);
+    let started = serde_json::to_string(order)
+        .map_err(|e| e.to_string())
+        .and_then(|t| std::fs::write(&order_file, t).map_err(|e| e.to_string()))
+        .and_then(|()| {
+            let _ = write_record(dir, &running_record(&order.req, "starting"));
+            let exe = crate::progress::tool_bin(&order.env, "INTENTS_BIN_PATH", None)
+                .or_else(|| std::env::current_exe().ok())
+                .ok_or("cannot find herdr-intents to run the capture")?;
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(".capture.log"))
+                .map(std::process::Stdio::from)
+                .unwrap_or_else(|_| std::process::Stdio::null());
+            std::process::Command::new(exe)
+                .arg("capture-run")
+                .arg(&order_file)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(log)
+                .process_group(0)
+                .spawn()
+                .map_err(|e| format!("could not start the capture: {e}"))
+        });
+    match started {
+        Ok(mut child) => {
+            let _ = write!(claim, "{}", child.id());
+            // reaped here while this process lives; adopted by init after it quits
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&lock);
+            let mut rec = running_record(&order.req, "");
+            rec.outcome = Outcome::Failed(e.clone());
+            let _ = write_record(dir, &rec);
+            Err(e)
+        }
+    }
+}
+
+/// Writes a record only while its folder is still there (a trashed or
+/// discarded intent's folder is gone, and must not come back).
+fn update_record(dir: &Path, rec: &CaptureRecord) {
+    if dir.is_dir() {
+        let _ = std::fs::write(
+            record_path(dir, rec.phase),
+            serde_json::to_string_pretty(rec).unwrap_or_default(),
+        );
+    }
+}
+
+static TERMINATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_terminate(_: std::os::raw::c_int) {
+    TERMINATED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A capture still running, as its record reads until it is done.
+pub fn running_record(req: &CaptureRequest, stage: &str) -> CaptureRecord {
+    CaptureRecord {
+        phase: req.phase,
+        shot: req.shot,
+        outcome: Outcome::Running(stage.to_string()),
+        file: None,
+        steps: Vec::new(),
+        viewport: VIEWPORT,
+        at: chrono::Local::now(),
+        merged: req.merged.clone(),
+        warning: None,
+    }
+}
+
+/// Runs one capture to its end in this process (`herdr-intents capture-run`):
+/// the records it writes are what the tool shows. SIGTERM (trash, discard)
+/// stops the agent and still finishes the effort; a hangup is ignored, so
+/// closing the terminal the tool ran in does not stop it.
+pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    let order: CaptureOrder = serde_json::from_str(&std::fs::read_to_string(order_file)?)?;
+    // SAFETY: the handler only stores to an atomic
+    unsafe {
+        let term = SigAction::new(
+            SigHandler::Handler(on_terminate),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        let _ = sigaction(Signal::SIGTERM, &term);
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        let _ = sigaction(Signal::SIGHUP, &ignore);
+    }
+    let dir = order.req.evidence.clone();
+    let mut job = CaptureJob::spawn(order.req.clone(), order.env.clone(), order.managed_mcp);
+    let mut cancelled = false;
+    let rec = loop {
+        if !cancelled && TERMINATED.load(std::sync::atomic::Ordering::SeqCst) {
+            cancelled = true;
+            job.cancel();
+        }
+        match job.rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(CaptureUpdate::Progress(m)) if !cancelled => {
+                update_record(&dir, &running_record(&order.req, &m));
+            }
+            Ok(CaptureUpdate::Done(rec)) => break rec,
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let mut r = running_record(&order.req, "");
+                r.outcome = Outcome::Failed("the capture stopped unexpectedly".into());
+                break r;
+            }
+        }
+    };
+    update_record(&dir, &rec);
+    // the lock is this runner's only while it holds this pid
+    let lock = dir.join(LOCK);
+    if std::fs::read_to_string(&lock).is_ok_and(|t| t.trim() == std::process::id().to_string()) {
+        let _ = std::fs::remove_file(&lock);
+    }
+    let _ = std::fs::remove_file(order_file);
     Ok(())
 }
 
