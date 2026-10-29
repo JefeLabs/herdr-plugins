@@ -50,6 +50,8 @@ fn main() -> ExitCode {
                 });
             with_config(|cfg, dirs| app::add(cfg, dirs, title, popup, piped))
         }
+        Mode::CaptureMcp(config) => herdr_intents::capture_mcp::serve(&config),
+        Mode::CaptureRun(order) => herdr_intents::capture::run_order(&order),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-intents ");
             println!("{text}");

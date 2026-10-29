@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod capture;
+pub mod capture_mcp;
 pub mod config;
 pub mod conversation;
 pub mod demos;

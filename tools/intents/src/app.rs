@@ -5386,6 +5386,7 @@ fn running_record(
         viewport: crate::capture::VIEWPORT,
         at: chrono::Local::now(),
         merged: req.merged.clone(),
+        warning: None,
     }
 }
 
@@ -9455,6 +9456,11 @@ mod tests {
             ("FAKE_CLAUDE_LOG".into(), p("claude.log")),
             ("FAKE_WORK_TREE".into(), p("worktree")),
             ("FAKE_CLAUDE_EVENTS".into(), p("capture-events.jsonl")),
+            (
+                "AGENT_BROWSER_BIN_PATH".into(),
+                fx_path("fake-agent-browser.sh"),
+            ),
+            ("FAKE_AB_LOG".into(), p("ab.log")),
         ];
     }
 
@@ -9641,6 +9647,7 @@ mod tests {
             viewport: VIEWPORT,
             at: chrono::Local::now(),
             merged: Vec::new(),
+            warning: None,
         };
         write_record(&dir, &rec).unwrap();
         fs::write(dir.join("before.mp4"), "video").unwrap();
@@ -9797,6 +9804,7 @@ mod tests {
             viewport: VIEWPORT,
             at: chrono::Local::now(),
             merged: Vec::new(),
+            warning: None,
         };
         write_record(
             &dir,
@@ -9920,6 +9928,8 @@ mod tests {
                 text.contains("set the clipboard to"),
                 "osascript, the file itself: {text}"
             );
+            // the osascript stand-in's whole entry first, so the two never interleave
+            wait_for_log(&log, "---");
             key(&mut fx.app, KeyCode::Char('Y'));
             wait_for_log(&log, &format!("stdin:{path}"));
         }

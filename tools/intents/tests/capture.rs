@@ -19,8 +19,7 @@ fn fixture(name: &str) -> String {
 const GUIDE: &str = "---\ndefault_area: org/social\nseed: [kathia-signup]\nurl: https://demo-org.skoolscout.com.local:{port}\n---\nSign in with Cmd+U.\n";
 
 const EVENTS: &str = r#"{"type":"system","subtype":"init","session_id":"s1"}
-{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"agent-browser open https://demo-org.skoolscout.com.local:3004/auth/sign-in"}}]}}
-{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"agent-browser record start /e/before.mp4"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__intents-capture__browser","input":{"command":"open","args":["/auth/sign-in"]}}]}}
 {"type":"result","subtype":"success","result":"Done.\nreproduced: the email goes to every admin","session_id":"s1"}
 "#;
 
@@ -43,6 +42,19 @@ impl Fx {
             ("WORK_BIN_PATH".into(), fixture("fake-work.sh")),
             ("MAKE_BIN_PATH".into(), fixture("fake-make.sh")),
             ("CLAUDE_BIN_PATH".into(), fixture("fake-claude.sh")),
+            (
+                "AGENT_BROWSER_BIN_PATH".into(),
+                fixture("fake-agent-browser.sh"),
+            ),
+            ("FAKE_AB_LOG".into(), p("ab.log")),
+            (
+                "INTENTS_BIN_PATH".into(),
+                env!("CARGO_BIN_EXE_herdr-intents").into(),
+            ),
+            (
+                "FAKE_CLAUDE_STEPS".into(),
+                "open /auth/sign-in\nclick @e3".into(),
+            ),
             ("FAKE_WORK_LOG".into(), p("work.log")),
             ("FAKE_MAKE_LOG".into(), p("make.log")),
             ("FAKE_CLAUDE_LOG".into(), p("claude.log")),
@@ -126,10 +138,8 @@ fn a_capture_runs_start_env_seed_agent_finish_in_order() {
     assert!(make.contains("app-test-e2e-runner"), "{make}");
     let claude = fx.log("claude.log");
     assert!(
-        claude
-            .lines()
-            .any(|l| l == "Bash(agent-browser open https://demo-org.skoolscout.com.local:3004:*)"),
-        "{claude}"
+        claude.contains("capture-mcp"),
+        "the browser tools' server: {claude}"
     );
     assert!(!claude.contains("dangerously"), "{claude}");
     assert!(
@@ -141,51 +151,114 @@ fn a_capture_runs_start_env_seed_agent_finish_in_order() {
         Outcome::Reproduced("the email goes to every admin".into())
     );
     assert_eq!(rec.file.as_deref(), Some("before.mp4"));
-    assert_eq!(rec.steps.len(), 2, "{:?}", rec.steps);
+    assert_eq!(
+        rec.steps,
+        ["open /auth/sign-in", "click @e3"],
+        "from the browser tools"
+    );
+    assert_eq!(rec.warning, None);
+}
+
+/// The argument after `flag` in claude's logged argv.
+fn arg_after(claude: &str, flag: &str) -> Option<String> {
+    let lines: Vec<&str> = claude.lines().collect();
+    lines
+        .iter()
+        .position(|l| *l == flag)
+        .and_then(|i| lines.get(i + 1))
+        .map(|l| l.to_string())
 }
 
 #[test]
-fn the_agent_may_run_only_the_browser_commands_it_needs() {
+fn the_agent_gets_no_shell_only_the_browser_tools() {
     let fx = Fx::new();
     fx.run(false);
     let claude = fx.log("claude.log");
-    let rules: Vec<&str> = claude.lines().filter(|l| l.starts_with("Bash(")).collect();
-    assert!(
-        !rules.contains(&"Bash(agent-browser:*)"),
-        "no blanket agent-browser: {rules:?}"
+    assert_eq!(
+        arg_after(&claude, "--tools").as_deref(),
+        Some(""),
+        "no built-in tools: {claude}"
+    );
+    assert_eq!(
+        arg_after(&claude, "--permission-mode").as_deref(),
+        Some("dontAsk"),
+        "{claude}"
     );
     assert!(
-        rules.contains(&"Bash(agent-browser open https://demo-org.skoolscout.com.local:3004:*)"),
-        "open only on the stack: {rules:?}"
+        claude.lines().any(|l| l == "--restricted"),
+        "user settings ignored: {claude}"
     );
-    let out = fx
-        .tmp
-        .path()
-        .join("evidence/before.mp4")
-        .display()
-        .to_string();
-    assert!(
-        rules.contains(&format!("Bash(agent-browser record start {out}:*)").as_str()),
-        "record only into the evidence file: {rules:?}"
+    assert_eq!(
+        arg_after(&claude, "--allowedTools").as_deref(),
+        Some(
+            "mcp__intents-capture__browser,mcp__intents-capture__record_start,mcp__intents-capture__record_stop"
+        ),
+        "{claude}"
     );
-    for banned in [
-        "eval",
-        "upload",
-        "download",
-        "cookies",
-        "storage",
-        "network",
-        "auth",
-        "profiles",
-        "pushstate",
-    ] {
-        assert!(
-            !rules
-                .iter()
-                .any(|r| r.contains(&format!("agent-browser {banned}"))),
-            "{banned}: {rules:?}"
-        );
+    assert!(!claude.lines().any(|l| l.starts_with("Bash")), "{claude}");
+    let mcp: serde_json::Value =
+        serde_json::from_str(&arg_after(&claude, "--mcp-config").unwrap()).unwrap();
+    let server = &mcp["mcpServers"]["intents-capture"];
+    assert_eq!(server["command"], env!("CARGO_BIN_EXE_herdr-intents"));
+    assert_eq!(server["args"][0], "capture-mcp");
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(server["args"][1].as_str().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(
+        config["base_url"],
+        "https://demo-org.skoolscout.com.local:3004"
+    );
+    assert_eq!(config["session"], "capture-new-ab12cd34-1");
+}
+
+#[test]
+fn an_older_claude_fails_closed_before_any_stack() {
+    let mut fx = Fx::new();
+    fx.set("FAKE_CLAUDE_OLD", "1");
+    let rec = fx.run(false);
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(why.contains("update claude"), "{why}"),
+        other => panic!("{other:?}"),
     }
+    assert_eq!(
+        fx.log("work.log"),
+        "",
+        "no stack for an agent that cannot be confined"
+    );
+}
+
+#[test]
+fn the_browser_session_is_closed_after_the_agent() {
+    let fx = Fx::new();
+    fx.run(false);
+    let ab = fx.log("ab.log");
+    assert!(
+        ab.lines()
+            .any(|l| l == "[--session][capture-new-ab12cd34-1][close]"),
+        "{ab}"
+    );
+}
+
+#[test]
+fn the_seed_runs_on_the_captures_own_slot() {
+    let mut fx = Fx::new();
+    fx.set("SLOT", "9"); // the shell the tool started in had another slot
+    fx.run(false);
+    let make = fx.log("make.log");
+    assert!(make.starts_with("SLOT=4 "), "{make}");
+}
+
+#[test]
+fn a_failed_finish_is_on_the_record() {
+    let mut fx = Fx::new();
+    fx.set("FAKE_WORK_FINISH_FAIL", "DIRTY_WORKTREE");
+    let rec = fx.run(false);
+    let warning = rec.warning.unwrap_or_default();
+    assert!(warning.contains("DIRTY_WORKTREE"), "{warning}");
+    assert!(
+        warning.contains("work finish --area org/team --task evidence-1"),
+        "what to run: {warning}"
+    );
 }
 
 #[test]
@@ -298,5 +371,10 @@ fn cancel_stops_the_agent_and_finishes_the_effort() {
             .unwrap()
             .contains("finish --area org/team"),
         "{work}"
+    );
+    assert!(
+        fx.log("ab.log")
+            .contains("[--session][capture-new-ab12cd34-1][close]"),
+        "the browser goes too"
     );
 }
