@@ -824,6 +824,33 @@ fn a_polish_dir_that_is_not_one_plain_folder_is_ignored() {
 }
 
 #[test]
+fn trash_takes_the_evidence_along() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("skoolscout/admin"), "A bug", "issue", "x\n", None)
+        .unwrap();
+    let scratch = s
+        .root()
+        .join(".polish")
+        .join(it.polish_name())
+        .join("evidence");
+    fs::create_dir_all(&scratch).unwrap();
+    fs::write(scratch.join("after.json"), "{}").unwrap();
+    let kept = it.assets_dir().join("evidence");
+    fs::create_dir_all(&kept).unwrap();
+    fs::write(kept.join("before.json"), "{}").unwrap();
+
+    let dest = s.trash(&it).unwrap();
+
+    assert!(dest.join("polish/evidence/after.json").is_file());
+    assert!(
+        dest.join(format!("{}.assets", it.stem()))
+            .join("evidence/before.json")
+            .is_file()
+    );
+}
+
+#[test]
 fn trash_moves_an_intent_and_everything_it_owns_out_of_the_tree() {
     let (tmp, s) = store();
     let it = s

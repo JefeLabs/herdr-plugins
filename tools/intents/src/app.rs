@@ -475,6 +475,8 @@ pub struct App {
     reconcile_limit: std::time::Duration,
     /// Merged sets already started this session, so a failure is not retried in a loop.
     reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
+    /// Bugs whose "after" was considered for a merged set (once per set).
+    capture_tried: HashSet<(PathBuf, Vec<u64>)>,
     /// Why the last reconcile of an intent failed; shown while it is
     /// selected until `r` retries it.
     reconcile_failed: HashMap<PathBuf, String>,
@@ -554,6 +556,7 @@ impl App {
             capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
             reconcile_tried: HashSet::new(),
+            capture_tried: HashSet::new(),
             reconcile_failed: HashMap::new(),
             last_area: std::cell::Cell::new(Rect::default()),
             card_hits: std::cell::RefCell::new(Vec::new()),
@@ -899,18 +902,27 @@ impl App {
         let mut intents = Vec::new();
         all(&self.tree, &mut intents);
         for it in intents {
-            if it.fm.repo.is_none() || self.reconcile_jobs.contains_key(&it.path) {
+            if it.fm.repo.is_none() {
                 continue;
             }
-            // wait for the pull-request search (it suggests the areas the work touched)
+            // wait for the pull-request search (it suggests the areas the work
+            // touched, and finds the pull requests that close the issue)
             let searched = crate::store::artifacts(&it.body).iter().any(|a| {
                 a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
-            });
+            }) || !crate::capture::issue_numbers(&it.body).is_empty();
             if searched && !self.found_prs.contains_key(&it.path) {
                 continue;
             }
-            let Some(merged) = crate::reconcile::needs_reconcile(&it, &self.evidence_for(&it))
-            else {
+            let ev = self.evidence_for(&it);
+            if it.fm.state == State::Sent
+                && let Some(set) = crate::reconcile::merged_set(&ev)
+            {
+                self.capture_after(&it, &set);
+            }
+            if self.reconcile_jobs.contains_key(&it.path) {
+                continue;
+            }
+            let Some(merged) = crate::reconcile::needs_reconcile(&it, &ev) else {
                 continue;
             };
             if self
@@ -1093,8 +1105,8 @@ impl App {
     }
 
     /// Search GitHub for pull requests mentioning each sent intent's spec
-    /// and plan file names (search is rate-limited, so this runs on entry, on
-    /// `r` and about every ten minutes).
+    /// and plan file names, and for those closing its issues (search is
+    /// rate-limited, so this runs on entry, on `r` and about every ten minutes).
     fn request_found_prs(&mut self) {
         let sent: Vec<(PathBuf, PathBuf, Vec<String>)> = self
             .all_intents()
@@ -1102,7 +1114,7 @@ impl App {
             .filter(|i| i.fm.state == State::Sent)
             .filter_map(|i| {
                 let repo = i.fm.repo.clone()?;
-                let names: Vec<String> = crate::store::artifacts(&i.body)
+                let mut names: Vec<String> = crate::store::artifacts(&i.body)
                     .into_iter()
                     .filter(|a| {
                         a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
@@ -1113,6 +1125,11 @@ impl App {
                             .map(|n| n.to_string_lossy().to_string())
                     })
                     .collect();
+                names.extend(
+                    crate::capture::issue_numbers(&i.body)
+                        .into_iter()
+                        .map(|n| format!("#{n}")),
+                );
                 (!names.is_empty()).then(|| (i.path.clone(), repo, names))
             })
             .collect();
@@ -1427,6 +1444,7 @@ impl App {
             Ok(t) => self.tree = t,
             Err(e) => self.message = Some(format!("rescan failed: {e:#}")),
         }
+        self.persist_evidence();
         self.rebuild_rows();
         if let Some(p) = keep {
             self.select_path(&p);
@@ -2769,8 +2787,7 @@ impl App {
             self.message = Some("evidence is for bugs".into());
             return;
         }
-        let name = it.polish_name();
-        if self.capture_jobs.contains_key(&name) {
+        if self.capture_jobs.contains_key(&it.polish_name()) {
             self.message =
                 Some("capturing already: the Evidence section shows how far it got".into());
             return;
@@ -2783,12 +2800,7 @@ impl App {
         let Some(repo) = repo else {
             return;
         };
-        let kept = it.assets_dir().join("evidence");
-        let evidence = if crate::capture::read_records(&kept).is_empty() {
-            crate::capture::evidence_dir(&polish_cwd(self.store.root(), &name))
-        } else {
-            kept
-        };
+        let evidence = self.evidence_home(&it);
         let recs = crate::capture::read_records(&evidence);
         let before = recs
             .iter()
@@ -2801,6 +2813,79 @@ impl App {
                 recs.first().map(|r| r.shot).unwrap_or(Shot::Video),
             ),
         };
+        self.start_capture_for(&it, repo, evidence, phase, shot, before, Vec::new());
+        self.message = Some("capturing: the Evidence section shows how far it got".into());
+    }
+
+    /// Once every pull request of a sent bug has merged, runs the steps that
+    /// reproduced it again (an "after"): once per merged set.
+    fn capture_after(&mut self, it: &Intent, set: &[u64]) {
+        use crate::capture::{Outcome, Phase};
+        if it.fm.kind != "issue" || self.capture_jobs.contains_key(&it.polish_name()) {
+            return;
+        }
+        let evidence = self.evidence_home(it);
+        let recs = crate::capture::read_records(&evidence);
+        let Some(before) = recs
+            .iter()
+            .find(|r| r.phase == Phase::Before && matches!(r.outcome, Outcome::Reproduced(_)))
+            .cloned()
+        else {
+            return;
+        };
+        if recs
+            .iter()
+            .any(|r| r.phase == Phase::After && r.merged == set)
+        {
+            return;
+        }
+        // no guide or no claude is not asked again for the same set
+        if !self.capture_tried.insert((it.path.clone(), set.to_vec())) {
+            return;
+        }
+        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
+        if self.capture_block_for(repo.clone()).is_some() {
+            return;
+        }
+        let Some(repo) = repo else {
+            return;
+        };
+        let shot = before.shot;
+        self.start_capture_for(
+            it,
+            repo,
+            evidence,
+            Phase::After,
+            shot,
+            Some(before),
+            set.to_vec(),
+        );
+    }
+
+    /// Where an intent's captures live: its attachments once kept there,
+    /// else its agent folder.
+    fn evidence_home(&self, it: &Intent) -> PathBuf {
+        let kept = it.assets_dir().join("evidence");
+        if crate::capture::read_records(&kept).is_empty() {
+            crate::capture::evidence_dir(&polish_cwd(self.store.root(), &it.polish_name()))
+        } else {
+            kept
+        }
+    }
+
+    /// Starts a capture of a saved intent in the background.
+    #[allow(clippy::too_many_arguments)]
+    fn start_capture_for(
+        &mut self,
+        it: &Intent,
+        repo: PathBuf,
+        evidence: PathBuf,
+        phase: crate::capture::Phase,
+        shot: crate::capture::Shot,
+        before: Option<crate::capture::CaptureRecord>,
+        merged: Vec<u64>,
+    ) {
+        let name = it.polish_name();
         let group_rel = it
             .path
             .parent()
@@ -2817,13 +2902,42 @@ impl App {
             evidence: evidence.clone(),
             before,
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
-            merged: Vec::new(),
+            merged,
         };
         let _ = crate::capture::write_record(&evidence, &running_record(&req, "starting"));
         let job =
             crate::capture::CaptureJob::spawn(req.clone(), self.capture_env.clone(), managed_mcp());
         self.capture_jobs.insert(name, (job, req));
-        self.message = Some("capturing: the Evidence section shows how far it got".into());
+    }
+
+    /// A sent bug's captures move from its agent folder into its attachments
+    /// (`<stem>.assets/evidence/`) once an `issue:` line names the issue they
+    /// prove. A capture still writing there is left until it finishes.
+    fn persist_evidence(&self) {
+        for it in self.all_intents() {
+            let filed = crate::store::artifacts(&it.body)
+                .iter()
+                .any(|a| a.kind.eq_ignore_ascii_case("issue"));
+            if it.fm.state != State::Sent || !filed {
+                continue;
+            }
+            let name = it.polish_name();
+            if self.capture_jobs.contains_key(&name) {
+                continue;
+            }
+            let scratch = crate::capture::evidence_dir(&polish_cwd(self.store.root(), &name));
+            let Ok(entries) = std::fs::read_dir(&scratch) else {
+                continue;
+            };
+            let kept = it.assets_dir().join("evidence");
+            if std::fs::create_dir_all(&kept).is_err() {
+                continue;
+            }
+            for e in entries.flatten() {
+                let _ = std::fs::rename(e.path(), kept.join(e.file_name()));
+            }
+            let _ = std::fs::remove_dir(&scratch);
+        }
     }
 
     /// Over SSH there is no local pasteboard: copies go to the terminal.
@@ -9305,7 +9419,11 @@ mod tests {
 
     /// Points the app's captures at the fakes and a repo with (or without) a guide.
     fn with_capture(fx: &mut Fx, guide: bool, claude: bool) {
-        let t = fx._tmp.path().to_path_buf();
+        capture_setup(fx._tmp.path(), &mut fx.app, guide, claude);
+    }
+
+    fn capture_setup(t: &Path, app: &mut App, guide: bool, claude: bool) {
+        let t = t.to_path_buf();
         let repo = t.join("capture-repo");
         fs::create_dir_all(repo.join(".helmsmith")).unwrap();
         if guide {
@@ -9315,8 +9433,8 @@ mod tests {
         fs::write(t.join("capture-events.jsonl"), CAPTURE_EVENTS).unwrap();
         let fx_path = |n: &str| fixtures().join(n).display().to_string();
         let p = |n: &str| t.join(n).display().to_string();
-        fx.app.capture_repo = Some(repo);
-        fx.app.capture_env = vec![
+        app.capture_repo = Some(repo);
+        app.capture_env = vec![
             ("WORK_BIN_PATH".into(), fx_path("fake-work.sh")),
             ("MAKE_BIN_PATH".into(), fx_path("fake-make.sh")),
             (
@@ -9496,6 +9614,156 @@ mod tests {
         assert!(
             work.lines().last().unwrap_or("").contains("finish --area"),
             "{work}"
+        );
+    }
+
+    // ---- keeping evidence, the after, finding the fix ------------------------
+
+    /// The list fixture's Notify intent as a bug, with a reproduced "before"
+    /// in its agent folder; returns (intent path, evidence dir).
+    fn notify_bug_with_a_before(fx: &mut ListFx) -> (PathBuf, PathBuf) {
+        use crate::capture::{CaptureRecord, Outcome, Phase, Shot, VIEWPORT, write_record};
+        let path = fx.app.store.root().join("skoolscout/org/pr.md");
+        Store::update_fields(&path, |fm| fm.kind = "issue".into()).unwrap();
+        let it = Store::load(&path).unwrap();
+        let dir = polish_cwd(fx.app.store.root(), &it.polish_name()).join("evidence");
+        let rec = CaptureRecord {
+            phase: Phase::Before,
+            shot: Shot::Video,
+            outcome: Outcome::Reproduced("every admin gets the email".into()),
+            file: Some("before.mp4".into()),
+            steps: vec!["agent-browser open https://x".into()],
+            viewport: VIEWPORT,
+            at: chrono::Local::now(),
+            merged: Vec::new(),
+        };
+        write_record(&dir, &rec).unwrap();
+        fs::write(dir.join("before.mp4"), "video").unwrap();
+        (path, dir)
+    }
+
+    fn add_issue_line(path: &Path, n: u64) {
+        let text = fs::read_to_string(path).unwrap();
+        fs::write(
+            path,
+            text.replace("- pr: #42\n", &format!("- pr: #42\n- issue: #{n}\n")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn evidence_moves_into_the_attachments_once_the_issue_exists() {
+        let mut fx = list_fixture(true);
+        let (path, scratch) = notify_bug_with_a_before(&mut fx);
+        fx.app.rescan();
+        assert!(
+            scratch.join("before.json").is_file(),
+            "no issue yet: it stays put"
+        );
+        add_issue_line(&path, 123);
+        fx.app.rescan();
+        let kept = Store::load(&path).unwrap().assets_dir().join("evidence");
+        assert!(kept.join("before.json").is_file(), "kept with the issue");
+        assert!(kept.join("before.mp4").is_file());
+        assert!(!scratch.join("before.json").exists(), "moved, not copied");
+        let it = Store::load(&path).unwrap();
+        let rows = fx.app.evidence_rows(&it);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].file.as_deref(),
+            Some(kept.join("before.mp4").as_path())
+        );
+    }
+
+    #[test]
+    fn the_after_runs_once_every_pr_merged() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        capture_setup(&t, &mut fx.app, true, true);
+        // the guide lives in the repo the intent was sent to
+        fs::create_dir_all(t.join("repo/.helmsmith")).unwrap();
+        fs::write(t.join("repo/.helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        fs::write(
+            t.join("capture-events.jsonl"),
+            "{\"type\":\"result\",\"result\":\"fixed: only the primary contact gets it\"}\n",
+        )
+        .unwrap();
+        let (_path, dir) = notify_bug_with_a_before(&mut fx);
+        fx.app.rescan();
+        settle(&mut fx.app);
+        let starts = |t: &Path| {
+            fs::read_to_string(t.join("work.log"))
+                .unwrap_or_default()
+                .matches("start --area")
+                .count()
+        };
+        assert_eq!(starts(&t), 0, "PR #42 is still open");
+        fs::write(t.join("prs/42"), "MERGED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        let after = |dir: &Path| {
+            crate::capture::read_records(dir)
+                .into_iter()
+                .find(|r| r.phase == crate::capture::Phase::After)
+        };
+        wait_until(&mut fx.app, "the after's result", |_| {
+            after(&dir).is_some_and(|r| !matches!(r.outcome, crate::capture::Outcome::Running(_)))
+        });
+        let rec = after(&dir).unwrap();
+        assert_eq!(rec.merged, vec![42]);
+        assert_eq!(
+            rec.outcome,
+            crate::capture::Outcome::Fixed("only the primary contact gets it".into())
+        );
+        assert_eq!(starts(&t), 1);
+        // the same merged set never runs it again
+        for _ in 0..3 {
+            fx.app.rescan();
+            settle(&mut fx.app);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            starts(&t),
+            1,
+            "{}",
+            fs::read_to_string(t.join("work.log")).unwrap()
+        );
+    }
+
+    #[test]
+    fn issue_numbers_join_the_pr_search() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        fx.app
+            .herdr_env
+            .push(("FAKE_GH_LOG".into(), t.join("gh.log").display().to_string()));
+        let (path, _) = notify_bug_with_a_before(&mut fx);
+        add_issue_line(&path, 123);
+        // the issue names the pull request that closes it
+        fs::write(
+            t.join("prs/issue-123.json"),
+            r#"{"closedByPullRequestsReferences":[{"number":77,"url":"https://github.com/o/r/pull/77"}]}"#,
+        )
+        .unwrap();
+        fs::write(t.join("prs/77"), "MERGED").unwrap();
+        fx.app.rescan();
+        settle(&mut fx.app);
+        settle(&mut fx.app);
+        let log = fs::read_to_string(t.join("gh.log")).unwrap_or_default();
+        assert!(log.contains("issue view 123"), "{log}");
+        let found = fx.app.found_prs.get(&path).cloned().unwrap_or_default();
+        let by_issue = found
+            .iter()
+            .find(|(q, _)| q == "#123")
+            .map(|(_, p)| p.clone());
+        assert_eq!(
+            by_issue
+                .unwrap_or_default()
+                .iter()
+                .map(|p| (p.number, p.state))
+                .collect::<Vec<_>>(),
+            vec![(77, crate::progress::PrState::Merged)],
+            "{found:?}"
         );
     }
 

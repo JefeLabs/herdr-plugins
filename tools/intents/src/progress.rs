@@ -754,36 +754,88 @@ pub fn prs_mentioning(
         return Vec::new();
     };
     v.as_array()
-        .map(|prs| {
-            prs.iter()
-                .filter_map(|p| {
-                    let number = p.get("number")?.as_u64()?;
-                    let state = match p.get("state")?.as_str()? {
-                        "OPEN" => PrState::Open,
-                        "MERGED" => PrState::Merged,
-                        "CLOSED" => PrState::Closed,
-                        _ => PrState::Unknown,
-                    };
-                    let branch = p
-                        .get("headRefName")
-                        .and_then(|b| b.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let title = p
-                        .get("title")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    Some(FoundPr {
-                        number,
-                        state,
-                        branch,
-                        title,
-                    })
-                })
-                .collect()
-        })
+        .map(|prs| prs.iter().filter_map(found_pr).collect())
         .unwrap_or_default()
+}
+
+/// One pull request from `gh`'s JSON (`number`, `state`, `headRefName`, `title`).
+fn found_pr(p: &serde_json::Value) -> Option<FoundPr> {
+    let number = p.get("number")?.as_u64()?;
+    let state = match p.get("state")?.as_str()? {
+        "OPEN" => PrState::Open,
+        "MERGED" => PrState::Merged,
+        "CLOSED" => PrState::Closed,
+        _ => PrState::Unknown,
+    };
+    let text = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(FoundPr {
+        number,
+        state,
+        branch: text("headRefName"),
+        title: text("title"),
+    })
+}
+
+/// The pull requests that close issue `issue`: GitHub's closing links
+/// ("Fixes #n", or linked by hand). A text search for `#n` is not used: it
+/// also finds every pull request that merely mentions the issue.
+pub fn prs_closing(gh: &Path, repo: &Path, issue: u64, env: &[(String, String)]) -> Vec<FoundPr> {
+    let run = |args: &[&str]| -> Option<serde_json::Value> {
+        let out = Command::new(gh)
+            .args(args)
+            .current_dir(repo)
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        serde_json::from_slice(&out.stdout).ok()
+    };
+    let issue = issue.to_string();
+    let Some(v) = run(&[
+        "issue",
+        "view",
+        &issue,
+        "--json",
+        "closedByPullRequestsReferences",
+    ]) else {
+        return Vec::new();
+    };
+    let refs = v
+        .get("closedByPullRequestsReferences")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    refs.iter()
+        .filter_map(|r| {
+            let number = r.get("number")?.as_u64()?;
+            // the url names the pull request's own repository
+            let target = r
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| number.to_string());
+            let mut pr = run(&[
+                "pr",
+                "view",
+                &target,
+                "--json",
+                "number,state,headRefName,title",
+            ])?;
+            if let Some(o) = pr.as_object_mut() {
+                o.entry("number").or_insert(number.into());
+            }
+            found_pr(&pr)
+        })
+        .collect()
 }
 
 /// `herdr agent list` as `name → AgentInfo`. Agents without a name (not
@@ -949,7 +1001,8 @@ impl Poller {
         });
     }
 
-    /// Search for pull requests mentioning each of `queries` (file names).
+    /// Search for pull requests mentioning each of `queries` (file names);
+    /// a `#<n>` query asks for the pull requests that close issue `n`.
     pub fn request_found_prs(&mut self, path: PathBuf, repo: PathBuf, queries: Vec<String>) {
         let key = format!("found:{}", path.display());
         if !self.in_flight.insert(key.clone()) {
@@ -961,7 +1014,13 @@ impl Poller {
             let by_name: FoundByName = match tool_bin(&env, "GH_BIN_PATH", Some("gh")) {
                 Some(gh) => queries
                     .iter()
-                    .map(|q| (q.clone(), prs_mentioning(&gh, &repo, q, &env)))
+                    .map(|q| {
+                        let prs = match q.strip_prefix('#').and_then(|n| n.parse::<u64>().ok()) {
+                            Some(n) => prs_closing(&gh, &repo, n, &env),
+                            None => prs_mentioning(&gh, &repo, q, &env),
+                        };
+                        (q.clone(), prs)
+                    })
                     .collect(),
                 None => Vec::new(),
             };

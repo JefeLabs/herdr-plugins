@@ -13,6 +13,11 @@ if [ "$1 $2" = "pr list" ]; then
   if [ -f "$FAKE_GH_DIR/search-$q.json" ]; then cat "$FAKE_GH_DIR/search-$q.json"; else echo '[]'; fi
   exit 0
 fi
+if [ "$1 $2" = "issue view" ]; then
+  if [ -f "$FAKE_GH_DIR/issue-$3.json" ]; then cat "$FAKE_GH_DIR/issue-$3.json"; exit 0; fi
+  echo "no issue" >&2
+  exit 1
+fi
 n="$3"
 case "$n" in
   */pull/*) n="${n##*/pull/}"; n="${n%%/*}" ;;
