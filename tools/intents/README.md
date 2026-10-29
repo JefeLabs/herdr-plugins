@@ -98,7 +98,7 @@ The Artifacts pane (`V`) lists what the agents produced for the intent: specs, p
 
 The Pull requests section lists each `pr:` line with its state from `gh` (`merged`, `open`, `closed`, or `…` until `gh` has answered) and its title, and counts them in its title (`Pull requests (6/7 merged)`). Pull requests the repo search found by the intent's spec and plan names, but no `pr:` line names, follow dimmed as found (`merged? #5840 …`); `L` links one, and it keeps the state and title the search gave until `gh` is asked about it. `Enter` or `o` opens a pull request in the browser. In Pull requests and Demo Videos, `a` adds a line of that kind without typing it (`#123`, or `story-id (criteria: 1, 4)`).
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent by conversation, filed in the selected group (see Adding an intent), `n` new group, `M` move the selected intent or group (type the target group path), `K` cycle kind (bug, refactor, feature, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` polish with the agent, `m` choose the agent and model, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a feature's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `D` delete an intent that has not been sent (after a y/n question; see below), `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent by conversation, filed in the selected group (see Adding an intent), `n` new group, `M` move the selected intent or group (type the target group path), `K` cycle kind (bug, refactor, feature, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` polish with the agent, `m` choose the agent and model, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a feature's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `D` delete an intent that has not been sent (after a y/n question; see below), `E` capture a bug again (see Evidence for bugs), `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
 
 `D` deletes the selected intent after asking. Nothing is lost for good: the intent's file, its conversation (`.chat.md`), its attachments and its agent folder move to `.trash/<date-time>-<name>/` in the intents folder, with `from.txt` naming the group it came from; move the files back to restore it. An intent that has been sent is refused, since an agent is working from it. With the mouse, a click selects a row in the tree, a click on the selected group opens or closes it, and the wheel moves the selection.
 
@@ -184,6 +184,40 @@ When every pull request of a sent intent has merged (one closed without merging 
 
 The rewrite is applied straight away; the previous version is kept beside the file as `<name>.before-reconcile.bak` (older ones as `<name>.before-reconcile.1.bak` up to `.4.bak`), and `u` puts it back, one reconcile per press. Whatever the rewrite leaves out of the old version is put back: a `## ` section it dropped (a Decisions list, say) returns where it was, and an artifact line it dropped is added again. A demo line it kept as it was is renumbered to point at the same criteria by their wording, and a criterion that is gone drops out of it. The intent is marked unread: its card and tree row show `*` before the title until you open it (select it in the tree, or `Enter` on its card). Each merged set is reconciled once (`reconciled_for` in the front matter), so a later merge reconciles again but a restart does not. If a reconcile fails (the agent returns no proposal, say), the reason stays on the status line while that intent is selected, and `r` retries it. A reconcile that runs longer than 10 minutes is stopped and reported the same way, and quitting the tool stops any reconcile still running. `R` and `U` leave a sent intent sent, since its progress tracks the work from then on. Pull request states are checked about once a minute in either view (tree or list), so a merge reconciles wherever you are; an intent whose merge happened while the tool was closed is reconciled shortly after it starts.
 
+## Evidence for bugs
+
+A bug can carry proof: a screenshot or a video of it happening on a local stack, recorded by an agent, and the same steps again once the fix has merged. It needs `work` (workbrokr), `claude` and `agent-browser` (`npm i -g agent-browser` or `brew install agent-browser`, then `agent-browser install` for its browser).
+
+**The question.** After the last question about a bug, before the write-up, the add view asks `Capture evidence? s screenshot · v video · Enter skip`. It asks once, and only for bugs. When the repo has no capture guide, or `claude` is not installed, the line says why instead and `Enter` continues.
+
+**In the background.** The capture runs while you finish: the write-up goes ahead and you can save. The intent's Evidence section shows how far it got (`starting a stack in org/social`, `seeding: kathia-signup`, `the agent is reproducing it`), then the result. In order, the capture:
+
+1. starts its own task effort, `work start --area <area> --task evidence-<n> --type fix --mode fullstack` with `WORK_SESSION=capture-<name>`, trying the area the intent's group ends with (its last two path segments), then the guide's `default_area`. It never joins an effort or merges into one;
+2. runs the guide's seed stories (`make -C <worktree>/app-test-e2e-runner e2e-story STORY=<story> FAST=1`);
+3. runs `claude` with the guide, the report and the app's address. The agent may run only `agent-browser`: `open` on the stack's own address, `set viewport`, `screenshot` or `record` into the evidence folder, and the commands that drive a page (click, fill, type, press, select, scroll, wait, snapshot and the like). The report reaches it as data between markers, never as instructions. An agent still running after 20 minutes is stopped;
+4. ends with `work finish` for its effort whatever happened, also when you cancel the conversation or quit.
+
+The agent's last line is `reproduced: …` or `couldn't reproduce: …`; a capture without one counts as failed. Captures are 1280×800.
+
+**The capture guide.** A repo opts in with `.helmsmith/capture.md`: front matter, then the instructions the agent gets (how to sign in, as whom, what to leave alone). No guide, no capture.
+
+```markdown
+---
+default_area: org/social     # where to start a stack when the intent's group names no area that starts
+seed: [kathia-signup]        # e2e stories run before the agent starts
+url: https://demo-org.skoolscout.com.local:{port}   # {port}: the stack's frontend port
+---
+Sign in at /auth/sign-in: press Meta+U and pick the person…
+```
+
+Keep passwords out of it: the agent signs in the way a person does on a local stack.
+
+**The Evidence section.** It follows Artifacts in every intent's detail pane (`Tab` reaches it). One row per capture: `before` or `after`, `video` or `screenshot`, and the agent's line, marked `…` running, `✓` reproduced or fixed, `✗` still broken, `·` couldn't reproduce, `!` failed. `Enter` opens the file in Chrome (on Linux, with `xdg-open`). `c` copies the file itself: on macOS, ⌘V into a GitHub comment uploads it; over SSH, or off macOS, it copies the path. `Y` copies the path. `E` (here, in the tree or on a card) captures the selected bug again: a "before" until one reproduced it, then an "after". It refuses while a capture of that intent is running.
+
+**After the fix.** When every pull request of a sent bug has merged and its "before" reproduced the bug, the tool runs the same steps on a fresh stack: an "after", once per merged set of pull requests. Its row reads `✓ after · … · fixed: …` or `✗ after · … · still broken: …`. Besides `pr:` lines and the spec and plan names, pull requests are found through the intent's `issue:` lines: the ones GitHub links as closing the issue ("Fixes #n").
+
+**Where the files are.** Until the bug has an issue, its captures sit in its agent folder, `.polish/<name>/evidence/`: `before.mp4` or `before.png`, and `before.json` with the result and the exact steps (the same for `after`). Once an `issue:` line names the filed issue, they move into the intent's attachments, `<name>.assets/evidence/`. A hand-off lists the captures wherever they are, so the agent filing the issue can use the screenshot as the issue's picture and ask you to paste the video. `D` takes them to the trash with the intent.
+
 ## List view
 
 `v` flips the browser between the group tree and one full-screen list of every intent, across all groups (collapsed or not). The selection carries across both ways, and the layout, sort order and filter are remembered.
@@ -238,6 +272,8 @@ Keys in the list: `j`/`k` move, `PgUp`/`PgDn` move a screen of cards (less one, 
   2026-10-24-pending-label.md            ← a quick capture, at the top until you move it (M)
   2026-10-24-pending-label.assets/screen.png
   2026-10-24-pending-label.chat.md
+  2026-10-24-pending-label.assets/evidence/before.mp4   ← a bug's capture, once its issue is filed
+  .polish/<name>/evidence/                ← captures until then
   skoolscout/applications/…
 ```
 
