@@ -87,6 +87,16 @@ pub enum PickStep {
     Model { provider: String },
 }
 
+/// One capture of the selected intent, as the Evidence section lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRow {
+    /// `before · video · <the agent's line or the stage>`
+    pub label: String,
+    pub file: Option<PathBuf>,
+    /// `…` running, `✓` reproduced or fixed, `✗` still broken, `!` failed, `·` not reproduced
+    pub mark: &'static str,
+}
+
 /// What tests (and the status line) can read about the add conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterviewView {
@@ -374,6 +384,8 @@ pub struct View {
     pub filter: &'static str,
     /// The add-by-conversation screen, when it shows.
     pub interview: Option<InterviewView>,
+    /// The selected intent's captures (Evidence section).
+    pub evidence: Vec<EvidenceRow>,
 }
 
 pub struct App {
@@ -452,6 +464,12 @@ pub struct App {
     /// Reconciles running: per intent, the merged set it covers, the
     /// agent turn, and when it started.
     reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant)>,
+    /// Running captures, by the intent's agent folder name.
+    capture_jobs: HashMap<String, (crate::capture::CaptureJob, crate::capture::CaptureRequest)>,
+    /// The env captures run with (`*_BIN_PATH` included); empty in production.
+    pub capture_env: Vec<(String, String)>,
+    /// The repo intents are captured for; `None` means `send::capture_repo()`.
+    pub capture_repo: Option<PathBuf>,
     /// How long a reconcile may run before it is stopped and reported.
     reconcile_limit: std::time::Duration,
     /// Merged sets already started this session, so a failure is not retried in a loop.
@@ -528,6 +546,9 @@ impl App {
             poll_ticks: 0,
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
+            capture_jobs: HashMap::new(),
+            capture_env: Vec::new(),
+            capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
             reconcile_tried: HashSet::new(),
             reconcile_failed: HashMap::new(),
@@ -2570,6 +2591,9 @@ impl App {
             write_up: None,
             save_kind: kind.to_string(),
             scroll: 0,
+            capture_asked: false,
+            pending_write_up: None,
+            capture_block: None,
         }));
     }
 
@@ -2620,12 +2644,146 @@ impl App {
 
     /// The next question, or the write-up once five have been asked.
     fn next_question_or_write_up(&mut self, st: &mut InterviewScreen, message: String) {
-        let step = if st.iv.budget_left() == 0 {
-            Step::WriteUp
+        if st.iv.budget_left() == 0 {
+            self.begin_write_up(st, message, true);
         } else {
-            Step::Ask
+            self.start_interview_turn(st, Step::Ask, message, true);
+        }
+    }
+
+    /// The write-up, but for a bug the evidence question comes first (once).
+    fn begin_write_up(&mut self, st: &mut InterviewScreen, message: String, show: bool) {
+        if st.iv.kind == "issue" && !st.capture_asked {
+            st.capture_asked = true;
+            st.pending_write_up = Some((message, show));
+            st.capture_block = self.capture_block();
+            st.awaiting = Awaiting::Capture;
+            return;
+        }
+        self.start_interview_turn(st, Step::WriteUp, message, show);
+    }
+
+    /// The repo intents are captured for: the test override, else the
+    /// repo the tool runs in (as a save records it).
+    fn current_repo(&self) -> Option<PathBuf> {
+        self.capture_repo.clone().or_else(crate::send::capture_repo)
+    }
+
+    /// Why capture cannot run here, if it cannot.
+    fn capture_block(&self) -> Option<String> {
+        let Some(repo) = self.current_repo() else {
+            return Some("capture needs the intent's repo, and none was found".into());
         };
-        self.start_interview_turn(st, step, message, true);
+        if crate::capture::read_guide(&repo).is_err() {
+            return Some(format!("no capture guide in {}", repo.display()));
+        }
+        let claude = match crate::progress::tool_bin(&self.capture_env, "CLAUDE_BIN_PATH", None) {
+            Some(p) => p.is_file(),
+            None => std::env::var_os("PATH")
+                .map(|paths| std::env::split_paths(&paths).any(|d| d.join("claude").is_file()))
+                .unwrap_or(false),
+        };
+        if !claude {
+            return Some("capture needs claude, which is not installed".into());
+        }
+        None
+    }
+
+    /// Starts a "before" capture for the interview, in the background.
+    fn start_capture_job(&mut self, st: &InterviewScreen, shot: crate::capture::Shot) {
+        let Some(repo) = self.current_repo() else {
+            return;
+        };
+        let name = st
+            .folder
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if self.capture_jobs.contains_key(&name) {
+            return;
+        }
+        let evidence = crate::capture::evidence_dir(&st.folder);
+        let req = crate::capture::CaptureRequest {
+            repo,
+            group_rel: st.iv.home.clone(),
+            stem: name.clone(),
+            phase: crate::capture::Phase::Before,
+            shot,
+            intent: st.iv.raw_body(),
+            evidence: evidence.clone(),
+            before: None,
+            // unique across intents capturing in the same area at once
+            n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
+            merged: Vec::new(),
+        };
+        let _ = crate::capture::write_record(&evidence, &running_record(&req, "starting"));
+        let job =
+            crate::capture::CaptureJob::spawn(req.clone(), self.capture_env.clone(), managed_mcp());
+        self.capture_jobs.insert(name, (job, req));
+    }
+
+    /// Records what the running captures report, beside their evidence.
+    fn poll_captures(&mut self) {
+        let mut finished = Vec::new();
+        for (key, (job, req)) in &self.capture_jobs {
+            while let Some(update) = job.try_recv() {
+                match update {
+                    crate::capture::CaptureUpdate::Progress(m) => {
+                        let _ =
+                            crate::capture::write_record(&req.evidence, &running_record(req, &m));
+                    }
+                    crate::capture::CaptureUpdate::Done(rec) => {
+                        let _ = crate::capture::write_record(&req.evidence, &rec);
+                        finished.push(key.clone());
+                    }
+                }
+            }
+        }
+        for key in finished {
+            self.capture_jobs.remove(&key);
+        }
+    }
+
+    /// The selected intent's captures: from its attachments once kept there,
+    /// else from its agent folder.
+    fn evidence_rows(&self, it: &Intent) -> Vec<EvidenceRow> {
+        use crate::capture::{Outcome, Phase, Shot};
+        let dirs = [
+            it.assets_dir().join("evidence"),
+            crate::capture::evidence_dir(&polish_cwd(self.store.root(), &it.polish_name())),
+        ];
+        for dir in dirs {
+            let recs = crate::capture::read_records(&dir);
+            if recs.is_empty() {
+                continue;
+            }
+            return recs
+                .iter()
+                .map(|r| {
+                    let (mark, text) = match &r.outcome {
+                        Outcome::Running(t) => ("…", t),
+                        Outcome::Reproduced(t) | Outcome::Fixed(t) => ("✓", t),
+                        Outcome::StillBroken(t) => ("✗", t),
+                        Outcome::Failed(t) => ("!", t),
+                        Outcome::NotReproduced(t) => ("·", t),
+                    };
+                    let phase = match r.phase {
+                        Phase::Before => "before",
+                        Phase::After => "after",
+                    };
+                    let shot = match r.shot {
+                        Shot::Video => "video",
+                        Shot::Screenshot => "screenshot",
+                    };
+                    EvidenceRow {
+                        label: format!("{phase} · {shot} · {text}"),
+                        file: r.file.as_ref().map(|f| dir.join(f)),
+                        mark,
+                    }
+                })
+                .collect();
+        }
+        Vec::new()
     }
 
     fn key_interview(&mut self, mut st: Box<InterviewScreen>, k: KeyEvent) -> Flow {
@@ -2656,6 +2814,26 @@ impl App {
             (KeyCode::Esc, _) => {
                 self.discard_interview(st);
                 return Flow::Continue;
+            }
+            // the evidence question: s / v start a capture (unless blocked), Enter skips
+            _ if st.awaiting == Awaiting::Capture => {
+                let choice = match k.code {
+                    KeyCode::Char('s') if st.capture_block.is_none() => {
+                        Some(Some(crate::capture::Shot::Screenshot))
+                    }
+                    KeyCode::Char('v') if st.capture_block.is_none() => {
+                        Some(Some(crate::capture::Shot::Video))
+                    }
+                    KeyCode::Enter => Some(None),
+                    _ => None,
+                };
+                if let Some(shot) = choice {
+                    if let Some(shot) = shot {
+                        self.start_capture_job(&st, shot);
+                    }
+                    let (message, show) = st.pending_write_up.take().unwrap_or_default();
+                    self.start_interview_turn(&mut st, Step::WriteUp, message, show);
+                }
             }
             (KeyCode::Enter, _)
                 if st.awaiting == Awaiting::Review && st.input.trim().is_empty() =>
@@ -2695,7 +2873,7 @@ impl App {
                     _ => String::new(),
                 };
                 st.input.clear();
-                self.start_interview_turn(&mut st, Step::WriteUp, message, true);
+                self.begin_write_up(&mut st, message, true);
             }
             (KeyCode::Enter, _) => {
                 let text = st.input.trim().to_string();
@@ -2772,7 +2950,7 @@ impl App {
             &title,
             &st.save_kind,
             &body,
-            crate::send::capture_repo(),
+            self.current_repo(),
         );
         let it = match created {
             Ok(it) => it,
@@ -2842,12 +3020,23 @@ impl App {
         for (_, turn, _) in self.reconcile_jobs.values_mut() {
             turn.cancel();
         }
+        for (job, _) in self.capture_jobs.values_mut() {
+            job.cancel();
+        }
     }
 
     /// Esc: nothing is kept, not even the agent's folder.
     fn discard_interview(&mut self, mut st: Box<InterviewScreen>) {
         if let Some(mut t) = st.turn.take() {
             t.cancel();
+        }
+        let name = st
+            .folder
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Some((mut job, _)) = self.capture_jobs.remove(&name) {
+            job.cancel();
         }
         let _ = std::fs::remove_dir_all(&st.folder);
         self.screen = Screen::Browse;
@@ -2909,7 +3098,7 @@ impl App {
             Step::Restate => st.awaiting = Awaiting::Confirm,
             Step::Ask => match crate::interview::parse_ask(&text) {
                 Asked::Question(q) => st.awaiting = Awaiting::Answer(q),
-                Asked::Enough => self.start_interview_turn(st, Step::WriteUp, String::new(), false),
+                Asked::Enough => self.begin_write_up(st, String::new(), false),
             },
             Step::WriteUp => {
                 if reply.proposal.is_some() && reply.title.is_some() {
@@ -3030,6 +3219,10 @@ impl App {
                 ui::render_input_box(&st.input, rows[3], buf);
                 let text = match &st.awaiting {
                     Awaiting::Words => "say it in your own words · Enter send · Esc cancel (nothing saved)".to_string(),
+                    Awaiting::Capture => match &st.capture_block {
+                        Some(why) => format!("{why} · Enter continue"),
+                        None => "Capture evidence? s screenshot · v video · Enter skip".to_string(),
+                    },
                     Awaiting::Turn => "waiting for the agent · Esc cancel".to_string(),
                     Awaiting::Confirm => "Enter (or yes) that's right · type a correction · Ctrl-d write it up now · Esc cancel".to_string(),
                     Awaiting::Answer(_) => "Enter answer · Enter on empty skips · Ctrl-d write it up now · Esc cancel".to_string(),
@@ -3913,6 +4106,7 @@ impl App {
         // every ~60 s; all on background threads
         self.drain_polls();
         self.poll_reconciles();
+        self.poll_captures();
         // pull requests, plans and searches are checked in either layout (a
         // merge must reconcile from the tree too); agent states only matter
         // to the cards, so they poll only while the list shows
@@ -4068,7 +4262,11 @@ impl App {
             sort: self.sort.label(),
             filter: self.filter.label(),
             interview: None,
+            evidence: Vec::new(),
         };
+        if let Some(it) = self.selected_intent() {
+            v.evidence = self.evidence_rows(it);
+        }
         match &self.screen {
             Screen::Browse => {}
             Screen::Edit => v.screen = "edit",
@@ -4793,6 +4991,33 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
             std::process::exit(1)
         }
     }
+}
+
+/// A capture still running, as its record reads until it is done.
+fn running_record(
+    req: &crate::capture::CaptureRequest,
+    stage: &str,
+) -> crate::capture::CaptureRecord {
+    crate::capture::CaptureRecord {
+        phase: req.phase,
+        shot: req.shot,
+        outcome: crate::capture::Outcome::Running(stage.to_string()),
+        file: None,
+        steps: Vec::new(),
+        viewport: crate::capture::VIEWPORT,
+        at: chrono::Local::now(),
+        merged: req.merged.clone(),
+    }
+}
+
+/// Whether an organization-managed MCP config is on this machine (claude
+/// then refuses --strict-mcp-config).
+fn managed_mcp() -> bool {
+    let paths: Vec<&Path> = crate::config::MANAGED_MCP_CONFIGS
+        .iter()
+        .map(Path::new)
+        .collect();
+    crate::config::managed_mcp_present(&paths)
 }
 
 /// The write-up as it would be saved: its title, and its body with the
@@ -7843,6 +8068,14 @@ mod tests {
         wait_until(app, "the agent's turn", |a| awaiting(a) != "turn");
     }
 
+    /// Skips the evidence question (Enter) when a bug's conversation reaches it.
+    fn past_capture(app: &mut App) {
+        if awaiting(app) == "capture" {
+            key(app, KeyCode::Enter);
+            wait_turn(app);
+        }
+    }
+
     fn md_files(dir: &Path) -> usize {
         let mut n = 0;
         for e in fs::read_dir(dir).unwrap().flatten() {
@@ -7951,12 +8184,14 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter); // that's right
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         for i in 1..=5 {
             let iv = fx.app.view().interview.unwrap();
             assert_eq!((iv.awaiting, iv.question_no), ("answer", i));
             type_str(&mut fx.app, &format!("a{i}"));
             key(&mut fx.app, KeyCode::Enter);
             wait_turn(&mut fx.app);
+            past_capture(&mut fx.app);
         }
         let c = calls(&fx);
         assert_eq!(c.len(), 7, "restate, five asks, a write-up: {c:?}");
@@ -7970,6 +8205,7 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert_eq!(c.len(), 3, "{c:?}");
         assert!(c[2].contains(crate::interview::WRITE_UP_MARKER), "{}", c[2]);
@@ -7983,14 +8219,17 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         key(&mut fx.app, KeyCode::Enter); // skip question 1
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(c[2].contains("(skipped)"), "{}", c[2]);
         assert_eq!(fx.app.view().interview.unwrap().question_no, 2);
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(
             c.last()
@@ -8012,6 +8251,7 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let iv = fx.app.view().interview.unwrap();
         assert_eq!(iv.awaiting, "review");
         assert_eq!(iv.save_kind, "issue");
@@ -8175,6 +8415,7 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "review");
         insta::assert_snapshot!(render(&fx.app, 80, 20));
     }
@@ -8195,8 +8436,10 @@ mod tests {
         type_str(&mut fx.app, WORDS);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "review", "{:?}", fx.app.view().hint);
     }
 
@@ -8279,6 +8522,7 @@ mod tests {
         type_str(&mut fx.app, "file it under skoolscout/global");
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         let last = c.last().unwrap();
         assert!(last.contains("file it under skoolscout/global"), "{last}");
@@ -8518,9 +8762,11 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)); // skip it, write up
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "review");
         let shown = render(&fx.app, 100, 40);
         assert!(
@@ -8550,6 +8796,7 @@ mod tests {
         type_str(&mut fx.app, "shorten it");
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "retry");
         fx.app
             .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
@@ -8595,10 +8842,12 @@ mod tests {
         start_bug_in_skoolscout(&mut fx);
         key(&mut fx.app, KeyCode::Enter);
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         type_str(&mut fx.app, "only the inviter");
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(
             c.last().unwrap().contains("only the inviter"),
@@ -8613,6 +8862,7 @@ mod tests {
         fx.app
             .key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
         let c = calls(&fx);
         assert!(
             c.last().unwrap().contains("only admins"),
@@ -8781,6 +9031,207 @@ mod tests {
         key(&mut fx.app, KeyCode::Char('y'));
         assert_eq!(fx.app.view().layout, "list", "stays in the card view");
         assert!(!fx.app.list.iter().any(|i| i.fm.title == "Beta"));
+    }
+
+    // ---- evidence capture ----------------------------------------------------
+
+    const CAPTURE_GUIDE: &str = "---\ndefault_area: org/social\nseed: [kathia-signup]\nurl: https://demo-org.skoolscout.com.local:{port}\n---\nSign in with Cmd+U.\n";
+    const CAPTURE_EVENTS: &str = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"agent-browser open https://x\"}}]}}\n{\"type\":\"result\",\"result\":\"reproduced: the email goes to every admin\"}\n";
+
+    /// Points the app's captures at the fakes and a repo with (or without) a guide.
+    fn with_capture(fx: &mut Fx, guide: bool, claude: bool) {
+        let t = fx._tmp.path().to_path_buf();
+        let repo = t.join("capture-repo");
+        fs::create_dir_all(repo.join(".helmsmith")).unwrap();
+        if guide {
+            fs::write(repo.join(".helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        }
+        fs::create_dir_all(t.join("worktree")).unwrap();
+        fs::write(t.join("capture-events.jsonl"), CAPTURE_EVENTS).unwrap();
+        let fx_path = |n: &str| fixtures().join(n).display().to_string();
+        let p = |n: &str| t.join(n).display().to_string();
+        fx.app.capture_repo = Some(repo);
+        fx.app.capture_env = vec![
+            ("WORK_BIN_PATH".into(), fx_path("fake-work.sh")),
+            ("MAKE_BIN_PATH".into(), fx_path("fake-make.sh")),
+            (
+                "CLAUDE_BIN_PATH".into(),
+                if claude {
+                    fx_path("fake-claude.sh")
+                } else {
+                    p("no-claude-here")
+                },
+            ),
+            ("FAKE_WORK_LOG".into(), p("work.log")),
+            ("FAKE_MAKE_LOG".into(), p("make.log")),
+            ("FAKE_CLAUDE_LOG".into(), p("claude.log")),
+            ("FAKE_WORK_TREE".into(), p("worktree")),
+            ("FAKE_CLAUDE_EVENTS".into(), p("capture-events.jsonl")),
+        ];
+    }
+
+    fn work_log(fx: &Fx) -> String {
+        fs::read_to_string(fx._tmp.path().join("work.log")).unwrap_or_default()
+    }
+
+    fn status_line(app: &App) -> String {
+        render(app, 100, 20)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A bug through the restatement to the moment the write-up would start.
+    fn bug_to_the_evidence_question(fx: &mut Fx) {
+        agent_replies(fx, &[RESTATE, "enough", WRITE_UP]);
+        start_bug_in_skoolscout(fx);
+        key(&mut fx.app, KeyCode::Enter); // that's right → the agent says enough
+        wait_turn(&mut fx.app);
+    }
+
+    #[test]
+    fn a_bug_is_asked_about_evidence_before_the_write_up() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        bug_to_the_evidence_question(&mut fx);
+        assert_eq!(awaiting(&fx.app), "capture");
+        assert!(
+            status_line(&fx.app).contains("Capture evidence?"),
+            "{}",
+            status_line(&fx.app)
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review", "the write-up went ahead");
+        assert!(
+            calls(&fx)
+                .last()
+                .unwrap()
+                .contains(crate::interview::WRITE_UP_MARKER)
+        );
+        let start = Instant::now();
+        while !work_log(&fx).contains("start --area") {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "no capture started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_feature_is_never_asked() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('f'));
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+    }
+
+    #[test]
+    fn enter_skips_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(work_log(&fx), "", "nothing started");
+    }
+
+    #[test]
+    fn no_capture_guide_means_no_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, false, true);
+        bug_to_the_evidence_question(&mut fx);
+        assert!(
+            status_line(&fx.app).contains("no capture guide in"),
+            "{}",
+            status_line(&fx.app)
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(
+            awaiting(&fx.app),
+            "capture",
+            "v does nothing without a guide"
+        );
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review");
+        assert_eq!(work_log(&fx), "");
+    }
+
+    #[test]
+    fn no_claude_means_no_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, false);
+        bug_to_the_evidence_question(&mut fx);
+        assert!(
+            status_line(&fx.app).contains("capture needs claude"),
+            "{}",
+            status_line(&fx.app)
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        assert_eq!(awaiting(&fx.app), "capture");
+    }
+
+    #[test]
+    fn the_saved_bug_shows_its_capture_in_evidence() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Char('v'));
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        assert_eq!(fx.app.view().screen, "browse");
+        wait_until(&mut fx.app, "the capture's result", |a| {
+            a.view().evidence.first().is_some_and(|r| r.mark == "✓")
+        });
+        let row = fx.app.view().evidence[0].clone();
+        assert!(
+            row.label
+                .contains("before · video · the email goes to every admin"),
+            "{}",
+            row.label
+        );
+    }
+
+    #[test]
+    fn shutdown_finishes_a_running_capture() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
+        bug_to_the_evidence_question(&mut fx);
+        key(&mut fx.app, KeyCode::Char('v'));
+        let claude_log = fx._tmp.path().join("claude.log");
+        let start = Instant::now();
+        while !fs::read_to_string(&claude_log)
+            .unwrap_or_default()
+            .contains("---")
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the agent never started"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fx.app.shutdown();
+        let work = work_log(&fx);
+        assert!(
+            work.lines().last().unwrap_or("").contains("finish --area"),
+            "{work}"
+        );
     }
 
     #[test]

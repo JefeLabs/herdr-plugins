@@ -292,6 +292,8 @@ pub enum Awaiting {
     Review,
     /// The last turn failed, for this reason.
     Retry(String),
+    /// A bug's evidence question, before the write-up.
+    Capture,
 }
 
 impl Awaiting {
@@ -303,6 +305,7 @@ impl Awaiting {
             Awaiting::Answer(_) => "answer",
             Awaiting::Review => "review",
             Awaiting::Retry(_) => "retry",
+            Awaiting::Capture => "capture",
         }
     }
 }
@@ -328,6 +331,12 @@ pub struct InterviewScreen {
     pub write_up: Option<crate::provider::Reply>,
     pub save_kind: String,
     pub scroll: u16,
+    /// The evidence question has been asked (once per conversation).
+    pub capture_asked: bool,
+    /// The write-up turn waiting behind the evidence question: `(message, show)`.
+    pub pending_write_up: Option<(String, bool)>,
+    /// Why capture cannot run here (no guide, no claude), shown instead of the question.
+    pub capture_block: Option<String>,
 }
 
 /// A fresh folder name under `<root>/.polish/` for one conversation.
