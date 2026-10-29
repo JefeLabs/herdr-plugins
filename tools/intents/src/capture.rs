@@ -261,6 +261,398 @@ pub fn steps_from_stream(line: &str) -> Option<String> {
         .map(|cmd| cmd.trim().to_string())
 }
 
+/// What to capture, for which intent, and where the files go.
+#[derive(Clone, Debug)]
+pub struct CaptureRequest {
+    /// The intent's repo: where `work` runs and the guide is read.
+    pub repo: PathBuf,
+    /// The intent's group path under the intents root, when known.
+    pub group_rel: Option<String>,
+    /// The intent's agent folder name: names the workbrokr session.
+    pub stem: String,
+    pub phase: Phase,
+    pub shot: Shot,
+    /// The bug in the reporter's words.
+    pub intent: String,
+    /// The evidence folder (the agent's cwd; captures land here).
+    pub evidence: PathBuf,
+    /// For an "after": the "before" whose steps it repeats.
+    pub before: Option<CaptureRecord>,
+    /// The capture's number, naming its task effort (`evidence-<n>`).
+    pub n: u32,
+    /// For an "after": the merged pull requests it checks.
+    pub merged: Vec<u64>,
+}
+
+/// What a running capture reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureUpdate {
+    Progress(String),
+    Done(CaptureRecord),
+}
+
+/// An agent that never finishes is stopped after this, so a capture cannot
+/// hold a slot forever.
+const AGENT_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// How a capture reaches its tools; `WORK_SESSION` keeps its effort apart
+/// from the owner's.
+#[derive(Clone)]
+struct Runner {
+    work: PathBuf,
+    make: PathBuf,
+    claude: PathBuf,
+    env: Vec<(String, String)>,
+    session: String,
+    repo: PathBuf,
+}
+
+impl Runner {
+    fn cmd(&self, bin: &Path) -> std::process::Command {
+        let mut c = std::process::Command::new(bin);
+        c.envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .env("WORK_SESSION", &self.session)
+            .stdin(std::process::Stdio::null());
+        c
+    }
+
+    fn work(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        self.cmd(&self.work)
+            .args(args)
+            .current_dir(&self.repo)
+            .output()
+    }
+}
+
+/// Shared between the capture's thread and `cancel`.
+#[derive(Default)]
+struct JobState {
+    agent_pgid: Option<i32>,
+    /// The task effort this capture started: `(area, task)`.
+    effort: Option<(String, String)>,
+    cancelled: bool,
+    finished: bool,
+}
+
+/// Ends the capture's own effort exactly once, whoever gets there first.
+fn finish_once(r: &Runner, state: &std::sync::Mutex<JobState>) {
+    let effort = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        match (&s.effort, s.finished) {
+            (Some(e), false) => {
+                let e = e.clone();
+                s.finished = true;
+                Some(e)
+            }
+            _ => None,
+        }
+    };
+    if let Some((area, task)) = effort {
+        let _ = r.work(&["finish", "--area", &area, "--task", &task, "--json"]);
+    }
+}
+
+fn cancelled(state: &std::sync::Mutex<JobState>) -> bool {
+    state.lock().map(|s| s.cancelled).unwrap_or(true)
+}
+
+/// `{"code": …}` from work's `--json` refusal on stderr (other lines, such
+/// as node warnings, are skipped).
+fn refusal_code(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr).lines().find_map(|l| {
+        serde_json::from_str::<serde_json::Value>(l.trim())
+            .ok()?
+            .get("code")?
+            .as_str()
+            .map(str::to_string)
+    })
+}
+
+/// One capture running on its own thread.
+pub struct CaptureJob {
+    rx: std::sync::mpsc::Receiver<CaptureUpdate>,
+    state: std::sync::Arc<std::sync::Mutex<JobState>>,
+    runner: Runner,
+}
+
+impl CaptureJob {
+    /// Starts the capture: `work start` (the intent's area, else the guide's
+    /// default), `work env`, the guide's seed stories, the agent (claude,
+    /// limited to agent-browser), then `work finish`, whatever happened.
+    pub fn spawn(req: CaptureRequest, env: Vec<(String, String)>, managed_mcp: bool) -> CaptureJob {
+        let bin = |key: &str, default: &str| {
+            crate::progress::tool_bin(&env, key, Some(default)).unwrap_or_else(|| default.into())
+        };
+        let runner = Runner {
+            work: bin("WORK_BIN_PATH", "work"),
+            make: bin("MAKE_BIN_PATH", "make"),
+            claude: bin("CLAUDE_BIN_PATH", "claude"),
+            env: env.clone(),
+            session: format!("capture-{}", req.stem),
+            repo: req.repo.clone(),
+        };
+        let state = std::sync::Arc::new(std::sync::Mutex::new(JobState::default()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (r, st) = (runner.clone(), std::sync::Arc::clone(&state));
+            std::thread::spawn(move || {
+                let rec = run(&req, &r, &st, managed_mcp, &tx);
+                finish_once(&r, &st);
+                let _ = tx.send(CaptureUpdate::Done(rec));
+            });
+        }
+        CaptureJob { rx, state, runner }
+    }
+
+    pub fn try_recv(&self) -> Option<CaptureUpdate> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Stops the agent and ends the capture's effort (shutdown, trash).
+    pub fn cancel(&mut self) {
+        let pgid = {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.cancelled = true;
+            s.agent_pgid
+        };
+        if let Some(p) = pgid {
+            stop_group(p);
+        }
+        finish_once(&self.runner, &self.state);
+    }
+}
+
+/// SIGTERM to the agent's process group, SIGKILL shortly after.
+fn stop_group(pgid: i32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let pid = Pid::from_raw(pgid);
+    let _ = killpg(pid, Signal::SIGTERM);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = killpg(pid, Signal::SIGKILL);
+}
+
+fn run(
+    req: &CaptureRequest,
+    r: &Runner,
+    state: &std::sync::Mutex<JobState>,
+    managed_mcp: bool,
+    tx: &std::sync::mpsc::Sender<CaptureUpdate>,
+) -> CaptureRecord {
+    let record = |outcome: Outcome, file: Option<String>, steps: Vec<String>| CaptureRecord {
+        phase: req.phase,
+        shot: req.shot,
+        outcome,
+        file,
+        steps,
+        viewport: VIEWPORT,
+        at: chrono::Local::now(),
+        merged: req.merged.clone(),
+    };
+    let failed = |why: String| record(Outcome::Failed(why), None, Vec::new());
+    let progress = |m: String| {
+        let _ = tx.send(CaptureUpdate::Progress(m));
+    };
+
+    let Ok(guide) = read_guide(&req.repo) else {
+        return failed(format!("no capture guide in {}", req.repo.display()));
+    };
+    let task = format!("evidence-{}", req.n);
+    let mut refused: Vec<String> = Vec::new();
+    let mut area: Option<String> = None;
+    for a in area_candidates(req.group_rel.as_deref(), &guide) {
+        if cancelled(state) {
+            return failed("cancelled".into());
+        }
+        progress(format!("starting a stack in {a}"));
+        let start = [
+            "start",
+            "--area",
+            &a,
+            "--task",
+            &task,
+            "--type",
+            "fix",
+            "--mode",
+            "fullstack",
+            "--json",
+        ];
+        match r.work(&start) {
+            Ok(o) if o.status.success() => {
+                area = Some(a);
+                break;
+            }
+            Ok(o) => {
+                let code = refusal_code(&o.stderr).unwrap_or_else(|| format!("exit {}", o.status));
+                if matches!(
+                    code.as_str(),
+                    "AREA_UNKNOWN" | "MANIFEST_INVALID" | "SCOPE_CONFLICT"
+                ) {
+                    refused.push(format!("{a}: {code}"));
+                    continue;
+                }
+                return failed(format!("work start: {code}"));
+            }
+            Err(e) => return failed(format!("work start: {e}")),
+        }
+    }
+    let Some(area) = area else {
+        return failed(format!(
+            "no area could start a stack ({})",
+            refused.join(", ")
+        ));
+    };
+    if let Ok(mut s) = state.lock() {
+        s.effort = Some((area.clone(), task.clone()));
+    }
+    if cancelled(state) {
+        return failed("cancelled".into());
+    }
+
+    // where the stack is
+    let env = match r.work(&["env", "--area", &area, "--task", &task, "--json"]) {
+        Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout).ok(),
+        _ => None,
+    };
+    let field = |k: &str| {
+        env.as_ref()
+            .and_then(|v| v.get(k))
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| x.to_string())
+            })
+            .filter(|x| !x.is_empty())
+    };
+    let (Some(port), Some(worktree)) = (field("PORT_FRONTEND"), field("WORKTREE")) else {
+        return failed(format!("work env: no frontend port or worktree for {area}"));
+    };
+    let base_url = guide.url.replace("{port}", &port);
+
+    // the people and the tenant the agent signs in as
+    let e2e = Path::new(&worktree).join("app-test-e2e-runner");
+    for story in &guide.seed {
+        if cancelled(state) {
+            return failed("cancelled".into());
+        }
+        progress(format!("seeding: {story}"));
+        let status = r
+            .cmd(&r.make)
+            .arg("-C")
+            .arg(&e2e)
+            .args(["e2e-story", &format!("STORY={story}"), "FAST=1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => return failed(format!("seed {story}: exit {}", s.code().unwrap_or(-1))),
+            Err(e) => return failed(format!("seed {story}: {e}")),
+        }
+    }
+
+    // the agent: claude, limited to agent-browser, in the evidence folder
+    if std::fs::create_dir_all(&req.evidence).is_err() {
+        return failed(format!("cannot create {}", req.evidence.display()));
+    }
+    let name = format!(
+        "{}.{}",
+        match req.phase {
+            Phase::Before => "before",
+            Phase::After => "after",
+        },
+        match req.shot {
+            Shot::Video => "mp4",
+            Shot::Screenshot => "png",
+        }
+    );
+    let out_file = req.evidence.join(&name);
+    let prompt = capture_prompt(
+        &guide,
+        req.phase,
+        req.shot,
+        &req.intent,
+        &base_url,
+        &out_file,
+        req.before.as_ref(),
+    );
+    let mut args: Vec<String> = [
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "Bash",
+        "--allowedTools",
+        "Bash(agent-browser:*)",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    if !managed_mcp {
+        args.push("--strict-mcp-config".into());
+    }
+    args.extend(["-p".to_string(), prompt]);
+    progress("the agent is reproducing it".into());
+    let mut cmd = r.cmd(&r.claude);
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.args(&args)
+            .current_dir(&req.evidence)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return failed(format!("claude: {e}")),
+    };
+    let pgid = child.id() as i32;
+    if let Ok(mut s) = state.lock() {
+        s.agent_pgid = Some(pgid);
+    }
+    // a watchdog: an agent that never finishes is stopped
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + AGENT_LIMIT;
+            while std::time::Instant::now() < until {
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            stop_group(pgid);
+        });
+    }
+    let mut steps: Vec<String> = Vec::new();
+    let mut result = String::new();
+    if let Some(out) = child.stdout.take() {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            if let Some(step) = steps_from_stream(&line) {
+                steps.push(step);
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("type").and_then(|t| t.as_str()) == Some("result")
+            {
+                result = v
+                    .get("result")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+    }
+    let _ = child.wait();
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    if cancelled(state) {
+        return failed("cancelled".into());
+    }
+    let file = out_file.exists().then_some(name);
+    record(parse_outcome(req.phase, &result), file, steps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
