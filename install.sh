@@ -82,7 +82,8 @@ fail() { printf 'herdr-plugins: %s\n' "$*" >&2; exit 1; }
 answers_from=""
 case "${HERDR_PLUGINS_TTY:-}" in
   none) ;;
-  "") if { : </dev/tty; } 2>/dev/null; then answers_from=/dev/tty; fi ;;
+  # (in a subshell: a failed redirect on the builtin `:` would end a POSIX shell)
+  "") if (: </dev/tty) 2>/dev/null; then answers_from=/dev/tty; fi ;;
   *) answers_from=$HERDR_PLUGINS_TTY ;;
 esac
 [ -z "$setup" ] || [ -n "$answers_from" ] || fail "--setup needs a terminal to ask in"
@@ -276,9 +277,10 @@ install_pinned() { # <name>: download, check and unpack its pinned build into th
   fi
   mkdir -p "$bin"
   file="$tmp/$(basename "$url")"
-  if ! fetch "$url" "$file"; then
+  if ! fetch "$url" "$file" 2>/dev/null; then
     say "  $name: could not get $(basename "$url")${from:+ from $from}"
-    refused="$refused $name"
+    # --tools fails the run for it; in the walk-through only its tool is left off
+    [ -n "${walkthrough:-}" ] || refused="$refused $name"
     return 1
   fi
   if [ "$(sha256 "$file")" != "$want" ]; then
@@ -362,11 +364,11 @@ if [ "$os" = macos ]; then vm=Virtualization; else vm=containerd; fi
 # how missing programs are installed: Homebrew, then mise, then direct
 # downloads; offline (--from) only the pinned downloads in the --from folder
 if [ -z "$from" ] && command -v brew >/dev/null 2>&1; then
-  installer=brew label=Homebrew
+  installer=brew
 elif [ -z "$from" ] && command -v mise >/dev/null 2>&1; then
-  installer=mise label=mise
+  installer=mise
 else
-  installer=curl label="direct downloads"
+  installer=curl
 fi
 brew_bin=""
 if [ "$installer" = brew ]; then
@@ -395,6 +397,12 @@ present() { # <program>: on PATH, in one of those folders, or (gh-dash) a gh ext
     *) command -v "$check" >/dev/null 2>&1 || found_in "$check" >/dev/null ;;
   esac
 }
+pinned_available() { # <name>: a pinned build for this machine (offline: in the --from folder)
+  row=$(tool_rows | awk -v n="$1" -v p="$os-$arch" '$1 == n && $2 == p' | head -n 1)
+  [ -n "$row" ] || return 1
+  case "$row" in *needs=glibc*) [ "$libc" != musl ] || return 1 ;; esac
+  [ -z "$from" ] || [ -f "$from/$(basename "$(printf '%s\n' "$row" | awk '{ print $3 }')")" ]
+}
 method_of() { # <program>: how it installs here (brew:<formula>, mise:<tool>, pinned:<name>), or nothing
   brew_name=$(program_field "$1" 3)
   mise_name=$(program_field "$1" 4)
@@ -404,7 +412,8 @@ method_of() { # <program>: how it installs here (brew:<formula>, mise:<tool>, pi
   elif [ "$installer" = mise ] && [ -n "$mise_name" ] && [ "$mise_name" != - ]; then
     printf 'mise:%s\n' "$mise_name"
   elif [ "$curl_way" = pinned ]; then
-    printf 'pinned:%s\n' "$(program_field "$1" 2)"
+    pinned_name=$(program_field "$1" 2)
+    if pinned_available "$pinned_name"; then printf 'pinned:%s\n' "$pinned_name"; fi
   elif [ "${curl_way%%:*}" = gh-ext ]; then
     # a gh extension installs only through a signed-in gh, and needs the network
     if [ -z "$from" ] && gh_signed_in; then printf '%s\n' "$curl_way"; fi
@@ -446,6 +455,13 @@ sed_text() { printf '%s' "$1" | sed 's/[\\|&]/\\&/g'; }   # a sed s|..|..| repla
 write_toolbar() { # <file> <nerd|text> <tool id>...
   file=$1 mode=$2
   shift 2
+  # the bar's order is the owner's (toolbar/setup/order), not the list's
+  wanted=" $* "
+  set --
+  bar_order=$(grep -v '^#' "$catalog/order")
+  for id in $bar_order; do
+    case "$wanted" in *" $id "*) set -- "$@" "$id" ;; esac
+  done
   order=""
   for id in "$@"; do order="$order${order:+, }\"$id\""; done
   if [ "$mode" = nerd ]; then field=6; else field=7; fi
@@ -509,6 +525,7 @@ choose_tools() { # the list: numbers switch tools on and off until an empty answ
   done
 }
 setup_toolbar() {
+  walkthrough=1
   awk '!/^#/ && NF' "$catalog/tools" > "$tmp/setup-tools"
   count=$(wc -l < "$tmp/setup-tools" | tr -d ' ')
   : > "$tmp/setup-missing"
@@ -539,16 +556,36 @@ setup_toolbar() {
       done
     done < "$tmp/setup-tools"
     if [ -n "$offer" ]; then
-      printf '%s ' "Install what's missing with $label?$offer [Y/n]"
+      say "Install what's missing?"
+      by_brew="" by_mise="" by_pinned="" by_ghext="" by_script=""
+      for program in $offer; do
+        way=$(method_of "$program")
+        case "$way" in
+          brew:*) by_brew="$by_brew $program" ;;
+          mise:*) by_mise="$by_mise $program" ;;
+          pinned:*) by_pinned="$by_pinned $program" ;;
+          gh-ext:*) by_ghext="$by_ghext $program" ;;
+          script:*) by_script="$by_script
+  with its own installer (${way#script:}): $program" ;;
+        esac
+      done
+      [ -z "$by_brew" ] || say "  with Homebrew:$by_brew"
+      [ -z "$by_mise" ] || say "  with mise:$by_mise"
+      [ -z "$by_pinned" ] || say "  as direct downloads (pinned, checksum-checked):$by_pinned"
+      [ -z "$by_ghext" ] || say "  with gh extension install:$by_ghext"
+      # a program's own installer (a script from its site) last
+      [ -z "$by_script" ] || say "${by_script#?}"
+      printf '%s ' "[Y/n]"
       ask reply
       case "$reply" in
-        [Nn]*) ;;
-        *)
+        "" | [Yy]*)
           for program in $offer; do
             install_program "$program" || true
             present "$program" </dev/null || failed="$failed $program"
           done
           ;;
+        [Nn]*) ;;
+        *) say "  not installing (answer y to install, n to skip)" ;;
       esac
     fi
   fi

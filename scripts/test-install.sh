@@ -562,9 +562,7 @@ echo "$*" >> "$HOME/.mise-log"
 [ "$1 $2" = "use -g" ] || exit 0
 case "$3" in
   github:ankitpokhrel/jira-cli) prog=jira ;;
-  github:neovim/neovim) prog=nvim ;;
-  github:Byron/dua-cli) prog=dua ;;
-  github:cli/cli) prog=gh ;;
+  neovim) prog=nvim ;;
   *) prog=${3##*/} ;;
 esac
 shims="$HOME/.local/share/mise/shims"
@@ -597,7 +595,7 @@ run_online "$h" "$work/f27"
 unset TTY
 if grep -q 'install ankitpokhrel/jira-cli/jira-cli' "$h/.brew-log" 2>/dev/null && grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null; then
   case "$out" in
-    *"Install what's missing with Homebrew?"*) pass "Homebrew installs what is missing" ;;
+    *"  with Homebrew: "*"jira-cli"*) pass "Homebrew installs what is missing" ;;
     *) flunk "Homebrew installs what is missing" "no question: $out" ;;
   esac
 else
@@ -650,7 +648,7 @@ run_online "$h" "$work/f30:$h/.local/share/mise/shims"
 unset TTY
 if grep -q 'use -g github:ankitpokhrel/jira-cli' "$h/.mise-log" 2>/dev/null && grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null; then
   case "$out" in
-    *"Install what's missing with mise?"*) pass "mise when there is no Homebrew" ;;
+    *"  with mise: "*"jira-cli"*) pass "mise when there is no Homebrew" ;;
     *) flunk "mise when there is no Homebrew" "no question: $out" ;;
   esac
 else
@@ -789,7 +787,7 @@ chmod +x "$HOME/.local/bin/terminal-browser"
 EOF
 h="$work/h36"
 mkdir -p "$h"
-answers "$work/a36" "2 3 4 7 9" "" "y" ""
+answers "$work/a36" "2 3 4 8 9" "" "y" ""
 TTY="$work/a36" TB="file://$work/tb-install"
 run_online "$h" -
 unset TTY TB
@@ -810,6 +808,93 @@ if ! grep -q '^id *= *"browser"' "$(toml "$h")" 2>/dev/null; then
   esac
 else
   flunk "offline, terminal-browser needs the network" "Browser added offline: $out"
+fi
+
+# --- review fixes
+# 37. no terminal at all (CI, Docker, ssh host 'curl … | sh'): no questions, and
+# the install carries on, under sh and under dash (Linux's sh)
+notty() { python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
+for shell in sh dash; do
+  shell_path=$(command -v "$shell") || continue
+  h="$work/h37-$shell"
+  mkdir -p "$h"
+  out=$(notty env -i HOME="$h" PATH="$base_path" HERDR_PLUGINS_TOOLS_MANIFEST="$work/good" \
+    "$shell_path" "$rel/install.sh" --from "$rel" </dev/null 2>&1)
+  status=$?
+  if [ $status -eq 0 ] && grep -q '^order *= *\["intents", "terminal"\]' "$(toml "$h")" 2>/dev/null; then
+    pass "no terminal at all ($shell): installs without questions"
+  else
+    flunk "no terminal at all ($shell): installs without questions" "exit $status: $out"
+  fi
+done
+
+# 38. offline, Enter offers only what the --from folder holds; nothing fails
+h="$work/h38"
+mkdir -p "$h"
+mv "$rel/gh-fake.tar.gz" "$work/gh-fake.tar.gz.aside"
+answers "$work/a38" "" "" ""
+TTY="$work/a38"
+run "$h" - "$work/good"
+unset TTY
+mv "$work/gh-fake.tar.gz.aside" "$rel/gh-fake.tar.gz"
+case "$status:$out" in
+  0:*"left off: GitHub issues (needs gh, gh-dash)"*)
+    case "$out" in
+      *"cp: "* | *"not installed:"*) flunk "offline: only what the folder holds" "an error: $out" ;;
+      *) pass "offline: only what the folder holds" ;;
+    esac ;;
+  *) flunk "offline: only what the folder holds" "exit $status: $out" ;;
+esac
+
+# 39. the install question names how each program installs
+h="$work/h39"
+mkdir -p "$h"
+fake_installers "$work/f39" - yes
+fake_gh "$work/f39" 0
+answers "$work/a39" "" "n" ""
+TTY="$work/a39"
+run_online "$h" "$work/f39"
+unset TTY
+case "$out" in
+  *"  with mise: "*"  with gh extension install: gh-dash"*"  with its own installer (https://terminal-browser.sh/install): terminal-browser"*)
+    pass "the install question names each channel" ;;
+  *) flunk "the install question names each channel" "$out" ;;
+esac
+
+# 40. an answer that is neither yes nor no installs nothing
+h="$work/h40"
+mkdir -p "$h"
+fake_installers "$work/f40" 0 no
+answers "$work/a40" "" "skip" ""
+TTY="$work/a40"
+run_online "$h" "$work/f40"
+unset TTY
+if ! grep -q install "$h/.brew-log" 2>/dev/null; then
+  case "$out" in
+    *"not installing"*) pass "an unclear answer installs nothing" ;;
+    *) flunk "an unclear answer installs nothing" "no note: $out" ;;
+  esac
+else
+  flunk "an unclear answer installs nothing" "brew: $(cat "$h/.brew-log")"
+fi
+
+# 41. the list follows the agreed mock-up (Browser, then Browser in toolbar);
+# the bar keeps the owner's order
+h="$work/h41"
+mkdir -p "$h"
+mkdir -p "$work/f41"
+fake_bin "$work/f41/terminal-browser" terminal-browser
+answers "$work/a41" "7" "" "n" ""
+TTY="$work/a41"
+run "$h" "$work/f41" "$work/good" --tools
+unset TTY
+if grep -q '^order *= *\["intents", "db", "files", "web", "editor", "browser", "usage", "terminal"\]' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"[x] 6  Browser "*"[ ] 7  Browser in toolbar"*) pass "list in the mock-up's order, bar in the owner's" ;;
+    *) flunk "list in the mock-up's order, bar in the owner's" "list: $out" ;;
+  esac
+else
+  flunk "list in the mock-up's order, bar in the owner's" "$(grep '^order' "$(toml "$h")" 2>&1): $out"
 fi
 
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"
