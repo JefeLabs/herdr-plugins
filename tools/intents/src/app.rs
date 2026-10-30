@@ -433,6 +433,9 @@ pub struct App {
     pr_titles: HashMap<(PathBuf, String), String>,
     /// Artifacts found in the selected intent's repo, cached per path.
     found_cache: Option<(PathBuf, Vec<crate::store::Artifact>)>,
+    /// Unacknowledged criteria per intent, by its change stamp (reading the
+    /// transcript to tell is too slow for every card on every frame).
+    unread_cache: std::cell::RefCell<HashMap<PathBuf, (chrono::DateTime<chrono::Local>, usize)>>,
     pub layout: Layout,
     pub sort: SortOrder,
     pub filter: ListFilter,
@@ -534,6 +537,7 @@ impl App {
             demos_selected: 0,
             pr_titles: HashMap::new(),
             found_cache: None,
+            unread_cache: std::cell::RefCell::new(HashMap::new()),
             layout: Layout::Tree,
             sort: SortOrder::Updated,
             filter: ListFilter::All,
@@ -860,7 +864,42 @@ impl App {
                 None
             };
         }
-        crate::progress::Evidence { plans, prs }
+        // missing items still open (a deleted one is not: deleting dismisses it)
+        let open_missing = it
+            .fm
+            .missing
+            .iter()
+            .filter(|l| {
+                self.intent_by_stem(&l.stem)
+                    .is_some_and(crate::check::item_is_open)
+            })
+            .count();
+        let unacknowledged = {
+            let stamp = crate::store::stamp(it);
+            let mut cache = self.unread_cache.borrow_mut();
+            match cache.get(&it.path) {
+                Some((s, n)) if *s == stamp => *n,
+                _ => {
+                    let n = crate::store::new_criteria(it).len();
+                    cache.insert(it.path.clone(), (stamp, n));
+                    n
+                }
+            }
+        };
+        let check_dir = crate::check::checks_dir(it);
+        let checking = crate::capture::is_running(&check_dir).then(|| {
+            (
+                crate::check::proof_so_far(&check_dir),
+                crate::store::criteria(&it.body).len(),
+            )
+        });
+        crate::progress::Evidence {
+            plans,
+            prs,
+            open_missing,
+            unacknowledged,
+            checking,
+        }
     }
 
     fn poller(&mut self) -> &mut crate::progress::Poller {
@@ -875,6 +914,17 @@ impl App {
     }
 
     /// Every intent in the tree, whatever the list's filter.
+    /// The intent with this file stem in the tree, without copying the tree.
+    fn intent_by_stem(&self, stem: &str) -> Option<&Intent> {
+        fn walk<'a>(g: &'a Group, stem: &str) -> Option<&'a Intent> {
+            g.intents
+                .iter()
+                .find(|i| i.stem() == stem)
+                .or_else(|| g.groups.iter().find_map(|sub| walk(sub, stem)))
+        }
+        walk(&self.tree, stem)
+    }
+
     fn all_intents(&self) -> Vec<Intent> {
         fn all(g: &Group, out: &mut Vec<Intent>) {
             out.extend(g.intents.iter().cloned());
@@ -9715,6 +9765,77 @@ mod tests {
         let row = fx.app.view().evidence[0].clone();
         assert_eq!(row.mark, "!", "{row:?}");
         assert!(row.label.contains("interrupted"), "{row:?}");
+    }
+
+    #[test]
+    fn evidence_counts_open_missing_items_and_unread_criteria() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let it = fx.app.selected_intent().unwrap().clone();
+        let group = it
+            .path
+            .parent()
+            .unwrap()
+            .strip_prefix(fx.app.store.root())
+            .unwrap()
+            .to_path_buf();
+        let open = fx
+            .app
+            .store
+            .create(
+                &group,
+                "the email names the meeting",
+                "issue",
+                "## Acceptance criteria\n- [ ] the email names the meeting\n",
+                None,
+            )
+            .unwrap();
+        let done = fx
+            .app
+            .store
+            .create(
+                &group,
+                "admins get nothing",
+                "issue",
+                "## Acceptance criteria\n- [x] admins get nothing\n",
+                None,
+            )
+            .unwrap();
+        Store::update_fields(&it.path, |fm| {
+            fm.state = State::Sent;
+            fm.acknowledged = Some(Vec::new());
+            fm.missing = vec![
+                crate::store::MissingLink {
+                    stem: open.stem(),
+                    key: "k2".into(),
+                    rechecked: false,
+                },
+                crate::store::MissingLink {
+                    stem: done.stem(),
+                    key: "k3".into(),
+                    rechecked: false,
+                },
+                crate::store::MissingLink {
+                    stem: "gone".into(),
+                    key: "k4".into(),
+                    rechecked: false,
+                },
+            ];
+        })
+        .unwrap();
+        fx.app.rescan();
+        let it = Store::load(&it.path).unwrap();
+        let ev = fx.app.evidence_for(&it);
+        assert_eq!(
+            ev.open_missing, 1,
+            "the done one and the deleted one are not open"
+        );
+        assert_eq!(
+            ev.unacknowledged,
+            crate::store::criteria(&it.body).len(),
+            "none acknowledged"
+        );
+        assert_eq!(ev.checking, None);
     }
 
     #[test]

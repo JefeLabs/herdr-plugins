@@ -98,6 +98,7 @@ fn plans_sum_tasks() {
     let ev = Evidence {
         plans: vec![tasks(2, 4), tasks(1, 5)],
         prs: vec![],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- plan: a.md\n- plan: b.md\n", &ev);
     assert_eq!(label, "building 3/9");
@@ -109,6 +110,7 @@ fn a_plan_without_tasks_counts_as_planned() {
     let ev = Evidence {
         plans: vec![tasks(0, 0)],
         prs: vec![],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- plan: a.md\n", &ev);
     assert!(close(fill, 3.0), "{fill}");
@@ -129,6 +131,7 @@ fn an_unreadable_plan_shows_a_question_mark() {
             tasks(1, 2),
         ],
         prs: vec![],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- plan: a.md\n- plan: b.md\n", &ev);
     assert_eq!(label, "building ?");
@@ -143,6 +146,7 @@ fn an_open_pr_skips_missing_plan_stages() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(5830, PrState::Open)],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- pr: #5830\n", &ev);
     assert!(close(fill, 7.0), "{fill}");
@@ -154,6 +158,7 @@ fn an_unknown_pr_state_shows_no_state_word() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(7, PrState::Unknown)],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- pr: #7\n", &ev);
     assert!(close(fill, 7.0), "still past planning: {fill}");
@@ -161,6 +166,7 @@ fn an_unknown_pr_state_shows_no_state_word() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(1, PrState::Merged), (2, PrState::Unknown)],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- pr: #1\n- pr: #2\n", &ev);
     assert!(close(fill, 7.0));
@@ -176,6 +182,7 @@ fn several_prs_read_merged_count() {
             (2, PrState::Open),
             (3, PrState::Closed),
         ],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- pr: #1\n- pr: #2\n- pr: #3\n", &ev);
     assert_eq!(label, "PRs 1/2 merged");
@@ -187,6 +194,7 @@ fn only_closed_prs_count_as_none() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(3, PrState::Closed)],
+        ..Default::default()
     };
     let (fill, label, _) = p("## Artifacts\n- pr: #3\n", &ev);
     assert!(close(fill, 1.0));
@@ -198,6 +206,7 @@ fn merged_reads_verifying() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(1, PrState::Merged)],
+        ..Default::default()
     };
     let body = format!("{TWO_CRITERIA_ONE_TICKED}\n## Artifacts\n- pr: #1\n");
     let (fill, label, complete) = p(&body, &ev);
@@ -228,6 +237,7 @@ fn no_criteria_after_merge_says_so() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(1, PrState::Merged)],
+        ..Default::default()
     };
     let (fill, label, complete) = p("## Artifacts\n- pr: #1\n", &ev);
     assert!(close(fill, 8.0));
@@ -477,6 +487,7 @@ fn slices_not_yet_planned_hold_the_bar_at_building() {
     let ev = Evidence {
         plans: vec![slice1, to_plan, to_plan, to_plan, to_plan],
         prs: vec![(1, PrState::Merged)],
+        ..Default::default()
     };
     let (_tmp, it) = intent(
         State::Sent,
@@ -658,6 +669,7 @@ fn without_a_ledger_building_shows_no_count_and_no_share() {
     let ev = Evidence {
         plans: vec![tasks(2, 8), uncounted],
         prs: vec![],
+        ..Default::default()
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- plan: a.md\n- plan: b.md\n");
     let pr = progress(&it, &ev).unwrap();
@@ -674,6 +686,7 @@ fn segments_follow_the_stages_reached() {
     let ev = Evidence {
         plans: vec![tasks(1, 3)],
         prs: vec![],
+        ..Default::default()
     };
     let (_tmp, it) = intent(
         State::Sent,
@@ -694,6 +707,7 @@ fn segments_follow_the_stages_reached() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(1, PrState::Merged)],
+        ..Default::default()
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
     let pr = progress(&it, &ev).unwrap();
@@ -787,6 +801,7 @@ fn building_holds_one_block_per_sized_plan() {
             (5831, PrState::Merged),
             (5832, PrState::Open),
         ],
+        ..Default::default()
     };
     let (_tmp, it) = intent(
         State::Sent,
@@ -806,6 +821,7 @@ fn building_holds_one_block_per_sized_plan() {
             pr: None,
         }],
         prs: vec![],
+        ..Default::default()
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- plan: p.md\n");
     assert_eq!(
@@ -827,6 +843,7 @@ fn blocks_touch_and_borders_show_where_they_meet() {
     let ev = Evidence {
         plans: vec![],
         prs: vec![(1, PrState::Open)],
+        ..Default::default()
     };
     let (_tmp, it) = intent(State::Sent, "## Artifacts\n- pr: #1\n");
     let (glyphs, kinds) = bar_of(&progress(&it, &ev).unwrap());
@@ -853,4 +870,66 @@ fn a_workbrokr_branch_names_its_area() {
     assert_eq!(branch_area("main"), None);
     assert_eq!(branch_area("feature/no-area-marker"), None);
     assert_eq!(branch_area("changeset-release/develop"), None);
+}
+
+const ALL_TICKED_ONE_PR: &str =
+    "## Acceptance criteria\n- [x] one\n- [x] two\n\n## Artifacts\n- pr: #1\n";
+
+#[test]
+fn complete_needs_merged_prs_no_open_items_and_everything_read() {
+    let merged = Evidence {
+        prs: vec![(1, PrState::Merged)],
+        ..Default::default()
+    };
+    let (_, label, complete) = p(ALL_TICKED_ONE_PR, &merged);
+    assert!(complete, "{label}");
+    assert_eq!(label, "✓ complete");
+
+    let open = Evidence {
+        prs: vec![(1, PrState::Open)],
+        ..Default::default()
+    };
+    let (_, _, complete) = p(ALL_TICKED_ONE_PR, &open);
+    assert!(!complete, "a PR still open");
+
+    let missing = Evidence {
+        open_missing: 1,
+        ..merged.clone()
+    };
+    let (_, label, complete) = p(ALL_TICKED_ONE_PR, &missing);
+    assert!(!complete, "a missing item open");
+    assert!(label.ends_with("· 1 missing"), "{label}");
+
+    let unread = Evidence {
+        unacknowledged: 2,
+        ..merged
+    };
+    let (_, label, complete) = p(ALL_TICKED_ONE_PR, &unread);
+    assert!(!complete, "criteria nobody read");
+    assert_eq!(label, "✓ 2/2 · 2 new to read");
+}
+
+#[test]
+fn the_card_says_checking_while_a_check_runs() {
+    let ev = Evidence {
+        prs: vec![(1, PrState::Merged)],
+        checking: Some((2, 5)),
+        ..Default::default()
+    };
+    let (_, label, _) = p(ALL_TICKED_ONE_PR, &ev);
+    assert_eq!(label, "checking 2/5");
+}
+
+#[test]
+fn the_card_counts_open_missing_items() {
+    let ev = Evidence {
+        prs: vec![(1, PrState::Merged)],
+        open_missing: 2,
+        ..Default::default()
+    };
+    let (_, label, _) = p(
+        "## Acceptance criteria\n- [x] one\n- [ ] two\n\n## Artifacts\n- pr: #1\n",
+        &ev,
+    );
+    assert_eq!(label, "verifying 1/2 · 2 missing");
 }

@@ -188,6 +188,37 @@ pub fn require_proof(
         .collect()
 }
 
+/// How many criteria a running check has kept proof for so far: proof files
+/// written since its runner took the lock.
+pub fn proof_so_far(check_dir: &Path) -> usize {
+    let Some(started) = std::fs::metadata(check_dir.join(".capture.lock"))
+        .and_then(|m| m.modified())
+        .ok()
+    else {
+        return 0;
+    };
+    let mut numbers: Vec<usize> = std::fs::read_dir(check_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t >= started)
+        })
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let n = name
+                .strip_suffix(".png")
+                .or_else(|| name.strip_suffix(".log.txt"))?;
+            n.parse::<usize>().ok()
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers.len()
+}
+
 /// Where an intent's check results and proof live.
 pub fn checks_dir(it: &Intent) -> PathBuf {
     it.assets_dir().join("checks")

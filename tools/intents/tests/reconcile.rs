@@ -22,6 +22,7 @@ fn ev(prs: &[(u64, PrState)]) -> Evidence {
     Evidence {
         plans: vec![],
         prs: prs.to_vec(),
+        ..Default::default()
     }
 }
 
