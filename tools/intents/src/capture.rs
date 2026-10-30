@@ -533,6 +533,32 @@ fn run(
             "this claude cannot confine the capture agent (it needs --restricted and --permission-mode dontAsk): update claude".into(),
         );
     }
+    // a check: which criteria, and where its proof goes
+    let (mode, check_dir, items) = match &req.job {
+        Job::Capture => (crate::capture_mcp::Mode::Capture, None, Vec::new()),
+        Job::Check {
+            keys,
+            check_dir,
+            intent_path,
+            ..
+        } => {
+            let body = crate::store::Store::load(intent_path)
+                .map(|it| it.body)
+                .unwrap_or_default();
+            let items = crate::check::items(&body, keys.as_deref());
+            if items.is_empty() {
+                return failed("no acceptance criteria to check".into());
+            }
+            if std::fs::create_dir_all(check_dir).is_err() {
+                return failed(format!("cannot create {}", check_dir.display()));
+            }
+            (
+                crate::capture_mcp::Mode::Check,
+                Some(check_dir.clone()),
+                items,
+            )
+        }
+    };
     let task = format!("evidence-{}", req.n);
     let mut refused: Vec<String> = Vec::new();
     let mut area: Option<String> = None;
@@ -630,32 +656,6 @@ fn run(
         }
     }
 
-    // a check: which criteria, and where its proof goes
-    let (mode, check_dir, items) = match &req.job {
-        Job::Capture => (crate::capture_mcp::Mode::Capture, None, Vec::new()),
-        Job::Check {
-            keys,
-            check_dir,
-            intent_path,
-            ..
-        } => {
-            let body = crate::store::Store::load(intent_path)
-                .map(|it| it.body)
-                .unwrap_or_default();
-            let items = crate::check::items(&body, keys.as_deref());
-            if items.is_empty() {
-                return failed("no acceptance criteria to check".into());
-            }
-            if std::fs::create_dir_all(check_dir).is_err() {
-                return failed(format!("cannot create {}", check_dir.display()));
-            }
-            (
-                crate::capture_mcp::Mode::Check,
-                Some(check_dir.clone()),
-                items,
-            )
-        }
-    };
     let log_files = if check_dir.is_some() {
         match crate::check::log_paths(Path::new(&worktree), &guide.logs)
             .and_then(|paths| inside_worktree(Path::new(&worktree), paths))
