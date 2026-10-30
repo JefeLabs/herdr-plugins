@@ -22,22 +22,39 @@ struct Server {
 
 impl Server {
     fn start(shot: &str) -> Server {
-        let tmp = tempfile::tempdir().unwrap();
+        Server::spawn(tempfile::tempdir().unwrap(), shot, json!({}))
+    }
+
+    /// A completion check's server, with `logs` as `[{path, from}]`.
+    fn check(tmp: tempfile::TempDir, logs: Value) -> Server {
+        let check_dir = tmp.path().join("with space/checks");
+        fs::create_dir_all(&check_dir).unwrap();
+        Server::spawn(
+            tmp,
+            "screenshot",
+            json!({"mode": "check", "check_dir": check_dir, "logs": logs}),
+        )
+    }
+
+    fn check_dir(&self) -> PathBuf {
+        self._tmp.path().join("with space/checks")
+    }
+
+    fn spawn(tmp: tempfile::TempDir, shot: &str, extra: Value) -> Server {
         let evidence = tmp.path().join("with space/evidence");
         fs::create_dir_all(&evidence).unwrap();
         let config = tmp.path().join("mcp.json");
-        fs::write(
-            &config,
-            json!({
-                "base_url": BASE,
-                "session": "capture-x-1",
-                "evidence": evidence,
-                "phase": "before",
-                "shot": shot,
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let mut cfg = json!({
+            "base_url": BASE,
+            "session": "capture-x-1",
+            "evidence": evidence,
+            "phase": "before",
+            "shot": shot,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            cfg[k] = v.clone();
+        }
+        fs::write(&config, cfg.to_string()).unwrap();
         let log = tmp.path().join("ab.log");
         let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-intents"))
             .args(["capture-mcp", &config.display().to_string()])
@@ -213,4 +230,116 @@ fn a_screenshot_capture_gets_a_screenshot_tool() {
         s.log().last().unwrap(),
         &format!("[--session][capture-x-1][screenshot][{out}]")
     );
+}
+
+/// A backend log with one email before the agent started and one after;
+/// returns (tmp, log path, the offset at agent start).
+fn a_log() -> (tempfile::TempDir, PathBuf, u64) {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("wt/.logs/backend.log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, "INFO seed: To: kathia@old.example\nSubject: Seeded\n").unwrap();
+    let from = fs::metadata(&log).unwrap().len();
+    let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+    writeln!(
+        f,
+        "INFO email sent\nTo: kathia@x.example\nSubject: Meeting request\nBody: please book"
+    )
+    .unwrap();
+    writeln!(f, "INFO unrelated").unwrap();
+    (tmp, log, from)
+}
+
+#[test]
+fn a_check_gets_per_criterion_screenshots_and_logs() {
+    let (tmp, log, from) = a_log();
+    let mut s = Server::check(tmp, json!([{"path": log, "from": from}]));
+    s.open();
+    assert_eq!(s.tools(), ["browser", "screenshot", "logs"]);
+
+    let (err, text) = s.call("screenshot", json!({"criterion": 2}));
+    assert!(!err, "{text}");
+    let shot = s.check_dir().join("2.png").display().to_string();
+    assert_eq!(
+        s.log().last().unwrap(),
+        &format!("[--session][capture-x-1][screenshot][{shot}]")
+    );
+
+    let (err, text) = s.call("logs", json!({"criterion": 2, "pattern": "to: KATHIA"}));
+    assert!(!err, "{text}");
+    assert!(text.contains("To: kathia@x.example"), "{text}");
+    assert!(
+        text.contains("Subject: Meeting request"),
+        "the lines after it: {text}"
+    );
+    assert!(
+        !text.contains("old.example"),
+        "only what was logged since the start: {text}"
+    );
+    let proof = fs::read_to_string(s.check_dir().join("2.log.txt")).unwrap();
+    assert!(proof.contains("Subject: Meeting request"), "{proof}");
+
+    let (err, text) = s.call(
+        "logs",
+        json!({"criterion": 3, "pattern": "nothing like this"}),
+    );
+    assert!(!err, "{text}");
+    assert!(text.contains("no lines"), "{text}");
+    assert!(
+        !s.check_dir().join("3.log.txt").exists(),
+        "no proof without a match"
+    );
+
+    let (err, _) = s.call("screenshot", json!({}));
+    assert!(err, "a check's screenshot needs its criterion");
+}
+
+#[test]
+fn a_truncated_log_is_read_from_the_start() {
+    let (tmp, log, _) = a_log();
+    let mut s = Server::check(tmp, json!([{"path": log, "from": 1_000_000}]));
+    s.open();
+    let (err, text) = s.call(
+        "logs",
+        json!({"criterion": 1, "pattern": "Meeting request"}),
+    );
+    assert!(!err && text.contains("Subject: Meeting request"), "{text}");
+}
+
+#[test]
+fn logs_only_reads_the_listed_files() {
+    let (tmp, log, from) = a_log();
+    let mut s = Server::check(tmp, json!([{"path": log, "from": from}]));
+    s.open();
+    let (_, text) = s.call(
+        "logs",
+        json!({"criterion": 1, "pattern": "../../etc/passwd"}),
+    );
+    assert!(
+        text.contains("no lines") && !text.contains("root:"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_check_with_no_logs_has_no_logs_tool() {
+    let mut s = Server::check(tempfile::tempdir().unwrap(), json!([]));
+    s.open();
+    assert_eq!(s.tools(), ["browser", "screenshot"]);
+    let (err, _) = s.call("logs", json!({"criterion": 1, "pattern": "x"}));
+    assert!(err);
+}
+
+#[test]
+fn a_symlinked_log_is_not_followed() {
+    let (tmp, log, _) = a_log();
+    let outside = tmp.path().join("outside.txt");
+    fs::write(&outside, "Subject: secret\n").unwrap();
+    let link = tmp.path().join("wt/.logs/link.log");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let _ = log;
+    let mut s = Server::check(tmp, json!([{"path": link, "from": 0}]));
+    s.open();
+    let (_, text) = s.call("logs", json!({"criterion": 1, "pattern": "secret"}));
+    assert!(!text.contains("Subject: secret"), "{text}");
 }

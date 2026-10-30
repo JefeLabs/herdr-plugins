@@ -98,7 +98,7 @@ The Artifacts pane (`V`) lists what the agents produced for the intent: specs, p
 
 The Pull requests section lists each `pr:` line with its state from `gh` (`merged`, `open`, `closed`, or `…` until `gh` has answered) and its title, and counts them in its title (`Pull requests (6/7 merged)`). Pull requests the repo search found by the intent's spec and plan names, but no `pr:` line names, follow dimmed as found (`merged? #5840 …`); `L` links one, and it keeps the state and title the search gave until `gh` is asked about it. `Enter` or `o` opens a pull request in the browser. In Pull requests and Demo Videos, `a` adds a line of that kind without typing it (`#123`, or `story-id (criteria: 1, 4)`).
 
-Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent by conversation, filed in the selected group (see Adding an intent), `n` new group, `M` move the selected intent or group (type the target group path), `K` cycle kind (bug, refactor, feature, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` polish with the agent, `m` choose the agent and model, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a feature's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `D` delete an intent that has not been sent (after a y/n question; see below), `E` capture a bug again (see Evidence for bugs), `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
+Browse: `j`/`k` move, `h`/`l` collapse/expand a group (sub-groups start collapsed and open one level at a time), `Enter`/`e` edit, `a` add an intent by conversation, filed in the selected group (see Adding an intent), `n` new group, `M` move the selected intent or group (type the target group path), `K` cycle kind (bug, refactor, feature, idea), `R` ready (refused while any question is unanswered), `U` back to refining, `p` polish with the agent, `m` choose the agent and model, `Tab` move between panes, `t` rename (a bug's title says what goes wrong and when, a feature's who can do what, an idea's the idea itself), `Q` jump to questions, `C` jump to criteria, `s` send, `A` attach a file (type or paste its path), `o` open the first attachment, `D` delete an intent that has not been sent (after a y/n question; see below), `E` capture a bug again (see Evidence for bugs), `X` check a sent intent's acceptance criteria (see Completion check), `r` rescan, `q` quit. A file that fails to parse shows as a `!` row with its error.
 
 `D` deletes the selected intent after asking. Nothing is lost for good: the intent's file, its conversation (`.chat.md`), its attachments and its agent folder move to `.trash/<date-time>-<name>/` in the intents folder, with `from.txt` naming the group it came from; move the files back to restore it. An intent that has been sent is refused, since an agent is working from it. With the mouse, a click selects a row in the tree, a click on the selected group opens or closes it, and the wheel moves the selection.
 
@@ -216,9 +216,48 @@ Keep passwords out of it: the agent signs in the way a person does on a local st
 
 **The Evidence section.** It follows Artifacts in every intent's detail pane (`Tab` reaches it). One row per capture: `before` or `after`, `video` or `screenshot`, and the agent's line, marked `…` running, `✓` reproduced or fixed, `✗` still broken, `·` couldn't reproduce, `!` failed or interrupted; `⚠` adds anything to act on, such as a `work finish` that failed. `Enter` opens the file in Chrome (on Linux, with `xdg-open`). `c` copies the file itself: on macOS, ⌘V into a GitHub comment uploads it; over SSH, or off macOS, it copies the path. `Y` copies the path. `E` (here, in the tree or on a card) captures the selected bug again: a "before" until one reproduced it, then an "after". It refuses while a capture of that intent is running.
 
-**After the fix.** When every pull request of a sent bug has merged and its "before" reproduced the bug, the tool runs the same steps on a fresh stack: an "after", once per merged set of pull requests. Its row reads `✓ after · … · fixed: …` or `✗ after · … · still broken: …`. Besides `pr:` lines and the spec and plan names, pull requests are found through the intent's `issue:` lines: the ones GitHub links as closing the issue ("Fixes #n").
+**After the fix.** When every pull request of a sent bug has merged and its "before" reproduced the bug, the completion check that follows the reconcile (see Completion check) also runs the same steps on its fresh stack: an "after", once per merged set of pull requests (a bug with no acceptance criteria gets the after on its own). Its row reads `✓ after · … · fixed: …` or `✗ after · … · still broken: …`. Besides `pr:` lines and the spec and plan names, pull requests are found through the intent's `issue:` lines: the ones GitHub links as closing the issue ("Fixes #n").
 
 **Where the files are.** Until the bug has an issue, its captures sit in its agent folder, `.polish/<name>/evidence/`: `before.mp4` or `before.png`, and `before.json` with the result and the `browser` calls the agent made (the same for `after`). Once an `issue:` line names the filed issue, they move into the intent's attachments, `<name>.assets/evidence/`. A hand-off lists the captures wherever they are, so the agent filing the issue can use the screenshot as the issue's picture and ask you to paste the video. `D` takes them to the trash with the intent.
+
+## Completion check
+
+A sent intent reads `✓ complete` when every acceptance criterion is ticked, every pull request has merged, no missing item is open and you have read every criterion. A completion check does the ticking for you: an agent tries each criterion in the running app, on a fresh local stack, and ticks the ones it can prove.
+
+**When it runs.** `X` (in the tree, on a card, or in Acceptance criteria) checks the selected sent intent now. A check also runs by itself once every pull request has merged and the reconcile for that set has been applied, once per merged set and one check at a time per repo. The reconcile goes first because it may reword the criteria. The first time the tool starts with this feature, every merged set already reconciled counts as checked, so there is no backlog of stacks.
+
+**How it checks.** It uses evidence capture's machinery: its own process, its own `work` stack seeded by the guide, and the same agent with no shell. Its tools are:
+- `browser`;
+- a `screenshot` per criterion;
+- when the guide lists `logs:` (paths under the stack's worktree, such as `.logs/backend.log`), a `logs` tool that searches those files. It returns only what was logged after the agent started, so the seed's own output proves nothing. A log path that is a symlink or leads out of the worktree is refused.
+
+The agent ends with one line per criterion:
+- `<n>: confirmed: …`;
+- `<n>: fails: …` (built, but wrong);
+- `<n>: missing: …` (not built);
+- `<n>: can't check: …`.
+
+A `confirmed` counts only with proof kept in that run (the criterion's screenshot or log lines); otherwise it reads `can't check: no proof kept`. For a criterion that fails or is missing the agent keeps proof of what it saw instead, which goes to the missing item. A check's agent may run 10 minutes plus 3 per criterion (5 more when it records a bug's after). A run whose agent gives no answers at all (it timed out, or claude failed) applies nothing, so the check runs again later.
+
+**Ticks.**
+- A check ticks the criteria it confirmed and records that it did.
+- It never unticks one you ticked. If one of yours fails, it shows `✗` beside your tick and still files a missing item.
+- It unticks only its own ticks, when a later check fails them.
+- When you untick a check's tick, no check ticks that criterion again.
+
+**Missing items / Bugs.** Each criterion that fails or is missing becomes a new intent in the same group:
+- a bug for `fails`, a feature for `missing`;
+- created as refining, with the criterion as its one criterion and the proof in its attachments;
+- listed in the original's **Missing items / Bugs** section, after Pull requests: `✓` closed, `→` sent, `○` not yet. Enter goes to it.
+
+A later check that fails the same criterion adds its proof to the open item instead of filing another; one that fails after the item was completed files a new one. Deleting a missing item that is still open (`D`) dismisses that gap: later checks do not file it again. Deleting a done one only removes it, and a later failure of its criterion is filed anew. Once an item closes (its criterion ticked, by its own check or by you), the original re-checks just that criterion, once.
+
+**Where the results show.**
+- **Acceptance criteria:** the latest result sits beside each checkbox (`✓` confirmed, `✗` fails or missing, `?` can't check). The status line gives the selected criterion's finding and date, and `o` opens its proof.
+- **Evidence:** one row per criterion (`check · 3 · ✓ …`), with Enter, `c` and `Y` as for captures.
+- **The card:** reads `checking 2/5` while a check runs. It reads `✓ 5/5 · 2 new to read` when every criterion is ticked but some are unread (`Y` reads them), and adds `· 1 missing` while items are open.
+
+Results live in `<name>.assets/checks/` (`latest.json` and the proof files).
 
 ## List view
 

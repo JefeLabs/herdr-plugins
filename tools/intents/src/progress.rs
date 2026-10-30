@@ -128,6 +128,12 @@ pub struct Evidence {
     pub plans: Vec<PlanTasks>,
     /// One entry per `pr:` line whose number could be read.
     pub prs: Vec<(u64, PrState)>,
+    /// Missing items a completion check filed that are still open.
+    pub open_missing: usize,
+    /// Acceptance criteria not yet acknowledged by the owner.
+    pub unacknowledged: usize,
+    /// A completion check running: (criteria with proof so far, criteria).
+    pub checking: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,7 +264,7 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
     };
     let crit = criteria(&it.body);
     let ticked = crit.iter().filter(|c| c.done).count();
-    let complete = !crit.is_empty() && ticked == crit.len();
+    let all_ticked = !crit.is_empty() && ticked == crit.len();
     let verified = if crit.is_empty() {
         0.0
     } else {
@@ -272,6 +278,10 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         .filter(|(_, s)| *s != PrState::Closed)
         .collect();
     let merged = prs.iter().filter(|(_, s)| *s == PrState::Merged).count();
+    // complete: every criterion ticked, every pull request merged (none counts),
+    // no missing item open, and every criterion read by the owner
+    let shipped = merged == prs.len();
+    let complete = all_ticked && shipped && ev.open_missing == 0 && ev.unacknowledged == 0;
     // slices the spec plans for later hold the intent at building, even
     // once the planned slices' pull requests are open or merged
     let to_plan = ev.plans.iter().filter(|p| p.unplanned).count();
@@ -402,10 +412,25 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         plans,
         segments,
         fill: (base + verified).min(10.0),
-        label: if complete {
-            "✓ complete".to_string()
-        } else {
-            label
+        label: match ev.checking {
+            Some((done, total)) => format!("checking {done}/{total}"),
+            None if complete => "✓ complete".to_string(),
+            None => {
+                let label = if all_ticked && shipped && ev.open_missing == 0 {
+                    format!(
+                        "✓ {n}/{n} · {} new to read",
+                        ev.unacknowledged,
+                        n = crit.len()
+                    )
+                } else {
+                    label
+                };
+                if ev.open_missing > 0 {
+                    format!("{label} · {} missing", ev.open_missing)
+                } else {
+                    label
+                }
+            }
         },
         complete,
     })

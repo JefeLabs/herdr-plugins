@@ -47,6 +47,8 @@ pub struct CaptureGuide {
     pub url: String,
     /// Instructions for the agent: signing in, what to avoid.
     pub body: String,
+    /// Log files a completion check may search, relative to the stack's worktree.
+    pub logs: Vec<String>,
 }
 
 /// One capture, as written beside the evidence (`<phase>.json`).
@@ -81,6 +83,8 @@ struct GuideFront {
     #[serde(default)]
     seed: Vec<String>,
     url: String,
+    #[serde(default)]
+    logs: Vec<String>,
 }
 
 /// Reads `<repo>/.helmsmith/capture.md`: YAML front matter, then the body.
@@ -102,6 +106,7 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
         seed: front.seed,
         url: front.url,
         body: rest[end + "\n---\n".len()..].to_string(),
+        logs: front.logs,
     })
 }
 
@@ -263,12 +268,43 @@ pub struct CaptureRequest {
     pub n: u32,
     /// For an "after": the merged pull requests it checks.
     pub merged: Vec<u64>,
+    /// A capture (the default) or a completion check.
+    #[serde(default)]
+    pub job: Job,
+}
+
+/// What a run does.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Job {
+    /// Records a bug's before or after.
+    #[default]
+    Capture,
+    /// Checks the intent's acceptance criteria (`keys`: only those; `None`: all).
+    Check {
+        keys: Option<Vec<String>>,
+        check_dir: PathBuf,
+        intent_path: PathBuf,
+        root: PathBuf,
+    },
+}
+
+impl CaptureRequest {
+    /// The folder the run keeps its lock, order and log in: the check's
+    /// folder for a check, the evidence folder for a capture.
+    pub fn run_dir(&self) -> &Path {
+        match &self.job {
+            Job::Check { check_dir, .. } => check_dir,
+            Job::Capture => &self.evidence,
+        }
+    }
 }
 
 /// What a running capture reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CaptureUpdate {
     Progress(String),
+    /// A check's results, sent before `Done`.
+    Checked(crate::check::CheckRecord),
     Done(CaptureRecord),
 }
 
@@ -497,6 +533,32 @@ fn run(
             "this claude cannot confine the capture agent (it needs --restricted and --permission-mode dontAsk): update claude".into(),
         );
     }
+    // a check: which criteria, and where its proof goes
+    let (mode, check_dir, items) = match &req.job {
+        Job::Capture => (crate::capture_mcp::Mode::Capture, None, Vec::new()),
+        Job::Check {
+            keys,
+            check_dir,
+            intent_path,
+            ..
+        } => {
+            let body = crate::store::Store::load(intent_path)
+                .map(|it| it.body)
+                .unwrap_or_default();
+            let items = crate::check::items(&body, keys.as_deref());
+            if items.is_empty() {
+                return failed("no acceptance criteria to check".into());
+            }
+            if std::fs::create_dir_all(check_dir).is_err() {
+                return failed(format!("cannot create {}", check_dir.display()));
+            }
+            (
+                crate::capture_mcp::Mode::Check,
+                Some(check_dir.clone()),
+                items,
+            )
+        }
+    };
     let task = format!("evidence-{}", req.n);
     let mut refused: Vec<String> = Vec::new();
     let mut area: Option<String> = None;
@@ -594,6 +656,17 @@ fn run(
         }
     }
 
+    let log_files = if check_dir.is_some() {
+        match crate::check::log_paths(Path::new(&worktree), &guide.logs)
+            .and_then(|paths| inside_worktree(Path::new(&worktree), paths))
+        {
+            Ok(p) => p,
+            Err(e) => return failed(format!("the guide's logs: {e}")),
+        }
+    } else {
+        Vec::new()
+    };
+
     // the agent: claude with no shell, only the browser tools, in the evidence folder
     if std::fs::create_dir_all(&req.evidence).is_err() {
         return failed(format!("cannot create {}", req.evidence.display()));
@@ -608,6 +681,16 @@ fn run(
         evidence: req.evidence.clone(),
         phase: req.phase,
         shot: req.shot,
+        mode,
+        check_dir: check_dir.clone(),
+        // only what is logged from here on: the seed's lines are not the agent's
+        logs: log_files
+            .iter()
+            .map(|path| crate::capture_mcp::LogFile {
+                path: path.clone(),
+                from: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            })
+            .collect(),
     };
     let config_file = req.evidence.join(".capture-mcp.json");
     let written = serde_json::to_string(&mcp_config)
@@ -627,19 +710,28 @@ fn run(
         }
     })
     .to_string();
-    let allowed = crate::capture_mcp::tool_names(req.shot)
+    let allowed = crate::capture_mcp::tool_names(&mcp_config)
         .iter()
         .map(|t| format!("mcp__{server}__{t}"))
         .collect::<Vec<_>>()
         .join(",");
-    let prompt = capture_prompt(
-        &guide,
-        req.phase,
-        req.shot,
-        &req.intent,
-        &base_url,
-        req.before.as_ref(),
-    );
+    let prompt = match &req.job {
+        Job::Capture => capture_prompt(
+            &guide,
+            req.phase,
+            req.shot,
+            &req.intent,
+            &base_url,
+            req.before.as_ref(),
+        ),
+        Job::Check { .. } => crate::check::check_prompt(
+            &guide,
+            &items,
+            &req.intent,
+            &base_url,
+            req.before.as_ref().filter(|_| req.phase == Phase::After),
+        ),
+    };
     let mut args: Vec<String> = [
         "--output-format",
         "stream-json",
@@ -666,7 +758,11 @@ fn run(
     if cancelled(state) {
         return failed("cancelled".into());
     }
-    progress("the agent is reproducing it".into());
+    progress(match req.job {
+        Job::Capture => "the agent is reproducing it".into(),
+        Job::Check { .. } => "the agent is checking the criteria".into(),
+    });
+    let since = std::time::SystemTime::now();
     let mut cmd = r.cmd(&r.claude);
     {
         use std::os::unix::process::CommandExt;
@@ -693,10 +789,14 @@ fn run(
     }
     // a watchdog: an agent that never finishes is stopped
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let limit = match req.job {
+        Job::Capture => AGENT_LIMIT,
+        Job::Check { .. } => crate::check::check_limit(items.len(), req.phase == Phase::After),
+    };
     {
         let done = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
-            let until = std::time::Instant::now() + AGENT_LIMIT;
+            let until = std::time::Instant::now() + limit;
             while std::time::Instant::now() < until {
                 if done.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -737,8 +837,65 @@ fn run(
         .filter(|l| !l.trim().is_empty())
         .map(str::to_string)
         .collect();
+    if let Some(dir) = &check_dir {
+        let parsed = crate::check::parse_verdicts(&items, &result);
+        // no verdict at all (it timed out, or claude failed): nothing to apply,
+        // so the merged set is not spent and the check runs again later
+        let no_answer = crate::check::Verdict::CantCheck("no answer".into());
+        if parsed.iter().all(|(_, v)| *v == no_answer) {
+            // a bug's check keeps its after; the criteria wait for a later check
+            if req.phase != Phase::After {
+                return failed(
+                    "the agent gave no answers (it timed out or failed): X tries again".into(),
+                );
+            }
+        } else {
+            let verdicts = crate::check::require_proof(parsed, dir, since);
+            let results = items
+                .iter()
+                .zip(verdicts)
+                .map(|(it, (_, verdict))| crate::check::CriterionResult {
+                    number: it.number,
+                    key: it.key.clone(),
+                    text: it.text.clone(),
+                    proof: crate::check::proof_file(dir, it.number, since),
+                    verdict,
+                })
+                .collect();
+            let checked = crate::check::CheckRecord {
+                at: chrono::Local::now(),
+                merged: req.merged.clone(),
+                results,
+                warning: None,
+            };
+            let latest = crate::check::merge_check(crate::check::read_check(dir), checked.clone());
+            let _ = crate::check::write_check(dir, &latest);
+            let _ = tx.send(CaptureUpdate::Checked(checked));
+        }
+    }
     let file = out_file.exists().then_some(name);
     record(parse_outcome(req.phase, &result), file, steps)
+}
+
+/// Log files that really are inside the worktree: no symlink, and a real
+/// location (folders resolved) under the worktree's own. A file that does not
+/// exist yet is kept; the browser tools never follow a symlink when they open it.
+fn inside_worktree(worktree: &Path, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let root =
+        std::fs::canonicalize(worktree).map_err(|e| format!("{}: {e}", worktree.display()))?;
+    for p in &paths {
+        let Ok(meta) = std::fs::symlink_metadata(p) else {
+            continue;
+        };
+        let real = std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if meta.file_type().is_symlink() || !real.starts_with(&root) {
+            return Err(format!(
+                "{} leads outside the stack's worktree",
+                p.display()
+            ));
+        }
+    }
+    Ok(paths)
 }
 
 /// What `herdr-intents capture-run` is handed: the request, the env its tools
@@ -835,7 +992,7 @@ pub fn is_interrupted(r: &CaptureRecord) -> bool {
 pub fn launch(order: &CaptureOrder) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
-    let dir = &order.req.evidence;
+    let dir = order.req.run_dir();
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     if is_running(dir) {
         return Err("capturing already".into());
@@ -852,7 +1009,9 @@ pub fn launch(order: &CaptureOrder) -> Result<(), String> {
         .map_err(|e| e.to_string())
         .and_then(|t| std::fs::write(&order_file, t).map_err(|e| e.to_string()))
         .and_then(|()| {
-            let _ = write_record(dir, &running_record(&order.req, "starting"));
+            if order.req.job == Job::Capture {
+                let _ = write_record(dir, &running_record(&order.req, "starting"));
+            }
             let exe = crate::progress::tool_bin(&order.env, "INTENTS_BIN_PATH", None)
                 .or_else(|| std::env::current_exe().ok())
                 .ok_or("cannot find herdr-intents to run the capture")?;
@@ -883,9 +1042,11 @@ pub fn launch(order: &CaptureOrder) -> Result<(), String> {
         }
         Err(e) => {
             let _ = std::fs::remove_file(&lock);
-            let mut rec = running_record(&order.req, "");
-            rec.outcome = Outcome::Failed(e.clone());
-            let _ = write_record(dir, &rec);
+            if order.req.job == Job::Capture {
+                let mut rec = running_record(&order.req, "");
+                rec.outcome = Outcome::Failed(e.clone());
+                let _ = write_record(dir, &rec);
+            }
             Err(e)
         }
     }
@@ -941,18 +1102,21 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
         let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
         let _ = sigaction(Signal::SIGHUP, &ignore);
     }
-    let dir = order.req.evidence.clone();
+    let dir = order.req.run_dir().to_path_buf();
+    let capture = order.req.job == Job::Capture;
     let mut job = CaptureJob::spawn(order.req.clone(), order.env.clone(), order.managed_mcp);
     let mut cancelled = false;
+    let mut checked: Option<crate::check::CheckRecord> = None;
     let rec = loop {
         if !cancelled && TERMINATED.load(std::sync::atomic::Ordering::SeqCst) {
             cancelled = true;
             job.cancel();
         }
         match job.rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(CaptureUpdate::Progress(m)) if !cancelled => {
+            Ok(CaptureUpdate::Progress(m)) if !cancelled && capture => {
                 update_record(&dir, &running_record(&order.req, &m));
             }
+            Ok(CaptureUpdate::Checked(c)) => checked = Some(c),
             Ok(CaptureUpdate::Done(rec)) => break rec,
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -963,7 +1127,34 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
             }
         }
     };
-    update_record(&dir, &rec);
+    match &order.req.job {
+        Job::Capture => update_record(&dir, &rec),
+        Job::Check {
+            check_dir,
+            intent_path,
+            root,
+            ..
+        } => {
+            // a bug's check recorded its after too
+            if order.req.phase == Phase::After {
+                update_record(&order.req.evidence, &rec);
+            }
+            if let Some(w) = &rec.warning
+                && let Some(mut latest) = crate::check::read_check(check_dir)
+            {
+                latest.warning = Some(w.clone());
+                let _ = crate::check::write_check(check_dir, &latest);
+            }
+            if let Some(c) = &checked {
+                let applied = crate::store::Store::open(root)
+                    .and_then(|store| crate::check::apply(&store, intent_path, c));
+                if let Err(e) = applied {
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "applying the check: {e:#}");
+                }
+            }
+        }
+    }
     // the lock is this runner's only while it holds this pid
     let lock = dir.join(LOCK);
     if std::fs::read_to_string(&lock).is_ok_and(|t| t.trim() == std::process::id().to_string()) {
@@ -1051,6 +1242,7 @@ mod tests {
             seed: vec!["kathia-signup".into()],
             url: "https://demo-org.skoolscout.com.local:{port}".into(),
             body: "Sign in with Cmd+U.\n".into(),
+            logs: Vec::new(),
         }
     }
 
@@ -1076,6 +1268,20 @@ mod tests {
         assert_eq!(read_guide(tmp.path()).unwrap(), guide());
         let e = read_guide(&tmp.path().join("nowhere")).unwrap_err();
         assert!(format!("{e:#}").contains("capture.md"), "{e:#}");
+    }
+
+    #[test]
+    fn the_guide_lists_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".helmsmith")).unwrap();
+        std::fs::write(
+            tmp.path().join(".helmsmith/capture.md"),
+            "---\ndefault_area: org/social\nurl: https://x:{port}\nlogs: [.logs/backend.log]\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(read_guide(tmp.path()).unwrap().logs, [".logs/backend.log"]);
+        std::fs::write(tmp.path().join(".helmsmith/capture.md"), GUIDE).unwrap();
+        assert!(read_guide(tmp.path()).unwrap().logs.is_empty());
     }
 
     #[test]

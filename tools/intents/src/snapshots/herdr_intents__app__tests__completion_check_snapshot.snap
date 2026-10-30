@@ -1,0 +1,28 @@
+---
+source: tools/intents/src/app.rs
+expression: "render(&fx.app, 80, 24)"
+---
+▾ Inbox (1)            │# Alpha
+  ○ In the inbox ?2    │kind: idea   state: sent
+▾ skoolscout (3)       │ Description ───────────────────────────────────────────
+  → Alpha              │x
+  ○ Beta               │ ▸ Preconditions (0/0) ─────────────────────────────────
+  ◐ Missing meeting nam│ ▾ Acceptance criteria (0/2) ───────────────────────────
+                       │[ ] ✓ the primary contact gets an email
+                       │[ ] ✗ the email names the meeting
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │ ▸ Demo Videos (0) ─────────────────────────────────────
+                       │ ▸ Open questions (0 open) ─────────────────────────────
+                       │ ▸ Pull requests (0) ───────────────────────────────────
+                       │ ▸ Missing items / Bugs (1) ────────────────────────────
+                       │ ▸ Artifacts (0) ───────────────────────────────────────
+                       │ ▸ Evidence (2) ────────────────────────────────────────
+checked 10-30: only the contact got it · o proof

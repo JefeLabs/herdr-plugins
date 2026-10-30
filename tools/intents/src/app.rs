@@ -87,6 +87,14 @@ pub enum PickStep {
     Model { provider: String },
 }
 
+/// What an intent's unread-criteria count depends on: its criteria's keys,
+/// what was acknowledged, and its transcript's change time.
+type UnreadKey = (
+    Vec<String>,
+    Option<Vec<String>>,
+    Option<std::time::SystemTime>,
+);
+
 /// One capture of the selected intent, as the Evidence section lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRow {
@@ -427,12 +435,16 @@ pub struct App {
     question_selected: usize,
     artifacts_selected: usize,
     evidence_selected: usize,
+    missing_selected: usize,
     prs_selected: usize,
     demos_selected: usize,
     /// PR titles from `gh`, keyed like `pr_states`.
     pr_titles: HashMap<(PathBuf, String), String>,
     /// Artifacts found in the selected intent's repo, cached per path.
     found_cache: Option<(PathBuf, Vec<crate::store::Artifact>)>,
+    /// Unacknowledged criteria per intent, by its change stamp (reading the
+    /// transcript to tell is too slow for every card on every frame).
+    unread_cache: std::cell::RefCell<HashMap<PathBuf, (UnreadKey, usize)>>,
     pub layout: Layout,
     pub sort: SortOrder,
     pub filter: ListFilter,
@@ -474,7 +486,9 @@ pub struct App {
     /// Merged sets already started this session, so a failure is not retried in a loop.
     reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
     /// Bugs whose "after" was considered for a merged set (once per set).
-    capture_tried: HashSet<(PathBuf, Vec<u64>)>,
+    check_tried: HashSet<(PathBuf, Vec<u64>)>,
+    /// Re-checks started this session (original, criterion key): once each.
+    recheck_tried: HashSet<(PathBuf, String)>,
     /// Why the last reconcile of an intent failed; shown while it is
     /// selected until `r` retries it.
     reconcile_failed: HashMap<PathBuf, String>,
@@ -493,6 +507,7 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Questions => "questions",
         Pane::Artifacts => "artifacts",
         Pane::Evidence => "evidence",
+        Pane::Missing => "missing",
         Pane::Demos => "demos",
         Pane::PullRequests => "pull requests",
     }
@@ -530,10 +545,12 @@ impl App {
             question_selected: 0,
             artifacts_selected: 0,
             evidence_selected: 0,
+            missing_selected: 0,
             prs_selected: 0,
             demos_selected: 0,
             pr_titles: HashMap::new(),
             found_cache: None,
+            unread_cache: std::cell::RefCell::new(HashMap::new()),
             layout: Layout::Tree,
             sort: SortOrder::Updated,
             filter: ListFilter::All,
@@ -553,7 +570,8 @@ impl App {
             capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
             reconcile_tried: HashSet::new(),
-            capture_tried: HashSet::new(),
+            check_tried: HashSet::new(),
+            recheck_tried: HashSet::new(),
             reconcile_failed: HashMap::new(),
             last_area: std::cell::Cell::new(Rect::default()),
             card_hits: std::cell::RefCell::new(Vec::new()),
@@ -568,6 +586,7 @@ impl App {
         if let Some(f) = last.filter.as_deref().and_then(ListFilter::parse) {
             app.filter = f;
         }
+        app.baseline_checks();
         app.rebuild_rows();
         Ok(app)
     }
@@ -860,7 +879,53 @@ impl App {
                 None
             };
         }
-        crate::progress::Evidence { plans, prs }
+        // missing items still open (a deleted one is not: deleting dismisses it)
+        let open_missing = it
+            .fm
+            .missing
+            .iter()
+            .filter(|l| {
+                self.intent_by_stem(&l.stem)
+                    .is_some_and(crate::check::item_is_open)
+            })
+            .count();
+        let unacknowledged = {
+            // what decides it: the criteria, what was acknowledged (Y does not
+            // bump `updated`) and the transcript (read when nothing was recorded)
+            let key: UnreadKey = (
+                crate::store::criteria(&it.body)
+                    .iter()
+                    .map(|c| crate::store::criterion_key(&c.text))
+                    .collect(),
+                it.fm.acknowledged.clone(),
+                std::fs::metadata(it.transcript_path())
+                    .and_then(|m| m.modified())
+                    .ok(),
+            );
+            let mut cache = self.unread_cache.borrow_mut();
+            match cache.get(&it.path) {
+                Some((k, n)) if *k == key => *n,
+                _ => {
+                    let n = crate::store::new_criteria(it).len();
+                    cache.insert(it.path.clone(), (key, n));
+                    n
+                }
+            }
+        };
+        let check_dir = crate::check::checks_dir(it);
+        let checking = crate::capture::is_running(&check_dir).then(|| {
+            (
+                crate::check::proof_so_far(&check_dir),
+                crate::store::criteria(&it.body).len(),
+            )
+        });
+        crate::progress::Evidence {
+            plans,
+            prs,
+            open_missing,
+            unacknowledged,
+            checking,
+        }
     }
 
     fn poller(&mut self) -> &mut crate::progress::Poller {
@@ -875,6 +940,17 @@ impl App {
     }
 
     /// Every intent in the tree, whatever the list's filter.
+    /// The intent with this file stem in the tree, without copying the tree.
+    fn intent_by_stem(&self, stem: &str) -> Option<&Intent> {
+        fn walk<'a>(g: &'a Group, stem: &str) -> Option<&'a Intent> {
+            g.intents
+                .iter()
+                .find(|i| i.stem() == stem)
+                .or_else(|| g.groups.iter().find_map(|sub| walk(sub, stem)))
+        }
+        walk(&self.tree, stem)
+    }
+
     fn all_intents(&self) -> Vec<Intent> {
         fn all(g: &Group, out: &mut Vec<Intent>) {
             out.extend(g.intents.iter().cloned());
@@ -911,11 +987,6 @@ impl App {
                 continue;
             }
             let ev = self.evidence_for(&it);
-            if it.fm.state == State::Sent
-                && let Some(set) = crate::reconcile::merged_set(&ev)
-            {
-                self.capture_after(&it, &set);
-            }
             if self.reconcile_jobs.contains_key(&it.path) {
                 continue;
             }
@@ -933,6 +1004,8 @@ impl App {
                 self.poller().request_reconcile(it, merged);
             }
         }
+        self.check_due();
+        self.recheck_closed_items();
     }
 
     /// Ask the refinement agent (the last one used, else the configured one)
@@ -1014,6 +1087,8 @@ impl App {
                         "reconciled `{title}` with what shipped (* until you read it, u undoes)"
                     ));
                     self.reload_tree();
+                    // the merged set is reconciled: now it can be checked
+                    self.check_due();
                 }
                 Err(why) => {
                     // kept until r retries it, shown while the intent is selected
@@ -1419,6 +1494,7 @@ impl App {
             KeyCode::Char('a') => self.screen = Screen::KindPick { group: None },
             KeyCode::Char('D') => self.ask_trash(),
             KeyCode::Char('E') => self.capture_again(),
+            KeyCode::Char('X') => self.check_now(),
             _ => {}
         }
         Flow::Continue
@@ -1429,6 +1505,8 @@ impl App {
         self.reload_tree();
         self.refresh_found();
         self.poll_ticks = 0;
+        self.check_due();
+        self.recheck_closed_items();
     }
 
     /// Re-read every intent from disk, keeping both selections.
@@ -1696,6 +1774,7 @@ impl App {
                 | Pane::Demos
                 | Pane::Questions
                 | Pane::PullRequests
+                | Pane::Missing
                 | Pane::Artifacts
                 | Pane::Evidence
         ) {
@@ -1779,7 +1858,8 @@ impl App {
                     Pane::Criteria => Pane::Demos,
                     Pane::Demos => Pane::Questions,
                     Pane::Questions => Pane::PullRequests,
-                    Pane::PullRequests => Pane::Artifacts,
+                    Pane::PullRequests => Pane::Missing,
+                    Pane::Missing => Pane::Artifacts,
                     Pane::Artifacts => Pane::Evidence,
                     Pane::Evidence => Pane::Tree,
                 };
@@ -1789,7 +1869,8 @@ impl App {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Evidence,
                     Pane::Evidence => Pane::Artifacts,
-                    Pane::Artifacts => Pane::PullRequests,
+                    Pane::Artifacts => Pane::Missing,
+                    Pane::Missing => Pane::PullRequests,
                     Pane::PullRequests => Pane::Questions,
                     Pane::Questions => Pane::Demos,
                     Pane::Demos => Pane::Criteria,
@@ -1873,6 +1954,7 @@ impl App {
             }
             KeyCode::Char('D') => self.ask_trash(),
             KeyCode::Char('E') => self.capture_again(),
+            KeyCode::Char('X') => self.check_now(),
             KeyCode::Char('n') => {
                 let parent = self.selected_group_dir();
                 self.screen = Screen::Input {
@@ -2090,6 +2172,18 @@ impl App {
                         crate::store::CRITERIA_HEADING,
                         self.criteria_selected,
                     ),
+                    KeyCode::Char('X') => self.check_now(),
+                    // the selected criterion's proof from the latest check
+                    KeyCode::Char('o') => {
+                        let proof = self
+                            .criterion_result(&it, self.criteria_selected)
+                            .and_then(|r| r.proof)
+                            .map(|f| crate::check::checks_dir(&it).join(f));
+                        match proof {
+                            Some(f) => self.open_in_chrome(&f),
+                            None => self.message = Some("no proof for this criterion yet".into()),
+                        }
+                    }
                     // acknowledge a criterion someone else added: the selected one, or all
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         let which: Vec<usize> = if k.code == KeyCode::Char('Y') {
@@ -2127,6 +2221,28 @@ impl App {
                     _ => {}
                 }
             }
+            Pane::Missing => {
+                let rows = self.missing_rows(&it);
+                let last = rows.len().saturating_sub(1);
+                let selected = self.missing_selected.min(last);
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.missing_selected = (selected + 1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.missing_selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter => {
+                        if let Some((_, _, Some(path))) = rows.get(selected) {
+                            let path = path.clone();
+                            self.select_path(&path);
+                            self.focus = Pane::Tree;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Pane::Evidence => {
                 let rows = self.evidence_rows(&it);
                 let last = rows.len().saturating_sub(1);
@@ -2147,6 +2263,7 @@ impl App {
                         None => self.message = Some("no file for this capture yet".into()),
                     },
                     KeyCode::Char('E') => self.capture_again(),
+                    KeyCode::Char('X') => self.check_now(),
                     _ => {}
                 }
             }
@@ -2389,6 +2506,21 @@ impl App {
         };
         match Store::load(&path) {
             Ok(mut it) => {
+                // unticking a tick a check made: no check ticks it again
+                if heading == crate::store::CRITERIA_HEADING {
+                    let was = crate::store::criteria(&it.body)
+                        .get(index)
+                        .filter(|c| c.done)
+                        .map(|c| crate::store::criterion_key(&c.text));
+                    if let Some(k) = was
+                        && it.fm.check_ticks.contains(&k)
+                    {
+                        it.fm.check_ticks.retain(|x| *x != k);
+                        if !it.fm.owner_unticked.contains(&k) {
+                            it.fm.owner_unticked.push(k);
+                        }
+                    }
+                }
                 if let Some(body) = crate::store::toggle_checklist(&it.body, heading, index) {
                     it.body = body;
                     if let Err(e) = Store::save(&mut it) {
@@ -2563,8 +2695,23 @@ impl App {
 
     fn trash(&mut self, path: &Path) {
         self.screen = Screen::Browse;
-        // a capture still running for it stops (and finishes its effort)
+        // a capture still running for it stops (and finishes its effort); a
+        // missing item deleted dismisses its gap on the original
         if let Ok(it) = Store::load(path) {
+            if let Some(mf) = &it.fm.missing_for
+                && let Some(orig) = crate::check::find_intent(&self.store, &mf.stem)
+            {
+                // an open item deleted dismisses its gap; a done one just goes,
+                // and a later failure of its criterion is filed again
+                let (stem, key) = (it.stem(), mf.key.clone());
+                let dismiss = crate::check::item_is_open(&it);
+                let _ = Store::update_fields(&orig.path, |fm| {
+                    fm.missing.retain(|l| l.stem != stem);
+                    if dismiss && !fm.dismissed.contains(&key) {
+                        fm.dismissed.push(key);
+                    }
+                });
+            }
             let scratch = polish_cwd(self.store.root(), &it.polish_name());
             for dir in [
                 it.assets_dir().join("evidence"),
@@ -2773,6 +2920,7 @@ impl App {
             // unique across intents capturing in the same area at once
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
             merged: Vec::new(),
+            job: crate::capture::Job::Capture,
         };
         if let Err(e) = self.launch_capture(req) {
             self.message = Some(format!("capture: {e}"));
@@ -2788,6 +2936,197 @@ impl App {
         })
     }
 
+    /// `X`: checks the selected sent intent's acceptance criteria now.
+    fn check_now(&mut self) {
+        let Some(it) = self.selected_intent().cloned() else {
+            return;
+        };
+        if it.fm.state != State::Sent {
+            self.message = Some("a check is for sent intents".into());
+            return;
+        }
+        self.message = Some(match self.start_check(&it, None, Vec::new(), None) {
+            Ok(()) => "checking: the card shows how far it got".into(),
+            Err(e) => format!("check: {e}"),
+        });
+    }
+
+    /// Starts a completion check of `it` in its own process: all criteria, or
+    /// only `keys`; `merged` is the set it checks for (empty by hand); `after`
+    /// (a bug's reproduced before) makes it record the after too.
+    fn start_check(
+        &mut self,
+        it: &Intent,
+        keys: Option<Vec<String>>,
+        merged: Vec<u64>,
+        after: Option<crate::capture::CaptureRecord>,
+    ) -> Result<(), String> {
+        use crate::capture::{Phase, Shot};
+        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
+        if let Some(why) = self.capture_block_for(repo.clone()) {
+            return Err(why);
+        }
+        let Some(repo) = repo else {
+            return Err("no repo to check in".into());
+        };
+        let check_dir = crate::check::checks_dir(it);
+        if crate::capture::is_running(&check_dir) {
+            return Err("checking already".into());
+        }
+        let home = self.evidence_home(it);
+        if crate::capture::is_running(&home) {
+            return Err("a capture of it is running: check when it ends".into());
+        }
+        let group_rel = it
+            .path
+            .parent()
+            .and_then(|p| p.strip_prefix(self.store.root()).ok())
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty());
+        let (phase, shot, evidence) = match &after {
+            Some(_) => (Phase::After, Shot::Video, home),
+            None => (Phase::Before, Shot::Screenshot, check_dir.clone()),
+        };
+        let req = crate::capture::CaptureRequest {
+            repo,
+            group_rel,
+            stem: it.polish_name(),
+            phase,
+            shot,
+            intent: format!("{}\n\n{}", it.fm.title, it.body),
+            evidence,
+            before: after,
+            n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
+            merged,
+            job: crate::capture::Job::Check {
+                keys,
+                check_dir,
+                intent_path: it.path.clone(),
+                root: self.store.root().to_path_buf(),
+            },
+        };
+        self.launch_capture(req)
+    }
+
+    /// Starts the automatic check of each sent intent whose merged set was
+    /// reconciled but not yet checked, once per set, one at a time per repo.
+    /// A bug whose "before" reproduced it records its "after" in the same run.
+    pub(crate) fn check_due(&mut self) {
+        use crate::capture::{Outcome, Phase};
+        let all = self.all_intents();
+        for it in &all {
+            if it.fm.state != State::Sent
+                || it.fm.repo.is_none()
+                || it.fm.reconciled_for.is_empty()
+                || it.fm.reconciled_for == it.fm.checked_for
+            {
+                continue;
+            }
+            let busy = all.iter().any(|o| {
+                o.fm.repo == it.fm.repo && crate::capture::is_running(&crate::check::checks_dir(o))
+            });
+            if busy {
+                continue;
+            }
+            if !self
+                .check_tried
+                .insert((it.path.clone(), it.fm.reconciled_for.clone()))
+            {
+                continue;
+            }
+            let before = (it.fm.kind == "issue")
+                .then(|| {
+                    crate::capture::read_records_live(&self.evidence_home(it))
+                        .into_iter()
+                        .find(|r| {
+                            r.phase == Phase::Before && matches!(r.outcome, Outcome::Reproduced(_))
+                        })
+                })
+                .flatten();
+            match before {
+                // nothing to check: the plain after, as before checks existed
+                Some(b) if crate::store::criteria(&it.body).is_empty() => {
+                    let repo = it.fm.repo.clone();
+                    if self.capture_block_for(repo.clone()).is_none()
+                        && let Some(repo) = repo
+                    {
+                        let shot = b.shot;
+                        let _ = self.start_capture_for(
+                            it,
+                            repo,
+                            self.evidence_home(it),
+                            Phase::After,
+                            shot,
+                            Some(b),
+                            it.fm.reconciled_for.clone(),
+                        );
+                    }
+                }
+                before => {
+                    let _ = self.start_check(it, None, it.fm.reconciled_for.clone(), before);
+                }
+            }
+        }
+    }
+
+    /// Re-checks an original's criterion once the missing item filed for it
+    /// closes (its criterion ticked, by its own check or the owner). It counts
+    /// as done when the check's results are applied (`check::apply`); one that
+    /// could not start is tried again on a later pass, and a started one is not
+    /// started twice in a session.
+    pub(crate) fn recheck_closed_items(&mut self) {
+        for orig in self.all_intents() {
+            for link in orig.fm.missing.iter().filter(|l| !l.rechecked) {
+                let closed = self
+                    .intent_by_stem(&link.stem)
+                    .is_some_and(|item| !crate::check::item_is_open(item));
+                let tried = (orig.path.clone(), link.key.clone());
+                if !closed || self.recheck_tried.contains(&tried) {
+                    continue;
+                }
+                if self
+                    .start_check(&orig, Some(vec![link.key.clone()]), Vec::new(), None)
+                    .is_ok()
+                {
+                    self.recheck_tried.insert(tried);
+                }
+            }
+        }
+    }
+
+    /// On the first start with completion checks (no `checks-since` in the
+    /// config folder), every sent intent's already reconciled merged set
+    /// counts as checked: only later merges start a check (owner: no backlog).
+    /// The whole store, not just this workspace's group.
+    pub(crate) fn baseline_checks(&mut self) {
+        fn walk(g: &Group, out: &mut Vec<Intent>) {
+            out.extend(g.intents.iter().cloned());
+            for sub in &g.groups {
+                walk(sub, out);
+            }
+        }
+        let marker = self.dirs.config.join("checks-since");
+        if marker.exists() {
+            return;
+        }
+        let mut all = Vec::new();
+        if let Ok(tree) = self.store.scan() {
+            walk(&tree, &mut all);
+        }
+        for it in all {
+            if it.fm.state == State::Sent
+                && !it.fm.reconciled_for.is_empty()
+                && it.fm.checked_for.is_empty()
+            {
+                let set = it.fm.reconciled_for.clone();
+                let _ = Store::update_meta(&it.path, |fm| fm.checked_for = set);
+            }
+        }
+        let _ = std::fs::create_dir_all(&self.dirs.config);
+        let _ = std::fs::write(&marker, format!("{}\n", chrono::Local::now().to_rfc3339()));
+        self.reload_tree();
+    }
+
     /// `E`: captures the selected bug again: the "before" until one reproduced
     /// it, then an "after" (also run on its own once every PR merges).
     fn capture_again(&mut self) {
@@ -2799,7 +3138,9 @@ impl App {
             self.message = Some("evidence is for bugs".into());
             return;
         }
-        if crate::capture::is_running(&self.evidence_home(&it)) {
+        if crate::capture::is_running(&self.evidence_home(&it))
+            || crate::capture::is_running(&crate::check::checks_dir(&it))
+        {
             self.message =
                 Some("capturing already: the Evidence section shows how far it got".into());
             return;
@@ -2830,53 +3171,6 @@ impl App {
                 Ok(()) => "capturing: the Evidence section shows how far it got".into(),
                 Err(e) => format!("capture: {e}"),
             },
-        );
-    }
-
-    /// Once every pull request of a sent bug has merged, runs the steps that
-    /// reproduced it again (an "after"): once per merged set.
-    fn capture_after(&mut self, it: &Intent, set: &[u64]) {
-        use crate::capture::{Outcome, Phase};
-        if it.fm.kind != "issue" {
-            return;
-        }
-        let evidence = self.evidence_home(it);
-        if crate::capture::is_running(&evidence) {
-            return;
-        }
-        let recs = crate::capture::read_records_live(&evidence);
-        let Some(before) = recs
-            .iter()
-            .find(|r| r.phase == Phase::Before && matches!(r.outcome, Outcome::Reproduced(_)))
-            .cloned()
-        else {
-            return;
-        };
-        if recs.iter().any(|r| {
-            r.phase == Phase::After && r.merged == set && !crate::capture::is_interrupted(r)
-        }) {
-            return;
-        }
-        // no guide or no claude is not asked again for the same set
-        if !self.capture_tried.insert((it.path.clone(), set.to_vec())) {
-            return;
-        }
-        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
-        if self.capture_block_for(repo.clone()).is_some() {
-            return;
-        }
-        let Some(repo) = repo else {
-            return;
-        };
-        let shot = before.shot;
-        let _ = self.start_capture_for(
-            it,
-            repo,
-            evidence,
-            Phase::After,
-            shot,
-            Some(before),
-            set.to_vec(),
         );
     }
 
@@ -2921,6 +3215,7 @@ impl App {
             before,
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
             merged,
+            job: crate::capture::Job::Capture,
         };
         self.launch_capture(req)
     }
@@ -2938,7 +3233,9 @@ impl App {
             }
             let name = it.polish_name();
             let scratch = crate::capture::evidence_dir(&polish_cwd(self.store.root(), &name));
-            if crate::capture::is_running(&scratch) {
+            if crate::capture::is_running(&scratch)
+                || crate::capture::is_running(&crate::check::checks_dir(&it))
+            {
                 continue;
             }
             let Ok(entries) = std::fs::read_dir(&scratch) else {
@@ -3068,6 +3365,74 @@ impl App {
         });
     }
 
+    /// The missing items filed for `it`'s criteria: (mark, label, its file).
+    /// `✓` closed, `→` sent, `○` not yet; a deleted one is not listed.
+    fn missing_rows(&self, it: &Intent) -> Vec<(String, String, Option<PathBuf>)> {
+        let keys: Vec<String> = crate::store::criteria(&it.body)
+            .iter()
+            .map(|c| crate::store::criterion_key(&c.text))
+            .collect();
+        it.fm
+            .missing
+            .iter()
+            .filter_map(|l| {
+                let item = self.intent_by_stem(&l.stem)?;
+                let mark = if !crate::check::item_is_open(item) {
+                    "✓"
+                } else if item.fm.state == State::Sent {
+                    "→"
+                } else {
+                    "○"
+                };
+                let n = keys
+                    .iter()
+                    .position(|k| *k == l.key)
+                    .map(|i| (i + 1).to_string())
+                    .unwrap_or_else(|| "?".into());
+                Some((
+                    mark.to_string(),
+                    format!("{} (criterion {n})", item.fm.title),
+                    Some(item.path.clone()),
+                ))
+            })
+            .collect()
+    }
+
+    /// The latest check's result for criterion `index` (0-based), by wording.
+    fn criterion_result(&self, it: &Intent, index: usize) -> Option<crate::check::CriterionResult> {
+        let c = crate::store::criteria(&it.body).into_iter().nth(index)?;
+        let key = crate::store::criterion_key(&c.text);
+        crate::check::read_check(&crate::check::checks_dir(it))?
+            .results
+            .into_iter()
+            .find(|r| r.key == key)
+    }
+
+    /// The latest check's mark per criterion: `✓` confirmed, `✗` fails or
+    /// missing, `?` can't check.
+    fn check_marks(&self, it: &Intent) -> Vec<(usize, char)> {
+        use crate::check::Verdict;
+        let Some(rec) = crate::check::read_check(&crate::check::checks_dir(it)) else {
+            return Vec::new();
+        };
+        crate::store::criteria(&it.body)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let key = crate::store::criterion_key(&c.text);
+                let r = rec.results.iter().find(|r| r.key == key)?;
+                Some((
+                    i,
+                    match r.verdict {
+                        Verdict::Confirmed(_) => '✓',
+                        Verdict::Fails(_) | Verdict::Missing(_) => '✗',
+                        Verdict::CantCheck(_) => '?',
+                    },
+                ))
+            })
+            .collect()
+    }
+
     /// The selected intent's captures: from its attachments once kept there,
     /// else from its agent folder.
     fn evidence_rows(&self, it: &Intent) -> Vec<EvidenceRow> {
@@ -3076,12 +3441,13 @@ impl App {
             it.assets_dir().join("evidence"),
             crate::capture::evidence_dir(&polish_cwd(self.store.root(), &it.polish_name())),
         ];
+        let mut rows: Vec<EvidenceRow> = Vec::new();
         for dir in dirs {
             let recs = crate::capture::read_records_live(&dir);
             if recs.is_empty() {
                 continue;
             }
-            return recs
+            rows = recs
                 .iter()
                 .map(|r| {
                     let (mark, text) = match &r.outcome {
@@ -3109,8 +3475,26 @@ impl App {
                     }
                 })
                 .collect();
+            break;
         }
-        Vec::new()
+        // the latest completion check: one row per criterion, with its proof
+        let check_dir = crate::check::checks_dir(it);
+        if let Some(rec) = crate::check::read_check(&check_dir) {
+            use crate::check::Verdict;
+            rows.extend(rec.results.iter().map(|r| {
+                let (mark, text) = match &r.verdict {
+                    Verdict::Confirmed(t) => ("✓", t),
+                    Verdict::Fails(t) | Verdict::Missing(t) => ("✗", t),
+                    Verdict::CantCheck(t) => ("?", t),
+                };
+                EvidenceRow {
+                    label: format!("check · {} · {text}", r.number),
+                    file: r.proof.as_ref().map(|f| check_dir.join(f)),
+                    mark,
+                }
+            }));
+        }
+        rows
     }
 
     fn key_interview(&mut self, mut st: Box<InterviewScreen>, k: KeyEvent) -> Flow {
@@ -5013,6 +5397,12 @@ impl App {
                         .into_iter()
                         .map(|r| (r.mark.to_string(), r.label))
                         .collect();
+                    let marks = self.check_marks(intent);
+                    let missing: Vec<(String, String)> = self
+                        .missing_rows(intent)
+                        .into_iter()
+                        .map(|(m, l, _)| (m, l))
+                        .collect();
                     ui::render_intent(
                         &ui::DetailView {
                             intent,
@@ -5031,6 +5421,9 @@ impl App {
                             demos_selected: self.demos_selected,
                             evidence: &evidence,
                             evidence_selected: self.evidence_selected,
+                            results: &marks,
+                            missing: &missing,
+                            missing_selected: self.missing_selected,
                         },
                         right,
                         buf,
@@ -5073,7 +5466,21 @@ impl App {
                 (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  m model  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  M move  A attach  r rescan  D delete  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Criteria) => {
+                    let finding = self.selected_intent().and_then(|it| {
+                        let r = self.criterion_result(it, self.criteria_selected)?;
+                        let text = match &r.verdict {
+                            crate::check::Verdict::Confirmed(t)
+                            | crate::check::Verdict::Fails(t)
+                            | crate::check::Verdict::Missing(t)
+                            | crate::check::Verdict::CantCheck(t) => t.clone(),
+                        };
+                        let at = crate::check::read_check(&crate::check::checks_dir(it))?.at;
+                        Some(format!("checked {}: {text} · o proof", at.format("%m-%d")))
+                    });
+                    finding.unwrap_or_else(|| "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · X check · Tab next pane · Esc tree".to_string())
+                }
+                (None, Pane::Missing) => "Missing items: j/k choose · Enter go to it · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
@@ -8060,6 +8467,7 @@ mod tests {
             "demos",
             "questions",
             "pull requests",
+            "missing",
             "artifacts",
             "evidence",
         ] {
@@ -8084,7 +8492,7 @@ mod tests {
 
     /// Tab from the tree to the named section.
     fn tab_to(app: &mut App, pane: &str) {
-        for _ in 0..8 {
+        for _ in 0..12 {
             if app.view().focus == pane {
                 return;
             }
@@ -8205,6 +8613,8 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "pull requests");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "missing");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "evidence");
@@ -8214,6 +8624,8 @@ mod tests {
         assert_eq!(fx.app.view().focus, "evidence");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "artifacts");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "missing");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "pull requests");
         key(&mut fx.app, KeyCode::Tab);
@@ -9715,6 +10127,726 @@ mod tests {
         assert!(row.label.contains("interrupted"), "{row:?}");
     }
 
+    // ---- when completion checks run -------------------------------------------
+
+    const CRITERIA: &str = "## Description\nx\n\n## Acceptance criteria\n- [ ] the primary contact gets an email\n- [ ] the email names the meeting\n";
+
+    /// Makes `title` a sent intent with two criteria on the capture repo.
+    fn sent_with_criteria(fx: &mut Fx, title: &str) -> PathBuf {
+        select(&mut fx.app, title);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = CRITERIA.into();
+        it.fm.state = State::Sent;
+        it.fm.repo = fx.app.capture_repo.clone();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, title);
+        path
+    }
+
+    fn checks_of(path: &Path) -> PathBuf {
+        crate::check::checks_dir(&Store::load(path).unwrap())
+    }
+
+    fn wait_check_end(path: &Path) {
+        let dir = checks_of(path);
+        let start = Instant::now();
+        while crate::capture::is_running(&dir) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "the check never ended"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stop_check(path: &Path) {
+        crate::capture::cancel_running(&checks_of(path));
+        wait_check_end(path);
+    }
+
+    #[test]
+    fn x_checks_the_selected_sent_intent() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        key(&mut fx.app, KeyCode::Char('X'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("checking"),
+            "{:?}",
+            fx.app.view().message
+        );
+        wait_for_work(&fx, "start --area");
+        wait_check_end(&path);
+        let cfg = fs::read_to_string(checks_of(&path).join(".capture-mcp.json")).unwrap();
+        assert!(cfg.contains("\"mode\":\"check\""), "{cfg}");
+    }
+
+    #[test]
+    fn x_is_refused_while_a_check_or_capture_runs() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        key(&mut fx.app, KeyCode::Char('X'));
+        wait_for_work(&fx, "start --area");
+        key(&mut fx.app, KeyCode::Char('X'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("checking already"),
+            "{:?}",
+            fx.app.view().message
+        );
+        stop_check(&path);
+        assert_eq!(work_log(&fx).matches("start --area").count(), 1);
+    }
+
+    #[test]
+    fn x_is_only_for_sent_intents() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        select(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('X'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("a check is for sent intents"),
+            "{:?}",
+            fx.app.view().message
+        );
+        assert_eq!(work_log(&fx), "");
+    }
+
+    #[test]
+    fn x_without_a_guide_says_why() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, false, true);
+        sent_with_criteria(&mut fx, "Alpha");
+        key(&mut fx.app, KeyCode::Char('X'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("no capture guide"),
+            "{:?}",
+            fx.app.view().message
+        );
+    }
+
+    #[test]
+    fn a_check_runs_once_after_the_reconcile_of_each_merged_set() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        capture_setup(&t, &mut fx.app, true, true);
+        fs::create_dir_all(t.join("repo/.helmsmith")).unwrap();
+        fs::write(t.join("repo/.helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        fs::write(t.join("prs/42"), "MERGED").unwrap();
+        let notify = fx.app.store.root().join("skoolscout/org/pr.md");
+        let starts = |t: &Path| {
+            fs::read_to_string(t.join("work.log"))
+                .unwrap_or_default()
+                .matches("start --area")
+                .count()
+        };
+        let start = Instant::now();
+        while starts(&t) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "no check after the reconcile"
+            );
+            fx.app.rescan();
+            settle(&mut fx.app);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            Store::load(&notify).unwrap().fm.reconciled_for,
+            vec![42],
+            "reconciled first"
+        );
+        wait_check_end(&notify);
+        for _ in 0..3 {
+            fx.app.rescan();
+            settle(&mut fx.app);
+        }
+        assert_eq!(starts(&t), 1, "once per merged set");
+    }
+
+    #[test]
+    fn automatic_checks_take_turns_per_repo() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let beta = sent_with_criteria(&mut fx, "Beta");
+        for p in [&alpha, &beta] {
+            Store::update_fields(p, |fm| fm.reconciled_for = vec![7]).unwrap();
+        }
+        fx.app.rescan();
+        fx.app.check_due();
+        wait_for_work(&fx, "start --area");
+        fx.app.check_due();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            work_log(&fx).matches("start --area").count(),
+            1,
+            "one at a time"
+        );
+        let first = if crate::capture::is_running(&checks_of(&alpha)) {
+            alpha.clone()
+        } else {
+            beta.clone()
+        };
+        let second = if first == alpha {
+            beta.clone()
+        } else {
+            alpha.clone()
+        };
+        stop_check(&first);
+        fx.app.check_due();
+        let start = Instant::now();
+        while work_log(&fx).matches("start --area").count() < 2 {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "the second never took its turn"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop_check(&second);
+    }
+
+    #[test]
+    fn the_first_start_marks_reconciled_sets_checked() {
+        let mut fx = setup("agy.jsonl");
+        let marker = fx.app.dirs.config.join("checks-since");
+        assert!(marker.exists(), "written on the first start");
+        fs::remove_file(&marker).unwrap();
+        select(&mut fx.app, "Alpha");
+        let alpha = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&alpha, |fm| {
+            fm.state = State::Sent;
+            fm.reconciled_for = vec![42];
+        })
+        .unwrap();
+        fx.app.rescan();
+        fx.app.baseline_checks();
+        assert_eq!(Store::load(&alpha).unwrap().fm.checked_for, vec![42]);
+        assert!(marker.exists());
+        select(&mut fx.app, "Beta");
+        let beta = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&beta, |fm| {
+            fm.state = State::Sent;
+            fm.reconciled_for = vec![7];
+        })
+        .unwrap();
+        fx.app.rescan();
+        fx.app.baseline_checks();
+        assert!(
+            Store::load(&beta).unwrap().fm.checked_for.is_empty(),
+            "only once"
+        );
+    }
+
+    #[test]
+    fn unticking_a_check_tick_records_the_owners_veto() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let key1 = crate::store::criterion_key("the primary contact gets an email");
+        let mut it = Store::load(&path).unwrap();
+        it.body = CRITERIA.replace("- [ ] the primary", "- [x] the primary");
+        it.fm.state = State::Sent;
+        it.fm.check_ticks = vec![key1.clone()];
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('C'));
+        assert_eq!(fx.app.view().focus, "criteria");
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&path).unwrap();
+        assert!(!crate::store::criteria(&it.body)[0].done);
+        assert!(it.fm.check_ticks.is_empty());
+        assert_eq!(it.fm.owner_unticked, vec![key1]);
+    }
+
+    /// A refining missing item filed for `original`'s criterion `key`.
+    fn missing_item(fx: &mut Fx, original: &Path, key: &str, ticked: bool) -> PathBuf {
+        let group = original
+            .parent()
+            .unwrap()
+            .strip_prefix(fx.app.store.root())
+            .unwrap()
+            .to_path_buf();
+        let body = format!(
+            "## Acceptance criteria\n- [{}] the email names the meeting\n",
+            if ticked { "x" } else { " " }
+        );
+        let item = fx
+            .app
+            .store
+            .create(&group, "Missing meeting name", "issue", &body, None)
+            .unwrap();
+        let original_stem = Store::load(original).unwrap().stem();
+        Store::update_fields(&item.path, |fm| {
+            fm.state = State::Refining;
+            fm.missing_for = Some(crate::store::MissingFor {
+                stem: original_stem,
+                key: key.into(),
+            });
+        })
+        .unwrap();
+        let stem = item.stem();
+        let key = key.to_string();
+        Store::update_fields(original, |fm| {
+            fm.missing.push(crate::store::MissingLink {
+                stem,
+                key,
+                rechecked: false,
+            })
+        })
+        .unwrap();
+        fx.app.rescan();
+        item.path
+    }
+
+    #[test]
+    fn deleting_a_missing_item_dismisses_its_gap() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, false);
+        select(&mut fx.app, "Missing meeting name");
+        key(&mut fx.app, KeyCode::Char('D'));
+        key(&mut fx.app, KeyCode::Char('y'));
+        let it = Store::load(&alpha).unwrap();
+        assert_eq!(it.fm.dismissed, vec![key2]);
+        assert!(it.fm.missing.is_empty());
+    }
+
+    #[test]
+    fn a_closed_item_rechecks_its_criterion_once() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        // the agent answers criterion 2 (the re-check's one)
+        fs::write(
+            fx._tmp.path().join("capture-events.jsonl"),
+            "{\"type\":\"result\",\"result\":\"2: can't check: backend only\"}\n",
+        )
+        .unwrap();
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, true);
+        fx.app.recheck_closed_items();
+        wait_for_work(&fx, "start --area");
+        wait_check_end(&alpha);
+        let claude = fs::read_to_string(fx._tmp.path().join("claude.log")).unwrap();
+        assert!(
+            claude.contains("2. the email names the meeting"),
+            "{claude}"
+        );
+        assert!(
+            !claude.contains("1. the primary contact"),
+            "only its criterion: {claude}"
+        );
+        assert!(Store::load(&alpha).unwrap().fm.missing[0].rechecked);
+        fx.app.rescan();
+        fx.app.recheck_closed_items();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(work_log(&fx).matches("start --area").count(), 1, "once");
+    }
+
+    #[test]
+    fn an_item_whose_original_is_gone_closes_quietly() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        let item = missing_item(&mut fx, &alpha, &key2, true);
+        // the original goes; the item stays
+        fs::remove_file(&alpha).unwrap();
+        fx.app.rescan();
+        assert!(item.exists());
+        fx.app.recheck_closed_items();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(work_log(&fx), "");
+    }
+
+    // ---- showing check results ----------------------------------------------------
+
+    /// Alpha, sent, with a check that confirmed criterion 1 (with proof) and
+    /// failed criterion 2; returns its path.
+    fn checked_alpha(fx: &mut Fx) -> PathBuf {
+        use crate::check::{CheckRecord, CriterionResult, Verdict, write_check};
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = CRITERIA.into();
+        it.fm.state = State::Sent;
+        Store::save_force(&mut it).unwrap();
+        let dir = crate::check::checks_dir(&it);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1.png"), "png").unwrap();
+        let key = |t: &str| crate::store::criterion_key(t);
+        let rec = CheckRecord {
+            at: chrono::Local::now(),
+            merged: vec![42],
+            results: vec![
+                CriterionResult {
+                    number: 1,
+                    key: key("the primary contact gets an email"),
+                    text: "the primary contact gets an email".into(),
+                    verdict: Verdict::Confirmed("only the contact got it".into()),
+                    proof: Some("1.png".into()),
+                },
+                CriterionResult {
+                    number: 2,
+                    key: key("the email names the meeting"),
+                    text: "the email names the meeting".into(),
+                    verdict: Verdict::Fails("no meeting name".into()),
+                    proof: None,
+                },
+            ],
+            warning: None,
+        };
+        write_check(&dir, &rec).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, "Alpha");
+        path
+    }
+
+    #[test]
+    fn criteria_show_check_results() {
+        let mut fx = setup("agy.jsonl");
+        checked_alpha(&mut fx);
+        key(&mut fx.app, KeyCode::Char('C'));
+        let shown = render(&fx.app, 100, 30);
+        assert!(
+            shown.contains("✓ the primary contact gets an email"),
+            "{shown}"
+        );
+        assert!(shown.contains("✗ the email names the meeting"), "{shown}");
+        assert!(
+            shown.contains("only the contact got it"),
+            "the selected one's finding: {shown}"
+        );
+    }
+
+    #[test]
+    fn o_opens_a_criterions_proof() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let path = checked_alpha(&mut fx);
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('o'));
+        let proof = checks_of(&path).join("1.png").display().to_string();
+        wait_for_log(&log, &proof);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('o'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("no proof"),
+            "{:?}",
+            fx.app.view().message
+        );
+    }
+
+    #[test]
+    fn evidence_lists_check_proof() {
+        let mut fx = setup("agy.jsonl");
+        let path = checked_alpha(&mut fx);
+        let rows = fx.app.view().evidence;
+        let one = rows
+            .iter()
+            .find(|r| r.label.starts_with("check · 1 · "))
+            .expect("criterion 1's row");
+        assert_eq!(one.mark, "✓");
+        assert_eq!(
+            one.file.as_deref(),
+            Some(checks_of(&path).join("1.png").as_path())
+        );
+        let two = rows
+            .iter()
+            .find(|r| r.label.starts_with("check · 2 · "))
+            .expect("criterion 2's row");
+        assert_eq!(two.mark, "✗");
+        assert!(two.label.contains("no meeting name"), "{two:?}");
+    }
+
+    #[test]
+    fn the_missing_section_follows_pull_requests() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, false);
+        select(&mut fx.app, "Alpha");
+        tab_to(&mut fx.app, "pull requests");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "missing");
+        let shown = render(&fx.app, 100, 30);
+        assert!(shown.contains("Missing items / Bugs (1)"), "{shown}");
+        assert!(
+            shown.contains("Missing meeting name (criterion 2)"),
+            "{shown}"
+        );
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "artifacts");
+    }
+
+    #[test]
+    fn enter_on_a_missing_item_selects_it() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, false);
+        select(&mut fx.app, "Alpha");
+        tab_to(&mut fx.app, "missing");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(
+            fx.app
+                .selected_intent()
+                .map(|i| i.fm.title.clone())
+                .as_deref(),
+            Some("Missing meeting name")
+        );
+    }
+
+    #[test]
+    fn completion_check_snapshot() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = checked_alpha(&mut fx);
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, false);
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('C'));
+        insta::assert_snapshot!(render(&fx.app, 80, 24));
+    }
+
+    // ---- the review's fixes -------------------------------------------------------
+
+    #[test]
+    fn y_reads_the_new_criteria_and_the_intent_completes() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = CRITERIA.replace("- [ ]", "- [x]");
+        it.fm.state = State::Sent;
+        it.fm.acknowledged = Some(Vec::new());
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, "Alpha");
+        let complete = |app: &App| {
+            let it = app.selected_intent().unwrap().clone();
+            crate::progress::progress(&it, &app.evidence_for(&it)).unwrap()
+        };
+        assert!(!complete(&fx.app).complete);
+        assert_eq!(complete(&fx.app).label, "✓ 2/2 · 2 new to read");
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('Y'));
+        fx.app.rescan();
+        select(&mut fx.app, "Alpha");
+        assert!(complete(&fx.app).complete, "{}", complete(&fx.app).label);
+    }
+
+    #[test]
+    fn e_waits_while_a_check_runs() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app
+            .capture_env
+            .push(("FAKE_CLAUDE_HANG".into(), "1".into()));
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        Store::update_fields(&path, |fm| fm.kind = "issue".into()).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('X'));
+        wait_for_work(&fx, "start --area");
+        key(&mut fx.app, KeyCode::Char('E'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("already"),
+            "{:?}",
+            fx.app.view().message
+        );
+        stop_check(&path);
+        assert_eq!(work_log(&fx).matches("start --area").count(), 1);
+    }
+
+    #[test]
+    fn a_recheck_that_could_not_start_tries_again() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, false, true); // no guide yet
+        // the agent answers criterion 2 (the re-check's one)
+        fs::write(
+            fx._tmp.path().join("capture-events.jsonl"),
+            "{\"type\":\"result\",\"result\":\"2: can't check: backend only\"}\n",
+        )
+        .unwrap();
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, true);
+        fx.app.recheck_closed_items();
+        assert!(
+            !Store::load(&alpha).unwrap().fm.missing[0].rechecked,
+            "not run, not done"
+        );
+        // the guide arrives
+        let repo = fx.app.capture_repo.clone().unwrap();
+        fs::write(repo.join(".helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        fx.app.rescan();
+        fx.app.recheck_closed_items();
+        wait_for_work(&fx, "start --area");
+        wait_check_end(&alpha);
+        assert!(
+            Store::load(&alpha).unwrap().fm.missing[0].rechecked,
+            "done once it ran"
+        );
+    }
+
+    #[test]
+    fn deleting_a_completed_item_keeps_watching_its_criterion() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, true); // closed
+        select(&mut fx.app, "Missing meeting name");
+        key(&mut fx.app, KeyCode::Char('D'));
+        key(&mut fx.app, KeyCode::Char('y'));
+        let fm = Store::load(&alpha).unwrap().fm;
+        assert!(
+            fm.dismissed.is_empty(),
+            "a done item's gap is not dismissed"
+        );
+        assert!(fm.missing.is_empty(), "its link goes with it");
+    }
+
+    #[test]
+    fn a_bug_without_criteria_still_gets_its_after() {
+        use crate::capture::{CaptureRecord, Outcome, Phase, Shot, VIEWPORT, write_record};
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        let mut it = Store::load(&path).unwrap();
+        it.body = "## Description\nAdmins are emailed.\n".into();
+        it.fm.kind = "issue".into();
+        it.fm.reconciled_for = vec![7];
+        Store::save_force(&mut it).unwrap();
+        let before = CaptureRecord {
+            phase: Phase::Before,
+            shot: Shot::Screenshot,
+            outcome: Outcome::Reproduced("every admin".into()),
+            file: Some("before.png".into()),
+            steps: vec!["open /x".into()],
+            viewport: VIEWPORT,
+            at: chrono::Local::now(),
+            merged: Vec::new(),
+            warning: None,
+        };
+        let home =
+            crate::capture::evidence_dir(&polish_cwd(fx.app.store.root(), &it.polish_name()));
+        write_record(&home, &before).unwrap();
+        fx.app.rescan();
+        fx.app.check_due();
+        wait_for_work(&fx, "finish --area");
+        let after = crate::capture::read_records(&home)
+            .into_iter()
+            .find(|r| r.phase == Phase::After)
+            .expect("an after was recorded");
+        assert_eq!(after.merged, vec![7]);
+        assert_eq!(after.shot, Shot::Screenshot, "as the before was");
+    }
+
+    #[test]
+    fn evidence_counts_open_missing_items_and_unread_criteria() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let it = fx.app.selected_intent().unwrap().clone();
+        let group = it
+            .path
+            .parent()
+            .unwrap()
+            .strip_prefix(fx.app.store.root())
+            .unwrap()
+            .to_path_buf();
+        let open = fx
+            .app
+            .store
+            .create(
+                &group,
+                "the email names the meeting",
+                "issue",
+                "## Acceptance criteria\n- [ ] the email names the meeting\n",
+                None,
+            )
+            .unwrap();
+        let done = fx
+            .app
+            .store
+            .create(
+                &group,
+                "admins get nothing",
+                "issue",
+                "## Acceptance criteria\n- [x] admins get nothing\n",
+                None,
+            )
+            .unwrap();
+        Store::update_fields(&it.path, |fm| {
+            fm.state = State::Sent;
+            fm.acknowledged = Some(Vec::new());
+            fm.missing = vec![
+                crate::store::MissingLink {
+                    stem: open.stem(),
+                    key: "k2".into(),
+                    rechecked: false,
+                },
+                crate::store::MissingLink {
+                    stem: done.stem(),
+                    key: "k3".into(),
+                    rechecked: false,
+                },
+                crate::store::MissingLink {
+                    stem: "gone".into(),
+                    key: "k4".into(),
+                    rechecked: false,
+                },
+            ];
+        })
+        .unwrap();
+        fx.app.rescan();
+        let it = Store::load(&it.path).unwrap();
+        let ev = fx.app.evidence_for(&it);
+        assert_eq!(
+            ev.open_missing, 1,
+            "the done one and the deleted one are not open"
+        );
+        assert_eq!(
+            ev.unacknowledged,
+            crate::store::criteria(&it.body).len(),
+            "none acknowledged"
+        );
+        assert_eq!(ev.checking, None);
+    }
+
     #[test]
     fn a_warning_shows_on_its_capture() {
         use crate::capture::{Phase, read_records, write_record};
@@ -9855,6 +10987,12 @@ mod tests {
         });
         let rec = after(&dir).unwrap();
         assert_eq!(rec.merged, vec![42]);
+        // a bug's check runs in its evidence folder, where the after's video goes
+        let cfg = fs::read_to_string(dir.join(".capture-mcp.json")).unwrap_or_default();
+        assert!(
+            cfg.contains("\"mode\":\"check\""),
+            "the after came from the completion check: {cfg}"
+        );
         assert_eq!(
             rec.outcome,
             crate::capture::Outcome::Fixed("only the primary contact gets it".into())

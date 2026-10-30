@@ -5,9 +5,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use herdr_intents::capture::{
-    CaptureJob, CaptureOrder, CaptureRecord, CaptureRequest, CaptureUpdate, Outcome, Phase, Shot,
-    cancel_running, is_running, launch, read_records,
+    CaptureJob, CaptureOrder, CaptureRecord, CaptureRequest, CaptureUpdate, Job, Outcome, Phase,
+    Shot, cancel_running, is_running, launch, read_records,
 };
+use herdr_intents::check::{CheckRecord, Verdict, read_check};
 
 fn fixture(name: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -86,6 +87,7 @@ impl Fx {
             before: None,
             n: 1,
             merged: Vec::new(),
+            job: Job::Capture,
         }
     }
 
@@ -373,11 +375,19 @@ fn cancel_stops_the_agent_and_finishes_the_effort() {
             .contains("finish --area org/team"),
         "{work}"
     );
-    assert!(
-        fx.log("ab.log")
-            .contains("[--session][capture-new-ab12cd34-1][close]"),
-        "the browser goes too"
-    );
+    // a cancel that lands before the agent's group is known leaves the stop
+    // (and the browser's close) to the job's own thread, a moment later
+    let start = Instant::now();
+    while !fx
+        .log("ab.log")
+        .contains("[--session][capture-new-ab12cd34-1][close]")
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the browser goes too"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // ---- a capture in its own process --------------------------------------------
@@ -509,5 +519,280 @@ fn a_capture_cancelled_while_seeding_never_starts_the_agent() {
             .last()
             .unwrap()
             .contains("finish --area org/team")
+    );
+}
+
+// ---- a completion check ------------------------------------------------------
+
+const INTENT: &str = "---\ntitle: Notify primary contact\nkind: idea\nstate: sent\n---\n## Description\nx\n\n## Acceptance criteria\n- [ ] the primary contact gets an email\n- [ ] the email names the meeting\n";
+
+impl Fx {
+    /// A check of a two-criterion intent; the guide lists the backend log.
+    fn checking(result: &str) -> Fx {
+        let mut fx = Fx::new();
+        let t = fx.tmp.path().to_path_buf();
+        fs::write(
+            t.join("repo/.helmsmith/capture.md"),
+            "---\ndefault_area: org/social\nseed: [kathia-signup]\nurl: https://demo-org.skoolscout.com.local:{port}\nlogs: [.logs/backend.log]\n---\nSign in with Cmd+U.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(t.join("worktree/.logs")).unwrap();
+        fs::write(t.join("worktree/.logs/backend.log"), "seeded: an email\n").unwrap();
+        fs::create_dir_all(t.join("root/skoolscout/org")).unwrap();
+        fs::write(t.join("root/skoolscout/org/notify.md"), INTENT).unwrap();
+        fs::create_dir_all(t.join("checks")).unwrap();
+        let events = t.join("check-events.jsonl");
+        fs::write(
+            &events,
+            format!(
+                "{{\"type\":\"result\",\"result\":{}}}\n",
+                serde_json::Value::String(result.into())
+            ),
+        )
+        .unwrap();
+        fx.set("FAKE_CLAUDE_EVENTS", &events.display().to_string());
+        fx.set("FAKE_CHECK_DIR", &t.join("checks").display().to_string());
+        fx.env
+            .retain(|(k, _)| k != "FAKE_CLAUDE_WRITES" && k != "FAKE_CLAUDE_STEPS");
+        fx
+    }
+
+    fn check_request(&self, keys: Option<Vec<String>>) -> CaptureRequest {
+        let t = self.tmp.path();
+        CaptureRequest {
+            phase: Phase::Before,
+            shot: Shot::Screenshot,
+            evidence: t.join("checks"),
+            job: Job::Check {
+                keys,
+                check_dir: t.join("checks"),
+                intent_path: t.join("root/skoolscout/org/notify.md"),
+                root: t.join("root"),
+            },
+            ..self.request()
+        }
+    }
+
+    /// Runs `req` in this process; (the check's results, the run's record).
+    fn run_check(&self, req: CaptureRequest) -> (Option<CheckRecord>, CaptureRecord) {
+        let job = CaptureJob::spawn(req, self.env.clone(), false);
+        let start = Instant::now();
+        let mut checked = None;
+        loop {
+            while let Some(u) = job.try_recv() {
+                match u {
+                    CaptureUpdate::Checked(c) => checked = Some(c),
+                    CaptureUpdate::Done(rec) => return (checked, rec),
+                    _ => {}
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the check never finished"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn a_check_runs_on_the_same_stack_and_records_each_criterion() {
+    let mut fx = Fx::checking("Done.\n1: confirmed: only the contact\n2: fails: no meeting name");
+    fx.set("FAKE_CLAUDE_PROOF", "1");
+    let (checked, _) = fx.run_check(fx.check_request(None));
+    let work: Vec<String> = fx.log("work.log").lines().map(str::to_string).collect();
+    assert!(work[0].contains("start --area org/team"), "{work:?}");
+    assert!(
+        work.last().unwrap().contains("finish --area org/team"),
+        "{work:?}"
+    );
+    let claude = fx.log("claude.log");
+    let allowed = arg_after(&claude, "--allowedTools").unwrap();
+    assert!(
+        allowed.contains("mcp__intents-capture__screenshot")
+            && allowed.contains("mcp__intents-capture__logs"),
+        "{allowed}"
+    );
+    assert!(
+        claude.contains("1. the primary contact gets an email"),
+        "{claude}"
+    );
+    let checks = fx.tmp.path().join("checks");
+    let cfg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(checks.join(".capture-mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(cfg["mode"], "check");
+    assert_eq!(
+        cfg["logs"][0]["from"],
+        "seeded: an email\n".len() as u64,
+        "the seed's lines are not the agent's: {cfg}"
+    );
+    let checked = checked.expect("a check reports its results");
+    assert_eq!(
+        checked.results[0].verdict,
+        Verdict::Confirmed("only the contact".into())
+    );
+    assert_eq!(checked.results[0].proof.as_deref(), Some("1.png"));
+    assert_eq!(
+        checked.results[1].verdict,
+        Verdict::Fails("no meeting name".into())
+    );
+    assert_eq!(read_check(&checks), Some(checked), "kept as latest.json");
+}
+
+#[test]
+fn a_bugs_check_also_records_the_after() {
+    let mut fx = Fx::checking("fixed: only the contact now\n1: confirmed: ok\n2: confirmed: ok");
+    fx.set("FAKE_CLAUDE_PROOF", "1,2");
+    let evidence = fx.tmp.path().join("evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    fx.set(
+        "FAKE_CLAUDE_WRITES",
+        &evidence.join("after.mp4").display().to_string(),
+    );
+    let before = CaptureRecord {
+        phase: Phase::Before,
+        shot: Shot::Video,
+        outcome: Outcome::Reproduced("every admin gets it".into()),
+        file: Some("before.mp4".into()),
+        steps: vec!["open /x".into()],
+        viewport: (1280, 800),
+        at: chrono::Local::now(),
+        merged: Vec::new(),
+        warning: None,
+    };
+    let req = CaptureRequest {
+        phase: Phase::After,
+        shot: Shot::Video,
+        evidence: evidence.clone(),
+        before: Some(before),
+        merged: vec![42],
+        ..fx.check_request(None)
+    };
+    let (checked, rec) = fx.run_check(req);
+    assert_eq!(rec.outcome, Outcome::Fixed("only the contact now".into()));
+    assert_eq!(rec.file.as_deref(), Some("after.mp4"));
+    let allowed = arg_after(&fx.log("claude.log"), "--allowedTools").unwrap();
+    assert!(allowed.contains("record_start"), "{allowed}");
+    let checked = checked.unwrap();
+    assert_eq!(checked.merged, vec![42]);
+    assert!(
+        checked
+            .results
+            .iter()
+            .all(|r| matches!(r.verdict, Verdict::Confirmed(_)))
+    );
+}
+
+#[test]
+fn a_recheck_checks_only_its_criteria() {
+    let mut fx = Fx::checking("2: confirmed: names it now");
+    fx.set("FAKE_CLAUDE_PROOF", "2");
+    let checks = fx.tmp.path().join("checks");
+    let key = |t: &str| herdr_intents::store::criterion_key(t);
+    let earlier = CheckRecord {
+        at: chrono::Local::now(),
+        merged: vec![42],
+        results: vec![
+            herdr_intents::check::CriterionResult {
+                number: 1,
+                key: key("the primary contact gets an email"),
+                text: "the primary contact gets an email".into(),
+                verdict: Verdict::Confirmed("earlier".into()),
+                proof: Some("1.png".into()),
+            },
+            herdr_intents::check::CriterionResult {
+                number: 2,
+                key: key("the email names the meeting"),
+                text: "the email names the meeting".into(),
+                verdict: Verdict::Fails("no name".into()),
+                proof: None,
+            },
+        ],
+        warning: None,
+    };
+    herdr_intents::check::write_check(&checks, &earlier).unwrap();
+    fx.run_check(fx.check_request(Some(vec![key("the email names the meeting")])));
+    let claude = fx.log("claude.log");
+    assert!(
+        claude.contains("2. the email names the meeting"),
+        "{claude}"
+    );
+    assert!(
+        !claude.contains("1. the primary contact"),
+        "only its criterion: {claude}"
+    );
+    let latest = read_check(&checks).unwrap();
+    assert_eq!(
+        latest.results[0].verdict,
+        Verdict::Confirmed("earlier".into())
+    );
+    assert_eq!(
+        latest.results[1].verdict,
+        Verdict::Confirmed("names it now".into())
+    );
+}
+
+#[test]
+fn a_launched_check_applies_its_results() {
+    let mut fx = Fx::checking("1: confirmed: ok\n2: fails: no meeting name");
+    fx.set("FAKE_CLAUDE_PROOF", "1");
+    let order = CaptureOrder {
+        req: fx.check_request(None),
+        env: fx.env.clone(),
+        managed_mcp: false,
+    };
+    launch(&order).unwrap();
+    let checks = fx.tmp.path().join("checks");
+    fx.wait("the check to end", |_| !is_running(&checks));
+    let intent = fx.tmp.path().join("root/skoolscout/org/notify.md");
+    let it = herdr_intents::store::Store::load(&intent).unwrap();
+    let crit = herdr_intents::store::criteria(&it.body);
+    assert!(crit[0].done && !crit[1].done, "{}", it.body);
+    assert_eq!(it.fm.missing.len(), 1, "the failing one has its item");
+}
+
+#[test]
+fn a_log_that_leads_out_of_the_worktree_is_refused() {
+    let fx = Fx::checking("1: confirmed: ok");
+    let t = fx.tmp.path();
+    fs::write(t.join("outside.txt"), "token: secret\n").unwrap();
+    let log = t.join("worktree/.logs/backend.log");
+    fs::remove_file(&log).unwrap();
+    std::os::unix::fs::symlink(t.join("outside.txt"), &log).unwrap();
+    let (_, rec) = fx.run_check(fx.check_request(None));
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(why.contains("log"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        fx.log("claude.log"),
+        "",
+        "no agent with a log it may not read"
+    );
+    assert!(
+        fx.log("work.log")
+            .lines()
+            .last()
+            .unwrap()
+            .contains("finish --area")
+    );
+}
+
+#[test]
+fn a_check_with_no_answers_spends_nothing() {
+    let fx = Fx::checking("I ran out of time before I could look.");
+    let (checked, rec) = fx.run_check(fx.check_request(None));
+    assert!(
+        checked.is_none(),
+        "nothing to apply: the merged set is not spent"
+    );
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(why.contains("no answers"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        read_check(&fx.tmp.path().join("checks")).is_none(),
+        "no ? results written"
     );
 }
