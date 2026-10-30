@@ -205,15 +205,16 @@ repos = [
 start: docker compose up -d db && npm --prefix ../api run dev & npm --prefix ../web run dev
 url: http://localhost:{port}         # {port}: a free port the tool picks and passes as PORT
 ready: /health                       # polled until the app answers (default: the url itself)
-ready_timeout: 600                   # seconds (the default)
+ready_timeout: 600                   # seconds (the default); also the limit for each seed
 seed: ["npm --prefix ../api run seed:demo"]
 stop: docker compose down            # optional
+stop_timeout: 60                     # seconds `stop` may take (the default)
 logs: [../api/logs/app.log]          # what a completion check may search
 ---
 Sign in as demo@acme.test (password in the seed). Leave the billing pages alone.
 ```
 
-Every command runs with `sh -c` from the meta repo. `start` runs in its own process group for the whole run; the tool waits until the app answers, fails at once with `start`'s last lines if `start` exits first, runs each `seed` (each must succeed), and at the end runs `stop` and ends `start`'s whole group, also when the run is cancelled or fails. An app left by a crashed run is ended by the next run. Without `{port}` in `url`, runs in a space take turns; a second is refused with the address in use. Log paths must stay inside the space's folder: no `..` out of it, no symlinks. The app runs from whatever your repos have checked out; the tool never switches branches.
+Every command runs with `sh -c` from the meta repo. `start` runs in its own process group for the whole run: it may stay in the foreground, or exit 0 leaving the app running (`docker compose up -d`); one that fails first ends the run at once with its last lines. The tool waits until the app answers, runs each `seed` (each must succeed within `ready_timeout`), and at the end runs `stop` (cut off after `stop_timeout`) and ends `start`'s whole group, also when the run is cancelled or fails. An app a crashed run left behind is ended by that intent's next run, and only if it is still the very process that run started. Without `{port}` in `url`, runs in a space take turns (a second is refused with the address in use), and a fixed address that already answers before `start` is refused too: the tool never seeds, drives or stops an app it did not start. A check that could not run (its app never answered, a seed failed) says why in the Evidence section. Log paths must stay inside the space's folder: no `..` out of it, no symlinks. The app runs from whatever your repos have checked out; the tool never switches branches.
 
 **Which space.** The space is the Herdr workspace (and its `~/intents` group). Your own config keeps where each space's meta repo is, in `spaces.toml` beside `intents.toml`:
 
@@ -224,7 +225,7 @@ meta = "~/code/shop-meta"
 
 It is filled in for you the first time the tool starts in a workspace whose folder has `.helmsmith/space.toml`. The run guide is looked for in the space's meta repo, then in the intent's own repo; with neither, the tool says where to add one.
 
-**Waiting for the pull.** In a project run this way, the automatic check after a merge waits until your checkout has the merged code: every merged pull request's merge commit (from `gh`) must be in the intent's repo's `HEAD`. Until you pull, the card reads `· waiting for a pull` and the merge is not counted as checked. `X` checks whatever is checked out.
+**Waiting for the pull.** In a project run this way, the automatic check after a merge waits until your checkout has the merged code: every merged pull request's merge commit (from `gh`) must be in the `HEAD` of the clone it merged into, which is the intent's repo for `#12`, or for `owner/repo#12` the space repo whose git URL in `space.toml` names that repo. A pull request in a repo the space does not list does not hold the check back. Until you pull, the card reads `· waiting for a pull` and the merge is not counted as checked. `X` checks whatever is checked out.
 
 **Skoolscout's way.** A guide with `default_area` in place of `start` keeps skoolscout's own steps: a `work` slot, e2e seed stories and logs in the slot's worktree, as the next sections describe.
 

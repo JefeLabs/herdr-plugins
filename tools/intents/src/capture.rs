@@ -51,6 +51,8 @@ pub enum GuideMode {
         ready_timeout: u64,
         /// Run after the run, before `start`'s processes are ended.
         stop: Option<String>,
+        /// Seconds `stop` may take before it is cut off.
+        stop_timeout: u64,
     },
 }
 
@@ -109,6 +111,8 @@ struct GuideFront {
     #[serde(default)]
     stop: Option<String>,
     #[serde(default)]
+    stop_timeout: Option<u64>,
+    #[serde(default)]
     seed: Vec<String>,
     url: String,
     #[serde(default)]
@@ -117,6 +121,8 @@ struct GuideFront {
 
 /// How long the app gets to answer, unless the guide says.
 pub const READY_TIMEOUT_SECS: u64 = 600;
+/// How long the guide's `stop` may take, unless the guide says.
+pub const STOP_TIMEOUT_SECS: u64 = 60;
 
 /// Reads `<repo>/.helmsmith/run.md` (else the older `capture.md`): YAML front
 /// matter, then the body. `start` makes it any project's commands; else
@@ -150,6 +156,7 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
             ready: front.ready,
             ready_timeout: front.ready_timeout.unwrap_or(READY_TIMEOUT_SECS),
             stop: front.stop,
+            stop_timeout: front.stop_timeout.unwrap_or(STOP_TIMEOUT_SECS),
         },
         (None, Some(default_area)) => GuideMode::Work { default_area },
         (None, None) => anyhow::bail!(
@@ -445,6 +452,27 @@ struct AppRun {
     port: Option<u16>,
     lock: Option<PathBuf>,
     pgid_file: PathBuf,
+    /// Seconds the guide's `stop` may take.
+    stop_timeout: u64,
+    /// Set once `stop_app_once` has ended it.
+    stopped: bool,
+}
+
+/// An app whose run ends any other way (a panic, a poisoned lock) is still
+/// ended: its group, its pid file and its lock (not the guide's `stop`,
+/// which could hang).
+impl Drop for AppRun {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        stop_group(self.pgid);
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.pgid_file);
+        if let Some(lock) = &self.lock {
+            release_space_lock(lock);
+        }
+    }
 }
 
 /// Shared between the capture's thread and `cancel`.
@@ -453,6 +481,8 @@ struct JobState {
     agent_pgid: Option<i32>,
     /// The app this run started (commands mode), until it is stopped.
     app: Option<AppRun>,
+    /// The process group of a guide command running now (a seed).
+    seed_pgid: Option<i32>,
     /// The task effort this capture started: `(area, task)`.
     effort: Option<(String, String)>,
     cancelled: bool,
@@ -499,6 +529,63 @@ fn app_command(r: &Runner, meta: &Path, port: Option<u16>, command: &str) -> std
     c
 }
 
+/// How a bounded guide command ended.
+enum Ended {
+    Done(std::process::ExitStatus),
+    TimedOut,
+    Cancelled,
+}
+
+/// Runs a guide command in its own process group for at most `limit`; its
+/// whole group is ended when it takes longer or (given the run's `state`)
+/// when the run is cancelled.
+fn run_bounded(
+    mut cmd: std::process::Command,
+    limit: std::time::Duration,
+    state: Option<&std::sync::Mutex<JobState>>,
+) -> std::io::Result<Ended> {
+    use std::os::unix::process::CommandExt;
+    let mut child = cmd.process_group(0).spawn()?;
+    let pgid = child.id() as i32;
+    if let Some(Ok(mut s)) = state.map(|st| st.lock()) {
+        s.seed_pgid = Some(pgid);
+    }
+    let deadline = std::time::Instant::now() + limit;
+    let ended = loop {
+        if let Some(status) = child.try_wait()? {
+            break Ended::Done(status);
+        }
+        if state.is_some_and(cancelled) {
+            stop_group(pgid);
+            let _ = child.wait();
+            break Ended::Cancelled;
+        }
+        if std::time::Instant::now() >= deadline {
+            stop_group(pgid);
+            let _ = child.wait();
+            break Ended::TimedOut;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    if let Some(Ok(mut s)) = state.map(|st| st.lock()) {
+        s.seed_pgid = None;
+    }
+    Ok(ended)
+}
+
+/// When a process started, as `ps` says: with its number, it tells a crashed
+/// run's app from a later process that reused the number.
+fn started_at(pid: i32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let when = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!when.is_empty()).then_some(when)
+}
+
 /// Stops the app a commands-mode run started, exactly once, whoever gets
 /// there first: the guide's `stop`, then `start`'s whole process group, then
 /// the space lock. Says what went wrong with `stop`, if anything.
@@ -506,13 +593,21 @@ fn stop_app_once(r: &Runner, state: &std::sync::Mutex<JobState>) -> Option<Strin
     let mut app = state.lock().unwrap_or_else(|e| e.into_inner()).app.take()?;
     let mut warning = None;
     if let Some(stop) = &app.stop {
-        match app_command(r, &app.meta, app.port, stop)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            Ok(s) => warning = Some(format!("the guide's stop: exit {}", s.code().unwrap_or(-1))),
+        let mut cmd = app_command(r, &app.meta, app.port, stop);
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let limit = std::time::Duration::from_secs(app.stop_timeout);
+        match run_bounded(cmd, limit, None) {
+            Ok(Ended::Done(s)) if s.success() => {}
+            Ok(Ended::Done(s)) => {
+                warning = Some(format!("the guide's stop: exit {}", s.code().unwrap_or(-1)))
+            }
+            Ok(_) => {
+                warning = Some(format!(
+                    "the guide's stop did not finish within {}s; it was ended, then the app",
+                    app.stop_timeout
+                ))
+            }
             Err(e) => warning = Some(format!("the guide's stop: {e}")),
         }
     }
@@ -522,6 +617,7 @@ fn stop_app_once(r: &Runner, state: &std::sync::Mutex<JobState>) -> Option<Strin
     if let Some(lock) = &app.lock {
         release_space_lock(lock);
     }
+    app.stopped = true;
     warning
 }
 
@@ -582,15 +678,18 @@ fn release_space_lock(lock: &Path) {
 /// Ends an app a crashed run left behind in this run's folder.
 fn reap_stale_app(run_dir: &Path) {
     let file = run_dir.join(".app.pgid");
-    if let Some(pgid) = std::fs::read_to_string(&file)
-        .ok()
-        .and_then(|t| t.trim().parse::<i32>().ok())
-        .filter(|p| *p > 0)
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut lines = text.lines();
+    let pgid = lines
+        .next()
+        .and_then(|l| l.trim().parse::<i32>().ok())
+        .filter(|p| *p > 0);
+    let when = lines.next().map(str::trim).filter(|w| !w.is_empty());
+    // only the very process the crashed run started, not one that reused its number
+    if let (Some(pgid), Some(when)) = (pgid, when)
+        && started_at(pgid).as_deref() == Some(when)
     {
-        use nix::sys::signal::killpg;
-        if killpg(nix::unistd::Pid::from_raw(pgid), None).is_ok() {
-            stop_group(pgid);
-        }
+        stop_group(pgid);
     }
     let _ = std::fs::remove_file(file);
 }
@@ -663,17 +762,18 @@ impl ReadyTarget {
 
     /// Something answers: an http reply of any status, or (https) a connection.
     fn answers(&self) -> bool {
-        use std::io::{Read, Write};
         use std::net::ToSocketAddrs;
-        let timeout = std::time::Duration::from_secs(1);
-        let Some(addr) = (self.host.as_str(), self.port)
+        // every address of the host: `localhost` is often ::1 first, while
+        // many apps listen on 127.0.0.1 only
+        (self.host.as_str(), self.port)
             .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-        else {
-            return false;
-        };
-        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+            .is_ok_and(|mut addrs| addrs.any(|a| self.answers_at(&a)))
+    }
+
+    fn answers_at(&self, addr: &std::net::SocketAddr) -> bool {
+        use std::io::{Read, Write};
+        let timeout = std::time::Duration::from_secs(1);
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(addr, timeout) else {
             return false;
         };
         if self.https {
@@ -717,6 +817,7 @@ fn start_app(
     ready: Option<&str>,
     ready_timeout: u64,
     stop: Option<String>,
+    stop_timeout: u64,
     wants_logs: bool,
     progress: &dyn Fn(String),
 ) -> Result<(String, Vec<PathBuf>), String> {
@@ -751,6 +852,16 @@ fn start_app(
         None => Some(take_space_lock(&meta, &base_url)?),
         Some(_) => None,
     };
+    // a fixed address someone else's app already answers on is not ours to
+    // seed, drive or stop
+    if port.is_none() && ReadyTarget::parse(&base_url).is_some_and(|t| t.answers()) {
+        if let Some(l) = &lock {
+            release_space_lock(l);
+        }
+        return Err(format!(
+            "something already answers at {base_url}: stop it, or put {{port}} in the guide's url so each run gets its own port"
+        ));
+    }
     progress("starting the app".into());
     let log_path = run_dir.join(".app.log");
     let spawned = std::fs::File::create(&log_path)
@@ -771,7 +882,10 @@ fn start_app(
     };
     let pgid = child.id() as i32;
     let pgid_file = run_dir.join(".app.pgid");
-    let _ = std::fs::write(&pgid_file, pgid.to_string());
+    let _ = std::fs::write(
+        &pgid_file,
+        format!("{pgid}\n{}\n", started_at(pgid).unwrap_or_default()),
+    );
     if let Ok(mut s) = state.lock() {
         s.app = Some(AppRun {
             child,
@@ -781,9 +895,12 @@ fn start_app(
             port,
             lock,
             pgid_file,
+            stop_timeout,
+            stopped: false,
         });
     }
-    // wait until it answers; a start that ends first has failed
+    // wait until it answers; a start that fails first has failed (one that
+    // exits 0, leaving the app running, as `docker compose up -d`, has not)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout);
     loop {
         if cancelled(state) {
@@ -794,7 +911,9 @@ fn start_app(
                 .as_mut()
                 .and_then(|a| a.child.try_wait().ok().flatten())
         });
-        if let Some(status) = exited {
+        if let Some(status) = exited
+            && !status.success()
+        {
             return Err(format!(
                 "the guide's start exited ({status}) before the app answered: {}",
                 tail(&log_path, 5)
@@ -817,19 +936,27 @@ fn start_app(
             return Err("cancelled".into());
         }
         progress(format!("seeding: {seed}"));
-        let status = std::fs::OpenOptions::new()
+        let limit = std::time::Duration::from_secs(ready_timeout);
+        let ended = std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
             .and_then(|out| Ok((out.try_clone()?, out)))
             .and_then(|(out, err)| {
-                app_command(r, &meta, port, seed)
-                    .stdout(out)
-                    .stderr(err)
-                    .status()
+                let mut cmd = app_command(r, &meta, port, seed);
+                cmd.stdout(out).stderr(err);
+                run_bounded(cmd, limit, Some(state))
             });
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => return Err(format!("seed `{seed}`: exit {}", s.code().unwrap_or(-1))),
+        match ended {
+            Ok(Ended::Done(s)) if s.success() => {}
+            Ok(Ended::Done(s)) => {
+                return Err(format!("seed `{seed}`: exit {}", s.code().unwrap_or(-1)));
+            }
+            Ok(Ended::TimedOut) => {
+                return Err(format!(
+                    "seed `{seed}` did not finish within {ready_timeout}s"
+                ));
+            }
+            Ok(Ended::Cancelled) => return Err("cancelled".into()),
             Err(e) => return Err(format!("seed `{seed}`: {e}")),
         }
     }
@@ -1002,6 +1129,7 @@ fn run(
             ready,
             ready_timeout,
             stop,
+            stop_timeout,
         } => match start_app(
             req,
             r,
@@ -1011,6 +1139,7 @@ fn run(
             ready.as_deref(),
             *ready_timeout,
             stop.clone(),
+            *stop_timeout,
             check_dir.is_some(),
             &progress,
         ) {
@@ -1649,6 +1778,14 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
                 latest.warning = Some(w.clone());
                 let _ = crate::check::write_check(check_dir, &latest);
             }
+            // a check that never reached its agent says why; one that ran clears it
+            match (&checked, &rec.outcome) {
+                (Some(_), _) => crate::check::clear_failure(check_dir),
+                (None, Outcome::Failed(why)) if why != "cancelled" => {
+                    let _ = crate::check::write_failure(check_dir, why);
+                }
+                _ => {}
+            }
             if let Some(c) = &checked {
                 let applied = crate::store::Store::open(root)
                     .and_then(|store| crate::check::apply(&store, intent_path, c));
@@ -1764,6 +1901,34 @@ mod tests {
             merged: Vec::new(),
             warning: None,
         }
+    }
+
+    #[test]
+    fn an_app_run_dropped_without_stopping_stops_its_group() {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        let tmp = tempfile::tempdir().unwrap();
+        let run = AppRun {
+            child,
+            pgid,
+            stop: None,
+            meta: tmp.path().to_path_buf(),
+            port: None,
+            lock: None,
+            pgid_file: tmp.path().join(".app.pgid"),
+            stop_timeout: 60,
+            stopped: false,
+        };
+        drop(run);
+        assert!(
+            nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None).is_err(),
+            "its group is gone"
+        );
     }
 
     #[test]

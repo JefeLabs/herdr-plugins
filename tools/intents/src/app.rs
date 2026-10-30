@@ -3480,18 +3480,33 @@ impl App {
         self.launch_capture(req)
     }
 
+    /// Whether two intents run the same app on one fixed address (a space
+    /// whose guide's url has no `{port}`): their runs must take turns.
+    fn share_a_fixed_app(&self, a: &Intent, b: &Intent) -> bool {
+        let ra = self.run_repo_for(a.fm.repo.clone()).ok();
+        let rb = self.run_repo_for(b.fm.repo.clone()).ok();
+        match (ra, rb) {
+            (Some(ra), Some(rb)) if ra == rb => crate::capture::read_guide(&ra).is_ok_and(|g| {
+                matches!(g.mode, crate::capture::GuideMode::Commands { .. })
+                    && !g.url.contains("{port}")
+            }),
+            _ => false,
+        }
+    }
+
     /// Whether the intent's repo has every merge commit of `set` checked out
     /// (`git merge-base --is-ancestor`, locally: it never fetches or pulls).
     /// A merge commit not known yet counts as not pulled.
     pub(crate) fn pulled(&self, it: &Intent, set: &[u64]) -> bool {
-        let Some(repo) = it.fm.repo.as_ref() else {
-            return false;
-        };
         set.iter().all(|n| {
+            // a PR in a repo with no clone the space lists does not hold it back
+            let Some(repo) = self.clone_of_pr(it, *n) else {
+                return true;
+            };
             self.merge_commit_of(it, *n).is_some_and(|sha| {
                 std::process::Command::new("git")
                     .args(["merge-base", "--is-ancestor", &sha, "HEAD"])
-                    .current_dir(repo)
+                    .current_dir(&repo)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -3499,6 +3514,32 @@ impl App {
                     .is_ok_and(|s| s.success())
             })
         })
+    }
+
+    /// The local clone a merged pull request landed in: the intent's repo for
+    /// `#n` and for PRs its search found; for `owner/repo#n` or a PR's URL,
+    /// the space's repo with that GitHub name (from `space.toml`'s git URLs),
+    /// or the intent's repo when it is that repo. `None`: not one we have.
+    fn clone_of_pr(&self, it: &Intent, n: u64) -> Option<PathBuf> {
+        let own = it.fm.repo.clone()?;
+        let linked = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+            .find(|a| crate::progress::pr_number(&a.target) == Some(n));
+        let Some(slug) = linked.and_then(|a| crate::space::target_slug(&a.target)) else {
+            return Some(own);
+        };
+        if crate::space::origin_slug(&own).as_deref() == Some(slug.as_str()) {
+            return Some(own);
+        }
+        let meta = self.run_repo_for(Some(own)).ok()?;
+        let space = crate::space::read_space(&meta).ok()?;
+        space
+            .repos
+            .iter()
+            .find(|r| crate::space::git_slug(&r.git).as_deref() == Some(slug.as_str()))
+            .map(|r| r.path.clone())
+            .filter(|p| p.is_dir())
     }
 
     /// A merged pull request's merge commit: from its `pr:` line's `gh pr
@@ -3552,7 +3593,8 @@ impl App {
                 continue;
             }
             let busy = all.iter().any(|o| {
-                o.fm.repo == it.fm.repo && crate::capture::is_running(&crate::check::checks_dir(o))
+                crate::capture::is_running(&crate::check::checks_dir(o))
+                    && (o.fm.repo == it.fm.repo || self.share_a_fixed_app(o, it))
             });
             if busy {
                 continue;
@@ -4048,6 +4090,14 @@ impl App {
                     mark,
                 }
             }));
+        }
+        if let Some(why) = crate::check::read_failure(&check_dir) {
+            let log = check_dir.join(".app.log");
+            rows.push(EvidenceRow {
+                label: format!("check · couldn't run: {why}"),
+                file: log.is_file().then_some(log),
+                mark: "!",
+            });
         }
         rows
     }
@@ -11381,6 +11431,167 @@ mod tests {
         assert!(
             fx.app.check_tried.contains(&(alpha.clone(), vec![42])),
             "skoolscout's slots merge develop themselves"
+        );
+        wait_check_end(&alpha);
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_shows_why_in_evidence() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let it = Store::load(&alpha).unwrap();
+        crate::check::write_failure(
+            &crate::check::checks_dir(&it),
+            "the guide's start exited (exit status: 2)",
+        )
+        .unwrap();
+        let labels: Vec<String> = fx
+            .app
+            .evidence_rows(&it)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("couldn't run: the guide's start exited")),
+            "{labels:?}"
+        );
+    }
+
+    /// A space whose meta repo's guide has a fixed url, with `alpha` and
+    /// `beta` in two of its repos, both merged (pulled) and due a check.
+    fn fixed_port_space(fx: &mut Fx) -> (PathBuf, PathBuf) {
+        with_capture(fx, false, true);
+        let t = fx._tmp.path().to_path_buf();
+        let meta = t.join("space/meta");
+        fs::create_dir_all(meta.join(".helmsmith")).unwrap();
+        fs::write(
+            meta.join(".helmsmith/run.md"),
+            "---\nstart: exit 1\nurl: http://127.0.0.1:9\n---\n",
+        )
+        .unwrap();
+        fx.app.cfg.scope = Some("skoolscout".into());
+        crate::space::remember_meta(&fx.app.dirs, "skoolscout", &meta).unwrap();
+        let mut paths = Vec::new();
+        for (title, dir) in [("Alpha", "api"), ("Beta", "web")] {
+            let repo = t.join("space").join(dir);
+            fs::create_dir_all(&repo).unwrap();
+            git_in(&repo, &["init", "-q", "-b", "main"]);
+            git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "c0"]);
+            let head = git_in(&repo, &["rev-parse", "HEAD"]);
+            let path = sent_with_criteria(fx, title);
+            let mut it = Store::load(&path).unwrap();
+            it.fm.repo = Some(repo.clone());
+            it.fm.reconciled_for = vec![42];
+            it.body.push_str("\n## Artifacts\n- pr: #42\n");
+            Store::save_force(&mut it).unwrap();
+            fx.app.pr_states.insert(
+                (repo.clone(), "#42".into()),
+                crate::progress::PrState::Merged,
+            );
+            fx.app.pr_merge_commits.insert((repo, "#42".into()), head);
+            paths.push(path);
+        }
+        fx.app.rescan();
+        (paths[0].clone(), paths[1].clone())
+    }
+
+    #[test]
+    fn checks_in_one_fixed_port_space_take_turns() {
+        let mut fx = setup("agy.jsonl");
+        let (alpha, beta) = fixed_port_space(&mut fx);
+        let dir = checks_of(&alpha);
+        let lock = hold_lock(&dir);
+        fx.app.check_due();
+        let tried = fx.app.check_tried.iter().any(|(p, _)| *p == beta);
+        release_lock(&dir, lock);
+        assert!(
+            !tried,
+            "a check of another repo of the space is running: beta waits its turn"
+        );
+    }
+
+    /// A space (meta + a `web` sibling listed in space.toml) whose intent
+    /// lives in the meta repo and links web's PR `acme/web#12`, merged as a
+    /// commit on a branch web's checkout does not have yet.
+    fn pr_in_a_sibling(fx: &mut Fx, listed: bool) -> (PathBuf, PathBuf) {
+        with_capture(fx, false, true);
+        let t = fx._tmp.path().to_path_buf();
+        let meta = t.join("space/meta");
+        let web = t.join("space/web");
+        for repo in [&meta, &web] {
+            fs::create_dir_all(repo).unwrap();
+            git_in(repo, &["init", "-q", "-b", "main"]);
+            git_in(repo, &["commit", "-q", "--allow-empty", "-m", "c0"]);
+        }
+        git_in(&web, &["checkout", "-q", "-b", "side"]);
+        git_in(&web, &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        let sha = git_in(&web, &["rev-parse", "HEAD"]);
+        git_in(&web, &["checkout", "-q", "main"]);
+        fs::create_dir_all(meta.join(".helmsmith")).unwrap();
+        fs::write(
+            meta.join(".helmsmith/run.md"),
+            "---\nstart: exit 1\nurl: http://127.0.0.1:{port}\n---\n",
+        )
+        .unwrap();
+        let web_line = if listed {
+            "  { path = \"../web\", git = \"git@github.com:acme/web.git\" },\n"
+        } else {
+            ""
+        };
+        fs::write(
+            meta.join(".helmsmith/space.toml"),
+            format!(
+                "repos = [\n  {{ path = \".\", git = \"git@github.com:acme/shop.git\" }},\n{web_line}]\n"
+            ),
+        )
+        .unwrap();
+        fx.app.cfg.scope = Some("skoolscout".into());
+        crate::space::remember_meta(&fx.app.dirs, "skoolscout", &meta).unwrap();
+        let alpha = sent_with_criteria(fx, "Alpha");
+        let mut it = Store::load(&alpha).unwrap();
+        it.fm.repo = Some(meta.clone());
+        it.fm.reconciled_for = vec![12];
+        it.body.push_str("\n## Artifacts\n- pr: acme/web#12\n");
+        Store::save_force(&mut it).unwrap();
+        fx.app.pr_states.insert(
+            (meta.clone(), "acme/web#12".into()),
+            crate::progress::PrState::Merged,
+        );
+        fx.app
+            .pr_merge_commits
+            .insert((meta, "acme/web#12".into()), sha);
+        fx.app.rescan();
+        (alpha, web)
+    }
+
+    #[test]
+    fn a_pr_in_a_sibling_repo_is_pulled_there() {
+        let mut fx = setup("agy.jsonl");
+        let (alpha, web) = pr_in_a_sibling(&mut fx, true);
+        fx.app.check_due();
+        assert!(
+            fx.app.awaiting_pull.contains(&alpha),
+            "web's checkout lacks the merge"
+        );
+        git_in(&web, &["merge", "-q", "--ff-only", "side"]);
+        fx.app.check_due();
+        assert!(
+            fx.app.check_tried.contains(&(alpha.clone(), vec![12])),
+            "pulled in web: the check starts"
+        );
+        wait_check_end(&alpha);
+    }
+
+    #[test]
+    fn a_pr_in_an_unlisted_repo_does_not_hold_the_check() {
+        let mut fx = setup("agy.jsonl");
+        let (alpha, _) = pr_in_a_sibling(&mut fx, false);
+        fx.app.check_due();
+        assert!(
+            fx.app.check_tried.contains(&(alpha.clone(), vec![12])),
+            "no clone to look in: the check is not held back"
         );
         wait_check_end(&alpha);
     }

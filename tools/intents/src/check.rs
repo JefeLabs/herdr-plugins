@@ -59,6 +59,27 @@ pub struct CheckRecord {
     pub warning: Option<String>,
 }
 
+/// Why the last check could not run (it never reached its agent), kept for
+/// the Evidence section until a check runs.
+pub fn write_failure(dir: &Path, why: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(FAILURE), format!("{why}\n"))?;
+    Ok(())
+}
+
+pub fn read_failure(dir: &Path) -> Option<String> {
+    let why = std::fs::read_to_string(dir.join(FAILURE)).ok()?;
+    let why = why.trim();
+    (!why.is_empty()).then(|| why.to_string())
+}
+
+/// A check ran: the last failure no longer applies.
+pub fn clear_failure(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(FAILURE));
+}
+
+const FAILURE: &str = "last-failure.txt";
+
 /// The intent's criteria to check: all, or only those whose keys `only` holds.
 pub fn items(body: &str, only: Option<&[String]>) -> Vec<CheckItem> {
     crate::store::criteria(body)

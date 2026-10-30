@@ -58,6 +58,46 @@ pub(crate) fn plain(path: &Path) -> PathBuf {
     out
 }
 
+/// `owner/repo` (lower case) from a git URL: `git@github.com:o/r.git`,
+/// `https://github.com/o/r(.git)`, `ssh://git@github.com/o/r.git`.
+pub fn git_slug(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let mut parts = url.rsplit(['/', ':']);
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{repo}").to_lowercase())
+}
+
+/// `owner/repo` from a `pr:` target in another repo (`owner/repo#12`, or a
+/// pull request's URL); `None` for `#12`, which is the intent's own repo.
+pub fn target_slug(target: &str) -> Option<String> {
+    let t = target.trim();
+    if t.starts_with('#') {
+        return None;
+    }
+    if let Some((before, _)) = t.split_once("/pull/") {
+        return git_slug(before);
+    }
+    let (slug, _) = t.split_once('#')?;
+    git_slug(slug)
+}
+
+/// `owner/repo` of a clone's `origin`, as `git` says.
+pub fn origin_slug(repo: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| git_slug(&String::from_utf8_lossy(&out.stdout)))
+        .flatten()
+}
+
 /// Reads `<meta>/.helmsmith/space.toml`.
 pub fn read_space(meta: &Path) -> anyhow::Result<Space> {
     use anyhow::Context;
