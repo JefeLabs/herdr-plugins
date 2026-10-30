@@ -221,6 +221,8 @@ pub enum Screen {
     /// home group when it is known (the tree's selection), else `None`.
     KindPick {
         group: Option<PathBuf>,
+        /// Filing a follow-up of this intent (its file).
+        follow_up: Option<PathBuf>,
     },
     /// Adding by conversation, in its own view.
     Interview(Box<InterviewScreen>),
@@ -1499,10 +1501,16 @@ impl App {
             KeyCode::Char('+') => self.open_areas_input(),
             KeyCode::Char('u') => self.undo_reconcile(),
             // the card view says nothing about where an intent belongs
-            KeyCode::Char('a') => self.screen = Screen::KindPick { group: None },
+            KeyCode::Char('a') => {
+                self.screen = Screen::KindPick {
+                    group: None,
+                    follow_up: None,
+                }
+            }
             KeyCode::Char('D') => self.ask_trash(),
             KeyCode::Char('E') => self.capture_again(),
             KeyCode::Char('X') => self.check_now(),
+            KeyCode::Char('F') => self.new_follow_up(),
             _ => {}
         }
         Flow::Continue
@@ -1837,7 +1845,7 @@ impl App {
                 scroll,
             } => self.key_send_confirm(handoff, provider, repo, prompt, scroll, k),
             Screen::Prompt { question, pending } => self.key_prompt(question, pending, k),
-            Screen::KindPick { group } => self.key_kind_pick(group, k),
+            Screen::KindPick { group, follow_up } => self.key_kind_pick(group, follow_up, k),
             Screen::Interview(st) => self.key_interview(st, k),
             Screen::Input {
                 label,
@@ -1958,11 +1966,15 @@ impl App {
             },
             KeyCode::Char('a') => {
                 let group = (!self.rows.is_empty()).then(|| self.selected_group_dir());
-                self.screen = Screen::KindPick { group };
+                self.screen = Screen::KindPick {
+                    group,
+                    follow_up: None,
+                };
             }
             KeyCode::Char('D') => self.ask_trash(),
             KeyCode::Char('E') => self.capture_again(),
             KeyCode::Char('X') => self.check_now(),
+            KeyCode::Char('F') => self.new_follow_up(),
             KeyCode::Char('n') => {
                 let parent = self.selected_group_dir();
                 self.screen = Screen::Input {
@@ -2181,6 +2193,7 @@ impl App {
                         self.criteria_selected,
                     ),
                     KeyCode::Char('X') => self.check_now(),
+                    KeyCode::Char('F') => self.new_follow_up(),
                     // the selected criterion's proof from the latest check
                     KeyCode::Char('o') => {
                         let proof = self
@@ -2272,6 +2285,7 @@ impl App {
                     },
                     KeyCode::Char('E') => self.capture_again(),
                     KeyCode::Char('X') => self.check_now(),
+                    KeyCode::Char('F') => self.new_follow_up(),
                     _ => {}
                 }
             }
@@ -2748,10 +2762,18 @@ impl App {
     /// is saved or the conversation is cancelled.
     pub fn start_capture(&mut self) {
         self.exit_on_browse = true;
-        self.screen = Screen::KindPick { group: None };
+        self.screen = Screen::KindPick {
+            group: None,
+            follow_up: None,
+        };
     }
 
-    fn key_kind_pick(&mut self, group: Option<PathBuf>, k: KeyEvent) -> Flow {
+    fn key_kind_pick(
+        &mut self,
+        group: Option<PathBuf>,
+        follow_up: Option<PathBuf>,
+        k: KeyEvent,
+    ) -> Flow {
         let kind = match k.code {
             KeyCode::Char('b') => "issue",
             KeyCode::Char('r') => "refactor",
@@ -2762,17 +2784,17 @@ impl App {
                 return Flow::Continue;
             }
             _ => {
-                self.screen = Screen::KindPick { group };
+                self.screen = Screen::KindPick { group, follow_up };
                 return Flow::Continue;
             }
         };
-        self.open_interview(group, kind);
+        self.open_interview(group, kind, follow_up);
         Flow::Continue
     }
 
     /// Starts adding by conversation. The agent's folder is named now: the
     /// intent's file name exists only once the agent has written the title.
-    fn open_interview(&mut self, home: Option<PathBuf>, kind: &str) {
+    fn open_interview(&mut self, home: Option<PathBuf>, kind: &str, follow_up: Option<PathBuf>) {
         let fallback = match &home {
             Some(h) => h.clone(),
             None if self.exit_on_browse => self.home_dir(),
@@ -2783,7 +2805,12 @@ impl App {
             .map(|h| self.rel(h).display().to_string())
             .filter(|r| !r.is_empty());
         let guide = crate::config::interview_guide(&self.dirs, kind).unwrap_or_default();
-        let iv = crate::interview::Interview::new(kind, home_rel, self.group_paths(), guide);
+        let mut iv = crate::interview::Interview::new(kind, home_rel, self.group_paths(), guide);
+        // a follow-up: the agent sees the original, as data
+        iv.context = follow_up
+            .as_ref()
+            .and_then(|p| Store::load(p).ok())
+            .map(|o| format!("# {}\n\n{}", o.fm.title, o.body.trim_end()));
         let last = last_used(&self.dirs, &self.cfg);
         let folder = polish_cwd(self.store.root(), &crate::interview::polish_folder_name());
         self.screen = Screen::Interview(Box::new(InterviewScreen {
@@ -2805,6 +2832,7 @@ impl App {
             capture_asked: false,
             pending_write_up: None,
             capture_block: None,
+            follow_up_of: follow_up,
         }));
     }
 
@@ -2942,6 +2970,28 @@ impl App {
             env: self.capture_env.clone(),
             managed_mcp: managed_mcp(),
         })
+    }
+
+    /// `F`: files a follow-up of the selected sent intent, linked to it; on a
+    /// follow-up, linked to the first original it refines.
+    fn new_follow_up(&mut self) {
+        let Some(it) = self.selected_intent().cloned() else {
+            return;
+        };
+        if it.fm.state != State::Sent {
+            self.message = Some("F is for sent intents: edit this one instead".into());
+            return;
+        }
+        let original = it
+            .fm
+            .follow_up_of
+            .as_ref()
+            .and_then(|stem| crate::check::find_intent(&self.store, stem))
+            .unwrap_or(it);
+        self.screen = Screen::KindPick {
+            group: original.path.parent().map(Path::to_path_buf),
+            follow_up: Some(original.path),
+        };
     }
 
     /// `X`: checks the selected sent intent's acceptance criteria now.
@@ -3684,6 +3734,7 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().to_string());
         let (provider, conv) = (st.provider.clone(), st.conv_id.clone());
+        let original = st.follow_up_of.as_ref().and_then(|p| Store::load(p).ok());
         let _ = Store::update_fields(&it.path, |fm| {
             fm.state = if raw { State::Raw } else { State::Refining };
             fm.areas = areas;
@@ -3691,7 +3742,18 @@ impl App {
             if let Some(c) = conv {
                 fm.conversations.insert(provider, c);
             }
+            fm.follow_up_of = original.as_ref().map(|o| o.stem());
         });
+        // the original lists it
+        if let Some(o) = &original {
+            let stem = it.stem();
+            let _ = Store::update_meta(&o.path, |fm| {
+                fm.follow_ups.push(crate::store::FollowUpLink {
+                    stem,
+                    folded: false,
+                })
+            });
+        }
         // the owner's own write-up: none of its criteria are someone else's news
         let _ = crate::store::acknowledge_all_criteria(&it.path);
         for (role, text) in &st.transcript {
@@ -3823,10 +3885,17 @@ impl App {
 
     /// Where a save would file the intent, and the other groups its criteria name.
     fn interview_target(&self, st: &InterviewScreen) -> (String, Vec<String>) {
-        let group = st
-            .iv
-            .save_group(st.write_up.as_ref().and_then(|r| r.group.as_deref()))
-            .unwrap_or_else(|| self.rel(&st.fallback).display().to_string());
+        // a follow-up lives beside its original, whatever group the agent names
+        let original_group = st
+            .follow_up_of
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|g| self.rel(g).display().to_string());
+        let group = original_group.unwrap_or_else(|| {
+            st.iv
+                .save_group(st.write_up.as_ref().and_then(|r| r.group.as_deref()))
+                .unwrap_or_else(|| self.rel(&st.fallback).display().to_string())
+        });
         let areas = st
             .write_up
             .as_ref()
@@ -3864,7 +3933,7 @@ impl App {
             _ => "group to be decided".to_string(),
         };
         match &self.screen {
-            Screen::KindPick { group } => {
+            Screen::KindPick { group, .. } => {
                 let home = group.as_ref().map(|g| self.rel(g).display().to_string());
                 let header = format!("new intent · {}", place(home.as_deref()));
                 ui::render_kind_question(&header, body, buf);
@@ -10491,6 +10560,99 @@ mod tests {
         fx.app.recheck_closed_items();
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(work_log(&fx), "");
+    }
+
+    // ---- follow-ups ------------------------------------------------------------------
+
+    #[test]
+    fn f_opens_the_add_view_linked_to_the_original() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "In the inbox");
+        let original = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&original, |fm| fm.state = State::Sent).unwrap();
+        fx.app.rescan();
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        select(&mut fx.app, "In the inbox");
+        key(&mut fx.app, KeyCode::Char('F'));
+        key(&mut fx.app, KeyCode::Char('f'));
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        assert!(
+            calls(&fx)[0].contains("<<<ORIGINAL"),
+            "the agent sees the original: {}",
+            calls(&fx)[0]
+        );
+        key(&mut fx.app, KeyCode::Enter); // that's right → enough
+        wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        let follow = fx.app.selected_intent().unwrap().clone();
+        assert_ne!(follow.path, original);
+        let orig = Store::load(&original).unwrap();
+        assert_eq!(
+            follow.fm.follow_up_of.as_deref(),
+            Some(orig.stem().as_str())
+        );
+        assert_eq!(
+            orig.fm.follow_ups,
+            vec![crate::store::FollowUpLink {
+                stem: follow.stem(),
+                folded: false
+            }]
+        );
+        assert_eq!(
+            follow.path.parent(),
+            original.parent(),
+            "filed in the original's group, whatever group the agent names"
+        );
+    }
+
+    #[test]
+    fn f_on_a_follow_up_links_to_the_first_original() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let alpha_stem = Store::load(&alpha).unwrap().stem();
+        let group = alpha
+            .parent()
+            .unwrap()
+            .strip_prefix(fx.app.store.root())
+            .unwrap()
+            .to_path_buf();
+        let follow = fx
+            .app
+            .store
+            .create(&group, "A first refinement", "enhancement", CRITERIA, None)
+            .unwrap();
+        Store::update_fields(&follow.path, |fm| {
+            fm.state = State::Sent;
+            fm.follow_up_of = Some(alpha_stem);
+        })
+        .unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&follow.path); // it sorts above Alpha
+        key(&mut fx.app, KeyCode::Char('F'));
+        assert!(
+            matches!(&fx.app.screen, Screen::KindPick { follow_up: Some(p), .. } if *p == alpha),
+            "links to the first original"
+        );
+    }
+
+    #[test]
+    fn f_is_refused_on_an_unsent_intent() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Beta");
+        key(&mut fx.app, KeyCode::Char('F'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("F is for sent intents"),
+            "{:?}",
+            fx.app.view().message
+        );
+        assert_eq!(fx.app.view().screen, "browse");
     }
 
     // ---- showing check results ----------------------------------------------------
