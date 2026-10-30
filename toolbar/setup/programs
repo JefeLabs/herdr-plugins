@@ -1,5 +1,5 @@
 # The programs the tools need, and how the walk-through installs each one:
-#   program|command it is found by|Homebrew formula|mise tool|curl
+#   program|command it is found by|Homebrew formula (cask:<name> for a cask)|mise tool|curl
 # curl is `pinned` (a pinned download in install.sh, named by the command),
 # `script:<url>` (the program's own installer), `gh-ext:<repo>` (a gh
 # extension) or -. A - elsewhere means that installer has no way to get it.
@@ -8,7 +8,7 @@ gh-dash|gh-dash|-|-|gh-ext:dlvhdr/gh-dash
 lazysql|lazysql|lazysql|github:jorgerojas26/lazysql|pinned
 yazi|yazi|yazi|github:sxyazi/yazi|pinned
 jira-cli|jira|ankitpokhrel/jira-cli/jira-cli|github:ankitpokhrel/jira-cli|pinned
-terminal-browser|terminal-browser|-|-|script:https://terminal-browser.sh/install
+terminal-browser|terminal-browser|cask:terminal-browser|-|script:https://terminal-browser.sh/install
 neovim|nvim|neovim|github:neovim/neovim|pinned
 procs|procs|procs|github:dalance/procs|pinned
 oxker|oxker|oxker|github:mrjackwills/oxker|pinned

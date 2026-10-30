@@ -383,11 +383,15 @@ found_in() { # <command>: the folder holding it outside PATH (bin folder, mise's
   done
   return 1
 }
+gh_path() { # where gh is, on PATH or in one of those folders
+  command -v gh 2>/dev/null || { d=$(found_in gh) && printf '%s/gh\n' "$d"; }
+}
+gh_signed_in() { g=$(gh_path) && "$g" auth status >/dev/null 2>&1; }
 present() { # <program>: on PATH, in one of those folders, or (gh-dash) a gh extension
   check=$(program_field "$1" 2)
   [ -n "$check" ] || check=$1
   case "$check" in
-    gh-dash) command -v gh >/dev/null 2>&1 && gh extension list 2>/dev/null | grep -q gh-dash ;;
+    gh-dash) g=$(gh_path) && "$g" extension list 2>/dev/null | grep -q gh-dash ;;
     *) command -v "$check" >/dev/null 2>&1 || found_in "$check" >/dev/null ;;
   esac
 }
@@ -401,14 +405,34 @@ method_of() { # <program>: how it installs here (brew:<formula>, mise:<tool>, pi
     printf 'mise:%s\n' "$mise_name"
   elif [ "$curl_way" = pinned ]; then
     printf 'pinned:%s\n' "$(program_field "$1" 2)"
+  elif [ "${curl_way%%:*}" = gh-ext ]; then
+    # a gh extension installs only through a signed-in gh, and needs the network
+    if [ -z "$from" ] && gh_signed_in; then printf '%s\n' "$curl_way"; fi
+  elif [ "${curl_way%%:*}" = script ]; then
+    # the program's own installer, from the network (HERDR_PLUGINS_TB_INSTALL: for testing)
+    if [ -z "$from" ] || [ -n "${HERDR_PLUGINS_TB_INSTALL:-}" ]; then
+      printf 'script:%s\n' "${HERDR_PLUGINS_TB_INSTALL:-${curl_way#script:}}"
+    fi
   fi
 }
 install_program() { # <program>: 0 when it installed
   way=$(method_of "$1")
   case "$way" in
+    brew:cask:*) brew install --cask "${way#brew:cask:}" </dev/null ;;
     brew:*) brew install "${way#brew:}" </dev/null ;;
     mise:*) mise use -g "${way#mise:}" </dev/null ;;
     pinned:*) install_pinned "${way#pinned:}" ;;
+    gh-ext:*) g=$(gh_path) && "$g" extension install "${way#gh-ext:}" </dev/null ;;
+    script:*)
+      # its own installer; its follow-up setup (agent skills) is left to the owner
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${way#script:}" -o "$tmp/install-$1"
+      else
+        wget -qO "$tmp/install-$1" "${way#script:}"
+      fi && TERMINAL_BROWSER_SKIP_SETUP=1 bash "$tmp/install-$1" </dev/null &&
+        next_steps="$next_steps
+  $1: run \`$1 setup\` to finish setting it up"
+      ;;
     *) return 1 ;;
   esac
 }
@@ -497,16 +521,21 @@ setup_toolbar() {
   done < "$tmp/setup-tools"
   ticks=" $(awk -F'|' '$4 == 1 { printf "%s ", $1 }' "$tmp/setup-tools")"
   [ -z "$answers_from" ] || choose_tools
-  failed=""
+  failed="" network="" next_steps=""
   if [ -n "$answers_from" ]; then
     # what the ticked tools still need, each program once, that can be installed here
     offer=""
     while IFS='|' read -r id _name _summary _ticked needs _nerd _text; do
       case "$ticks" in *" $id "*) ;; *) continue ;; esac
       for program in $needs; do
-        case " $offer " in *" $program "*) continue ;; esac
+        case " $offer $network " in *" $program "*) continue ;; esac
         present "$program" </dev/null && continue
-        [ -n "$(method_of "$program")" ] && offer="$offer $program"
+        if [ -n "$(method_of "$program")" ]; then
+          offer="$offer $program"
+        elif [ -n "$from" ] && [ "$(program_field "$program" 5 | cut -d: -f1)" = script ]; then
+          network="$network $program"
+          say "  $program: needs the network (its own installer)"
+        fi
       done
     done < "$tmp/setup-tools"
     if [ -n "$offer" ]; then
@@ -534,10 +563,17 @@ setup_toolbar() {
         *) missing="$missing${missing:+, }$program" ;;
       esac
     done
-    if [ -n "$broke" ]; then
+    # signing in is left to the owner: these tools wait for it
+    if [ "$id" = issues ] && [ -n "$(gh_path)" ] && ! gh_signed_in; then
+      next_steps="$next_steps
+  GitHub issues: run gh auth login, then install.sh --setup to add it"
+    elif [ -n "$broke" ]; then
       say "  left off: $name ($broke did not install)"
     elif [ -n "$missing" ]; then
       say "  left off: $name (needs $missing)"
+    elif [ "$id" = jira ] && [ ! -f "${JIRA_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/.jira/.config.yml}" ]; then
+      next_steps="$next_steps
+  Jira: run jira init, then install.sh --setup to add it"
     else
       chosen="$chosen $id"
     fi
@@ -567,6 +603,9 @@ setup_toolbar() {
   # shellcheck disable=SC2086
   set -- $chosen
   say "Wrote $config/tools.toml ($# tools, $mode icons)"
+  if [ -n "$next_steps" ]; then
+    say "Next:$next_steps"
+  fi
 }
 if [ -n "$config" ] && { [ -n "$setup" ] || [ ! -f "$config/tools.toml" ]; }; then
   if [ -d "$catalog" ]; then

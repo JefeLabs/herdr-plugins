@@ -543,6 +543,7 @@ fake_installers() { # <folder> <brew exit status, or - for no Homebrew> <mise: y
 echo "\$*" >> "\$HOME/.brew-log"
 [ "\$1" = install ] || exit 0
 [ $2 = 0 ] || exit $2
+[ "\$2" != --cask ] || shift
 case "\$2" in
   ankitpokhrel/jira-cli/jira-cli) prog=jira ;;
   neovim) prog=nvim ;;
@@ -580,7 +581,7 @@ run_online() { # <home> <extra PATH or -> <args...>: like run, from a file:// re
   p=$base_path
   [ "$extra" = - ] || p="$extra:$p"
   out=$(env -i HOME="$h" PATH="$p" HERDR_PLUGINS_BASE_URL="file://$rel" HERDR_PLUGINS_TTY="${TTY:-none}" \
-    sh "$rel/install.sh" "$@" 2>&1)
+    HERDR_PLUGINS_TOOLS_MANIFEST="$work/good" ${TB:+HERDR_PLUGINS_TB_INSTALL="$TB"} sh "$rel/install.sh" "$@" 2>&1)
   status=$?
 }
 jira_config() { mkdir -p "$1/.config/.jira" && echo "installation: cloud" > "$1/.config/.jira/.config.yml"; }
@@ -704,6 +705,112 @@ case "$status:$out" in
     fi ;;
   *) flunk "a tampered jira download is refused" "exit $status: $out" ;;
 esac
+
+# --- gh dash, Jira and terminal-browser
+fake_gh() { # <folder> <exit status of gh auth status>: a gh that logs, and installs gh-dash
+  mkdir -p "$1"
+  cat > "$1/gh" <<EOF
+#!/bin/sh
+echo "\$*" >> "\$HOME/.gh-log"
+case "\$1 \$2" in
+  "auth status") exit $2 ;;
+  "extension install") touch "\$HOME/.gh-dash-installed" ;;
+  "extension list") [ -e "\$HOME/.gh-dash-installed" ] && echo "gh dash	dlvhdr/gh-dash	v4.26.2" ;;
+esac
+exit 0
+EOF
+  chmod +x "$1/gh"
+}
+
+# 33. GitHub issues waits for a signed-in gh, and says how to add it later
+h="$work/h33"
+mkdir -p "$h"
+fake_installers "$work/f33" 0 no
+fake_gh "$work/f33" 1
+answers "$work/a33" "" "y" ""
+TTY="$work/a33"
+run_online "$h" "$work/f33"
+unset TTY
+if ! grep -q '^id *= *"issues"' "$(toml "$h")" 2>/dev/null && ! grep -q 'extension install' "$h/.gh-log" 2>/dev/null; then
+  case "$out" in
+    *"GitHub issues: run gh auth login, then install.sh --setup to add it"*) pass "GitHub issues waits for sign-in" ;;
+    *) flunk "GitHub issues waits for sign-in" "no hint: $out" ;;
+  esac
+else
+  flunk "GitHub issues waits for sign-in" "gh: $(cat "$h/.gh-log" 2>&1): $(cat "$(toml "$h")" 2>&1)"
+fi
+
+# 34. signed in: gh dash is installed and GitHub issues is added
+h="$work/h34"
+mkdir -p "$h"
+fake_installers "$work/f34" 0 no
+fake_gh "$work/f34" 0
+answers "$work/a34" "" "y" ""
+TTY="$work/a34"
+run_online "$h" "$work/f34"
+unset TTY
+if grep -q 'extension install dlvhdr/gh-dash' "$h/.gh-log" 2>/dev/null && grep -q '^id *= *"issues"' "$(toml "$h")" 2>/dev/null; then
+  pass "signed in, gh dash is installed"
+else
+  flunk "signed in, gh dash is installed" "gh: $(cat "$h/.gh-log" 2>&1): $out"
+fi
+# (Homebrew's terminal-browser is a cask)
+if grep -q 'install --cask terminal-browser' "$h/.brew-log" 2>/dev/null && grep -q '^id *= *"browser"' "$(toml "$h")" 2>/dev/null; then
+  pass "Homebrew installs terminal-browser as a cask"
+else
+  flunk "Homebrew installs terminal-browser as a cask" "brew: $(cat "$h/.brew-log" 2>&1)"
+fi
+
+# 35. Jira waits for jira init
+h="$work/h35"
+mkdir -p "$h"
+fake_installers "$work/f35" 0 no
+fake_bin "$work/f35/jira" jira
+answers "$work/a35" "5" "" "n" ""
+TTY="$work/a35"
+run_online "$h" "$work/f35"
+unset TTY
+if ! grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"Jira: run jira init, then install.sh --setup to add it"*) pass "Jira waits for jira init" ;;
+    *) flunk "Jira waits for jira init" "no hint: $out" ;;
+  esac
+else
+  flunk "Jira waits for jira init" "added without a config: $out"
+fi
+
+# 36. terminal-browser from its own installer (no Homebrew); offline it needs the network
+cat > "$work/tb-install" <<'EOF'
+#!/bin/bash
+echo "skip setup: ${TERMINAL_BROWSER_SKIP_SETUP:-no}" >> "$HOME/.tb-log"
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/sh\necho "terminal-browser fake"\n' > "$HOME/.local/bin/terminal-browser"
+chmod +x "$HOME/.local/bin/terminal-browser"
+EOF
+h="$work/h36"
+mkdir -p "$h"
+answers "$work/a36" "2 3 4 7 9" "" "y" ""
+TTY="$work/a36" TB="file://$work/tb-install"
+run_online "$h" -
+unset TTY TB
+if grep -q '^id *= *"browser"' "$(toml "$h")" 2>/dev/null && grep -q 'skip setup: 1' "$h/.tb-log" 2>/dev/null; then
+  pass "terminal-browser from its own installer"
+else
+  flunk "terminal-browser from its own installer" "exit $status, tb: $(cat "$h/.tb-log" 2>&1): $out"
+fi
+h="$work/h36b"
+mkdir -p "$h"
+TTY="$work/a36"
+run "$h" - "$work/good"
+unset TTY
+if ! grep -q '^id *= *"browser"' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"terminal-browser: needs the network (its own installer)"*) pass "offline, terminal-browser needs the network" ;;
+    *) flunk "offline, terminal-browser needs the network" "no message: $out" ;;
+  esac
+else
+  flunk "offline, terminal-browser needs the network" "Browser added offline: $out"
+fi
 
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"
 [ $failures -eq 0 ]
