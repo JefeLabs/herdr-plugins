@@ -956,6 +956,12 @@ pub enum Update {
         merged: Vec<u64>,
         prompt: String,
     },
+    /// A fold of a shipped follow-up into its original, gathered: the prompt.
+    Fold {
+        path: PathBuf,
+        follow_up: String,
+        prompt: String,
+    },
     /// Pull requests found mentioning each of the intent's spec or plan
     /// file names, per name.
     FoundPrs {
@@ -1088,6 +1094,38 @@ impl Poller {
                 Update::Reconcile {
                     path: intent.path,
                     merged,
+                    prompt,
+                },
+            ));
+        });
+    }
+
+    /// Gather a shipped follow-up's merged pull requests and ask for its fold
+    /// into the original, off the UI thread.
+    pub fn request_fold(&mut self, original: Intent, follow_up: Intent, merged: Vec<u64>) {
+        let key = format!("fold:{}", original.path.display());
+        let Some(repo) = follow_up
+            .fm
+            .repo
+            .clone()
+            .or_else(|| original.fm.repo.clone())
+        else {
+            return;
+        };
+        if !self.in_flight.insert(key.clone()) {
+            return;
+        }
+        let env = self.env.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let gh = tool_bin(&env, "GH_BIN_PATH", Some("gh")).unwrap_or_else(|| "gh".into());
+            let ctx = crate::reconcile::gather(&repo, &follow_up, &merged, &gh, &env);
+            let prompt = crate::reconcile::fold_prompt(&original, &follow_up, &ctx.prs);
+            let _ = tx.send((
+                key,
+                Update::Fold {
+                    path: original.path,
+                    follow_up: follow_up.stem(),
                     prompt,
                 },
             ));
