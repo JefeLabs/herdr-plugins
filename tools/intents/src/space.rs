@@ -43,7 +43,7 @@ struct RepoEntry {
 }
 
 /// `path` without `.` and `..` (worked out on the names; the folders need not exist).
-fn plain(path: &Path) -> PathBuf {
+pub(crate) fn plain(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for part in path.components() {

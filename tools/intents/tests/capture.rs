@@ -197,6 +197,286 @@ impl Fx {
     }
 }
 
+// ---- commands mode: any project's app, from its run guide ------------------------
+
+/// "The app": answers every connection with 200 until the test ends; its port.
+fn fake_app() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            use std::io::{Read, Write};
+            let mut stream = stream;
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    port
+}
+
+/// A port nothing listens on.
+fn unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+impl Fx {
+    /// A meta repo (`repo/`) whose run.md has `front` ({log} and {pid}: files
+    /// the test reads; {port} is left for the tool).
+    fn commands(front: &str) -> Fx {
+        let fx = Fx::new();
+        let log = fx.tmp.path().join("app-events.log");
+        let pid = fx.tmp.path().join("app.pid");
+        let text = front
+            .replace("{log}", &log.display().to_string())
+            .replace("{pid}", &pid.display().to_string());
+        fs::write(
+            fx.tmp.path().join("repo/.helmsmith/run.md"),
+            format!("---\n{text}---\nSign in as demo.\n"),
+        )
+        .unwrap();
+        fx
+    }
+
+    fn app_pid(&self) -> Option<i32> {
+        fs::read_to_string(self.tmp.path().join("app.pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn wait_done(&self, job: &CaptureJob) -> CaptureRecord {
+        let start = Instant::now();
+        loop {
+            while let Some(u) = job.try_recv() {
+                if let CaptureUpdate::Done(rec) = u {
+                    return rec;
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn a_commands_guide_starts_seeds_runs_and_stops() {
+    let port = fake_app();
+    let fx = Fx::commands(&format!(
+        "start: echo start >> {{log}}; echo $$ > {{pid}}; exec sleep 60\nurl: http://127.0.0.1:{port}\nseed: [\"echo seed1 >> {{log}}\", \"echo seed2 >> {{log}}\"]\nstop: echo stop >> {{log}}\n"
+    ));
+    let rec = fx.run(false);
+    assert!(
+        !matches!(rec.outcome, Outcome::Failed(_)),
+        "{:?}",
+        rec.outcome
+    );
+    let events: Vec<String> = fx
+        .log("app-events.log")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(events, ["start", "seed1", "seed2", "stop"]);
+    assert_eq!(fx.log("work.log"), "", "no work slots in commands mode");
+    assert!(
+        fx.log("claude.log")
+            .contains(&format!("http://127.0.0.1:{port}")),
+        "the agent gets the app's address"
+    );
+    assert!(
+        !alive(fx.app_pid().unwrap()),
+        "the app's processes are gone"
+    );
+}
+
+#[test]
+fn the_port_placeholder_gets_a_free_port_as_port() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let fx = Fx::commands(
+        "start: echo \"start $PORT\" >> {log}; echo $$ > {pid}; exec python3 -m http.server --bind 127.0.0.1 $PORT\nurl: http://127.0.0.1:{port}\n",
+    );
+    let rec = fx.run(false);
+    assert!(
+        !matches!(rec.outcome, Outcome::Failed(_)),
+        "{:?}",
+        rec.outcome
+    );
+    let events = fx.log("app-events.log");
+    let port: u16 = events
+        .trim()
+        .strip_prefix("start ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        fx.log("claude.log")
+            .contains(&format!("http://127.0.0.1:{port}")),
+        "{events}"
+    );
+}
+
+#[test]
+fn a_start_that_exits_fails_fast_with_its_output() {
+    let dead = unused_port();
+    let fx = Fx::commands(&format!(
+        "start: echo oops-no-such-script; exit 3\nurl: http://127.0.0.1:{dead}\nready_timeout: 30\n"
+    ));
+    let t = Instant::now();
+    let rec = fx.run(false);
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(
+            why.contains("start exited") && why.contains("oops-no-such-script"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_app_that_never_answers_times_out() {
+    let dead = unused_port();
+    let fx = Fx::commands(&format!(
+        "start: echo $$ > {{pid}}; exec sleep 60\nurl: http://127.0.0.1:{dead}\nready_timeout: 2\n"
+    ));
+    let rec = fx.run(false);
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(why.contains("did not answer"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(!alive(fx.app_pid().unwrap()), "stopped after the timeout");
+}
+
+#[test]
+fn a_failing_seed_ends_the_run_and_stops_the_app() {
+    let port = fake_app();
+    let fx = Fx::commands(&format!(
+        "start: echo $$ > {{pid}}; exec sleep 60\nurl: http://127.0.0.1:{port}\nseed: [\"exit 4\"]\nstop: echo stop >> {{log}}\n"
+    ));
+    let rec = fx.run(false);
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(why.contains("exit 4"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fx.log("app-events.log").trim(), "stop");
+    assert!(!alive(fx.app_pid().unwrap()));
+}
+
+#[test]
+fn a_cancelled_run_stops_the_apps_process_group() {
+    let port = fake_app();
+    let mut fx = Fx::commands(&format!(
+        "start: echo $$ > {{pid}}; exec sleep 60\nurl: http://127.0.0.1:{port}\nstop: echo stop >> {{log}}\n"
+    ));
+    fx.set("FAKE_CLAUDE_HANG", "1");
+    let mut job = CaptureJob::spawn(fx.request(), fx.env.clone(), false);
+    let start = Instant::now();
+    while fx.log("claude.log").is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the agent never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    job.cancel();
+    let rec = fx.wait_done(&job);
+    assert!(
+        matches!(rec.outcome, Outcome::Failed(_)),
+        "{:?}",
+        rec.outcome
+    );
+    assert!(fx.log("app-events.log").contains("stop"));
+    assert!(!alive(fx.app_pid().unwrap()), "cancelled: the app is gone");
+}
+
+#[test]
+fn a_second_run_without_a_port_placeholder_waits_its_turn() {
+    let port = fake_app();
+    let fx = Fx::commands(&format!(
+        "start: echo $$ > {{pid}}; exec sleep 60\nurl: http://127.0.0.1:{port}\n"
+    ));
+    let lock = herdr_intents::capture::space_lock_path(&fx.tmp.path().join("repo"));
+    fs::write(
+        &lock,
+        format!("{} http://127.0.0.1:{port}\n", std::process::id()),
+    )
+    .unwrap();
+    let rec = fx.run(false);
+    let _ = fs::remove_file(&lock);
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(
+            why.contains(&format!("another run is using http://127.0.0.1:{port}")),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(fx.app_pid().is_none(), "the app never started");
+}
+
+#[test]
+fn a_missing_sibling_repo_is_named_with_its_clone_command() {
+    let port = fake_app();
+    let fx = Fx::commands(&format!(
+        "start: echo start >> {{log}}; exec sleep 60\nurl: http://127.0.0.1:{port}\n"
+    ));
+    fs::write(
+        fx.tmp.path().join("repo/.helmsmith/space.toml"),
+        "repos = [\n  { path = \".\", git = \"git@example.com:acme/meta.git\" },\n  { path = \"../web\", git = \"git@example.com:acme/web.git\" },\n]\n",
+    )
+    .unwrap();
+    let rec = fx.run(false);
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(
+            why.contains("../web") && why.contains("git clone git@example.com:acme/web.git ../web"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fx.log("app-events.log"), "", "nothing started");
+}
+
+#[test]
+fn a_crashed_runs_app_is_ended_by_the_next_run() {
+    use std::os::unix::process::CommandExt;
+    let port = fake_app();
+    let fx = Fx::commands(&format!(
+        "start: exec sleep 60\nurl: http://127.0.0.1:{port}\n"
+    ));
+    let mut left = std::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let evidence = fx.tmp.path().join("evidence");
+    fs::create_dir_all(&evidence).unwrap();
+    fs::write(evidence.join(".app.pgid"), left.id().to_string()).unwrap();
+    let _ = fx.run(false);
+    let start = Instant::now();
+    while left.try_wait().unwrap().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the crashed run's app is still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn a_capture_runs_start_env_seed_agent_finish_in_order() {
     let fx = Fx::new();

@@ -12365,10 +12365,21 @@ mod tests {
         fx.app.rescan();
         fx.app.check_due();
         wait_for_work(&fx, "finish --area");
-        let after = crate::capture::read_records(&home)
-            .into_iter()
-            .find(|r| r.phase == Phase::After)
-            .expect("an after was recorded");
+        // the runner writes the record just after `work finish`: wait for it
+        let start = Instant::now();
+        let after = loop {
+            if let Some(r) = crate::capture::read_records(&home)
+                .into_iter()
+                .find(|r| r.phase == Phase::After)
+            {
+                break r;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "an after was recorded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert_eq!(after.merged, vec![7]);
         assert_eq!(after.shot, Shot::Screenshot, "as the before was");
     }

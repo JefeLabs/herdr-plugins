@@ -421,3 +421,31 @@ fn an_untick_made_in_the_editor_is_a_veto_too() {
     assert_eq!(fm.owner_unticked, [criterion_key(C1)]);
     assert!(fm.check_ticks.is_empty());
 }
+
+// ---- commands mode: logs relative to the meta repo, inside the space ---------------
+
+#[test]
+fn a_check_reads_logs_relative_to_the_meta_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let meta = tmp.path().join("space/meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::create_dir_all(tmp.path().join("space/api/logs")).unwrap();
+    std::fs::write(tmp.path().join("space/api/logs/app.log"), "hello\n").unwrap();
+    let got =
+        herdr_intents::capture::space_log_paths(&meta, &["../api/logs/app.log".into()]).unwrap();
+    assert_eq!(got, vec![tmp.path().join("space/api/logs/app.log")]);
+}
+
+#[test]
+fn a_log_outside_the_space_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let meta = tmp.path().join("space/meta");
+    std::fs::create_dir_all(meta.join("logs")).unwrap();
+    for listed in ["../../etc/passwd", "/etc/passwd"] {
+        let e = herdr_intents::capture::space_log_paths(&meta, &[listed.into()]).unwrap_err();
+        assert!(e.contains("outside the space"), "{listed}: {e}");
+    }
+    std::os::unix::fs::symlink("/etc/hosts", meta.join("logs/link.log")).unwrap();
+    let e = herdr_intents::capture::space_log_paths(&meta, &["logs/link.log".into()]).unwrap_err();
+    assert!(e.contains("outside the space"), "{e}");
+}
