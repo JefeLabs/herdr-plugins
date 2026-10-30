@@ -491,6 +491,11 @@ pub struct App {
     pub capture_repo: Option<PathBuf>,
     /// How long a reconcile may run before it is stopped and reported.
     reconcile_limit: std::time::Duration,
+    /// What opens files and links outside (tests set a fake); `None`: the
+    /// system's (`open` on macOS, else `xdg-open`).
+    opener: Option<String>,
+    /// The port `make demos-open` serves the demos page on.
+    demos_port: u16,
     /// Merged sets already started this session, so a failure is not retried in a loop.
     reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
     /// Bugs whose "after" was considered for a merged set (once per set).
@@ -581,6 +586,8 @@ impl App {
             capture_env: Vec::new(),
             capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
+            opener: None,
+            demos_port: 4400,
             reconcile_tried: HashSet::new(),
             check_tried: HashSet::new(),
             recheck_tried: HashSet::new(),
@@ -2619,16 +2626,28 @@ impl App {
             .map(crate::send::worktrees)
             .unwrap_or_default();
         if external {
-            let arg = crate::demos::video_for(&roots, &id)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| crate::demos::site_url(&id));
-            let opener = if cfg!(target_os = "macos") {
-                "open"
-            } else {
-                "xdg-open"
+            // the newest take; else the demos page, only while it runs
+            let arg = match crate::demos::video_for(&roots, &id) {
+                Some(take) => take.display().to_string(),
+                None if crate::demos::site_running(self.demos_port) => {
+                    crate::demos::site_url(self.demos_port, &id)
+                }
+                None => {
+                    self.message = Some(format!(
+                        "no recorded video of `{id}` yet: record one with `make demos STORY={id}` in app-demos, on a slot stack"
+                    ));
+                    return;
+                }
             };
+            let opener = self.opener.clone().unwrap_or_else(|| {
+                if cfg!(target_os = "macos") {
+                    "open".into()
+                } else {
+                    "xdg-open".into()
+                }
+            });
             self.message = Some(
-                match std::process::Command::new(opener)
+                match std::process::Command::new(&opener)
                     .arg(&arg)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -6897,6 +6916,95 @@ mod tests {
         let v = fx.app.view();
         assert_eq!(v.screen, "reader", "{v:?}");
         assert_eq!(v.reader_title, "Alex shows Alpha working");
+    }
+
+    /// Alpha with a demo line for `alex-shows-alpha` in its repo, the Demo
+    /// Videos section focused, a fake opener that logs what it is asked to
+    /// open, and no demos page running; returns (the repo, the opener's log).
+    fn alpha_with_a_demo(fx: &mut Fx) -> (PathBuf, PathBuf) {
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let t = fx._tmp.path().to_path_buf();
+        let repo = t.join("repo");
+        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
+        fs::write(
+            repo.join("app-demos/stories/a.yaml"),
+            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
+        )
+        .unwrap();
+        let mut it = Store::load(&path).unwrap();
+        it.fm.repo = Some(repo.clone());
+        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n\n## Artifacts\n- demo: alex-shows-alpha (criteria: 1)\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        let log = t.join("opened.log");
+        let opener = t.join("opener.sh");
+        fs::write(
+            &opener,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&opener, fs::Permissions::from_mode(0o755)).unwrap();
+        fx.app.opener = Some(opener.display().to_string());
+        // a port nothing listens on
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        fx.app.demos_port = free.local_addr().unwrap().port();
+        drop(free);
+        tab_to(&mut fx.app, "demos");
+        (repo, log)
+    }
+
+    fn opened(log: &Path) -> String {
+        let start = Instant::now();
+        loop {
+            let s = fs::read_to_string(log).unwrap_or_default();
+            if !s.is_empty() || start.elapsed() > Duration::from_secs(3) {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn o_on_a_demo_without_a_take_or_page_says_how_to_record_it() {
+        let mut fx = setup("agy.jsonl");
+        let (_, log) = alpha_with_a_demo(&mut fx);
+        key(&mut fx.app, KeyCode::Char('o'));
+        let msg = fx.app.view().message.unwrap_or_default();
+        assert!(
+            msg.contains("no recorded video of `alex-shows-alpha`"),
+            "{msg}"
+        );
+        assert!(msg.contains("make demos STORY=alex-shows-alpha"), "{msg}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default(),
+            "",
+            "no dead link opened"
+        );
+    }
+
+    #[test]
+    fn o_on_a_demo_opens_the_demos_page_when_it_runs() {
+        let mut fx = setup("agy.jsonl");
+        let (_, log) = alpha_with_a_demo(&mut fx);
+        let page = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        fx.app.demos_port = page.local_addr().unwrap().port();
+        key(&mut fx.app, KeyCode::Char('o'));
+        let url = format!("http://localhost:{}/#alex-shows-alpha", fx.app.demos_port);
+        assert!(opened(&log).contains(&url), "{}", opened(&log));
+    }
+
+    #[test]
+    fn o_on_a_demo_with_a_take_opens_the_file() {
+        let mut fx = setup("agy.jsonl");
+        let (repo, log) = alpha_with_a_demo(&mut fx);
+        let take = repo.join("app-demos/videos/alex-shows-alpha/take-1.webm");
+        fs::create_dir_all(take.parent().unwrap()).unwrap();
+        fs::write(&take, b"webm").unwrap();
+        key(&mut fx.app, KeyCode::Char('o'));
+        assert!(opened(&log).contains("take-1.webm"), "{}", opened(&log));
     }
 
     /// Alpha, sent, with one criterion from its refinement transcript and two
