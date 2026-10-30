@@ -468,6 +468,14 @@ pub fn apply(
     if !record.merged.is_empty() {
         it.fm.checked_for = record.merged.clone();
     }
+    // a fold's criteria are checked once answered (not when it gave no answer)
+    let no_answer = Verdict::CantCheck("no answer".into());
+    it.fm.fold_check.retain(|k| {
+        !record
+            .results
+            .iter()
+            .any(|r| r.key == *k && r.verdict != no_answer)
+    });
     // a closed item's criterion has now been checked again: its re-check is done
     for link in it.fm.missing.iter_mut() {
         let checked = record.results.iter().any(|r| r.key == link.key);

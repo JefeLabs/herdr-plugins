@@ -161,6 +161,9 @@ pub struct FrontMatter {
     /// On an original: the follow-up the last fold came from (for `u`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fold: Option<String>,
+    /// On an original: the criteria a fold changed, still to be checked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fold_check: Vec<String>,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -448,6 +451,7 @@ impl Store {
             follow_ups: Vec::new(),
             fold_declined: false,
             last_fold: None,
+            fold_check: Vec::new(),
             extra: BTreeMap::new(),
         };
         let mut it = Intent {

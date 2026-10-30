@@ -483,6 +483,8 @@ pub struct App {
     reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant, Option<String>)>,
     /// Folds started this session (original, follow-up stem): once each, until `r`.
     fold_tried: HashSet<(PathBuf, String)>,
+    /// Fold checks started this session (original, keys): once each.
+    fold_check_tried: HashSet<(PathBuf, Vec<String>)>,
     /// The env captures run with (`*_BIN_PATH` included); empty in production.
     pub capture_env: Vec<(String, String)>,
     /// The repo intents are captured for; `None` means `send::capture_repo()`.
@@ -575,6 +577,7 @@ impl App {
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
             fold_tried: HashSet::new(),
+            fold_check_tried: HashSet::new(),
             capture_env: Vec::new(),
             capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
@@ -862,25 +865,7 @@ impl App {
             .collect();
         // add pull requests found by spec/plan name that no pr: line names,
         // except a follow-up's: they belong to the follow-up
-        let theirs: Vec<u64> = it
-            .fm
-            .follow_ups
-            .iter()
-            .filter_map(|l| self.intent_by_stem(&l.stem))
-            .flat_map(|f| {
-                let linked = crate::store::artifacts(&f.body)
-                    .into_iter()
-                    .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
-                    .filter_map(|a| pr_number(&a.target));
-                let found = self
-                    .found_prs
-                    .get(&f.path)
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|(_, prs)| prs.iter().map(|p| p.number));
-                linked.chain(found).collect::<Vec<_>>()
-            })
-            .collect();
+        let theirs = self.follow_up_prs(it);
         let mut prs: Vec<(u64, PrState)> = prs;
         let found = self.found_prs.get(&it.path);
         for f in found.into_iter().flatten().flat_map(|(_, prs)| prs) {
@@ -1025,12 +1010,10 @@ impl App {
             if it.fm.repo.is_none() {
                 continue;
             }
-            // wait for the pull-request search (it suggests the areas the work
-            // touched, and finds the pull requests that close the issue)
-            let searched = crate::store::artifacts(&it.body).iter().any(|a| {
-                a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan")
-            }) || !crate::capture::issue_numbers(&it.body).is_empty();
-            if searched && !self.found_prs.contains_key(&it.path) {
+            // wait for the pull-request searches (they suggest the areas the work
+            // touched, find the pull requests that close the issue, and tell
+            // which found ones are a follow-up's)
+            if !self.searches_answered(&it) {
                 continue;
             }
             let ev = self.evidence_for(&it);
@@ -1059,6 +1042,7 @@ impl App {
                 self.poller().request_reconcile(it, merged, folded);
             }
         }
+        self.fold_checks_due();
         self.check_due();
         self.recheck_closed_items();
         self.fold_due();
@@ -1073,6 +1057,14 @@ impl App {
         prompt: String,
         fold: Option<String>,
     ) {
+        if self.reconcile_jobs.contains_key(&path) {
+            // one job per intent: this one is asked again on a later pass
+            match fold {
+                Some(stem) => self.fold_tried.remove(&(path, stem)),
+                None => self.reconcile_tried.remove(&(path, merged)),
+            };
+            return;
+        }
         let last = crate::config::last_used(&self.dirs, &self.cfg);
         let Some(mut spec) = self.cfg.providers.get(&last.provider).cloned() else {
             self.message = Some(format!("reconcile: unknown provider `{}`", last.provider));
@@ -1140,7 +1132,11 @@ impl App {
             let outcome: Result<String, String> = match result {
                 Ok(reply) => match reply.proposal {
                     Some(prop) => {
-                        let body = merge_questions(&prop, &reply.questions);
+                        let mut body = merge_questions(&prop, &reply.questions);
+                        if fold.is_some() {
+                            // the follow-up's spec, plan and PR lines stay its own
+                            body = crate::reconcile::own_artifacts(&before, &body);
+                        }
                         crate::reconcile::apply(&path, &body, &merged, self.store.root())
                             .map(|it| {
                                 changed = crate::reconcile::changed_criteria(&before, &it.body);
@@ -1159,23 +1155,35 @@ impl App {
                         "reconciled `{title}` with what shipped (* until you read it, u undoes)"
                     ));
                     if let Some(stem) = &fold {
+                        // the original re-proves what the fold changed: kept until
+                        // checked, with what an earlier fold left unchecked
+                        let present: Vec<String> = Store::load(&path)
+                            .map(|it| {
+                                crate::store::criteria(&it.body)
+                                    .iter()
+                                    .map(|c| crate::store::criterion_key(&c.text))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         let _ = Store::update_meta(&path, |fm| {
                             fm.last_fold = Some(stem.clone());
                             for l in fm.follow_ups.iter_mut().filter(|l| l.stem == *stem) {
                                 l.folded = true;
                             }
+                            fm.fold_check.retain(|k| present.contains(k));
+                            for k in changed {
+                                if !fm.fold_check.contains(&k) {
+                                    fm.fold_check.push(k);
+                                }
+                            }
                         });
                         self.message = Some(format!(
                             "folded a follow-up into `{title}` (* until you read it, u undoes)"
                         ));
-                        // the original re-proves what the fold changed (with a guide)
-                        if !changed.is_empty()
-                            && let Ok(it) = Store::load(&path)
-                        {
-                            let _ = self.start_check(&it, Some(changed), Vec::new(), None, true);
-                        }
                     }
                     self.reload_tree();
+                    // a fold's criteria are checked first (they read the reloaded tree)
+                    self.fold_checks_due();
                     // the merged set is reconciled: now it can be checked
                     self.check_due();
                 }
@@ -1236,8 +1244,19 @@ impl App {
             .and_then(|it| it.fm.last_fold)
             .filter(|stem| before_fold.as_ref() != Some(stem))
             .and_then(|stem| self.intent_by_stem(&stem).cloned());
+        let links = Store::load(&path)
+            .map(|it| it.fm.follow_ups)
+            .unwrap_or_default();
         self.message = Some(match crate::reconcile::undo(&path) {
             Ok(true) => {
+                // follow-ups filed since that version keep their link
+                let _ = Store::update_meta(&path, |fm| {
+                    for l in links {
+                        if !fm.follow_ups.iter().any(|x| x.stem == l.stem) {
+                            fm.follow_ups.push(l);
+                        }
+                    }
+                });
                 let note = match undone_fold {
                     Some(f) => match Store::update_meta(&f.path, |fm| fm.fold_declined = true) {
                         Ok(_) => format!(
@@ -1635,6 +1654,7 @@ impl App {
         self.reload_tree();
         self.refresh_found();
         self.poll_ticks = 0;
+        self.fold_checks_due();
         self.check_due();
         self.recheck_closed_items();
         self.fold_due();
@@ -1766,9 +1786,46 @@ impl App {
         self.found_cache = Some((it.path, found));
     }
 
+    /// The pull requests `it`'s follow-ups own: linked by a `pr:` line or
+    /// found by their own search. They stay out of `it`'s set.
+    fn follow_up_prs(&self, it: &Intent) -> Vec<u64> {
+        use crate::progress::pr_number;
+        it.fm
+            .follow_ups
+            .iter()
+            .filter_map(|l| self.intent_by_stem(&l.stem))
+            .flat_map(|f| {
+                let linked = crate::store::artifacts(&f.body)
+                    .into_iter()
+                    .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+                    .filter_map(|a| pr_number(&a.target));
+                let found = self
+                    .found_prs
+                    .get(&f.path)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(_, prs)| prs.iter().map(|p| p.number));
+                linked.chain(found).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether the pull-request searches `it`'s set depends on have answered:
+    /// its own, and each follow-up's (whose found pull requests leave it).
+    fn searches_answered(&self, it: &Intent) -> bool {
+        let answered = |i: &Intent| !is_searched(i) || self.found_prs.contains_key(&i.path);
+        answered(it)
+            && it
+                .fm
+                .follow_ups
+                .iter()
+                .filter_map(|l| self.intent_by_stem(&l.stem))
+                .all(answered)
+    }
+
     /// Pull requests for the detail view: the linked ones with what `gh`
     /// said about them, then those the repo search found that no `pr:`
-    /// line names.
+    /// line names (a follow-up's stay with the follow-up).
     fn pr_rows(&self, it: &Intent) -> Vec<ui::PrRow> {
         use crate::progress::{PrState, pr_number};
         let key = |t: &str| {
@@ -1815,6 +1872,7 @@ impl App {
             })
             .collect();
         let mut seen: Vec<u64> = rows.iter().filter_map(|r| pr_number(&r.target)).collect();
+        seen.extend(self.follow_up_prs(it));
         for f in found {
             if seen.contains(&f.number) {
                 continue;
@@ -2219,6 +2277,10 @@ impl App {
             self.focus = Pane::Tree;
             return Flow::Continue;
         };
+        if k.code == KeyCode::Char('F') {
+            self.new_follow_up();
+            return Flow::Continue;
+        }
         if k.code == KeyCode::Char('a') {
             let (label, action) = match self.focus {
                 Pane::Preconditions => (
@@ -2311,7 +2373,6 @@ impl App {
                         self.criteria_selected,
                     ),
                     KeyCode::Char('X') => self.check_now(),
-                    KeyCode::Char('F') => self.new_follow_up(),
                     // the selected criterion's proof from the latest check
                     KeyCode::Char('o') => {
                         let proof = self
@@ -2425,7 +2486,6 @@ impl App {
                     },
                     KeyCode::Char('E') => self.capture_again(),
                     KeyCode::Char('X') => self.check_now(),
-                    KeyCode::Char('F') => self.new_follow_up(),
                     _ => {}
                 }
             }
@@ -3119,6 +3179,58 @@ impl App {
         })
     }
 
+    /// Whether `check_due` has yet to try `it`'s own check of its merged set
+    /// (it waits while another check of the repo runs).
+    fn check_pending(&self, it: &Intent) -> bool {
+        it.fm.repo.is_some()
+            && !it.fm.reconciled_for.is_empty()
+            && it.fm.reconciled_for != it.fm.checked_for
+            && !self
+                .check_tried
+                .contains(&(it.path.clone(), it.fm.reconciled_for.clone()))
+    }
+
+    /// Starts each kept fold check (the criteria a fold changed, `fold_check`)
+    /// once its original is free: no check or capture of it running. Without
+    /// a capture guide nothing can run it, so the criteria wait for the owner.
+    pub(crate) fn fold_checks_due(&mut self) {
+        for it in self.all_intents() {
+            if it.fm.fold_check.is_empty() {
+                continue;
+            }
+            let present: Vec<String> = crate::store::criteria(&it.body)
+                .iter()
+                .map(|c| crate::store::criterion_key(&c.text))
+                .collect();
+            let keys: Vec<String> = it
+                .fm
+                .fold_check
+                .iter()
+                .filter(|k| present.contains(k))
+                .cloned()
+                .collect();
+            let repo = it.fm.repo.clone().or_else(|| self.current_repo());
+            if keys.is_empty() || self.capture_block_for(repo).is_some() {
+                let _ = Store::update_meta(&it.path, |fm| fm.fold_check.clear());
+                continue;
+            }
+            if crate::capture::is_running(&crate::check::checks_dir(&it))
+                || crate::capture::is_running(&self.evidence_home(&it))
+                || !self
+                    .fold_check_tried
+                    .insert((it.path.clone(), keys.clone()))
+            {
+                continue;
+            }
+            if let Err(e) = self.start_check(&it, Some(keys), Vec::new(), None, true) {
+                self.message = Some(format!(
+                    "the check after the fold of `{}` could not start: {e}",
+                    it.fm.title
+                ));
+            }
+        }
+    }
+
     /// Folds each completed follow-up into its original once the original is
     /// finished: none of its pull requests open, and its own reconcile applied
     /// for its merged set. One fold per original at a time, each follow-up once
@@ -3129,6 +3241,10 @@ impl App {
             if original.fm.state != State::Sent
                 || self.reconcile_jobs.contains_key(&original.path)
                 || self.reconcile_failed.contains_key(&original.path)
+                || !self.searches_answered(&original)
+                || crate::capture::is_running(&crate::check::checks_dir(&original))
+                || crate::capture::is_running(&self.evidence_home(&original))
+                || self.check_pending(&original)
             {
                 continue;
             }
@@ -6173,6 +6289,17 @@ pub fn add(
 /// The user's home folder, for shortening paths to `~/…`.
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Whether the repo search covers `it` (as `request_found_prs` asks): sent,
+/// with a repo, and a spec, plan or issue to search by.
+fn is_searched(it: &Intent) -> bool {
+    it.fm.state == State::Sent
+        && it.fm.repo.is_some()
+        && (crate::store::artifacts(&it.body)
+            .iter()
+            .any(|a| a.kind.eq_ignore_ascii_case("spec") || a.kind.eq_ignore_ascii_case("plan"))
+            || !crate::capture::issue_numbers(&it.body).is_empty())
 }
 
 #[cfg(test)]
@@ -11357,6 +11484,330 @@ mod tests {
         key(&mut fx.app, KeyCode::Char('u'));
         assert!(!Store::load(&f).unwrap().fm.fold_declined);
         assert!(Store::load(&notify).unwrap().fm.follow_ups[0].folded);
+    }
+
+    // ---- review fixes: the fold ----------------------------------------------------
+
+    /// A live process holding `dir`'s run lock, as a running check or capture does.
+    fn hold_lock(dir: &Path) -> std::process::Child {
+        fs::create_dir_all(dir).unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        fs::write(dir.join(".capture.lock"), child.id().to_string()).unwrap();
+        child
+    }
+
+    fn release_lock(dir: &Path, mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(dir.join(".capture.lock"));
+    }
+
+    #[test]
+    fn f_files_a_follow_up_from_the_follow_ups_section() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        follow_up(&mut fx, &alpha, "Name the meeting too", false);
+        fx.app.select_path(&alpha);
+        tab_to(&mut fx.app, "follow-ups");
+        key(&mut fx.app, KeyCode::Char('F'));
+        assert!(
+            matches!(&fx.app.screen, Screen::KindPick { follow_up: Some(p), .. } if *p == alpha),
+            "{:?}",
+            fx.app.view().message
+        );
+    }
+
+    #[test]
+    fn the_original_does_not_offer_a_follow_ups_pr() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let f = follow_up(&mut fx, &alpha, "Name the meeting too", false);
+        let mut fu = Store::load(&f).unwrap();
+        fu.body.push_str("\n## Artifacts\n- pr: #77\n");
+        Store::save_force(&mut fu).unwrap();
+        fx.app.found_prs.insert(
+            alpha.clone(),
+            vec![(
+                "alpha-spec.md".into(),
+                vec![crate::progress::FoundPr {
+                    number: 77,
+                    state: crate::progress::PrState::Open,
+                    branch: String::new(),
+                    title: String::new(),
+                }],
+            )],
+        );
+        fx.app.rescan();
+        let it = Store::load(&alpha).unwrap();
+        let rows = fx.app.pr_rows(&it);
+        assert!(
+            !rows.iter().any(|r| r.target == "#77"),
+            "L must not be able to take the follow-up's PR"
+        );
+    }
+
+    #[test]
+    fn u_keeps_follow_ups_filed_after_the_fold() {
+        let mut fx = list_fixture(true);
+        let (notify, _) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        settle_folds(&mut fx, |fx| {
+            Store::load(&fx.app.store.root().join("skoolscout/org/pr.md"))
+                .unwrap()
+                .fm
+                .last_fold
+                .is_some()
+        });
+        let later = fx
+            .app
+            .store
+            .create(
+                Path::new("skoolscout/org"),
+                "Say when it was sent",
+                "enhancement",
+                "## Acceptance criteria\n- [ ] the email says when it was sent\n",
+                None,
+            )
+            .unwrap();
+        let later_stem = later.stem();
+        Store::update_meta(&notify, |fm| {
+            fm.follow_ups.push(crate::store::FollowUpLink {
+                stem: later_stem.clone(),
+                folded: false,
+            })
+        })
+        .unwrap();
+        fx.app.rescan();
+        fx.app.reveal(&notify);
+        key(&mut fx.app, KeyCode::Char('u'));
+        let links: Vec<String> = Store::load(&notify)
+            .unwrap()
+            .fm
+            .follow_ups
+            .iter()
+            .map(|l| l.stem.clone())
+            .collect();
+        assert_eq!(links.len(), 2, "{links:?}");
+        assert!(links.contains(&later_stem), "{links:?}");
+    }
+
+    #[test]
+    fn a_fold_keeps_the_originals_own_artifacts() {
+        let mut fx = list_fixture(true);
+        list_agent_says(
+            &mut fx,
+            "```proposal\n## Description\nThe primary contact gets no prompt to book the intro meeting.\n\n## Acceptance criteria\n- [ ] gets an email\n- [ ] the email names the meeting\n\n## Artifacts\n- spec: docs/superpowers/specs/notify.md\n- pr: #42\n- spec: docs/superpowers/specs/meeting-name.md\n- pr: #77\n```\nquestions: none\n",
+        );
+        let (notify, _) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        settle_folds(&mut fx, |fx| {
+            Store::load(&fx.app.store.root().join("skoolscout/org/pr.md"))
+                .unwrap()
+                .fm
+                .last_fold
+                .is_some()
+        });
+        let body = Store::load(&notify).unwrap().body;
+        let targets: Vec<String> = crate::store::artifacts(&body)
+            .iter()
+            .map(|a| a.target.trim().to_string())
+            .collect();
+        assert_eq!(
+            targets,
+            vec!["docs/superpowers/specs/notify.md", "#42"],
+            "{body}"
+        );
+        assert!(body.contains("the email names the meeting"), "{body}");
+    }
+
+    #[test]
+    fn a_fold_waits_for_the_originals_search() {
+        let mut fx = list_fixture(true);
+        let (notify, _) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        // no pr: line: its pull requests are known only from the search
+        let mut it = Store::load(&notify).unwrap();
+        it.body = it.body.replace("- pr: #42\n", "");
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        assert!(
+            fx.app.fold_tried.is_empty(),
+            "the search has not answered: an open PR may be out there"
+        );
+    }
+
+    #[test]
+    fn a_follow_ups_found_pr_waits_for_its_search() {
+        let mut fx = list_fixture(true);
+        let (notify, f) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        let mut fu = Store::load(&f).unwrap();
+        fu.body
+            .push_str("\n## Artifacts\n- plan: docs/superpowers/plans/meeting-name.md\n");
+        let repo = Store::load(&notify).unwrap().fm.repo.unwrap();
+        fu.fm.repo = Some(repo.clone()); // sent with a plan: it is searched
+        Store::save_force(&mut fu).unwrap();
+        fx.app.rescan();
+        fx.app
+            .pr_states
+            .insert((repo, "#42".into()), crate::progress::PrState::Merged);
+        let found = |n| crate::progress::FoundPr {
+            number: n,
+            state: crate::progress::PrState::Merged,
+            branch: String::new(),
+            title: String::new(),
+        };
+        // the original's search answered (and found the follow-up's #77);
+        // the follow-up's has not
+        fx.app.found_prs.insert(
+            notify.clone(),
+            vec![("notify.md".into(), vec![found(42), found(77)])],
+        );
+        fx.app.found_prs.remove(&f);
+        fx.app.check_reconciles();
+        assert!(
+            !fx.app.reconcile_tried.iter().any(|(p, _)| *p == notify),
+            "no reconcile over a PR that may be the follow-up's: {:?}",
+            fx.app.reconcile_tried
+        );
+    }
+
+    #[test]
+    fn a_reconcile_never_replaces_a_running_one() {
+        let mut fx = list_fixture(true);
+        let notify = fx.app.store.root().join("skoolscout/org/pr.md");
+        fx.app.start_reconcile(
+            notify.clone(),
+            vec![42],
+            "fold it".into(),
+            Some("a-follow-up".into()),
+        );
+        fx.app
+            .reconcile_tried
+            .insert((notify.clone(), vec![42, 77]));
+        fx.app
+            .start_reconcile(notify.clone(), vec![42, 77], "reconcile it".into(), None);
+        assert_eq!(
+            fx.app
+                .reconcile_jobs
+                .get(&notify)
+                .and_then(|j| j.3.clone())
+                .as_deref(),
+            Some("a-follow-up"),
+            "the running fold is kept"
+        );
+        assert!(
+            !fx.app
+                .reconcile_tried
+                .contains(&(notify.clone(), vec![42, 77])),
+            "the dropped reconcile is tried again later"
+        );
+    }
+
+    #[test]
+    fn a_fold_waits_while_the_original_is_checked() {
+        let mut fx = list_fixture(true);
+        let (notify, _) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        let dir = checks_of(&notify);
+        let lock = hold_lock(&dir);
+        for _ in 0..3 {
+            fx.app.rescan();
+            settle(&mut fx.app);
+        }
+        let folds_while_checked = folds_asked(&fx);
+        release_lock(&dir, lock);
+        assert_eq!(folds_while_checked, 0, "a check of the original is running");
+        settle_folds(&mut fx, |fx| folds_asked(fx) == 1);
+    }
+
+    #[test]
+    fn a_fold_waits_for_the_originals_own_check() {
+        let mut fx = list_fixture(true);
+        let (notify, _) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        // its merged set is reconciled but not yet checked, and the repo is
+        // busy with another intent's check
+        Store::update_fields(&notify, |fm| fm.checked_for = Vec::new()).unwrap();
+        let other = checks_of(&fx.app.store.root().join("skoolscout/org/building.md"));
+        let lock = hold_lock(&other);
+        for _ in 0..3 {
+            fx.app.rescan();
+            settle(&mut fx.app);
+        }
+        let folds_while_due = folds_asked(&fx);
+        release_lock(&other, lock);
+        assert_eq!(folds_while_due, 0, "the original's own check comes first");
+        settle_folds(&mut fx, |fx| folds_asked(fx) == 1);
+    }
+
+    #[test]
+    fn a_fold_check_waits_for_the_original_and_then_runs() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        capture_setup(&t, &mut fx.app, true, true);
+        fs::create_dir_all(t.join("repo/.helmsmith")).unwrap();
+        fs::write(t.join("repo/.helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        fs::write(
+            t.join("capture-events.jsonl"),
+            "{\"type\":\"result\",\"result\":\"2: fails: no meeting name\"}\n",
+        )
+        .unwrap();
+        let notify = fx.app.store.root().join("skoolscout/org/pr.md");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        let mut it = Store::load(&notify).unwrap();
+        it.body = it.body.replace(
+            "- [ ] gets an email\n",
+            "- [ ] gets an email\n- [ ] the email names the meeting\n",
+        );
+        it.fm.reconciled_for = vec![42];
+        it.fm.checked_for = vec![42];
+        it.fm.fold_check = vec![key2];
+        Store::save_force(&mut it).unwrap();
+        // a fold landed while a capture of it ran: its check waits
+        let dir = checks_of(&notify);
+        let lock = hold_lock(&dir);
+        fx.app.rescan();
+        settle(&mut fx.app);
+        std::thread::sleep(Duration::from_millis(300));
+        let started_early = fs::read_to_string(t.join("work.log")).unwrap_or_default();
+        release_lock(&dir, lock);
+        assert_eq!(
+            started_early, "",
+            "nothing starts while the original is busy"
+        );
+        fx.app.rescan();
+        let start = Instant::now();
+        while !fs::read_to_string(t.join("work.log"))
+            .unwrap_or_default()
+            .contains("start --area")
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "the kept fold check never started: {:?}",
+                fx.app.message
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        wait_check_end(&notify);
+        let claude = fs::read_to_string(t.join("claude.log")).unwrap();
+        assert!(
+            claude.contains("2. the email names the meeting"),
+            "{claude}"
+        );
+        assert!(!claude.contains("1. gets an email"), "{claude}");
+        let it = Store::load(&notify).unwrap();
+        assert!(it.fm.fold_check.is_empty(), "checked: the queue is done");
+        assert!(it.fm.missing.is_empty(), "a fold's check files nothing");
+    }
+
+    #[test]
+    fn without_a_guide_a_fold_check_is_left_to_the_owner() {
+        let mut fx = list_fixture(true);
+        let notify = fx.app.store.root().join("skoolscout/org/pr.md");
+        Store::update_meta(&notify, |fm| {
+            fm.fold_check = vec![crate::store::criterion_key("gets an email")]
+        })
+        .unwrap();
+        fx.app.rescan();
+        assert!(Store::load(&notify).unwrap().fm.fold_check.is_empty());
     }
 
     // ---- showing check results ----------------------------------------------------

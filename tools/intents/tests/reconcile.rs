@@ -278,6 +278,16 @@ fn original_and_follow_up() -> (tempfile::TempDir, Intent, Intent) {
 }
 
 #[test]
+fn the_fold_prompt_keeps_the_follow_ups_artifacts_out() {
+    let (_t, original, follow) = original_and_follow_up();
+    let p = fold_prompt(&original, &follow, &[]);
+    assert!(
+        p.contains("Do not copy the follow-up's artifact lines"),
+        "{p}"
+    );
+}
+
+#[test]
 fn the_fold_prompt_carries_the_follow_up_as_data_and_its_rules() {
     let (_t, original, follow) = original_and_follow_up();
     let prs = [ShippedPr {

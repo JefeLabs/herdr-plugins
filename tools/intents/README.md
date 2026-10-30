@@ -272,12 +272,12 @@ A refinement asked for after an intent shipped is a follow-up: its own intent, l
 - Pull requests stay with their intent. One linked to or found for a follow-up is left out of the original's, so it never sets the original back to "PR open" or starts the original's reconcile or check.
 
 **The fold.** Once a follow-up reads `✓ complete`, it is folded into the original: a reconcile of the original that changes its acceptance criteria to describe the app as it now behaves.
-- It waits until the original is finished: no open pull request, and its own reconcile applied.
+- It waits until the original is finished: its pull-request searches have answered, no pull request is open, its own reconcile is applied and its own check has run.
 - One fold runs at a time per original, and each follow-up folds once.
 - The agent gets the original, the follow-up's description and criteria, and its merged pull requests. It changes only what the follow-up changed and copies every other criterion word for word. New and changed criteria start unticked.
 - As with any reconcile, the original is marked unread (`*`), changed criteria show as new until read (`Y`), and a fold that fails stays in the status line until `r` retries it. The original's own merged set is untouched.
 
-**After the fold.** With a capture guide in the repo, a completion check runs at once on just the criteria the fold added or changed, and when they pass the original reads `✓ complete` again. A criterion that fails files nothing: the follow-up's own check already proved the app, so it reads `can't check: the fold may describe this wrongly: …` and stays unticked for you to fix or tick. Without a guide, the changed criteria wait for your ticks.
+**After the fold.** With a capture guide in the repo, a completion check runs on just the criteria the fold added or changed: at once, or as soon as no other check or capture of the original is running (they are kept on the original until checked). When they pass, the original reads `✓ complete` again. A criterion that fails files nothing: the follow-up's own check already proved the app, so it reads `can't check: the fold may describe this wrongly: …` and stays unticked for you to fix or tick. Without a guide, the changed criteria wait for your ticks.
 
 **`u`** after a fold puts back the version before it and declines that follow-up: it never folds in again on its own. To make the change after all, edit the original's criteria by hand.
 
