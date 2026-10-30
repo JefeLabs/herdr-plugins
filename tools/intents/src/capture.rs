@@ -35,13 +35,32 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// `.helmsmith/capture.md` in a repo: front matter for the tool, the body for
-/// the agent.
+/// How a guide gets the app running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuideMode {
+    /// Skoolscout's way: a `work` slot started in an area (the intent's, else
+    /// this one), seeded with e2e stories (`make e2e-story`).
+    Work { default_area: String },
+    /// Any project's way: commands run from the meta repo.
+    Commands {
+        /// Starts the app; runs in the background for the whole run.
+        start: String,
+        /// The path polled until the app answers (default: the url itself).
+        ready: Option<String>,
+        /// Seconds to wait for it to answer.
+        ready_timeout: u64,
+        /// Run after the run, before `start`'s processes are ended.
+        stop: Option<String>,
+    },
+}
+
+/// The run guide (`.helmsmith/run.md`, else `capture.md`) in a repo: front
+/// matter for the tool, the body for the agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureGuide {
-    /// The area to start a stack in when the intent's own area cannot.
-    pub default_area: String,
-    /// e2e stories the tool runs on the new slot before the agent starts.
+    /// How the app gets running.
+    pub mode: GuideMode,
+    /// Before the agent starts: e2e stories (work mode) or commands.
     pub seed: Vec<String>,
     /// The app's address, with `{port}` for the slot's frontend port.
     pub url: String,
@@ -79,7 +98,16 @@ pub const VIEWPORT: (u16, u16) = (1280, 800);
 /// The guide's front matter, as written.
 #[derive(Deserialize)]
 struct GuideFront {
-    default_area: String,
+    #[serde(default)]
+    default_area: Option<String>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    ready: Option<String>,
+    #[serde(default)]
+    ready_timeout: Option<u64>,
+    #[serde(default)]
+    stop: Option<String>,
     #[serde(default)]
     seed: Vec<String>,
     url: String,
@@ -87,10 +115,25 @@ struct GuideFront {
     logs: Vec<String>,
 }
 
-/// Reads `<repo>/.helmsmith/capture.md`: YAML front matter, then the body.
+/// How long the app gets to answer, unless the guide says.
+pub const READY_TIMEOUT_SECS: u64 = 600;
+
+/// Reads `<repo>/.helmsmith/run.md` (else the older `capture.md`): YAML front
+/// matter, then the body. `start` makes it any project's commands; else
+/// `default_area` makes it skoolscout's work slots.
 pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
     use anyhow::Context;
-    let path = repo.join(".helmsmith").join("capture.md");
+    let dir = repo.join(".helmsmith");
+    let Some(path) = ["run.md", "capture.md"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+    else {
+        anyhow::bail!(
+            "no run guide in {}: add run.md (or the older capture.md)",
+            dir.display()
+        );
+    };
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let rest = text
@@ -101,8 +144,21 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
         .with_context(|| format!("{}: front matter never closes", path.display()))?;
     let front: GuideFront = serde_yaml_ng::from_str(&rest[..end])
         .with_context(|| format!("{}: front matter", path.display()))?;
+    let mode = match (front.start, front.default_area) {
+        (Some(start), _) => GuideMode::Commands {
+            start,
+            ready: front.ready,
+            ready_timeout: front.ready_timeout.unwrap_or(READY_TIMEOUT_SECS),
+            stop: front.stop,
+        },
+        (None, Some(default_area)) => GuideMode::Work { default_area },
+        (None, None) => anyhow::bail!(
+            "{}: the guide needs `start` (a command that starts the app) or `default_area` (skoolscout's work slots)",
+            path.display()
+        ),
+    };
     Ok(CaptureGuide {
-        default_area: front.default_area,
+        mode,
         seed: front.seed,
         url: front.url,
         body: rest[end + "\n---\n".len()..].to_string(),
@@ -114,6 +170,9 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
 /// ends with (its last two segments), then the guide's default. `work start`
 /// decides which one can run.
 pub fn area_candidates(group_rel: Option<&str>, guide: &CaptureGuide) -> Vec<String> {
+    let GuideMode::Work { default_area } = &guide.mode else {
+        return Vec::new();
+    };
     let mut out: Vec<String> = Vec::new();
     if let Some(group) = group_rel {
         let parts: Vec<&str> = group.split('/').filter(|p| !p.is_empty()).collect();
@@ -121,8 +180,8 @@ pub fn area_candidates(group_rel: Option<&str>, guide: &CaptureGuide) -> Vec<Str
             out.push(parts[parts.len() - 2..].join("/"));
         }
     }
-    if !out.contains(&guide.default_area) {
-        out.push(guide.default_area.clone());
+    if !out.contains(default_area) {
+        out.push(default_area.clone());
     }
     out
 }
@@ -522,7 +581,7 @@ fn run(
     };
 
     let Ok(guide) = read_guide(&req.repo) else {
-        return failed(format!("no capture guide in {}", req.repo.display()));
+        return failed(format!("no run guide in {}", req.repo.display()));
     };
     // the agent is confined by --restricted and dontAsk: without them, no capture
     let help = r
@@ -1261,7 +1320,9 @@ mod tests {
 
     fn guide() -> CaptureGuide {
         CaptureGuide {
-            default_area: "org/social".into(),
+            mode: GuideMode::Work {
+                default_area: "org/social".into(),
+            },
             seed: vec!["kathia-signup".into()],
             url: "https://demo-org.skoolscout.com.local:{port}".into(),
             body: "Sign in with Cmd+U.\n".into(),

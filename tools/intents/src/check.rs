@@ -497,7 +497,9 @@ mod tests {
 
     fn guide() -> CaptureGuide {
         CaptureGuide {
-            default_area: "org/social".into(),
+            mode: crate::capture::GuideMode::Work {
+                default_area: "org/social".into(),
+            },
             seed: vec!["kathia-signup".into()],
             url: "https://h:{port}".into(),
             body: "Sign in with Cmd+U.\n".into(),

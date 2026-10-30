@@ -15,5 +15,6 @@ pub mod provider;
 pub mod reconcile;
 pub mod scope;
 pub mod send;
+pub mod space;
 pub mod store;
 pub mod ui;

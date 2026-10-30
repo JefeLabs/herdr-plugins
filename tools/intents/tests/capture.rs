@@ -10,6 +10,90 @@ use herdr_intents::capture::{
 };
 use herdr_intents::check::{CheckRecord, Verdict, read_check};
 
+// ---- the run guide: run.md or capture.md, work or commands mode ------------------
+
+fn guide_in(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join(".helmsmith")).unwrap();
+    for (name, text) in files {
+        fs::write(tmp.path().join(".helmsmith").join(name), text).unwrap();
+    }
+    tmp
+}
+
+#[test]
+fn run_md_wins_and_capture_md_still_works() {
+    use herdr_intents::capture::{GuideMode, read_guide};
+    let old =
+        "---\ndefault_area: org/social\nseed: [kathia-signup]\nurl: https://old:{port}\n---\nold\n";
+    let tmp = guide_in(&[("capture.md", old)]);
+    let g = read_guide(tmp.path()).unwrap();
+    assert_eq!(
+        g.mode,
+        GuideMode::Work {
+            default_area: "org/social".into()
+        }
+    );
+    assert_eq!(g.url, "https://old:{port}");
+    assert_eq!(g.seed, ["kathia-signup"]);
+    let tmp = guide_in(&[
+        ("capture.md", old),
+        (
+            "run.md",
+            "---\nstart: npm run dev\nurl: http://localhost:{port}\n---\nnew\n",
+        ),
+    ]);
+    let g = read_guide(tmp.path()).unwrap();
+    assert_eq!(g.url, "http://localhost:{port}", "run.md wins");
+    assert!(matches!(g.mode, GuideMode::Commands { .. }), "{:?}", g.mode);
+}
+
+#[test]
+fn a_commands_guide_is_read() {
+    use herdr_intents::capture::{GuideMode, read_guide};
+    let tmp = guide_in(&[(
+        "run.md",
+        "---\nstart: docker compose up -d && npm run dev\nurl: http://localhost:{port}\nready: /health\nready_timeout: 30\nseed: [\"npm run seed\"]\nstop: docker compose down\nlogs: [../api/app.log]\n---\nSign in as demo@example.com.\n",
+    )]);
+    let g = read_guide(tmp.path()).unwrap();
+    assert_eq!(
+        g.mode,
+        GuideMode::Commands {
+            start: "docker compose up -d && npm run dev".into(),
+            ready: Some("/health".into()),
+            ready_timeout: 30,
+            stop: Some("docker compose down".into()),
+        }
+    );
+    assert_eq!(g.seed, ["npm run seed"]);
+    assert_eq!(g.logs, ["../api/app.log"]);
+    assert_eq!(g.body, "Sign in as demo@example.com.\n");
+    let tmp = guide_in(&[(
+        "run.md",
+        "---\nstart: make up\nurl: http://localhost:8080\n---\n",
+    )]);
+    match read_guide(tmp.path()).unwrap().mode {
+        GuideMode::Commands {
+            ready_timeout,
+            ready,
+            stop,
+            ..
+        } => {
+            assert_eq!(ready_timeout, 600, "ten minutes unless the guide says");
+            assert_eq!((ready, stop), (None, None));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_guide_with_neither_start_nor_default_area_is_refused() {
+    use herdr_intents::capture::read_guide;
+    let tmp = guide_in(&[("run.md", "---\nurl: http://localhost:8080\n---\n")]);
+    let e = read_guide(tmp.path()).unwrap_err().to_string();
+    assert!(e.contains("start") && e.contains("default_area"), "{e}");
+}
+
 fn fixture(name: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

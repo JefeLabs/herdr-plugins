@@ -3147,14 +3147,85 @@ impl App {
         self.capture_block_for(self.current_repo())
     }
 
+    /// The repo whose run guide drives a run for `intent_repo` (the intent's,
+    /// or the current one): the space's meta repo, else that repo; or why
+    /// there is none.
+    pub(crate) fn run_repo_for(&self, intent_repo: Option<PathBuf>) -> Result<PathBuf, String> {
+        let space = self.cfg.scope.clone();
+        let meta = space
+            .as_deref()
+            .and_then(|s| crate::space::meta_for(&self.dirs, s));
+        let mut repo = None;
+        for candidate in meta.iter().chain(intent_repo.iter()) {
+            let dir = candidate.join(".helmsmith");
+            if !dir.join("run.md").is_file() && !dir.join("capture.md").is_file() {
+                continue;
+            }
+            // a guide that is there but wrong says what is wrong
+            if let Err(e) = crate::capture::read_guide(candidate) {
+                return Err(format!("{e:#}"));
+            }
+            repo = Some(candidate.clone());
+            break;
+        }
+        let Some(repo) = repo else {
+            let pointers = crate::space::pointers_path(&self.dirs);
+            return Err(match (&space, &intent_repo) {
+                (Some(s), Some(r)) => format!(
+                    "no run guide: set [spaces.{s}] meta in {}, or add .helmsmith/run.md to {}",
+                    pointers.display(),
+                    r.display()
+                ),
+                (Some(s), None) => format!(
+                    "no run guide: set [spaces.{s}] meta in {}",
+                    pointers.display()
+                ),
+                (None, Some(r)) => {
+                    format!("no run guide: add .helmsmith/run.md to {}", r.display())
+                }
+                (None, None) => "capture needs the intent's repo, and none was found".into(),
+            });
+        };
+        if let Some(why) = self.claude_block() {
+            return Err(why);
+        }
+        Ok(repo)
+    }
+
+    /// On start: a workspace with no meta repo yet, started in a repo that has
+    /// a space file, records that repo as its meta repo.
+    pub(crate) fn remember_space_meta(&mut self) {
+        let Some(name) = self.cfg.scope.clone() else {
+            return;
+        };
+        if crate::space::meta_for(&self.dirs, &name).is_some() {
+            return;
+        }
+        let Some(here) = self.current_repo() else {
+            return;
+        };
+        if crate::space::read_space(&here).is_err() {
+            return;
+        }
+        self.message = Some(
+            match crate::space::remember_meta(&self.dirs, &name, &here) {
+                Ok(()) => format!(
+                    "{} is the meta repo of space {name} (kept in {})",
+                    here.display(),
+                    crate::space::pointers_path(&self.dirs).display()
+                ),
+                Err(e) => format!("could not record this space's meta repo: {e:#}"),
+            },
+        );
+    }
+
     /// Why capture cannot run for this repo, if it cannot.
     fn capture_block_for(&self, repo: Option<PathBuf>) -> Option<String> {
-        let Some(repo) = repo else {
-            return Some("capture needs the intent's repo, and none was found".into());
-        };
-        if crate::capture::read_guide(&repo).is_err() {
-            return Some(format!("no capture guide in {}", repo.display()));
-        }
+        self.run_repo_for(repo).err()
+    }
+
+    /// Why no agent can run: claude is not installed.
+    fn claude_block(&self) -> Option<String> {
         let claude = match crate::progress::tool_bin(&self.capture_env, "CLAUDE_BIN_PATH", None) {
             Some(p) => p.is_file(),
             None => std::env::var_os("PATH")
@@ -3169,7 +3240,7 @@ impl App {
 
     /// Starts a "before" capture for the interview, in the background.
     fn start_capture_job(&mut self, st: &InterviewScreen, shot: crate::capture::Shot) {
-        let Some(repo) = self.current_repo() else {
+        let Ok(repo) = self.run_repo_for(self.current_repo()) else {
             return;
         };
         let name = st
@@ -3356,13 +3427,7 @@ impl App {
         fold: bool,
     ) -> Result<(), String> {
         use crate::capture::{Phase, Shot};
-        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
-        if let Some(why) = self.capture_block_for(repo.clone()) {
-            return Err(why);
-        }
-        let Some(repo) = repo else {
-            return Err("no repo to check in".into());
-        };
+        let repo = self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo()))?;
         let check_dir = crate::check::checks_dir(it);
         if crate::capture::is_running(&check_dir) {
             return Err("checking already".into());
@@ -3441,10 +3506,7 @@ impl App {
             match before {
                 // nothing to check: the plain after, as before checks existed
                 Some(b) if crate::store::criteria(&it.body).is_empty() => {
-                    let repo = it.fm.repo.clone();
-                    if self.capture_block_for(repo.clone()).is_none()
-                        && let Some(repo) = repo
-                    {
+                    if let Ok(repo) = self.run_repo_for(it.fm.repo.clone()) {
                         let shot = b.shot;
                         let _ = self.start_capture_for(
                             it,
@@ -3540,13 +3602,12 @@ impl App {
                 Some("capturing already: the Evidence section shows how far it got".into());
             return;
         }
-        let repo = it.fm.repo.clone().or_else(|| self.current_repo());
-        if let Some(why) = self.capture_block_for(repo.clone()) {
-            self.message = Some(why);
-            return;
-        }
-        let Some(repo) = repo else {
-            return;
+        let repo = match self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo())) {
+            Ok(repo) => repo,
+            Err(why) => {
+                self.message = Some(why);
+                return;
+            }
         };
         let evidence = self.evidence_home(&it);
         let recs = crate::capture::read_records(&evidence);
@@ -6097,6 +6158,7 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
         default_hook(info);
     }));
     let mut app = App::new(cfg, dirs)?;
+    app.remember_space_meta();
     if capture {
         app.start_capture();
     } else {
@@ -10526,7 +10588,7 @@ mod tests {
         with_capture(&mut fx, false, true);
         bug_to_the_evidence_question(&mut fx);
         assert!(
-            status_line(&fx.app).contains("no capture guide in"),
+            status_line(&fx.app).contains("no run guide"),
             "{}",
             status_line(&fx.app)
         );
@@ -10807,7 +10869,7 @@ mod tests {
                 .view()
                 .message
                 .unwrap_or_default()
-                .contains("no capture guide"),
+                .contains("no run guide"),
             "{:?}",
             fx.app.view().message
         );
@@ -11050,6 +11112,84 @@ mod tests {
         fx.app.recheck_closed_items();
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(work_log(&fx), "");
+    }
+
+    // ---- spaces: where the run guide comes from ---------------------------------------
+
+    fn run_guide_in(repo: &Path) {
+        fs::create_dir_all(repo.join(".helmsmith")).unwrap();
+        fs::write(
+            repo.join(".helmsmith/run.md"),
+            "---\nstart: npm run dev\nurl: http://localhost:{port}\n---\nSign in as demo.\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_guide_comes_from_the_spaces_meta_repo() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, false, true);
+        let meta = fx._tmp.path().join("space-meta");
+        run_guide_in(&meta);
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        crate::space::remember_meta(&fx.app.dirs, "tourneyseason", &meta).unwrap();
+        let api = fx._tmp.path().join("api");
+        fs::create_dir_all(&api).unwrap();
+        assert_eq!(fx.app.run_repo_for(Some(api)), Ok(meta));
+    }
+
+    #[test]
+    fn without_a_space_the_intents_repo_guide_is_used() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app.cfg.scope = None;
+        let repo = fx.app.capture_repo.clone().unwrap();
+        assert_eq!(fx.app.run_repo_for(Some(repo.clone())), Ok(repo));
+    }
+
+    #[test]
+    fn no_guide_anywhere_names_both_places() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, false, true);
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        let repo = fx.app.capture_repo.clone().unwrap();
+        let why = fx.app.run_repo_for(Some(repo.clone())).unwrap_err();
+        assert!(
+            why.contains("no run guide: set [spaces.tourneyseason] meta in"),
+            "{why}"
+        );
+        assert!(
+            why.contains(&format!("or add .helmsmith/run.md to {}", repo.display())),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_meta_repo_is_remembered_when_the_tool_starts_in_it() {
+        let mut fx = setup("agy.jsonl");
+        let meta = fx._tmp.path().join("space-meta");
+        fs::create_dir_all(meta.join(".helmsmith")).unwrap();
+        fs::write(
+            meta.join(".helmsmith/space.toml"),
+            "repos = [{ path = \".\", git = \"git@example.com:acme/meta.git\" }]\n",
+        )
+        .unwrap();
+        fx.app.capture_repo = Some(meta.clone());
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        fx.app.remember_space_meta();
+        assert_eq!(
+            crate::space::meta_for(&fx.app.dirs, "tourneyseason"),
+            Some(meta)
+        );
+        assert!(
+            fx.app
+                .message
+                .clone()
+                .unwrap_or_default()
+                .contains("meta repo"),
+            "{:?}",
+            fx.app.message
+        );
     }
 
     // ---- follow-ups ------------------------------------------------------------------
