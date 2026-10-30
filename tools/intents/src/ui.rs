@@ -895,6 +895,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            follow_ups: &[],
+            follow_ups_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render_intent(&view, f.area(), f.buffer_mut()))
@@ -981,6 +983,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            follow_ups: &[],
+            follow_ups_selected: 0,
         };
         let (w, h) = (80u16, 30u16);
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -1110,10 +1114,11 @@ mod tests {
         let desc = row_of(&rows, "The description.");
         assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 1, "{all}");
         assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 1);
-        assert_eq!(row_of(&rows, "▸ Demo Videos"), 18, "{all}");
-        assert_eq!(row_of(&rows, "▸ Open questions"), 19, "{all}");
-        assert_eq!(row_of(&rows, "▸ Pull requests"), 20, "{all}");
-        assert_eq!(row_of(&rows, "▸ Missing items / Bugs"), 21, "{all}");
+        assert_eq!(row_of(&rows, "▸ Demo Videos"), 17, "{all}");
+        assert_eq!(row_of(&rows, "▸ Open questions"), 18, "{all}");
+        assert_eq!(row_of(&rows, "▸ Pull requests"), 19, "{all}");
+        assert_eq!(row_of(&rows, "▸ Missing items / Bugs"), 20, "{all}");
+        assert_eq!(row_of(&rows, "▸ Follow-ups"), 21, "{all}");
         assert_eq!(row_of(&rows, "▸ Artifacts"), 22, "{all}");
         assert_eq!(row_of(&rows, "▸ Evidence"), 23, "{all}");
 
@@ -1189,6 +1194,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            follow_ups: &[],
+            follow_ups_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
         t.draw(|f| render_intent(&view, f.area(), f.buffer_mut()))
@@ -1244,6 +1251,8 @@ pub enum Pane {
     PullRequests,
     /// The missing items / bugs a completion check filed.
     Missing,
+    /// The follow-ups (refinements) filed for it.
+    FollowUps,
     Artifacts,
     /// A bug's captures: before and after the fix.
     Evidence,
@@ -1378,6 +1387,9 @@ pub struct DetailView<'a> {
     /// The missing items filed for its criteria, as `(mark, label)`.
     pub missing: &'a [(String, String)],
     pub missing_selected: usize,
+    /// Its follow-ups, as `(mark, title)`.
+    pub follow_ups: &'a [(String, String)],
+    pub follow_ups_selected: usize,
 }
 
 /// A pull request in the detail view: linked by a `pr:` line or found by the
@@ -1424,6 +1436,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         Pane::Questions,
         Pane::PullRequests,
         Pane::Missing,
+        Pane::FollowUps,
         Pane::Artifacts,
         Pane::Evidence,
     ];
@@ -1581,12 +1594,26 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             v.missing.len()
         ),
         format!(
+            "{} Follow-ups ({})",
+            marker(Pane::FollowUps),
+            v.follow_ups.len()
+        ),
+        format!(
             "{} {}",
             marker(Pane::Artifacts),
             count_title("Artifacts", &artifact_rows)
         ),
         format!("{} Evidence ({})", marker(Pane::Evidence), v.evidence.len()),
     ];
+    let follow_up_rows: Vec<ItemRow> = v
+        .follow_ups
+        .iter()
+        .map(|(mark, title)| ItemRow {
+            tag: mark.clone(),
+            text: title.clone(),
+            found: false,
+        })
+        .collect();
     let missing_rows: Vec<ItemRow> = v
         .missing
         .iter()
@@ -1675,6 +1702,16 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 &missing_rows,
                 2,
                 "none — a completion check (X) files one for each criterion that does not hold",
+                rect,
+                buf,
+            ),
+            Pane::FollowUps => render_items(
+                &titles[i],
+                v.focus == Pane::FollowUps,
+                v.follow_ups_selected,
+                &follow_up_rows,
+                2,
+                "none — F files a follow-up: a refinement of this, as its own intent",
                 rect,
                 buf,
             ),

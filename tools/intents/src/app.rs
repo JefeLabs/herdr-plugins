@@ -438,6 +438,7 @@ pub struct App {
     artifacts_selected: usize,
     evidence_selected: usize,
     missing_selected: usize,
+    follow_ups_selected: usize,
     prs_selected: usize,
     demos_selected: usize,
     /// PR titles from `gh`, keyed like `pr_states`.
@@ -510,6 +511,7 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Artifacts => "artifacts",
         Pane::Evidence => "evidence",
         Pane::Missing => "missing",
+        Pane::FollowUps => "follow-ups",
         Pane::Demos => "demos",
         Pane::PullRequests => "pull requests",
     }
@@ -548,6 +550,7 @@ impl App {
             artifacts_selected: 0,
             evidence_selected: 0,
             missing_selected: 0,
+            follow_ups_selected: 0,
             prs_selected: 0,
             demos_selected: 0,
             pr_titles: HashMap::new(),
@@ -820,6 +823,20 @@ impl App {
     /// Plans and PR states gathered so far for `it`; a PR not yet answered by
     /// `gh` reads as `Unknown` (open).
     fn evidence_for(&self, it: &Intent) -> crate::progress::Evidence {
+        let mut ev = self.evidence_core(it);
+        ev.open_follow_ups = it
+            .fm
+            .follow_ups
+            .iter()
+            .filter_map(|l| self.intent_by_stem(&l.stem))
+            .filter(|f| !self.is_complete(f))
+            .count();
+        ev
+    }
+
+    /// Everything `evidence_for` gathers but the follow-ups' count (so a
+    /// follow-up's completeness never asks for its original's).
+    fn evidence_core(&self, it: &Intent) -> crate::progress::Evidence {
         use crate::progress::{PrState, pr_number};
         let prs = crate::store::artifacts(&it.body)
             .into_iter()
@@ -839,10 +856,33 @@ impl App {
                 Some((n, state))
             })
             .collect();
-        // add pull requests found by spec/plan name that no pr: line names
+        // add pull requests found by spec/plan name that no pr: line names,
+        // except a follow-up's: they belong to the follow-up
+        let theirs: Vec<u64> = it
+            .fm
+            .follow_ups
+            .iter()
+            .filter_map(|l| self.intent_by_stem(&l.stem))
+            .flat_map(|f| {
+                let linked = crate::store::artifacts(&f.body)
+                    .into_iter()
+                    .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+                    .filter_map(|a| pr_number(&a.target));
+                let found = self
+                    .found_prs
+                    .get(&f.path)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(_, prs)| prs.iter().map(|p| p.number));
+                linked.chain(found).collect::<Vec<_>>()
+            })
+            .collect();
         let mut prs: Vec<(u64, PrState)> = prs;
         let found = self.found_prs.get(&it.path);
         for f in found.into_iter().flatten().flat_map(|(_, prs)| prs) {
+            if theirs.contains(&f.number) {
+                continue;
+            }
             if !prs.iter().any(|(m, _)| *m == f.number) {
                 prs.push((f.number, f.state));
             }
@@ -927,6 +967,7 @@ impl App {
             open_missing,
             unacknowledged,
             checking,
+            open_follow_ups: 0,
         }
     }
 
@@ -1791,6 +1832,7 @@ impl App {
                 | Pane::Questions
                 | Pane::PullRequests
                 | Pane::Missing
+                | Pane::FollowUps
                 | Pane::Artifacts
                 | Pane::Evidence
         ) {
@@ -1875,7 +1917,8 @@ impl App {
                     Pane::Demos => Pane::Questions,
                     Pane::Questions => Pane::PullRequests,
                     Pane::PullRequests => Pane::Missing,
-                    Pane::Missing => Pane::Artifacts,
+                    Pane::Missing => Pane::FollowUps,
+                    Pane::FollowUps => Pane::Artifacts,
                     Pane::Artifacts => Pane::Evidence,
                     Pane::Evidence => Pane::Tree,
                 };
@@ -1885,7 +1928,8 @@ impl App {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Evidence,
                     Pane::Evidence => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Missing,
+                    Pane::Artifacts => Pane::FollowUps,
+                    Pane::FollowUps => Pane::Missing,
                     Pane::Missing => Pane::PullRequests,
                     Pane::PullRequests => Pane::Questions,
                     Pane::Questions => Pane::Demos,
@@ -2237,6 +2281,28 @@ impl App {
                                 index: self.question_selected,
                                 text: q.answer.clone().unwrap_or_default(),
                             };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Pane::FollowUps => {
+                let rows = self.follow_up_rows(&it);
+                let last = rows.len().saturating_sub(1);
+                let selected = self.follow_ups_selected.min(last);
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.follow_ups_selected = (selected + 1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.follow_ups_selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter => {
+                        if let Some((_, _, Some(path))) = rows.get(selected) {
+                            let path = path.clone();
+                            self.select_path(&path);
+                            self.focus = Pane::Tree;
                         }
                     }
                     _ => {}
@@ -2720,6 +2786,13 @@ impl App {
         // a capture still running for it stops (and finishes its effort); a
         // missing item deleted dismisses its gap on the original
         if let Ok(it) = Store::load(path) {
+            if let Some(of) = &it.fm.follow_up_of
+                && let Some(orig) = crate::check::find_intent(&self.store, of)
+            {
+                let stem = it.stem();
+                let _ =
+                    Store::update_fields(&orig.path, |fm| fm.follow_ups.retain(|l| l.stem != stem));
+            }
             if let Some(mf) = &it.fm.missing_for
                 && let Some(orig) = crate::check::find_intent(&self.store, &mf.stem)
             {
@@ -3421,6 +3494,30 @@ impl App {
         } else {
             "could not copy the path".to_string()
         });
+    }
+
+    /// Its follow-ups: (mark, title, file). `✓` complete, `→` sent, `○` not yet.
+    fn follow_up_rows(&self, it: &Intent) -> Vec<(String, String, Option<PathBuf>)> {
+        it.fm
+            .follow_ups
+            .iter()
+            .filter_map(|l| {
+                let f = self.intent_by_stem(&l.stem)?;
+                let mark = if self.is_complete(f) {
+                    "✓"
+                } else if f.fm.state == State::Sent {
+                    "→"
+                } else {
+                    "○"
+                };
+                Some((mark.to_string(), f.fm.title.clone(), Some(f.path.clone())))
+            })
+            .collect()
+    }
+
+    /// Whether an intent reads complete (its own follow-ups aside).
+    fn is_complete(&self, it: &Intent) -> bool {
+        crate::progress::progress(it, &self.evidence_core(it)).is_some_and(|p| p.complete)
     }
 
     /// The missing items filed for `it`'s criteria: (mark, label, its file).
@@ -5475,6 +5572,11 @@ impl App {
                         .map(|r| (r.mark.to_string(), r.label))
                         .collect();
                     let marks = self.check_marks(intent);
+                    let follow_ups: Vec<(String, String)> = self
+                        .follow_up_rows(intent)
+                        .into_iter()
+                        .map(|(m, t, _)| (m, t))
+                        .collect();
                     let missing: Vec<(String, String)> = self
                         .missing_rows(intent)
                         .into_iter()
@@ -5501,6 +5603,8 @@ impl App {
                             results: &marks,
                             missing: &missing,
                             missing_selected: self.missing_selected,
+                            follow_ups: &follow_ups,
+                            follow_ups_selected: self.follow_ups_selected,
                         },
                         right,
                         buf,
@@ -5558,6 +5662,7 @@ impl App {
                     finding.unwrap_or_else(|| "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · X check · Tab next pane · Esc tree".to_string())
                 }
                 (None, Pane::Missing) => "Missing items: j/k choose · Enter go to it · Esc tree".to_string(),
+                (None, Pane::FollowUps) => "Follow-ups: j/k choose · Enter go to it · F file another · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
@@ -8545,6 +8650,7 @@ mod tests {
             "questions",
             "pull requests",
             "missing",
+            "follow-ups",
             "artifacts",
             "evidence",
         ] {
@@ -8569,7 +8675,7 @@ mod tests {
 
     /// Tab from the tree to the named section.
     fn tab_to(app: &mut App, pane: &str) {
-        for _ in 0..12 {
+        for _ in 0..14 {
             if app.view().focus == pane {
                 return;
             }
@@ -8692,6 +8798,8 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "missing");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "follow-ups");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "evidence");
@@ -8701,6 +8809,8 @@ mod tests {
         assert_eq!(fx.app.view().focus, "evidence");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "artifacts");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "follow-ups");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "missing");
         key(&mut fx.app, KeyCode::BackTab);
@@ -10655,6 +10765,125 @@ mod tests {
         assert_eq!(fx.app.view().screen, "browse");
     }
 
+    /// A sent follow-up of `original`, titled `title`, linked both ways.
+    fn follow_up(fx: &mut Fx, original: &Path, title: &str, ticked: bool) -> PathBuf {
+        let group = original
+            .parent()
+            .unwrap()
+            .strip_prefix(fx.app.store.root())
+            .unwrap()
+            .to_path_buf();
+        let body = format!(
+            "## Description\nA refinement.\n\n## Acceptance criteria\n- [{}] the email names the meeting\n",
+            if ticked { "x" } else { " " }
+        );
+        let f = fx
+            .app
+            .store
+            .create(&group, title, "enhancement", &body, None)
+            .unwrap();
+        let original_stem = Store::load(original).unwrap().stem();
+        Store::update_fields(&f.path, |fm| {
+            fm.state = State::Sent;
+            fm.follow_up_of = Some(original_stem);
+        })
+        .unwrap();
+        let stem = f.stem();
+        Store::update_meta(original, |fm| {
+            fm.follow_ups.push(crate::store::FollowUpLink {
+                stem,
+                folded: false,
+            })
+        })
+        .unwrap();
+        fx.app.rescan();
+        f.path
+    }
+
+    #[test]
+    fn the_follow_ups_section_follows_missing_items() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        follow_up(&mut fx, &alpha, "Name the meeting too", false);
+        select(&mut fx.app, "Alpha");
+        tab_to(&mut fx.app, "missing");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "follow-ups");
+        let shown = render(&fx.app, 100, 30);
+        assert!(shown.contains("Follow-ups (1)"), "{shown}");
+        assert!(shown.contains("→ Name the meeting too"), "{shown}");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "artifacts");
+    }
+
+    #[test]
+    fn enter_on_a_follow_up_selects_it() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        follow_up(&mut fx, &alpha, "Name the meeting too", false);
+        fx.app.select_path(&alpha);
+        tab_to(&mut fx.app, "follow-ups");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(
+            fx.app
+                .selected_intent()
+                .map(|i| i.fm.title.clone())
+                .as_deref(),
+            Some("Name the meeting too")
+        );
+    }
+
+    #[test]
+    fn deleting_a_follow_up_drops_its_link() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let f = follow_up(&mut fx, &alpha, "Name the meeting too", false);
+        Store::update_fields(&f, |fm| fm.state = State::Refining).unwrap(); // D refuses sent ones
+        fx.app.rescan();
+        fx.app.select_path(&f);
+        key(&mut fx.app, KeyCode::Char('D'));
+        key(&mut fx.app, KeyCode::Char('y'));
+        assert!(Store::load(&alpha).unwrap().fm.follow_ups.is_empty());
+    }
+
+    #[test]
+    fn a_follow_ups_pr_stays_out_of_the_original() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let f = follow_up(&mut fx, &alpha, "Name the meeting too", false);
+        let mut fu = Store::load(&f).unwrap();
+        fu.body.push_str("\n## Artifacts\n- pr: #77\n");
+        Store::save_force(&mut fu).unwrap();
+        // the original's spec-name search found the follow-up's PR too
+        fx.app.found_prs.insert(
+            alpha.clone(),
+            vec![(
+                "alpha-spec.md".into(),
+                vec![crate::progress::FoundPr {
+                    number: 77,
+                    state: crate::progress::PrState::Open,
+                    branch: String::new(),
+                    title: String::new(),
+                }],
+            )],
+        );
+        fx.app.rescan();
+        let it = Store::load(&alpha).unwrap();
+        let ev = fx.app.evidence_for(&it);
+        assert!(!ev.prs.iter().any(|(n, _)| *n == 77), "{:?}", ev.prs);
+        assert_eq!(ev.open_follow_ups, 1);
+    }
+
+    #[test]
+    fn follow_ups_snapshot() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        follow_up(&mut fx, &alpha, "Name the meeting too", false);
+        fx.app.select_path(&alpha);
+        tab_to(&mut fx.app, "follow-ups");
+        insta::assert_snapshot!(render(&fx.app, 80, 24));
+    }
+
     // ---- showing check results ----------------------------------------------------
 
     /// Alpha, sent, with a check that confirmed criterion 1 (with proof) and
@@ -10776,7 +11005,7 @@ mod tests {
             "{shown}"
         );
         key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "artifacts");
+        assert_eq!(fx.app.view().focus, "follow-ups");
     }
 
     #[test]

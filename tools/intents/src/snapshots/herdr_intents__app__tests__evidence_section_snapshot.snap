@@ -13,11 +13,11 @@ expression: "render(&fx.app, 80, 24)"
                        │ ▸ Open questions (2 open) ─────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────
                        │ ▸ Missing items / Bugs (0) ────────────────────────────
+                       │ ▸ Follow-ups (0) ──────────────────────────────────────
                        │ ▸ Artifacts (0) ───────────────────────────────────────
                        │ ▾ Evidence (2) ────────────────────────────────────────
                        │✓ before · video · the email goes to every admin
                        │✗ after · video · admins still get it
-                       │
                        │
                        │
                        │

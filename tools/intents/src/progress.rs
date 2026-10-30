@@ -134,6 +134,8 @@ pub struct Evidence {
     pub unacknowledged: usize,
     /// A completion check running: (criteria with proof so far, criteria).
     pub checking: Option<(usize, usize)>,
+    /// Follow-ups filed for it that are not yet complete.
+    pub open_follow_ups: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,6 +252,16 @@ const BUILDING: f32 = 3.0;
 const PR_OPEN: f32 = 7.0;
 const MERGED: f32 = 8.0;
 const VERIFIED: f32 = 2.0;
+
+/// `· 1 follow-up` / `· N follow-ups` after a label while follow-ups are open
+/// (not while a check runs).
+fn follow_up_note(label: String, ev: &Evidence) -> String {
+    match (ev.open_follow_ups, ev.checking) {
+        (0, _) | (_, Some(_)) => label,
+        (1, None) => format!("{label} · 1 follow-up"),
+        (n, None) => format!("{label} · {n} follow-ups"),
+    }
+}
 
 /// `None` unless the intent has been sent.
 pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
@@ -412,26 +424,29 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         plans,
         segments,
         fill: (base + verified).min(10.0),
-        label: match ev.checking {
-            Some((done, total)) => format!("checking {done}/{total}"),
-            None if complete => "✓ complete".to_string(),
-            None => {
-                let label = if all_ticked && shipped && ev.open_missing == 0 {
-                    format!(
-                        "✓ {n}/{n} · {} new to read",
-                        ev.unacknowledged,
-                        n = crit.len()
-                    )
-                } else {
-                    label
-                };
-                if ev.open_missing > 0 {
-                    format!("{label} · {} missing", ev.open_missing)
-                } else {
-                    label
+        label: follow_up_note(
+            match ev.checking {
+                Some((done, total)) => format!("checking {done}/{total}"),
+                None if complete => "✓ complete".to_string(),
+                None => {
+                    let label = if all_ticked && shipped && ev.open_missing == 0 {
+                        format!(
+                            "✓ {n}/{n} · {} new to read",
+                            ev.unacknowledged,
+                            n = crit.len()
+                        )
+                    } else {
+                        label
+                    };
+                    if ev.open_missing > 0 {
+                        format!("{label} · {} missing", ev.open_missing)
+                    } else {
+                        label
+                    }
                 }
-            }
-        },
+            },
+            ev,
+        ),
         complete,
     })
 }

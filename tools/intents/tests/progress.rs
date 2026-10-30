@@ -933,3 +933,21 @@ fn the_card_counts_open_missing_items() {
     );
     assert_eq!(label, "verifying 1/2 · 2 missing");
 }
+
+#[test]
+fn the_card_counts_open_follow_ups() {
+    let one = Evidence {
+        prs: vec![(1, PrState::Merged)],
+        open_follow_ups: 1,
+        ..Default::default()
+    };
+    let (_, label, complete) = p(ALL_TICKED_ONE_PR, &one);
+    assert!(complete, "a follow-up never takes the ✓ away");
+    assert_eq!(label, "✓ complete · 1 follow-up");
+    let two = Evidence {
+        open_follow_ups: 2,
+        ..one
+    };
+    let (_, label, _) = p(ALL_TICKED_ONE_PR, &two);
+    assert_eq!(label, "✓ complete · 2 follow-ups");
+}
