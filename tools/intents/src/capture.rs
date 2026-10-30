@@ -657,7 +657,9 @@ fn run(
         }
     };
     let log_files = if check_dir.is_some() {
-        match crate::check::log_paths(Path::new(&worktree), &guide.logs) {
+        match crate::check::log_paths(Path::new(&worktree), &guide.logs)
+            .and_then(|paths| inside_worktree(Path::new(&worktree), paths))
+        {
             Ok(p) => p,
             Err(e) => return failed(format!("the guide's logs: {e}")),
         }
@@ -857,6 +859,27 @@ fn run(
     }
     let file = out_file.exists().then_some(name);
     record(parse_outcome(req.phase, &result), file, steps)
+}
+
+/// Log files that really are inside the worktree: no symlink, and a real
+/// location (folders resolved) under the worktree's own. A file that does not
+/// exist yet is kept; the browser tools never follow a symlink when they open it.
+fn inside_worktree(worktree: &Path, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let root =
+        std::fs::canonicalize(worktree).map_err(|e| format!("{}: {e}", worktree.display()))?;
+    for p in &paths {
+        let Ok(meta) = std::fs::symlink_metadata(p) else {
+            continue;
+        };
+        let real = std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if meta.file_type().is_symlink() || !real.starts_with(&root) {
+            return Err(format!(
+                "{} leads outside the stack's worktree",
+                p.display()
+            ));
+        }
+    }
+    Ok(paths)
 }
 
 /// What `herdr-intents capture-run` is handed: the request, the env its tools

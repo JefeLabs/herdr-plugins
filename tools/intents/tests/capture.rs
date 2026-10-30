@@ -751,3 +751,30 @@ fn a_launched_check_applies_its_results() {
     assert!(crit[0].done && !crit[1].done, "{}", it.body);
     assert_eq!(it.fm.missing.len(), 1, "the failing one has its item");
 }
+
+#[test]
+fn a_log_that_leads_out_of_the_worktree_is_refused() {
+    let fx = Fx::checking("1: confirmed: ok");
+    let t = fx.tmp.path();
+    fs::write(t.join("outside.txt"), "token: secret\n").unwrap();
+    let log = t.join("worktree/.logs/backend.log");
+    fs::remove_file(&log).unwrap();
+    std::os::unix::fs::symlink(t.join("outside.txt"), &log).unwrap();
+    let (_, rec) = fx.run_check(fx.check_request(None));
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(why.contains("log"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        fx.log("claude.log"),
+        "",
+        "no agent with a log it may not read"
+    );
+    assert!(
+        fx.log("work.log")
+            .lines()
+            .last()
+            .unwrap()
+            .contains("finish --area")
+    );
+}

@@ -84,7 +84,15 @@ pub fn search_logs(files: &[LogFile], pattern: &str) -> String {
     let mut out = String::new();
     let mut matches = 0;
     for f in files {
-        let Ok(mut file) = std::fs::File::open(&f.path) else {
+        // never through a symlink: the log must be the file itself
+        let opened = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(&f.path)
+        };
+        let Ok(mut file) = opened else {
             continue;
         };
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);

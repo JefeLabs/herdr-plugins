@@ -329,3 +329,17 @@ fn a_check_with_no_logs_has_no_logs_tool() {
     let (err, _) = s.call("logs", json!({"criterion": 1, "pattern": "x"}));
     assert!(err);
 }
+
+#[test]
+fn a_symlinked_log_is_not_followed() {
+    let (tmp, log, _) = a_log();
+    let outside = tmp.path().join("outside.txt");
+    fs::write(&outside, "Subject: secret\n").unwrap();
+    let link = tmp.path().join("wt/.logs/link.log");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let _ = log;
+    let mut s = Server::check(tmp, json!([{"path": link, "from": 0}]));
+    s.open();
+    let (_, text) = s.call("logs", json!({"criterion": 1, "pattern": "secret"}));
+    assert!(!text.contains("Subject: secret"), "{text}");
+}
