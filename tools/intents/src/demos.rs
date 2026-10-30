@@ -207,9 +207,16 @@ pub fn video_for(roots: &[PathBuf], id: &str) -> Option<PathBuf> {
     takes.into_iter().max_by_key(|(t, _)| *t).map(|(_, p)| p)
 }
 
-/// The demos site, opened at one story.
-pub fn site_url(id: &str) -> String {
-    format!("http://localhost:4400/#{id}")
+/// Whether the demos page (`make demos-open`, which listens on 127.0.0.1)
+/// answers on `port`.
+pub fn site_running(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
+}
+
+/// The demos site (`make demos-open`, on `port`), opened at one story.
+pub fn site_url(port: u16, id: &str) -> String {
+    format!("http://localhost:{port}/#{id}")
 }
 
 /// Stories in `repo` whose title shares at least two significant words with
