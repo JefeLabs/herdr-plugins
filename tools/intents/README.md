@@ -184,13 +184,58 @@ When every pull request of a sent intent has merged (one closed without merging 
 
 The rewrite is applied straight away; the previous version is kept beside the file as `<name>.before-reconcile.bak` (older ones as `<name>.before-reconcile.1.bak` up to `.4.bak`), and `u` puts it back, one reconcile per press. Whatever the rewrite leaves out of the old version is put back: a `## ` section it dropped (a Decisions list, say) returns where it was, and an artifact line it dropped is added again. A demo line it kept as it was is renumbered to point at the same criteria by their wording, and a criterion that is gone drops out of it. The intent is marked unread: its card and tree row show `*` before the title until you open it (select it in the tree, or `Enter` on its card). Each merged set is reconciled once (`reconciled_for` in the front matter), so a later merge reconciles again but a restart does not. If a reconcile fails (the agent returns no proposal, say), the reason stays on the status line while that intent is selected, and `r` retries it. A reconcile that runs longer than 10 minutes is stopped and reported the same way, and quitting the tool stops any reconcile still running. `R` and `U` leave a sent intent sent, since its progress tracks the work from then on. Pull request states are checked about once a minute in either view (tree or list), so a merge reconciles wherever you are; an intent whose merge happened while the tool was closed is reconciled shortly after it starts.
 
+## Spaces and the run guide
+
+Evidence capture, the completion check and (next) demo videos run your app in a browser. How to run it belongs to the project, which is often several repos, so it lives in the project's **meta repo**: one of its repos, or an extra one made for the purpose, with the others beside it as sibling folders. The meta repo's `.helmsmith/` folder holds two shared files, committed so teammates get the same.
+
+`.helmsmith/space.toml` lists the project's repos, relative to the meta repo. A listed repo that is missing stops a run with the `git clone` to bring it in; nothing is ever cloned for you.
+
+```toml
+repos = [
+  { path = ".",      git = "git@github.com:acme/shop-meta.git" },
+  { path = "../api", git = "git@github.com:acme/shop-api.git" },
+  { path = "../web", git = "git@github.com:acme/shop-web.git" },
+]
+```
+
+`.helmsmith/run.md` says how to run the app (the older name `capture.md` is still read): front matter for the tool, then instructions for the agent.
+
+```markdown
+---
+start: docker compose up -d db && npm --prefix ../api run dev & npm --prefix ../web run dev
+url: http://localhost:{port}         # {port}: a free port the tool picks and passes as PORT
+ready: /health                       # polled until the app answers (default: the url itself)
+ready_timeout: 600                   # seconds (the default); also the limit for each seed
+seed: ["npm --prefix ../api run seed:demo"]
+stop: docker compose down            # optional
+stop_timeout: 60                     # seconds `stop` may take (the default)
+logs: [../api/logs/app.log]          # what a completion check may search
+---
+Sign in as demo@acme.test (password in the seed). Leave the billing pages alone.
+```
+
+Every command runs with `sh -c` from the meta repo. `start` runs in its own process group for the whole run: it may stay in the foreground, or exit 0 leaving the app running (`docker compose up -d`); one that fails first ends the run at once with its last lines. The tool waits until the app answers, runs each `seed` (each must succeed within `ready_timeout`), and at the end runs `stop` (cut off after `stop_timeout`) and ends `start`'s whole group, also when the run is cancelled or fails. An app a crashed run left behind is ended by that intent's next run, and only if it is still the very process that run started. Without `{port}` in `url`, runs in a space take turns (a second is refused with the address in use), and a fixed address that already answers before `start` is refused too: the tool never seeds, drives or stops an app it did not start. A check that could not run (its app never answered, a seed failed) says why in the Evidence section. Log paths must stay inside the space's folder: no `..` out of it, no symlinks. The app runs from whatever your repos have checked out; the tool never switches branches.
+
+**Which space.** The space is the Herdr workspace (and its `~/intents` group). Your own config keeps where each space's meta repo is, in `spaces.toml` beside `intents.toml`:
+
+```toml
+[spaces.shop]
+meta = "~/code/shop-meta"
+```
+
+It is filled in for you the first time the tool starts in a workspace whose folder has `.helmsmith/space.toml`. The run guide is looked for in the space's meta repo, then in the intent's own repo; with neither, the tool says where to add one.
+
+**Waiting for the pull.** In a project run this way, the automatic check after a merge waits until your checkout has the merged code: every merged pull request's merge commit (from `gh`) must be in the `HEAD` of the clone it merged into, which is the intent's repo for `#12`, or for `owner/repo#12` the space repo whose git URL in `space.toml` names that repo. A pull request in a repo the space does not list does not hold the check back. Until you pull, the card reads `· waiting for a pull` and the merge is not counted as checked. `X` checks whatever is checked out.
+
+**Skoolscout's way.** A guide with `default_area` in place of `start` keeps skoolscout's own steps: a `work` slot, e2e seed stories and logs in the slot's worktree, as the next sections describe.
+
 ## Evidence for bugs
 
-A bug can carry proof: a screenshot or a video of it happening on a local stack, recorded by an agent, and the same steps again once the fix has merged. It needs `work` (workbrokr), a `claude` recent enough to have `--restricted` and `--permission-mode dontAsk` (an older one is refused before any stack starts), and `agent-browser` (`npm i -g agent-browser` or `brew install agent-browser`, then `agent-browser install` for its browser).
+A bug can carry proof: a screenshot or a video of it happening on a local stack, recorded by an agent, and the same steps again once the fix has merged. It needs a run guide (see Spaces and the run guide; with skoolscout's work mode, also `work` (workbrokr)), a `claude` recent enough to have `--restricted` and `--permission-mode dontAsk` (an older one is refused before any stack starts), and `agent-browser` (`npm i -g agent-browser` or `brew install agent-browser`, then `agent-browser install` for its browser).
 
 **The question.** After the last question about a bug, before the write-up, the add view asks `Capture evidence? s screenshot · v video · Enter skip`. It asks once, and only for bugs. When the repo has no capture guide, or `claude` is not installed, the line says why instead and `Enter` continues.
 
-**In the background.** Each capture runs in its own process (`herdr-intents capture-run`), so the write-up goes ahead, you can save, and closing the popup or quitting the tool leaves it running to its end. The intent's Evidence section shows how far it got (`starting a stack in org/social`, `seeding: kathia-signup`, `the agent is reproducing it`), then the result. In order, the capture:
+**In the background.** Each capture runs in its own process (`herdr-intents capture-run`), so the write-up goes ahead, you can save, and closing the popup or quitting the tool leaves it running to its end. The intent's Evidence section shows how far it got (`starting a stack in org/social`, `seeding: kathia-signup`, `the agent is reproducing it`), then the result. In order, a capture in skoolscout's work mode (any other project runs its guide's commands instead, as above):
 
 1. starts its own task effort, `work start --area <area> --task evidence-<n> --type fix --mode fullstack` with `WORK_SESSION=capture-<name>`, trying the area the intent's group ends with (its last two path segments), then the guide's `default_area`. It never joins an effort or merges into one;
 2. runs the guide's seed stories on its own slot (`make -C <worktree>/app-test-e2e-runner e2e-story STORY=<story> FAST=1`, with `SLOT` from `work env`);
@@ -201,7 +246,7 @@ Deleting the intent (`D`) or cancelling the conversation (`Esc`) stops its captu
 
 The agent's last line is `reproduced: …` or `couldn't reproduce: …`; a capture without one counts as failed. Captures are 1280×800.
 
-**The capture guide.** A repo opts in with `.helmsmith/capture.md`: front matter, then the instructions the agent gets (how to sign in, as whom, what to leave alone). No guide, no capture.
+**The capture guide (work mode).** A repo opts in with `.helmsmith/run.md` (or the older `capture.md`): front matter, then the instructions the agent gets (how to sign in, as whom, what to leave alone). No guide, no capture. In skoolscout's work mode the front matter is:
 
 ```markdown
 ---

@@ -35,13 +35,34 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// `.helmsmith/capture.md` in a repo: front matter for the tool, the body for
-/// the agent.
+/// How a guide gets the app running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuideMode {
+    /// Skoolscout's way: a `work` slot started in an area (the intent's, else
+    /// this one), seeded with e2e stories (`make e2e-story`).
+    Work { default_area: String },
+    /// Any project's way: commands run from the meta repo.
+    Commands {
+        /// Starts the app; runs in the background for the whole run.
+        start: String,
+        /// The path polled until the app answers (default: the url itself).
+        ready: Option<String>,
+        /// Seconds to wait for it to answer.
+        ready_timeout: u64,
+        /// Run after the run, before `start`'s processes are ended.
+        stop: Option<String>,
+        /// Seconds `stop` may take before it is cut off.
+        stop_timeout: u64,
+    },
+}
+
+/// The run guide (`.helmsmith/run.md`, else `capture.md`) in a repo: front
+/// matter for the tool, the body for the agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CaptureGuide {
-    /// The area to start a stack in when the intent's own area cannot.
-    pub default_area: String,
-    /// e2e stories the tool runs on the new slot before the agent starts.
+    /// How the app gets running.
+    pub mode: GuideMode,
+    /// Before the agent starts: e2e stories (work mode) or commands.
     pub seed: Vec<String>,
     /// The app's address, with `{port}` for the slot's frontend port.
     pub url: String,
@@ -79,7 +100,18 @@ pub const VIEWPORT: (u16, u16) = (1280, 800);
 /// The guide's front matter, as written.
 #[derive(Deserialize)]
 struct GuideFront {
-    default_area: String,
+    #[serde(default)]
+    default_area: Option<String>,
+    #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    ready: Option<String>,
+    #[serde(default)]
+    ready_timeout: Option<u64>,
+    #[serde(default)]
+    stop: Option<String>,
+    #[serde(default)]
+    stop_timeout: Option<u64>,
     #[serde(default)]
     seed: Vec<String>,
     url: String,
@@ -87,10 +119,27 @@ struct GuideFront {
     logs: Vec<String>,
 }
 
-/// Reads `<repo>/.helmsmith/capture.md`: YAML front matter, then the body.
+/// How long the app gets to answer, unless the guide says.
+pub const READY_TIMEOUT_SECS: u64 = 600;
+/// How long the guide's `stop` may take, unless the guide says.
+pub const STOP_TIMEOUT_SECS: u64 = 60;
+
+/// Reads `<repo>/.helmsmith/run.md` (else the older `capture.md`): YAML front
+/// matter, then the body. `start` makes it any project's commands; else
+/// `default_area` makes it skoolscout's work slots.
 pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
     use anyhow::Context;
-    let path = repo.join(".helmsmith").join("capture.md");
+    let dir = repo.join(".helmsmith");
+    let Some(path) = ["run.md", "capture.md"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+    else {
+        anyhow::bail!(
+            "no run guide in {}: add run.md (or the older capture.md)",
+            dir.display()
+        );
+    };
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let rest = text
@@ -101,8 +150,22 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
         .with_context(|| format!("{}: front matter never closes", path.display()))?;
     let front: GuideFront = serde_yaml_ng::from_str(&rest[..end])
         .with_context(|| format!("{}: front matter", path.display()))?;
+    let mode = match (front.start, front.default_area) {
+        (Some(start), _) => GuideMode::Commands {
+            start,
+            ready: front.ready,
+            ready_timeout: front.ready_timeout.unwrap_or(READY_TIMEOUT_SECS),
+            stop: front.stop,
+            stop_timeout: front.stop_timeout.unwrap_or(STOP_TIMEOUT_SECS),
+        },
+        (None, Some(default_area)) => GuideMode::Work { default_area },
+        (None, None) => anyhow::bail!(
+            "{}: the guide needs `start` (a command that starts the app) or `default_area` (skoolscout's work slots)",
+            path.display()
+        ),
+    };
     Ok(CaptureGuide {
-        default_area: front.default_area,
+        mode,
         seed: front.seed,
         url: front.url,
         body: rest[end + "\n---\n".len()..].to_string(),
@@ -114,6 +177,9 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
 /// ends with (its last two segments), then the guide's default. `work start`
 /// decides which one can run.
 pub fn area_candidates(group_rel: Option<&str>, guide: &CaptureGuide) -> Vec<String> {
+    let GuideMode::Work { default_area } = &guide.mode else {
+        return Vec::new();
+    };
     let mut out: Vec<String> = Vec::new();
     if let Some(group) = group_rel {
         let parts: Vec<&str> = group.split('/').filter(|p| !p.is_empty()).collect();
@@ -121,8 +187,8 @@ pub fn area_candidates(group_rel: Option<&str>, guide: &CaptureGuide) -> Vec<Str
             out.push(parts[parts.len() - 2..].join("/"));
         }
     }
-    if !out.contains(&guide.default_area) {
-        out.push(guide.default_area.clone());
+    if !out.contains(default_area) {
+        out.push(default_area.clone());
     }
     out
 }
@@ -376,10 +442,47 @@ fn browser_session(stem: &str, n: u32) -> String {
     format!("capture-{clean}-{n}")
 }
 
+/// The app a commands-mode run started: its process group, how to stop it,
+/// and the space lock it holds.
+struct AppRun {
+    child: std::process::Child,
+    pgid: i32,
+    stop: Option<String>,
+    meta: PathBuf,
+    port: Option<u16>,
+    lock: Option<PathBuf>,
+    pgid_file: PathBuf,
+    /// Seconds the guide's `stop` may take.
+    stop_timeout: u64,
+    /// Set once `stop_app_once` has ended it.
+    stopped: bool,
+}
+
+/// An app whose run ends any other way (a panic, a poisoned lock) is still
+/// ended: its group, its pid file and its lock (not the guide's `stop`,
+/// which could hang).
+impl Drop for AppRun {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        stop_group(self.pgid);
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.pgid_file);
+        if let Some(lock) = &self.lock {
+            release_space_lock(lock);
+        }
+    }
+}
+
 /// Shared between the capture's thread and `cancel`.
 #[derive(Default)]
 struct JobState {
     agent_pgid: Option<i32>,
+    /// The app this run started (commands mode), until it is stopped.
+    app: Option<AppRun>,
+    /// The process group of a guide command running now (a seed).
+    seed_pgid: Option<i32>,
     /// The task effort this capture started: `(area, task)`.
     effort: Option<(String, String)>,
     cancelled: bool,
@@ -409,6 +512,460 @@ fn finish_once(r: &Runner, state: &std::sync::Mutex<JobState>) -> Option<String>
     Some(format!(
         "work finish: {why}; its stack may still be up: run `work finish --area {area} --task {task}`"
     ))
+}
+
+/// A guide command, run by `sh` in the meta repo with the run's environment
+/// (and `PORT` when the guide's url has `{port}`).
+fn app_command(r: &Runner, meta: &Path, port: Option<u16>, command: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("sh");
+    c.arg("-c")
+        .arg(command)
+        .current_dir(meta)
+        .envs(r.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null());
+    if let Some(p) = port {
+        c.env("PORT", p.to_string());
+    }
+    c
+}
+
+/// How a bounded guide command ended.
+enum Ended {
+    Done(std::process::ExitStatus),
+    TimedOut,
+    Cancelled,
+}
+
+/// Runs a guide command in its own process group for at most `limit`; its
+/// whole group is ended when it takes longer or (given the run's `state`)
+/// when the run is cancelled.
+fn run_bounded(
+    mut cmd: std::process::Command,
+    limit: std::time::Duration,
+    state: Option<&std::sync::Mutex<JobState>>,
+) -> std::io::Result<Ended> {
+    use std::os::unix::process::CommandExt;
+    let mut child = cmd.process_group(0).spawn()?;
+    let pgid = child.id() as i32;
+    if let Some(Ok(mut s)) = state.map(|st| st.lock()) {
+        s.seed_pgid = Some(pgid);
+    }
+    let deadline = std::time::Instant::now() + limit;
+    let ended = loop {
+        if let Some(status) = child.try_wait()? {
+            break Ended::Done(status);
+        }
+        if state.is_some_and(cancelled) {
+            stop_group(pgid);
+            let _ = child.wait();
+            break Ended::Cancelled;
+        }
+        if std::time::Instant::now() >= deadline {
+            stop_group(pgid);
+            let _ = child.wait();
+            break Ended::TimedOut;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    if let Some(Ok(mut s)) = state.map(|st| st.lock()) {
+        s.seed_pgid = None;
+    }
+    Ok(ended)
+}
+
+/// When a process started, as `ps` says: with its number, it tells a crashed
+/// run's app from a later process that reused the number.
+fn started_at(pid: i32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let when = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!when.is_empty()).then_some(when)
+}
+
+/// Stops the app a commands-mode run started, exactly once, whoever gets
+/// there first: the guide's `stop`, then `start`'s whole process group, then
+/// the space lock. Says what went wrong with `stop`, if anything.
+fn stop_app_once(r: &Runner, state: &std::sync::Mutex<JobState>) -> Option<String> {
+    let mut app = state.lock().unwrap_or_else(|e| e.into_inner()).app.take()?;
+    let mut warning = None;
+    if let Some(stop) = &app.stop {
+        let mut cmd = app_command(r, &app.meta, app.port, stop);
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let limit = std::time::Duration::from_secs(app.stop_timeout);
+        match run_bounded(cmd, limit, None) {
+            Ok(Ended::Done(s)) if s.success() => {}
+            Ok(Ended::Done(s)) => {
+                warning = Some(format!("the guide's stop: exit {}", s.code().unwrap_or(-1)))
+            }
+            Ok(_) => {
+                warning = Some(format!(
+                    "the guide's stop did not finish within {}s; it was ended, then the app",
+                    app.stop_timeout
+                ))
+            }
+            Err(e) => warning = Some(format!("the guide's stop: {e}")),
+        }
+    }
+    stop_group(app.pgid);
+    let _ = app.child.wait();
+    let _ = std::fs::remove_file(&app.pgid_file);
+    if let Some(lock) = &app.lock {
+        release_space_lock(lock);
+    }
+    app.stopped = true;
+    warning
+}
+
+/// The lock that keeps one run at a time in a space whose url has no
+/// `{port}`: a file in the system temp folder named after the meta repo.
+pub fn space_lock_path(meta: &Path) -> PathBuf {
+    // FNV-1a of the meta repo's path: the same path, the same lock
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in meta.as_os_str().as_encoded_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    std::env::temp_dir().join(format!("herdr-intents-run-{h:016x}.lock"))
+}
+
+/// Takes the space's lock for `url`, unless a live run holds it.
+fn take_space_lock(meta: &Path, url: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let lock = space_lock_path(meta);
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{} {url}", std::process::id());
+                return Ok(lock);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let text = std::fs::read_to_string(&lock).unwrap_or_default();
+                let mut parts = text.split_whitespace();
+                let holder: Option<i32> = parts.next().and_then(|p| p.parse().ok());
+                let held = parts.next().unwrap_or(url).to_string();
+                if holder.is_some_and(|p| p > 0 && pid_alive(p)) {
+                    return Err(format!(
+                        "another run is using {held}: runs in this space take turns (a url with {{port}} lets them run side by side)"
+                    ));
+                }
+                // its run is gone: the lock is stale
+                let _ = std::fs::remove_file(&lock);
+            }
+            Err(e) => return Err(format!("{}: {e}", lock.display())),
+        }
+    }
+    Err(format!("{}: could not take the lock", lock.display()))
+}
+
+fn release_space_lock(lock: &Path) {
+    let ours = std::fs::read_to_string(lock).is_ok_and(|t| {
+        t.split_whitespace().next() == Some(std::process::id().to_string().as_str())
+    });
+    if ours {
+        let _ = std::fs::remove_file(lock);
+    }
+}
+
+/// Ends an app a crashed run left behind in this run's folder.
+fn reap_stale_app(run_dir: &Path) {
+    let file = run_dir.join(".app.pgid");
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut lines = text.lines();
+    let pgid = lines
+        .next()
+        .and_then(|l| l.trim().parse::<i32>().ok())
+        .filter(|p| *p > 0);
+    let when = lines.next().map(str::trim).filter(|w| !w.is_empty());
+    // only the very process the crashed run started, not one that reused its number
+    if let (Some(pgid), Some(when)) = (pgid, when)
+        && started_at(pgid).as_deref() == Some(when)
+    {
+        stop_group(pgid);
+    }
+    let _ = std::fs::remove_file(file);
+}
+
+/// A port nothing listens on, for a guide's `{port}`.
+pub fn free_port() -> Result<u16, String> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .map_err(|e| format!("no free port: {e}"))
+}
+
+/// Where to ask whether the app is up: host, port, whether it is https, path.
+struct ReadyTarget {
+    host: String,
+    port: u16,
+    https: bool,
+    path: String,
+}
+
+impl ReadyTarget {
+    fn parse(url: &str) -> Option<ReadyTarget> {
+        let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
+            (true, r)
+        } else {
+            (false, url.strip_prefix("http://")?)
+        };
+        let (hostport, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i..].to_string()),
+            None => (rest, "/".to_string()),
+        };
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()?),
+            None => (hostport.to_string(), if https { 443 } else { 80 }),
+        };
+        Some(ReadyTarget {
+            host,
+            port,
+            https,
+            path,
+        })
+    }
+
+    /// The guide's `ready`: a full url, or a path on the app's own address.
+    fn for_run(base_url: &str, ready: Option<&str>) -> Option<ReadyTarget> {
+        match ready {
+            Some(r) if r.starts_with("http://") || r.starts_with("https://") => Self::parse(r),
+            Some(path) => {
+                let mut t = Self::parse(base_url)?;
+                t.path = if path.starts_with('/') {
+                    path.to_string()
+                } else {
+                    format!("/{path}")
+                };
+                Some(t)
+            }
+            None => Self::parse(base_url),
+        }
+    }
+
+    fn shown(&self) -> String {
+        format!(
+            "{}://{}:{}{}",
+            if self.https { "https" } else { "http" },
+            self.host,
+            self.port,
+            self.path
+        )
+    }
+
+    /// Something answers: an http reply of any status, or (https) a connection.
+    fn answers(&self) -> bool {
+        use std::net::ToSocketAddrs;
+        // every address of the host: `localhost` is often ::1 first, while
+        // many apps listen on 127.0.0.1 only
+        (self.host.as_str(), self.port)
+            .to_socket_addrs()
+            .is_ok_and(|mut addrs| addrs.any(|a| self.answers_at(&a)))
+    }
+
+    fn answers_at(&self, addr: &std::net::SocketAddr) -> bool {
+        use std::io::{Read, Write};
+        let timeout = std::time::Duration::from_secs(1);
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(addr, timeout) else {
+            return false;
+        };
+        if self.https {
+            return true;
+        }
+        let _ = stream.set_read_timeout(Some(timeout));
+        let request = format!(
+            "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            self.path, self.host
+        );
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let mut head = [0u8; 5];
+        stream.read_exact(&mut head).is_ok() && &head == b"HTTP/"
+    }
+}
+
+/// The last `n` lines of a file, on one line.
+fn tail(path: &Path, n: usize) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let last = lines[lines.len().saturating_sub(n)..].join(" / ");
+    if last.is_empty() {
+        "(no output)".into()
+    } else {
+        last
+    }
+}
+
+/// Commands mode: brings the app up from the guide (in the meta repo,
+/// `req.repo`) and seeds it; the app's address and the log files a check may
+/// search. What it started is stopped by `stop_app_once`, whatever happens.
+#[allow(clippy::too_many_arguments)]
+fn start_app(
+    req: &CaptureRequest,
+    r: &Runner,
+    state: &std::sync::Mutex<JobState>,
+    guide: &CaptureGuide,
+    start: &str,
+    ready: Option<&str>,
+    ready_timeout: u64,
+    stop: Option<String>,
+    stop_timeout: u64,
+    wants_logs: bool,
+    progress: &dyn Fn(String),
+) -> Result<(String, Vec<PathBuf>), String> {
+    use std::os::unix::process::CommandExt;
+    let meta = req.repo.clone();
+    // every repo of the space is there (it is never cloned for you)
+    if let Ok(space) = crate::space::read_space(&meta) {
+        let gone = crate::space::missing(&space);
+        if !gone.is_empty() {
+            let hints: Vec<String> = gone
+                .iter()
+                .map(|g| format!("{} (from {}: `{}`)", g.rel, meta.display(), g.clone_hint()))
+                .collect();
+            return Err(format!("the space is missing {}", hints.join(", ")));
+        }
+    }
+    let run_dir = req.run_dir().to_path_buf();
+    std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
+    reap_stale_app(&run_dir);
+    let port = if guide.url.contains("{port}") {
+        Some(free_port()?)
+    } else {
+        None
+    };
+    let base_url = match port {
+        Some(p) => guide.url.replace("{port}", &p.to_string()),
+        None => guide.url.clone(),
+    };
+    let target = ReadyTarget::for_run(&base_url, ready)
+        .ok_or_else(|| format!("the guide's url is not an http(s) address: {base_url}"))?;
+    let lock = match port {
+        None => Some(take_space_lock(&meta, &base_url)?),
+        Some(_) => None,
+    };
+    // a fixed address someone else's app already answers on is not ours to
+    // seed, drive or stop
+    if port.is_none() && ReadyTarget::parse(&base_url).is_some_and(|t| t.answers()) {
+        if let Some(l) = &lock {
+            release_space_lock(l);
+        }
+        return Err(format!(
+            "something already answers at {base_url}: stop it, or put {{port}} in the guide's url so each run gets its own port"
+        ));
+    }
+    progress("starting the app".into());
+    let log_path = run_dir.join(".app.log");
+    let spawned = std::fs::File::create(&log_path)
+        .and_then(|out| Ok((out.try_clone()?, out)))
+        .and_then(|(out, err)| {
+            let mut cmd = app_command(r, &meta, port, start);
+            cmd.stdout(out).stderr(err).process_group(0);
+            cmd.spawn()
+        });
+    let child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(l) = &lock {
+                release_space_lock(l);
+            }
+            return Err(format!("the guide's start: {e}"));
+        }
+    };
+    let pgid = child.id() as i32;
+    let pgid_file = run_dir.join(".app.pgid");
+    let _ = std::fs::write(
+        &pgid_file,
+        format!("{pgid}\n{}\n", started_at(pgid).unwrap_or_default()),
+    );
+    if let Ok(mut s) = state.lock() {
+        s.app = Some(AppRun {
+            child,
+            pgid,
+            stop,
+            meta: meta.clone(),
+            port,
+            lock,
+            pgid_file,
+            stop_timeout,
+            stopped: false,
+        });
+    }
+    // wait until it answers; a start that fails first has failed (one that
+    // exits 0, leaving the app running, as `docker compose up -d`, has not)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout);
+    loop {
+        if cancelled(state) {
+            return Err("cancelled".into());
+        }
+        let exited = state.lock().ok().and_then(|mut s| {
+            s.app
+                .as_mut()
+                .and_then(|a| a.child.try_wait().ok().flatten())
+        });
+        if let Some(status) = exited
+            && !status.success()
+        {
+            return Err(format!(
+                "the guide's start exited ({status}) before the app answered: {}",
+                tail(&log_path, 5)
+            ));
+        }
+        if target.answers() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the app did not answer at {} within {ready_timeout}s; start's last output: {}",
+                target.shown(),
+                tail(&log_path, 5)
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    for seed in &guide.seed {
+        if cancelled(state) {
+            return Err("cancelled".into());
+        }
+        progress(format!("seeding: {seed}"));
+        let limit = std::time::Duration::from_secs(ready_timeout);
+        let ended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .and_then(|out| Ok((out.try_clone()?, out)))
+            .and_then(|(out, err)| {
+                let mut cmd = app_command(r, &meta, port, seed);
+                cmd.stdout(out).stderr(err);
+                run_bounded(cmd, limit, Some(state))
+            });
+        match ended {
+            Ok(Ended::Done(s)) if s.success() => {}
+            Ok(Ended::Done(s)) => {
+                return Err(format!("seed `{seed}`: exit {}", s.code().unwrap_or(-1)));
+            }
+            Ok(Ended::TimedOut) => {
+                return Err(format!(
+                    "seed `{seed}` did not finish within {ready_timeout}s"
+                ));
+            }
+            Ok(Ended::Cancelled) => return Err("cancelled".into()),
+            Err(e) => return Err(format!("seed `{seed}`: {e}")),
+        }
+    }
+    let log_files = if wants_logs {
+        space_log_paths(&meta, &guide.logs).map_err(|e| format!("the guide's logs: {e}"))?
+    } else {
+        Vec::new()
+    };
+    Ok((base_url, log_files))
 }
 
 fn cancelled(state: &std::sync::Mutex<JobState>) -> bool {
@@ -462,7 +1019,8 @@ impl CaptureJob {
             let (r, st) = (runner.clone(), std::sync::Arc::clone(&state));
             std::thread::spawn(move || {
                 let mut rec = run(&req, &r, &st, managed_mcp, &tx);
-                rec.warning = finish_once(&r, &st);
+                let app_warning = stop_app_once(&r, &st);
+                rec.warning = finish_once(&r, &st).or(app_warning);
                 let _ = tx.send(CaptureUpdate::Done(rec));
             });
         }
@@ -484,6 +1042,7 @@ impl CaptureJob {
             stop_group(p);
             self.runner.close_browser();
         }
+        stop_app_once(&self.runner, &self.state);
         finish_once(&self.runner, &self.state);
     }
 }
@@ -522,7 +1081,7 @@ fn run(
     };
 
     let Ok(guide) = read_guide(&req.repo) else {
-        return failed(format!("no capture guide in {}", req.repo.display()));
+        return failed(format!("no run guide in {}", req.repo.display()));
     };
     // the agent is confined by --restricted and dontAsk: without them, no capture
     let help = r
@@ -563,112 +1122,145 @@ fn run(
             )
         }
     };
-    let task = format!("evidence-{}", req.n);
-    let mut refused: Vec<String> = Vec::new();
-    let mut area: Option<String> = None;
-    for a in area_candidates(req.group_rel.as_deref(), &guide) {
-        if cancelled(state) {
-            return failed("cancelled".into());
-        }
-        progress(format!("starting a stack in {a}"));
-        let start = [
-            "start",
-            "--area",
-            &a,
-            "--task",
-            &task,
-            "--type",
-            "fix",
-            "--mode",
-            "fullstack",
-            "--json",
-        ];
-        match r.work(&start) {
-            Ok(o) if o.status.success() => {
-                area = Some(a);
-                break;
-            }
-            Ok(o) => {
-                let code = refusal_code(&o.stderr).unwrap_or_else(|| format!("exit {}", o.status));
-                if matches!(
-                    code.as_str(),
-                    "AREA_UNKNOWN" | "MANIFEST_INVALID" | "SCOPE_CONFLICT"
-                ) {
-                    refused.push(format!("{a}: {code}"));
-                    continue;
+    // the app: the guide's own commands (any project), or skoolscout's work slot
+    let (base_url, log_files) = match &guide.mode {
+        GuideMode::Commands {
+            start,
+            ready,
+            ready_timeout,
+            stop,
+            stop_timeout,
+        } => match start_app(
+            req,
+            r,
+            state,
+            &guide,
+            start,
+            ready.as_deref(),
+            *ready_timeout,
+            stop.clone(),
+            *stop_timeout,
+            check_dir.is_some(),
+            &progress,
+        ) {
+            Ok(found) => found,
+            Err(why) => return failed(why),
+        },
+        GuideMode::Work { .. } => {
+            let task = format!("evidence-{}", req.n);
+            let mut refused: Vec<String> = Vec::new();
+            let mut area: Option<String> = None;
+            for a in area_candidates(req.group_rel.as_deref(), &guide) {
+                if cancelled(state) {
+                    return failed("cancelled".into());
                 }
-                return failed(format!("work start: {code}"));
+                progress(format!("starting a stack in {a}"));
+                let start = [
+                    "start",
+                    "--area",
+                    &a,
+                    "--task",
+                    &task,
+                    "--type",
+                    "fix",
+                    "--mode",
+                    "fullstack",
+                    "--json",
+                ];
+                match r.work(&start) {
+                    Ok(o) if o.status.success() => {
+                        area = Some(a);
+                        break;
+                    }
+                    Ok(o) => {
+                        let code =
+                            refusal_code(&o.stderr).unwrap_or_else(|| format!("exit {}", o.status));
+                        if matches!(
+                            code.as_str(),
+                            "AREA_UNKNOWN" | "MANIFEST_INVALID" | "SCOPE_CONFLICT"
+                        ) {
+                            refused.push(format!("{a}: {code}"));
+                            continue;
+                        }
+                        return failed(format!("work start: {code}"));
+                    }
+                    Err(e) => return failed(format!("work start: {e}")),
+                }
             }
-            Err(e) => return failed(format!("work start: {e}")),
-        }
-    }
-    let Some(area) = area else {
-        return failed(format!(
-            "no area could start a stack ({})",
-            refused.join(", ")
-        ));
-    };
-    if let Ok(mut s) = state.lock() {
-        s.effort = Some((area.clone(), task.clone()));
-    }
-    if cancelled(state) {
-        return failed("cancelled".into());
-    }
+            let Some(area) = area else {
+                return failed(format!(
+                    "no area could start a stack ({})",
+                    refused.join(", ")
+                ));
+            };
+            if let Ok(mut s) = state.lock() {
+                s.effort = Some((area.clone(), task.clone()));
+            }
+            if cancelled(state) {
+                return failed("cancelled".into());
+            }
 
-    // where the stack is
-    let env = match r.work(&["env", "--area", &area, "--task", &task, "--json"]) {
-        Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout).ok(),
-        _ => None,
-    };
-    let field = |k: &str| {
-        env.as_ref()
-            .and_then(|v| v.get(k))
-            .map(|x| {
-                x.as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| x.to_string())
-            })
-            .filter(|x| !x.is_empty())
-    };
-    let (Some(port), Some(worktree)) = (field("PORT_FRONTEND"), field("WORKTREE")) else {
-        return failed(format!("work env: no frontend port or worktree for {area}"));
-    };
-    let base_url = guide.url.replace("{port}", &port);
+            // where the stack is
+            let env = match r.work(&["env", "--area", &area, "--task", &task, "--json"]) {
+                Ok(o) if o.status.success() => {
+                    serde_json::from_slice::<serde_json::Value>(&o.stdout).ok()
+                }
+                _ => None,
+            };
+            let field = |k: &str| {
+                env.as_ref()
+                    .and_then(|v| v.get(k))
+                    .map(|x| {
+                        x.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| x.to_string())
+                    })
+                    .filter(|x| !x.is_empty())
+            };
+            let (Some(port), Some(worktree)) = (field("PORT_FRONTEND"), field("WORKTREE")) else {
+                return failed(format!("work env: no frontend port or worktree for {area}"));
+            };
+            let base_url = guide.url.replace("{port}", &port);
 
-    // the people and the tenant the agent signs in as
-    let e2e = Path::new(&worktree).join("app-test-e2e-runner");
-    for story in &guide.seed {
-        if cancelled(state) {
-            return failed("cancelled".into());
-        }
-        progress(format!("seeding: {story}"));
-        let mut make = r.cmd(&r.make);
-        if let Some(slot) = field("SLOT") {
-            make.env("SLOT", slot);
-        }
-        let status = make
-            .arg("-C")
-            .arg(&e2e)
-            .args(["e2e-story", &format!("STORY={story}"), "FAST=1"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => return failed(format!("seed {story}: exit {}", s.code().unwrap_or(-1))),
-            Err(e) => return failed(format!("seed {story}: {e}")),
-        }
-    }
+            // the people and the tenant the agent signs in as
+            let e2e = Path::new(&worktree).join("app-test-e2e-runner");
+            for story in &guide.seed {
+                if cancelled(state) {
+                    return failed("cancelled".into());
+                }
+                progress(format!("seeding: {story}"));
+                let mut make = r.cmd(&r.make);
+                if let Some(slot) = field("SLOT") {
+                    make.env("SLOT", slot);
+                }
+                let status = make
+                    .arg("-C")
+                    .arg(&e2e)
+                    .args(["e2e-story", &format!("STORY={story}"), "FAST=1"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => {
+                        return failed(format!("seed {story}: exit {}", s.code().unwrap_or(-1)));
+                    }
+                    Err(e) => return failed(format!("seed {story}: {e}")),
+                }
+            }
 
-    let log_files = if check_dir.is_some() {
-        match crate::check::log_paths(Path::new(&worktree), &guide.logs)
-            .and_then(|paths| inside_worktree(Path::new(&worktree), paths))
-        {
-            Ok(p) => p,
-            Err(e) => return failed(format!("the guide's logs: {e}")),
+            let log_files = if check_dir.is_some() {
+                match crate::check::log_paths(Path::new(&worktree), &guide.logs).and_then(|paths| {
+                    inside_worktree(Path::new(&worktree), paths, "the stack's worktree")
+                }) {
+                    Ok(p) => p,
+                    Err(e) => return failed(format!("the guide's logs: {e}")),
+                }
+            } else {
+                Vec::new()
+            };
+            (base_url, log_files)
         }
-    } else {
-        Vec::new()
     };
 
     // the agent: claude with no shell, only the browser tools, in the evidence folder
@@ -900,10 +1492,31 @@ fn run(
     record(parse_outcome(req.phase, &result), file, steps)
 }
 
+/// Log files a commands-mode guide lists (relative to the meta repo), each
+/// inside the space's folder (the meta repo's parent): no absolute path, no
+/// way out by `..`, no symlink.
+pub fn space_log_paths(meta: &Path, listed: &[String]) -> Result<Vec<PathBuf>, String> {
+    let root = crate::space::plain(meta.parent().unwrap_or(meta));
+    let mut paths = Vec::new();
+    for l in listed {
+        let rel = Path::new(l);
+        let joined = crate::space::plain(&meta.join(rel));
+        if rel.is_absolute() || !joined.starts_with(&root) || joined == root {
+            return Err(format!("{l} leads outside the space ({})", root.display()));
+        }
+        paths.push(joined);
+    }
+    inside_worktree(&root, paths, "the space")
+}
+
 /// Log files that really are inside the worktree: no symlink, and a real
 /// location (folders resolved) under the worktree's own. A file that does not
 /// exist yet is kept; the browser tools never follow a symlink when they open it.
-fn inside_worktree(worktree: &Path, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+fn inside_worktree(
+    worktree: &Path,
+    paths: Vec<PathBuf>,
+    what: &str,
+) -> Result<Vec<PathBuf>, String> {
     let root =
         std::fs::canonicalize(worktree).map_err(|e| format!("{}: {e}", worktree.display()))?;
     for p in &paths {
@@ -912,10 +1525,7 @@ fn inside_worktree(worktree: &Path, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>,
         };
         let real = std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()))?;
         if meta.file_type().is_symlink() || !real.starts_with(&root) {
-            return Err(format!(
-                "{} leads outside the stack's worktree",
-                p.display()
-            ));
+            return Err(format!("{} leads outside {what}", p.display()));
         }
     }
     Ok(paths)
@@ -1168,6 +1778,14 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
                 latest.warning = Some(w.clone());
                 let _ = crate::check::write_check(check_dir, &latest);
             }
+            // a check that never reached its agent says why; one that ran clears it
+            match (&checked, &rec.outcome) {
+                (Some(_), _) => crate::check::clear_failure(check_dir),
+                (None, Outcome::Failed(why)) if why != "cancelled" => {
+                    let _ = crate::check::write_failure(check_dir, why);
+                }
+                _ => {}
+            }
             if let Some(c) = &checked {
                 let applied = crate::store::Store::open(root)
                     .and_then(|store| crate::check::apply(&store, intent_path, c));
@@ -1261,7 +1879,9 @@ mod tests {
 
     fn guide() -> CaptureGuide {
         CaptureGuide {
-            default_area: "org/social".into(),
+            mode: GuideMode::Work {
+                default_area: "org/social".into(),
+            },
             seed: vec!["kathia-signup".into()],
             url: "https://demo-org.skoolscout.com.local:{port}".into(),
             body: "Sign in with Cmd+U.\n".into(),
@@ -1281,6 +1901,34 @@ mod tests {
             merged: Vec::new(),
             warning: None,
         }
+    }
+
+    #[test]
+    fn an_app_run_dropped_without_stopping_stops_its_group() {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        let tmp = tempfile::tempdir().unwrap();
+        let run = AppRun {
+            child,
+            pgid,
+            stop: None,
+            meta: tmp.path().to_path_buf(),
+            port: None,
+            lock: None,
+            pgid_file: tmp.path().join(".app.pgid"),
+            stop_timeout: 60,
+            stopped: false,
+        };
+        drop(run);
+        assert!(
+            nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None).is_err(),
+            "its group is gone"
+        );
     }
 
     #[test]

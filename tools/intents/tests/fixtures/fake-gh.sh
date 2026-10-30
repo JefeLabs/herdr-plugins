@@ -23,7 +23,9 @@ case "$n" in
   */pull/*) n="${n##*/pull/}"; n="${n%%/*}" ;;
 esac
 if [ "$1 $2" = "pr view" ] && [ -f "$FAKE_GH_DIR/$n" ]; then
-  if [ -f "$FAKE_GH_DIR/$n.title" ]; then
+  if [ -f "$FAKE_GH_DIR/$n.merge" ]; then
+    printf '{"state":"%s","title":"x","mergeCommit":{"oid":"%s"}}\n' "$(cat "$FAKE_GH_DIR/$n")" "$(cat "$FAKE_GH_DIR/$n.merge")"
+  elif [ -f "$FAKE_GH_DIR/$n.title" ]; then
     printf '{"state":"%s","title":"%s"}\n' "$(cat "$FAKE_GH_DIR/$n")" "$(cat "$FAKE_GH_DIR/$n.title")"
   else
     printf '{"state":"%s"}\n' "$(cat "$FAKE_GH_DIR/$n")"
