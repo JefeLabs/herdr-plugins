@@ -39,6 +39,7 @@ rel="$work/release"
 stage="$work/stage/herdr-plugins"
 mkdir -p "$rel" "$stage/toolbar" "$stage/tools/intents" "$stage/target/release"
 cp toolbar/tools.example.toml "$stage/toolbar/"
+cp -R toolbar/setup "$stage/toolbar/"
 echo 'id = "jefelabs.toolbar"' > "$stage/toolbar/herdr-plugin.toml"
 echo 'id = "jefelabs.intents"' > "$stage/tools/intents/herdr-plugin.toml"
 # the real toolbar binary: install.sh runs `herdr-toolbar unzip` where no unzip
@@ -108,7 +109,10 @@ run() { # <home> <extra PATH or -> <manifest> <args...>; output in $out, status 
   shift 3
   p=$base_path
   [ "$extra" = - ] || p="$extra:$p"
+  # TTY: answers for the walk-through (a file), none by default; XTERM,
+  # XGHOSTTY, XKITTY: the terminal it is told it runs in (never the runner's)
   out=$(env -i HOME="$h" PATH="$p" HERDR_PLUGINS_TOOLS_MANIFEST="$m" ${REPOS:+HERDR_PLUGINS_REPOS="$REPOS"} ${LIBC:+HERDR_PLUGINS_LIBC="$LIBC"} \
+    HERDR_PLUGINS_TTY="${TTY:-none}" ${XTERM:+TERM="$XTERM"} ${XGHOSTTY:+GHOSTTY_RESOURCES_DIR="$XGHOSTTY"} ${XKITTY:+KITTY_WINDOW_ID="$XKITTY"} \
     sh "$rel/install.sh" --from "$rel" "$@" 2>&1)
   status=$?
 }
@@ -177,7 +181,7 @@ if grep -q '^id *= *"usage"' "$(toml "$h")" 2>/dev/null; then
   flunk "no Usage tool without its three tools" "added although oxker is missing"
 else
   case "$out" in
-    *"Usage tool not added"*) pass "no Usage tool without its three tools" ;;
+    *"left off: Usage (needs oxker)"*) pass "no Usage tool without its three tools" ;;
     *) flunk "no Usage tool without its three tools" "no message: $out" ;;
   esac
 fi
@@ -342,7 +346,7 @@ done
 h="$work/h16"
 mkdir -p "$h"
 out=$(env -i HOME="$h" PATH="$work/fakebin:$minbin" HERDR_PLUGINS_TOOLS_MANIFEST="$work/good" \
-  sh "$rel/install.sh" --from "$rel" --tools 2>&1)
+  HERDR_PLUGINS_TTY=none sh "$rel/install.sh" --from "$rel" --tools 2>&1)
 status=$?
 if [ -e "$minbin/unzip" ] || [ -e "$minbin/python3" ]; then
   flunk "zip tools without unzip or python3" "the test PATH still has unzip or python3"
@@ -351,6 +355,59 @@ elif [ $status -eq 0 ] && [ "$("$h/.local/bin/procs")" = "procs fake" ] &&
   pass "zip tools without unzip or python3"
 else
   flunk "zip tools without unzip or python3" "exit $status: $out"
+fi
+
+# 17. no terminal: the default bar from the catalog (the ticked tools whose
+# programs are present), the owner's settings and order. A variable set before
+# a function call outlives it in sh, so the earlier tests' settings are cleared.
+unset LIBC REPOS TTY XTERM XGHOSTTY XKITTY
+h="$work/h17"
+mkdir -p "$h"
+run "$h" - "$work/good" --tools
+t17=$(toml "$h")
+if [ $status -eq 0 ] && grep -q '^bar *= *"large"' "$t17" 2>/dev/null && grep -q '^prefix *= *"ctrl-\]"' "$t17" &&
+  grep -q '^order *= *\["intents", "db", "files", "editor", "usage", "terminal"\]' "$t17" &&
+  ! grep -qE '^id *= *"(jira|web|issues|browser)"' "$t17" &&
+  grep -qF "\"$h/.local/share/herdr-plugins/target/release/herdr-intents\"" "$t17"; then
+  pass "no terminal: the default bar from the catalog"
+else
+  flunk "no terminal: the default bar from the catalog" "exit $status: $(cat "$t17" 2>&1)"
+fi
+case "$out" in
+  *"left off: GitHub issues (needs gh, gh-dash)"*) pass "no terminal: says what it left off" ;;
+  *) flunk "no terminal: says what it left off" "$out" ;;
+esac
+
+# 18. no terminal: Nerd icons when told it runs in Ghostty, text icons otherwise
+esc=$(awk -F'|' '$1 == "intents" { print $6 }' toolbar/setup/tools 2>/dev/null)
+h="$work/h18"
+mkdir -p "$h"
+XTERM=xterm-ghostty
+run "$h" - "$work/good"
+unset XTERM
+nerd=$(grep -cF "\"$esc\"" "$(toml "$h")" 2>/dev/null)
+h="$work/h18b"
+mkdir -p "$h"
+XTERM=xterm-256color XGHOSTTY=/Applications/Ghostty.app/Contents/Resources/ghostty
+run "$h" - "$work/good"
+unset XTERM XGHOSTTY
+herdr_pane=$(grep -cF "\"$esc\"" "$(toml "$h")" 2>/dev/null)
+h="$work/h18c"
+mkdir -p "$h"
+XTERM=xterm-256color
+run "$h" - "$work/good"
+unset XTERM
+text=$(grep -cF '"✎"' "$(toml "$h")" 2>/dev/null)
+case "$esc:$nerd:$herdr_pane:$text" in
+  \\*:1:1:1) pass "icons: Nerd under Ghostty (also inside Herdr), text elsewhere" ;;
+  *) flunk "icons: Nerd under Ghostty (also inside Herdr), text elsewhere" "escape '$esc', nerd $nerd, herdr pane $herdr_pane, text $text" ;;
+esac
+
+# 19. nothing personal in the catalog or the example
+if [ -d toolbar/setup ] && ! grep -rqE 'JIRA_PROJECT|SKOOL|/Users/' toolbar/setup toolbar/tools.example.toml; then
+  pass "nothing personal in the catalog"
+else
+  flunk "nothing personal in the catalog" "$(grep -rnE 'JIRA_PROJECT|SKOOL|/Users/' toolbar/setup toolbar/tools.example.toml 2>&1)"
 fi
 
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"

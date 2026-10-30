@@ -1,0 +1,9 @@
+# A plain shell in a Herdr pane beside the work pane, in the workspace folder;
+# selecting it again closes that pane. The pane starts your shell; `clear`
+# only gives it a clean screen.
+[[tool]]
+id      = "terminal"
+name    = "Terminal"
+icon    = "@ICON@"
+command = ["clear"]
+open    = "pane"

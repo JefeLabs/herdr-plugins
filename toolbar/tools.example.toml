@@ -1,22 +1,28 @@
-# herdr-toolbar tools. Copy to the path printed by `herdr plugin config-dir jefelabs.toolbar`
-# as tools.toml. A worktree may add `.herdr-toolbar.toml` at its root with the same schema;
-# its entries replace global ones with the same id, and its `order`, if present, wins.
+# herdr-toolbar tools. The installer writes tools.toml for you through its
+# walk-through (run it again with --setup to choose again); this example is for
+# setting it up by hand. Copy it to the path printed by
+# `herdr plugin config-dir jefelabs.toolbar` as tools.toml. A worktree may add
+# `.herdr-toolbar.toml` at its root with the same schema; its entries replace
+# global ones with the same id, and its `order`, if present, wins.
+#
+# The icons here are plain text. Nerd Font icons (Ghostty and kitty ship
+# them) are listed in toolbar/setup/tools.
 
 prefix = "ctrl-]"
-# bar  = "large"   # bigger buttons: five columns by two rows (default "small")
-order  = ["issues", "intents", "db", "files", "jira", "browser"]
-
-[[tool]]
-id      = "issues"
-name    = "GitHub issues"
-icon    = "◉"
-command = ["gh", "dash"]
+bar    = "large"   # bigger buttons: five columns by two rows (or "small")
+order  = ["intents", "issues", "db", "files", "editor", "browser", "usage", "terminal"]
 
 [[tool]]
 id      = "intents"
 name    = "Intents"
 icon    = "✎"
 command = ["/absolute/path/to/herdr-plugins/target/release/herdr-intents"]
+
+[[tool]]
+id      = "issues"
+name    = "GitHub issues"
+icon    = "◉"
+command = ["gh", "dash"]
 
 [[tool]]
 id      = "db"
@@ -31,12 +37,23 @@ name    = "Files"
 icon    = "▭"
 command = ["yazi"]
 
+# Jira: lists issues from the project `jira init` set up. Add "jira" to
+# `order` to use it.
+# [[tool]]
+# id      = "jira"
+# name    = "Jira"
+# icon    = "◆"
+# command = ["jira", "issue", "list"]
+
+# Neovim in a pane, listening on a socket named after the workspace, so a file
+# can be opened in it from outside:
+#   nvim --server "$HOME/.cache/nvim-editor-<workspace id>.sock" --remote <file>
 [[tool]]
-id      = "jira"
-name    = "Jira"
-icon    = "◆"
-command = ["jira", "issue", "list"]
-env     = { JIRA_PROJECT = "SKOOL" }
+id      = "editor"
+name    = "Editor"
+icon    = "◫"
+command = ["sh", "-c", "d=${XDG_CACHE_HOME:-$HOME/.cache}; mkdir -p \"$d\"; s=\"$d/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\"; rm -f \"$s\"; exec nvim --listen \"$s\""]
+open    = "pane"
 
 # Opens in a Herdr pane beside the work pane, at full size and speed;
 # selecting it again closes that pane.
@@ -47,25 +64,34 @@ icon    = "◎"
 command = ["terminal-browser", "open"]
 open    = "pane"
 
+# Experimental: the browser inside the toolbar's slot. Add "web" to `order`.
+# [[tool]]
+# id       = "web"
+# name     = "Browser (in the toolbar)"
+# icon     = "◍"
+# command  = ["terminal-browser", "open"]
+# graphics = true
+
 # A pane tool can open several panes, stacked top to bottom: one command per
 # pane in `panes`, in place of `command`. Selecting it again closes them all.
-# [[tool]]
-# id    = "usage"
-# name  = "Usage"
-# icon  = "▤"
-# open  = "pane"
-# panes = [
-#   ["procs", "--watch-interval", "2", "--sortd", "cpu", "--or", "herdr", "docker", "Workspaces"],
-#   ["oxker"],
-#   ["dua", "i", "/path/to/your/repos"],
-# ]
+# On Linux, use "containerd" in place of "Virtualization".
+[[tool]]
+id    = "usage"
+name  = "Usage"
+icon  = "▤"
+open  = "pane"
+panes = [
+  ["procs", "--watch-interval", "2", "--sortd", "cpu", "--insert", "ReadBytes", "--insert", "WriteBytes",
+   "--or", "herdr", "docker", "Virtualization"],
+  ["oxker"],
+  ["dua", "i", "."],
+]
 
-# Neovim in a pane, listening on a socket named after the workspace, so a file
-# can be opened in it from outside:
-#   nvim --server "$HOME/.cache/nvim-editor-<workspace id>.sock" --remote <file>
-# [[tool]]
-# id      = "editor"
-# name    = "Editor"
-# icon    = "◫"
-# command = ["sh", "-c", "d=${XDG_CACHE_HOME:-$HOME/.cache}; mkdir -p \"$d\"; s=\"$d/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\"; rm -f \"$s\"; exec nvim --listen \"$s\""]
-# open    = "pane"
+# A plain shell in a pane beside the work pane; `clear` only gives it a clean
+# screen.
+[[tool]]
+id      = "terminal"
+name    = "Terminal"
+icon    = "▣"
+command = ["clear"]
+open    = "pane"

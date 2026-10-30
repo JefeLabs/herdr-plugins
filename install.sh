@@ -126,13 +126,8 @@ for plugin in toolbar tools/intents; do
   fi
 done
 
-# a first toolbar config, pointing at this install's intents tool
+# the toolbar's config folder; its tools.toml is written after the tools
 config=$(herdr plugin config-dir jefelabs.toolbar 2>/dev/null || true)
-if [ -n "$config" ] && [ ! -f "$config/tools.toml" ]; then
-  mkdir -p "$config"
-  sed "s|/absolute/path/to/herdr-plugins|$dir|" "$dir/toolbar/tools.example.toml" > "$config/tools.toml"
-  say "Wrote $config/tools.toml (edit it to choose your tools)"
-fi
 
 # The intents plugin used to be jefelabs.capabilities (folder tools/capabilities,
 # program herdr-capabilities). Unlink the old plugin, whose folder is gone now,
@@ -304,56 +299,6 @@ if [ -n "$tools" ]; then
     *) say "  $bin is not on your PATH: add  export PATH=\"$bin:\$PATH\"  to your shell's startup file" ;;
   esac
 
-  # the Usage tool: one icon, three panes stacked beside the work pane
-  have() { command -v "$1" >/dev/null 2>&1 || [ -x "$bin/$1" ]; }
-  if [ -n "$config" ] && [ -f "$config/tools.toml" ]; then
-    if grep -q '^id *= *"usage"' "$config/tools.toml"; then
-      :
-    elif have procs && have oxker && have dua; then
-      if [ "$os" = macos ]; then vm=Virtualization; else vm=containerd; fi
-      repos=$(printf '%s' "${HERDR_PLUGINS_REPOS:-$HOME}" | sed 's/\\/\\\\/g; s/"/\\"/g')
-      cat >> "$config/tools.toml" <<EOF
-
-# Added by the herdr-plugins installer: one press opens three panes stacked
-# beside the work pane (processes, Docker containers, disk use); the next
-# press closes them.
-[[tool]]
-id    = "usage"
-name  = "Usage"
-icon  = "▤"
-open  = "pane"
-panes = [
-  ["procs", "--watch-interval", "2", "--sortd", "cpu", "--insert", "ReadBytes", "--insert", "WriteBytes",
-   "--or", "herdr", "docker", "$vm"],
-  ["oxker"],
-  ["dua", "i", "$repos"],
-]
-EOF
-      say "  Added the Usage tool (▤) to $config/tools.toml"
-    else
-      say "  Usage tool not added: it needs procs, oxker and dua"
-    fi
-    # the Editor tool: Neovim in a pane, listening so files can be opened in it
-    if grep -q '^id *= *"editor"' "$config/tools.toml"; then
-      :
-    elif have nvim; then
-      cat >> "$config/tools.toml" <<'EOF'
-
-# Added by the herdr-plugins installer: Neovim in a pane beside the work pane,
-# listening on a socket named after the workspace, so files can be opened in
-# it from outside:
-#   nvim --server "$HOME/.cache/nvim-editor-<workspace id>.sock" --remote <file>
-[[tool]]
-id      = "editor"
-name    = "Editor"
-icon    = "◫"
-command = ["sh", "-c", "d=${XDG_CACHE_HOME:-$HOME/.cache}; mkdir -p \"$d\"; s=\"$d/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\"; rm -f \"$s\"; exec nvim --listen \"$s\""]
-open    = "pane"
-EOF
-      say "  Added the Editor tool (◫) to $config/tools.toml"
-    fi
-  fi
-
   hinted=""
   hint() {
     if [ -z "$hinted" ]; then
@@ -369,6 +314,78 @@ EOF
     hint "jira:              see https://github.com/ankitpokhrel/jira-cli"
   command -v terminal-browser >/dev/null 2>&1 ||
     hint "terminal-browser:  curl -fsSL https://terminal-browser.sh/install | bash"
+fi
+
+# --- the toolbar's tools.toml, from the catalog in toolbar/setup: the
+# ticked tools whose programs are here (see the walk-through below)
+catalog="$dir/toolbar/setup"
+if [ "$os" = macos ]; then vm=Virtualization; else vm=containerd; fi
+present() { # <program>: on PATH, in the bin folder, or (gh-dash) a gh extension
+  check=$(awk -F'|' -v p="$1" '$1 == p { print $2 }' "$catalog/programs")
+  [ -n "$check" ] || check=$1
+  case "$check" in
+    gh-dash) command -v gh >/dev/null 2>&1 && gh extension list 2>/dev/null | grep -q gh-dash ;;
+    *) command -v "$check" >/dev/null 2>&1 || [ -x "${HERDR_PLUGINS_BIN:-$HOME/.local/bin}/$check" ] ;;
+  esac
+}
+nerd_default() { # Ghostty or kitty, which ship Nerd Font symbols (also inside Herdr)
+  case "${TERM:-}" in xterm-ghostty | xterm-kitty) return 0 ;; esac
+  [ "${TERM_PROGRAM:-}" = ghostty ] && return 0
+  [ -n "${GHOSTTY_RESOURCES_DIR:-}" ] || [ -n "${KITTY_WINDOW_ID:-}" ]
+}
+toml_text() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }  # inside a TOML "string"
+sed_text() { printf '%s' "$1" | sed 's/[\\|&]/\\&/g'; }   # a sed s|..|..| replacement
+write_toolbar() { # <file> <nerd|text> <tool id>...
+  file=$1 mode=$2
+  shift 2
+  order=""
+  for id in "$@"; do order="$order${order:+, }\"$id\""; done
+  if [ "$mode" = nerd ]; then field=6; else field=7; fi
+  intents=$(sed_text "$(toml_text "$dir/target/release/herdr-intents")")
+  repos=$(sed_text "$(toml_text "${HERDR_PLUGINS_REPOS:-$HOME}")")
+  {
+    printf '%s\n' "# herdr-toolbar tools, written by the herdr-plugins installer. Run it again" \
+      "# with --setup to choose again, or edit this file (see the toolbar README)." "" \
+      'prefix = "ctrl-]"' 'bar    = "large"' "order  = [$order]"
+    for id in "$@"; do
+      icon=$(sed_text "$(awk -F'|' -v i="$id" -v f="$field" '$1 == i { print $f }' "$catalog/tools")")
+      printf '\n'
+      sed -e "s|@ICON@|$icon|" -e "s|@INTENTS@|$intents|" -e "s|@REPOS@|$repos|" -e "s|@VM@|$vm|" \
+        "$catalog/$id.toml"
+    done
+  } > "$file.tmp" && mv "$file.tmp" "$file"
+}
+setup_toolbar() {
+  chosen=""
+  while IFS='|' read -r id name _summary ticked needs _nerd _text; do
+    case "$id" in '' | '#'*) continue ;; esac
+    [ "$ticked" = 1 ] || continue
+    missing=""
+    for program in $needs; do
+      present "$program" </dev/null || missing="$missing${missing:+, }$program"
+    done
+    if [ -n "$missing" ]; then
+      say "  left off: $name (needs $missing)"
+    else
+      chosen="$chosen $id"
+    fi
+  done < "$catalog/tools"
+  if nerd_default; then mode=nerd; else mode=text; fi
+  # shellcheck disable=SC2086 # the chosen ids, one argument each
+  write_toolbar "$config/tools.toml" "$mode" $chosen
+  # shellcheck disable=SC2086
+  set -- $chosen
+  say "Wrote $config/tools.toml ($# tools, $mode icons)"
+}
+if [ -n "$config" ] && [ ! -f "$config/tools.toml" ]; then
+  if [ -d "$catalog" ]; then
+    mkdir -p "$config"
+    say ""
+    say "Toolbar:"
+    setup_toolbar
+  else
+    say "No toolbar catalog in $dir: tools.toml not written"
+  fi
 fi
 
 cat <<'KEYS'

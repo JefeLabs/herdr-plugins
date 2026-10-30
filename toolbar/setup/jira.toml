@@ -1,0 +1,6 @@
+# Lists issues from the project `jira init` set up.
+[[tool]]
+id      = "jira"
+name    = "Jira"
+icon    = "@ICON@"
+command = ["jira", "issue", "list"]

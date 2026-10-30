@@ -48,6 +48,7 @@ build() { # <rust target> <asset name>
   root="$stage/herdr-plugins"
   mkdir -p "$root/toolbar" "$root/tools/intents" "$root/target/release"
   cp toolbar/herdr-plugin.toml toolbar/README.md toolbar/tools.example.toml "$root/toolbar/"
+  cp -R toolbar/setup "$root/toolbar/"
   cp tools/intents/herdr-plugin.toml tools/intents/README.md "$root/tools/intents/"
   cp "target/$target/release/herdr-toolbar" "target/$target/release/herdr-intents" \
     "$root/target/release/"

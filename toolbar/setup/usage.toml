@@ -1,0 +1,13 @@
+# One press opens three panes stacked beside the work pane (processes,
+# Docker containers, disk use); the next press closes them.
+[[tool]]
+id    = "usage"
+name  = "Usage"
+icon  = "@ICON@"
+open  = "pane"
+panes = [
+  ["procs", "--watch-interval", "2", "--sortd", "cpu", "--insert", "ReadBytes", "--insert", "WriteBytes",
+   "--or", "herdr", "docker", "@VM@"],
+  ["oxker"],
+  ["dua", "i", "@REPOS@"],
+]

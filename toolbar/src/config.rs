@@ -445,12 +445,17 @@ mod tests {
     #[test]
     fn parses_the_spec_example() {
         let raw = parse(GLOBAL).unwrap();
-        assert_eq!(raw.tool.len(), 6);
+        assert_eq!(raw.tool.len(), 8);
         assert_eq!(raw.tool[2].id, "db");
-        assert_eq!(raw.tool[4].env["JIRA_PROJECT"], "SKOOL");
-        let want: Vec<String> = ["issues", "intents", "db", "files", "jira", "browser"]
-            .map(String::from)
-            .to_vec();
+        assert!(
+            raw.tool.iter().all(|t| t.env.is_empty()),
+            "nothing personal (such as a Jira project) in the example"
+        );
+        let want: Vec<String> = [
+            "intents", "issues", "db", "files", "editor", "browser", "usage", "terminal",
+        ]
+        .map(String::from)
+        .to_vec();
         assert_eq!(raw.order.as_deref(), Some(&want[..]));
         assert_eq!(raw.prefix.as_deref(), Some("ctrl-]"));
         assert_eq!(raw.tool[5].id, "browser");
@@ -468,7 +473,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
 "#;
         let (t, g, w) = dirs(GLOBAL, Some(ws));
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
-        assert_eq!(cfg.tools.len(), 6);
+        assert_eq!(cfg.tools.len(), 8);
         assert_eq!(cfg.tools[2].id, "db");
         assert_eq!(cfg.tools[2].name, "Slot DB");
         assert_eq!(cfg.tools[2].command[1], "postgres://localhost:5433/x");
@@ -480,14 +485,19 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let (t, g, w) = dirs(GLOBAL, Some(ws));
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
         let ids: Vec<&str> = cfg.tools.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, ["files", "db", "issues", "intents", "jira", "browser"]);
+        assert_eq!(
+            ids,
+            [
+                "files", "db", "intents", "issues", "editor", "browser", "usage", "terminal"
+            ]
+        );
     }
 
     #[test]
     fn missing_workspace_file_is_fine() {
         let (t, g, w) = dirs(GLOBAL, None);
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
-        assert_eq!(cfg.tools.len(), 6);
+        assert_eq!(cfg.tools.len(), 8);
         assert_eq!(cfg.prefix, "ctrl-]");
     }
 
@@ -531,7 +541,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let loaded = load_merged(&g, &w, &trust).unwrap();
         assert_eq!(
             loaded.config.tools.len(),
-            6,
+            8,
             "workspace tool must not be merged"
         );
         assert_eq!(loaded.ignored_untrusted, Some(w.join(WORKSPACE_FILE)));
@@ -544,13 +554,13 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let trust = Trust::new(t.path().join("trusted.json"));
         trust.allow(&w.join(WORKSPACE_FILE)).unwrap();
         let loaded = load_merged(&g, &w, &trust).unwrap();
-        assert_eq!(loaded.config.tools.len(), 7);
+        assert_eq!(loaded.config.tools.len(), 9);
         assert_eq!(loaded.ignored_untrusted, None);
         fs::write(w.join(WORKSPACE_FILE), format!("{ws}# changed\n")).unwrap();
         let loaded = load_merged(&g, &w, &trust).unwrap();
         assert_eq!(
             loaded.config.tools.len(),
-            6,
+            8,
             "a changed file needs re-trusting"
         );
         assert!(loaded.ignored_untrusted.is_some());
@@ -582,7 +592,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         trust.allow(&real).unwrap();
         std::os::unix::fs::symlink(&real, w.join(WORKSPACE_FILE)).unwrap();
         let loaded = load_merged(&g, &w, &trust).unwrap();
-        assert_eq!(loaded.config.tools.len(), 6);
+        assert_eq!(loaded.config.tools.len(), 8);
         assert!(loaded.ignored_untrusted.is_some());
         // and `allow` on the symlink itself must refuse
         assert!(trust.allow(&w.join(WORKSPACE_FILE)).is_err());

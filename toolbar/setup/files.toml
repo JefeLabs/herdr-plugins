@@ -1,0 +1,5 @@
+[[tool]]
+id      = "files"
+name    = "Files"
+icon    = "@ICON@"
+command = ["yazi"]

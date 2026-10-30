@@ -1,0 +1,8 @@
+# Experimental: the browser inside the toolbar's slot, its page images passed
+# through to Herdr. Slower than its own pane and only as big as the toolbar.
+[[tool]]
+id       = "web"
+name     = "Browser (in the toolbar)"
+icon     = "@ICON@"
+command  = ["terminal-browser", "open"]
+graphics = true
