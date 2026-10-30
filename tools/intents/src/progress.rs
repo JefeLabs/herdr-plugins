@@ -1054,7 +1054,7 @@ impl Poller {
     }
 
     /// Gather the spec, merged PRs and follow-ups for a reconcile, off the UI thread.
-    pub fn request_reconcile(&mut self, intent: Intent, merged: Vec<u64>) {
+    pub fn request_reconcile(&mut self, intent: Intent, merged: Vec<u64>, folded: Vec<Intent>) {
         let key = format!("reconcile:{}", intent.path.display());
         let Some(repo) = intent.fm.repo.clone() else {
             return;
@@ -1067,7 +1067,7 @@ impl Poller {
         std::thread::spawn(move || {
             let gh = tool_bin(&env, "GH_BIN_PATH", Some("gh")).unwrap_or_else(|| "gh".into());
             let ctx = crate::reconcile::gather(&repo, &intent, &merged, &gh, &env);
-            let prompt = crate::reconcile::reconcile_prompt(&intent, &ctx);
+            let prompt = crate::reconcile::reconcile_prompt(&intent, &ctx, &folded);
             let _ = tx.send((
                 key,
                 Update::Reconcile {

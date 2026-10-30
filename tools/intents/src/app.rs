@@ -1001,7 +1001,15 @@ impl App {
                 let mut it = it;
                 let suggested = self.suggested_areas(&it);
                 it.fm.areas.extend(suggested);
-                self.poller().request_reconcile(it, merged);
+                // what follow-ups shipped stays: they describe the app now
+                let folded: Vec<Intent> = it
+                    .fm
+                    .follow_ups
+                    .iter()
+                    .filter(|l| l.folded)
+                    .filter_map(|l| self.intent_by_stem(&l.stem).cloned())
+                    .collect();
+                self.poller().request_reconcile(it, merged, folded);
             }
         }
         self.check_due();

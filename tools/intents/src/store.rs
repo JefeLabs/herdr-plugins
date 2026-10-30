@@ -55,6 +55,15 @@ pub struct SentTo {
     pub at: DateTime<Local>,
 }
 
+/// A follow-up filed for an intent (by the follow-up's stem, which `M` keeps).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowUpLink {
+    pub stem: String,
+    /// Its shipped change was folded into this intent's criteria.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folded: bool,
+}
+
 /// A missing item filed for one of an intent's criteria (by the item's stem,
 /// which `M` keeps, so the link survives moves).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +149,18 @@ pub struct FrontMatter {
     /// On a missing item: the intent and criterion it was filed for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing_for: Option<MissingFor>,
+    /// On a follow-up: the stem of the (first) intent it refines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_of: Option<String>,
+    /// The follow-ups filed for this intent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follow_ups: Vec<FollowUpLink>,
+    /// On a follow-up: the owner undid its fold, so it never folds again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fold_declined: bool,
+    /// On an original: the follow-up the last fold came from (for `u`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fold: Option<String>,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -423,6 +444,10 @@ impl Store {
             missing: Vec::new(),
             dismissed: Vec::new(),
             missing_for: None,
+            follow_up_of: None,
+            follow_ups: Vec::new(),
+            fold_declined: false,
+            last_fold: None,
             extra: BTreeMap::new(),
         };
         let mut it = Intent {
