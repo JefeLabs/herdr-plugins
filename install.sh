@@ -183,7 +183,8 @@ rename_in "${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}" 'jefelabs\.cap
 # inside the archive. `dir=<folder>:<program>` unpacks the whole folder (a
 # program with runtime files, like Neovim) and links the program into the bin
 # folder; `needs=glibc` skips the row on musl systems such as Alpine, where
-# that build cannot run. oxker has no Intel Mac build.
+# that build cannot run. oxker has no Intel Mac build. gh and jira are not
+# installed by --tools, only by the toolbar walk-through when a tool needs them.
 builtin_tools() {
   cat <<'TOOLS'
 procs linux-x86_64 https://github.com/dalance/procs/releases/download/v0.14.12/procs-v0.14.12-x86_64-linux.zip 81964faf9d5cd0e9f399d5d0954fb6fe4d4d9f7d3cbec4507633df5a45b11713 procs
@@ -209,6 +210,14 @@ nvim linux-x86_64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvi
 nvim linux-arm64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-arm64.tar.gz 8f1f64a0bdb97247034038c3823c6cbad5bdf9ecd5751b85494b71c3ee04c815 dir=nvim-linux-arm64:bin/nvim needs=glibc
 nvim macos-arm64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-macos-arm64.tar.gz 1dbd148222b051ba6c307c4d17a318ed083df018a4f6a5a0ce46955ffc9ab87b dir=nvim-macos-arm64:bin/nvim
 nvim macos-x86_64 https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-macos-x86_64.tar.gz 481424f1dbc85f637d57e47d27d042aa9c883e5a4fe9ee64fc4ee9573b221998 dir=nvim-macos-x86_64:bin/nvim
+gh linux-x86_64 https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_linux_amd64.tar.gz 4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d gh_2.103.3_linux_amd64/bin/gh
+gh linux-arm64 https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_linux_arm64.tar.gz ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63 gh_2.103.3_linux_arm64/bin/gh
+gh macos-arm64 https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_macOS_arm64.zip d700207eae9ae98fe2b89535c2c087c07823d4628c56364695a5a07ef311c062 gh_2.103.3_macOS_arm64/bin/gh
+gh macos-x86_64 https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_macOS_amd64.zip a2f86418f4350ae6e9ec60d5000bdf7665728436946a97fc27fe50e6ae752682 gh_2.103.3_macOS_amd64/bin/gh
+jira linux-x86_64 https://github.com/ankitpokhrel/jira-cli/releases/download/v1.7.0/jira_1.7.0_linux_x86_64.tar.gz b5e0ba4804f3f11f92c483d9a6ea9ebccec1c735cd2e12b0440cab9d7afd626a jira_1.7.0_linux_x86_64/bin/jira
+jira linux-arm64 https://github.com/ankitpokhrel/jira-cli/releases/download/v1.7.0/jira_1.7.0_linux_arm64.tar.gz 80aa3cc02790892b29e1580a8e49eb49a6550815b362c5ef8c05aea1dee73a95 jira_1.7.0_linux_arm64/bin/jira
+jira macos-arm64 https://github.com/ankitpokhrel/jira-cli/releases/download/v1.7.0/jira_1.7.0_macOS_arm64.tar.gz f9c75d1b242a4cbd78fc49c00c9854c3856f1bd421bdf196c567b3bb71ccf527 jira_1.7.0_macOS_arm64/bin/jira
+jira macos-x86_64 https://github.com/ankitpokhrel/jira-cli/releases/download/v1.7.0/jira_1.7.0_macOS_x86_64.tar.gz c2cb2f6b440522ec73439ec9a10f4a194b78e4c409341d18da3f91dfef59d090 jira_1.7.0_macOS_x86_64/bin/jira
 TOOLS
 }
 tool_rows() {
@@ -240,8 +249,80 @@ if [ -z "$libc" ]; then
 fi
 
 refused=""
+bin="${HERDR_PLUGINS_BIN:-$HOME/.local/bin}"
+install_pinned() { # <name>: download, check and unpack its pinned build into the bin folder; 0 when installed
+  name=$1
+  row=$(tool_rows | awk -v n="$name" -v p="$os-$arch" '$1 == n && $2 == p' | head -n 1)
+  if [ -z "$row" ]; then
+    say "  $name: no build for $os-$arch; install it another way (e.g. brew install $name)"
+    return 1
+  fi
+  # shellcheck disable=SC2086 # the row's fields, split on spaces
+  set -- $row
+  url=$3
+  want=$4
+  shift 4
+  members=""
+  needs=""
+  for field in "$@"; do
+    case "$field" in
+      needs=*) needs=${field#needs=} ;;
+      *) members="$members $field" ;;
+    esac
+  done
+  if [ "$needs" = glibc ] && [ "$libc" = musl ]; then
+    say "  $name: its release build needs glibc, which this system lacks; install it with your package manager (e.g. apk add neovim)"
+    return 1
+  fi
+  mkdir -p "$bin"
+  file="$tmp/$(basename "$url")"
+  if ! fetch "$url" "$file"; then
+    say "  $name: could not get $(basename "$url")${from:+ from $from}"
+    refused="$refused $name"
+    return 1
+  fi
+  if [ "$(sha256 "$file")" != "$want" ]; then
+    say "  $name: checksum mismatch for $name, not installing"
+    refused="$refused $name"
+    return 1
+  fi
+  unpacked="$tmp/unpacked-$name"
+  mkdir -p "$unpacked"
+  for member in $members; do
+    case "$member" in
+      dir=*)
+        # a whole folder, kept beside the plugins, with its program linked
+        spec=${member#dir=}
+        folder=${spec%%:*}
+        program=${spec#*:}
+        home="$dir/vendor/$name"
+        if ! tar -xzf "$file" -C "$unpacked" "$folder"; then
+          say "  $name: could not unpack $folder"
+          refused="$refused $name"
+          return 1
+        fi
+        rm -rf "$home"
+        mkdir -p "$home"
+        mv "$unpacked/$folder" "$home/"
+        ln -sf "$home/$folder/$program" "$bin/$(basename "$program")"
+        ;;
+      *)
+        if ! case "$file" in
+          *.zip) unzip_member "$file" "$member" "$unpacked" ;;
+          *) tar -xzf "$file" -C "$unpacked" "$member" ;;
+        esac; then
+          say "  $name: could not unpack $member (from $(basename "$file"))"
+          refused="$refused $name"
+          return 1
+        fi
+        cp "$unpacked/$member" "$bin/$(basename "$member")"
+        chmod 755 "$bin/$(basename "$member")"
+        ;;
+    esac
+  done
+  say "  $name: installed"
+}
 if [ -n "$tools" ]; then
-  bin="${HERDR_PLUGINS_BIN:-$HOME/.local/bin}"
   mkdir -p "$bin"
   say ""
   say "Tools (into $bin):"
@@ -250,71 +331,7 @@ if [ -n "$tools" ]; then
       say "  $name: already installed ($(command -v "$name"))"
       continue
     fi
-    row=$(tool_rows | awk -v n="$name" -v p="$os-$arch" '$1 == n && $2 == p' | head -n 1)
-    if [ -z "$row" ]; then
-      say "  $name: no build for $os-$arch; install it another way (e.g. brew install $name)"
-      continue
-    fi
-    # shellcheck disable=SC2086 # the row's fields, split on spaces
-    set -- $row
-    url=$3
-    want=$4
-    shift 4
-    members=""
-    needs=""
-    for field in "$@"; do
-      case "$field" in
-        needs=*) needs=${field#needs=} ;;
-        *) members="$members $field" ;;
-      esac
-    done
-    if [ "$needs" = glibc ] && [ "$libc" = musl ]; then
-      say "  $name: its release build needs glibc, which this system lacks; install it with your package manager (e.g. apk add neovim)"
-      continue
-    fi
-    file="$tmp/$(basename "$url")"
-    if ! fetch "$url" "$file"; then
-      say "  $name: could not get $(basename "$url")${from:+ from $from}"
-      refused="$refused $name"
-      continue
-    fi
-    if [ "$(sha256 "$file")" != "$want" ]; then
-      say "  $name: checksum mismatch for $name, not installing"
-      refused="$refused $name"
-      continue
-    fi
-    unpacked="$tmp/unpacked-$name"
-    mkdir -p "$unpacked"
-    for member in $members; do
-      case "$member" in
-        dir=*)
-          # a whole folder, kept beside the plugins, with its program linked
-          spec=${member#dir=}
-          folder=${spec%%:*}
-          program=${spec#*:}
-          home="$dir/vendor/$name"
-          tar -xzf "$file" -C "$unpacked" "$folder" ||
-            { say "  $name: could not unpack $folder"; refused="$refused $name"; continue 2; }
-          rm -rf "$home"
-          mkdir -p "$home"
-          mv "$unpacked/$folder" "$home/"
-          ln -sf "$home/$folder/$program" "$bin/$(basename "$program")"
-          ;;
-        *)
-          case "$file" in
-            *.zip) unzip_member "$file" "$member" "$unpacked" ;;
-            *) tar -xzf "$file" -C "$unpacked" "$member" ;;
-          esac || {
-            say "  $name: could not unpack $member (from $(basename "$file"))"
-            refused="$refused $name"
-            continue 2
-          }
-          cp "$unpacked/$member" "$bin/$(basename "$member")"
-          chmod 755 "$bin/$(basename "$member")"
-          ;;
-      esac
-    done
-    say "  $name: installed"
+    install_pinned "$name" || true
   done
   case ":$PATH:" in
     *":$bin:"*) ;;
@@ -342,12 +359,57 @@ fi
 # ticked tools whose programs are here (see the walk-through below)
 catalog="$dir/toolbar/setup"
 if [ "$os" = macos ]; then vm=Virtualization; else vm=containerd; fi
-present() { # <program>: on PATH, in the bin folder, or (gh-dash) a gh extension
-  check=$(awk -F'|' -v p="$1" '$1 == p { print $2 }' "$catalog/programs")
+# how missing programs are installed: Homebrew, then mise, then direct
+# downloads; offline (--from) only the pinned downloads in the --from folder
+if [ -z "$from" ] && command -v brew >/dev/null 2>&1; then
+  installer=brew label=Homebrew
+elif [ -z "$from" ] && command -v mise >/dev/null 2>&1; then
+  installer=mise label=mise
+else
+  installer=curl label="direct downloads"
+fi
+brew_bin=""
+if [ "$installer" = brew ]; then
+  brew_bin=$(brew --prefix 2>/dev/null || true)
+  brew_bin=${brew_bin:+$brew_bin/bin}
+fi
+program_field() { awk -F'|' -v p="$1" -v f="$2" '$1 == p { print $f }' "$catalog/programs"; }
+found_in() { # <command>: the folder holding it outside PATH (bin folder, mise's shims, Homebrew's bin)
+  for d in "$bin" "$HOME/.local/share/mise/shims" ${brew_bin:+"$brew_bin"}; do
+    if [ -x "$d/$1" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+present() { # <program>: on PATH, in one of those folders, or (gh-dash) a gh extension
+  check=$(program_field "$1" 2)
   [ -n "$check" ] || check=$1
   case "$check" in
     gh-dash) command -v gh >/dev/null 2>&1 && gh extension list 2>/dev/null | grep -q gh-dash ;;
-    *) command -v "$check" >/dev/null 2>&1 || [ -x "${HERDR_PLUGINS_BIN:-$HOME/.local/bin}/$check" ] ;;
+    *) command -v "$check" >/dev/null 2>&1 || found_in "$check" >/dev/null ;;
+  esac
+}
+method_of() { # <program>: how it installs here (brew:<formula>, mise:<tool>, pinned:<name>), or nothing
+  brew_name=$(program_field "$1" 3)
+  mise_name=$(program_field "$1" 4)
+  curl_way=$(program_field "$1" 5)
+  if [ "$installer" = brew ] && [ -n "$brew_name" ] && [ "$brew_name" != - ]; then
+    printf 'brew:%s\n' "$brew_name"
+  elif [ "$installer" = mise ] && [ -n "$mise_name" ] && [ "$mise_name" != - ]; then
+    printf 'mise:%s\n' "$mise_name"
+  elif [ "$curl_way" = pinned ]; then
+    printf 'pinned:%s\n' "$(program_field "$1" 2)"
+  fi
+}
+install_program() { # <program>: 0 when it installed
+  way=$(method_of "$1")
+  case "$way" in
+    brew:*) brew install "${way#brew:}" </dev/null ;;
+    mise:*) mise use -g "${way#mise:}" </dev/null ;;
+    pinned:*) install_pinned "${way#pinned:}" ;;
+    *) return 1 ;;
   esac
 }
 nerd_default() { # Ghostty or kitty, which ship Nerd Font symbols (also inside Herdr)
@@ -435,16 +497,65 @@ setup_toolbar() {
   done < "$tmp/setup-tools"
   ticks=" $(awk -F'|' '$4 == 1 { printf "%s ", $1 }' "$tmp/setup-tools")"
   [ -z "$answers_from" ] || choose_tools
+  failed=""
+  if [ -n "$answers_from" ]; then
+    # what the ticked tools still need, each program once, that can be installed here
+    offer=""
+    while IFS='|' read -r id _name _summary _ticked needs _nerd _text; do
+      case "$ticks" in *" $id "*) ;; *) continue ;; esac
+      for program in $needs; do
+        case " $offer " in *" $program "*) continue ;; esac
+        present "$program" </dev/null && continue
+        [ -n "$(method_of "$program")" ] && offer="$offer $program"
+      done
+    done < "$tmp/setup-tools"
+    if [ -n "$offer" ]; then
+      printf '%s ' "Install what's missing with $label?$offer [Y/n]"
+      ask reply
+      case "$reply" in
+        [Nn]*) ;;
+        *)
+          for program in $offer; do
+            install_program "$program" || true
+            present "$program" </dev/null || failed="$failed $program"
+          done
+          ;;
+      esac
+    fi
+  fi
   chosen=""
-  while IFS='|' read -r id name _summary _ticked _needs _nerd _text; do
+  while IFS='|' read -r id name _summary _ticked needs _nerd _text; do
     case "$ticks" in *" $id "*) ;; *) continue ;; esac
-    missing=$(missing_of "$id")
-    if [ -n "$missing" ]; then
+    missing="" broke=""
+    for program in $needs; do
+      present "$program" </dev/null && continue
+      case " $failed " in
+        *" $program "*) broke="$broke${broke:+, }$program" ;;
+        *) missing="$missing${missing:+, }$program" ;;
+      esac
+    done
+    if [ -n "$broke" ]; then
+      say "  left off: $name ($broke did not install)"
+    elif [ -n "$missing" ]; then
       say "  left off: $name (needs $missing)"
     else
       chosen="$chosen $id"
     fi
   done < "$tmp/setup-tools"
+  # programs found outside PATH: the toolbar starts them from its PATH
+  hinted_dirs=""
+  for id in $chosen; do
+    needs=$(awk -F'|' -v i="$id" '$1 == i { print $5 }' "$tmp/setup-tools")
+    for program in $needs; do
+      check=$(program_field "$program" 2)
+      [ -n "$check" ] && [ "$check" != gh-dash ] || continue
+      command -v "$check" >/dev/null 2>&1 && continue
+      d=$(found_in "$check") || continue
+      case " $hinted_dirs " in *" $d "*) continue ;; esac
+      hinted_dirs="$hinted_dirs $d"
+      say "  $d is not on your PATH: add  export PATH=\"$d:\$PATH\"  to your shell's startup file"
+    done
+  done
   if nerd_default; then mode=nerd; else mode=text; fi
   if [ -n "$answers_from" ]; then
     if [ "$mode" = nerd ]; then printf 'Nerd Font icons? [Y/n] '; else printf 'Nerd Font icons? [y/N] '; fi

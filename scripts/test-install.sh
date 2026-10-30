@@ -83,6 +83,9 @@ fake_bin "$t/nvim/nvim-fake/bin/nvim" nvim
 mkdir -p "$t/nvim/nvim-fake/share/nvim/runtime"
 echo "-- runtime" > "$t/nvim/nvim-fake/share/nvim/runtime/filetype.lua"
 tar -czf "$rel/nvim-fake.tar.gz" -C "$t/nvim" nvim-fake
+mkdir -p "$t/gh" "$t/jira"
+fake_bin "$t/gh/gh-fake/bin/gh" gh && tar -czf "$rel/gh-fake.tar.gz" -C "$t/gh" gh-fake
+fake_bin "$t/jira/jira-fake/bin/jira" jira && tar -czf "$rel/jira-fake.tar.gz" -C "$t/jira" jira-fake
 write_manifest() { # <file> <bad tool or -> <missing tool or ->
   bad=$2 missing=$3
   {
@@ -99,6 +102,8 @@ dua dua-fake.tar.gz dua-fake/dua
 yazi yazi-fake.zip yazi-fake/yazi yazi-fake/ya
 lazysql lazysql-fake.tar.gz lazysql
 nvim nvim-fake.tar.gz dir=nvim-fake:bin/nvim needs=glibc
+gh gh-fake.tar.gz gh-fake/bin/gh
+jira jira-fake.tar.gz jira-fake/bin/jira
 ROWS
   } > "$1"
 }
@@ -423,7 +428,7 @@ default_order='^order *= *\["intents", "db", "files", "editor", "usage", "termin
 # 20. Enter takes the defaults
 h="$work/h20"
 mkdir -p "$h"
-answers "$work/a20" "" ""
+answers "$work/a20" "" "n" ""
 TTY="$work/a20"
 run "$h" - "$work/good" --tools
 unset TTY
@@ -439,7 +444,7 @@ fi
 # 21. numbers switch tools on and off, and the list is shown again
 h="$work/h21"
 mkdir -p "$h"
-answers "$work/a21" "4" "" ""
+answers "$work/a21" "4" "" "n" ""
 TTY="$work/a21"
 run "$h" - "$work/good" --tools
 unset TTY
@@ -455,7 +460,7 @@ fi
 # 22. junk answers are ignored with a note; "1 1" switches Intents off and on
 h="$work/h22"
 mkdir -p "$h"
-answers "$work/a22" "x" "42" "1 1" "*" "" ""
+answers "$work/a22" "x" "42" "1 1" "*" "" "n" ""
 TTY="$work/a22"
 run "$h" - "$work/good" --tools
 unset TTY
@@ -472,7 +477,7 @@ esac
 # 23. the icon answer wins over detection
 h="$work/h23"
 mkdir -p "$h"
-answers "$work/a23" "" "n"
+answers "$work/a23" "" "n" "n"
 TTY="$work/a23" XTERM=xterm-ghostty
 run "$h" - "$work/good"
 unset TTY XTERM
@@ -504,7 +509,7 @@ else
 fi
 
 # 25. --setup asks again, backing the old file up each time
-answers "$work/a25" "" ""
+answers "$work/a25" "" "n" ""
 TTY="$work/a25"
 run "$h" - "$work/good" --setup
 first=$status
@@ -525,6 +530,179 @@ run "$h" - "$work/good" --setup
 case "$status:$out" in
   1:*"--setup needs a terminal to ask in"*) pass "--setup needs a terminal" ;;
   *) flunk "--setup needs a terminal" "exit $status: $out" ;;
+esac
+
+# --- installing what the chosen tools need. Fake installers log their calls
+# to $HOME/.<name>-log and "install" a program by writing a script.
+fake_installers() { # <folder> <brew exit status, or - for no Homebrew> <mise: yes|no>
+  d=$1
+  mkdir -p "$d"
+  if [ "$2" != - ]; then
+    cat > "$d/brew" <<EOF
+#!/bin/sh
+echo "\$*" >> "\$HOME/.brew-log"
+[ "\$1" = install ] || exit 0
+[ $2 = 0 ] || exit $2
+case "\$2" in
+  ankitpokhrel/jira-cli/jira-cli) prog=jira ;;
+  neovim) prog=nvim ;;
+  dua-cli) prog=dua ;;
+  *) prog=\$2 ;;
+esac
+printf '#!/bin/sh\necho "%s fake"\n' "\$prog" > "$d/\$prog"
+chmod +x "$d/\$prog"
+EOF
+    chmod +x "$d/brew"
+  fi
+  if [ "$3" = yes ]; then
+    cat > "$d/mise" <<'EOF'
+#!/bin/sh
+echo "$*" >> "$HOME/.mise-log"
+[ "$1 $2" = "use -g" ] || exit 0
+case "$3" in
+  github:ankitpokhrel/jira-cli) prog=jira ;;
+  github:neovim/neovim) prog=nvim ;;
+  github:Byron/dua-cli) prog=dua ;;
+  github:cli/cli) prog=gh ;;
+  *) prog=${3##*/} ;;
+esac
+shims="$HOME/.local/share/mise/shims"
+mkdir -p "$shims"
+printf '#!/bin/sh\necho "%s fake"\n' "$prog" > "$shims/$prog"
+chmod +x "$shims/$prog"
+EOF
+    chmod +x "$d/mise"
+  fi
+}
+run_online() { # <home> <extra PATH or -> <args...>: like run, from a file:// release, not --from
+  h=$1 extra=$2
+  shift 2
+  p=$base_path
+  [ "$extra" = - ] || p="$extra:$p"
+  out=$(env -i HOME="$h" PATH="$p" HERDR_PLUGINS_BASE_URL="file://$rel" HERDR_PLUGINS_TTY="${TTY:-none}" \
+    sh "$rel/install.sh" "$@" 2>&1)
+  status=$?
+}
+jira_config() { mkdir -p "$1/.config/.jira" && echo "installation: cloud" > "$1/.config/.jira/.config.yml"; }
+
+# 27. Homebrew installs what is missing, after one question
+h="$work/h27"
+mkdir -p "$h"
+jira_config "$h"
+fake_installers "$work/f27" 0 no
+answers "$work/a27" "5" "" "y" ""
+TTY="$work/a27"
+run_online "$h" "$work/f27"
+unset TTY
+if grep -q 'install ankitpokhrel/jira-cli/jira-cli' "$h/.brew-log" 2>/dev/null && grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"Install what's missing with Homebrew?"*) pass "Homebrew installs what is missing" ;;
+    *) flunk "Homebrew installs what is missing" "no question: $out" ;;
+  esac
+else
+  flunk "Homebrew installs what is missing" "exit $status, brew: $(cat "$h/.brew-log" 2>&1): $out"
+fi
+
+# 28. no means nothing is installed and those tools are left off
+h="$work/h28"
+mkdir -p "$h"
+jira_config "$h"
+fake_installers "$work/f28" 0 no
+answers "$work/a28" "5" "" "n" ""
+TTY="$work/a28"
+run_online "$h" "$work/f28"
+unset TTY
+if ! grep -q install "$h/.brew-log" 2>/dev/null && ! grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null &&
+  [ -f "$(toml "$h")" ]; then
+  pass "no means left off"
+else
+  flunk "no means left off" "exit $status, brew: $(cat "$h/.brew-log" 2>&1): $out"
+fi
+
+# 29. a failed install leaves that tool off; the rest carry on
+h="$work/h29"
+mkdir -p "$h"
+jira_config "$h"
+fake_installers "$work/f29" 1 no
+answers "$work/a29" "5" "" "y" ""
+TTY="$work/a29"
+run_online "$h" "$work/f29"
+unset TTY
+case "$status:$out" in
+  0:*"left off: Jira (jira-cli did not install)"*)
+    if [ -f "$(toml "$h")" ] && ! grep -q '^id *= *"jira"' "$(toml "$h")"; then
+      pass "a failed brew install leaves that tool off"
+    else
+      flunk "a failed brew install leaves that tool off" "$(cat "$(toml "$h")" 2>&1)"
+    fi ;;
+  *) flunk "a failed brew install leaves that tool off" "exit $status: $out" ;;
+esac
+
+# 30. mise when there is no Homebrew
+h="$work/h30"
+mkdir -p "$h"
+jira_config "$h"
+fake_installers "$work/f30" - yes
+answers "$work/a30" "5" "" "y" ""
+TTY="$work/a30"
+run_online "$h" "$work/f30:$h/.local/share/mise/shims"
+unset TTY
+if grep -q 'use -g github:ankitpokhrel/jira-cli' "$h/.mise-log" 2>/dev/null && grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"Install what's missing with mise?"*) pass "mise when there is no Homebrew" ;;
+    *) flunk "mise when there is no Homebrew" "no question: $out" ;;
+  esac
+else
+  flunk "mise when there is no Homebrew" "exit $status, mise: $(cat "$h/.mise-log" 2>&1): $out"
+fi
+
+# 31. a program mise put outside PATH still counts, with the PATH line to add
+h="$work/h31"
+mkdir -p "$h"
+jira_config "$h"
+fake_installers "$work/f31" - yes
+answers "$work/a31" "5" "" "y" ""
+TTY="$work/a31"
+run_online "$h" "$work/f31"
+unset TTY
+if grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"$h/.local/share/mise/shims is not on your PATH"*) pass "a mise tool off PATH is added with a PATH hint" ;;
+    *) flunk "a mise tool off PATH is added with a PATH hint" "no hint: $out" ;;
+  esac
+else
+  flunk "a mise tool off PATH is added with a PATH hint" "exit $status: $out"
+fi
+
+# 32. with neither (and offline, where Homebrew is not used): a pinned download,
+# refused when its checksum is wrong
+h="$work/h32"
+mkdir -p "$h"
+jira_config "$h"
+fake_installers "$work/f32" 0 no
+answers "$work/a32" "5" "" "y" ""
+TTY="$work/a32"
+run "$h" "$work/f32" "$work/good"
+if [ $status -eq 0 ] && [ "$("$h/.local/bin/jira" 2>&1)" = "jira fake" ] && grep -q '^id *= *"jira"' "$(toml "$h")" &&
+  ! grep -q install "$h/.brew-log" 2>/dev/null; then
+  pass "pinned download when neither is there"
+else
+  flunk "pinned download when neither is there" "exit $status, brew: $(cat "$h/.brew-log" 2>&1): $out"
+fi
+h="$work/h32b"
+mkdir -p "$h"
+jira_config "$h"
+write_manifest "$work/bad-jira" jira -
+run "$h" - "$work/bad-jira"
+unset TTY
+case "$status:$out" in
+  1:*"checksum mismatch for jira"*)
+    if grep -q '^id *= *"jira"' "$(toml "$h")" 2>/dev/null; then
+      flunk "a tampered jira download is refused" "Jira added anyway"
+    else
+      pass "a tampered jira download is refused"
+    fi ;;
+  *) flunk "a tampered jira download is refused" "exit $status: $out" ;;
 esac
 
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"

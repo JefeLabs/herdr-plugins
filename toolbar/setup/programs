@@ -3,13 +3,13 @@
 # curl is `pinned` (a pinned download in install.sh, named by the command),
 # `script:<url>` (the program's own installer), `gh-ext:<repo>` (a gh
 # extension) or -. A - elsewhere means that installer has no way to get it.
-gh|gh|gh|gh|pinned
+gh|gh|gh|github:cli/cli|pinned
 gh-dash|gh-dash|-|-|gh-ext:dlvhdr/gh-dash
 lazysql|lazysql|lazysql|github:jorgerojas26/lazysql|pinned
-yazi|yazi|yazi|yazi|pinned
+yazi|yazi|yazi|github:sxyazi/yazi|pinned
 jira-cli|jira|ankitpokhrel/jira-cli/jira-cli|github:ankitpokhrel/jira-cli|pinned
 terminal-browser|terminal-browser|-|-|script:https://terminal-browser.sh/install
-neovim|nvim|neovim|neovim|pinned
-procs|procs|procs|procs|pinned
+neovim|nvim|neovim|github:neovim/neovim|pinned
+procs|procs|procs|github:dalance/procs|pinned
 oxker|oxker|oxker|github:mrjackwills/oxker|pinned
 dua|dua|dua-cli|github:Byron/dua-cli|pinned
