@@ -427,6 +427,7 @@ pub struct App {
     question_selected: usize,
     artifacts_selected: usize,
     evidence_selected: usize,
+    missing_selected: usize,
     prs_selected: usize,
     demos_selected: usize,
     /// PR titles from `gh`, keyed like `pr_states`.
@@ -496,6 +497,7 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Questions => "questions",
         Pane::Artifacts => "artifacts",
         Pane::Evidence => "evidence",
+        Pane::Missing => "missing",
         Pane::Demos => "demos",
         Pane::PullRequests => "pull requests",
     }
@@ -533,6 +535,7 @@ impl App {
             question_selected: 0,
             artifacts_selected: 0,
             evidence_selected: 0,
+            missing_selected: 0,
             prs_selected: 0,
             demos_selected: 0,
             pr_titles: HashMap::new(),
@@ -1749,6 +1752,7 @@ impl App {
                 | Pane::Demos
                 | Pane::Questions
                 | Pane::PullRequests
+                | Pane::Missing
                 | Pane::Artifacts
                 | Pane::Evidence
         ) {
@@ -1832,7 +1836,8 @@ impl App {
                     Pane::Criteria => Pane::Demos,
                     Pane::Demos => Pane::Questions,
                     Pane::Questions => Pane::PullRequests,
-                    Pane::PullRequests => Pane::Artifacts,
+                    Pane::PullRequests => Pane::Missing,
+                    Pane::Missing => Pane::Artifacts,
                     Pane::Artifacts => Pane::Evidence,
                     Pane::Evidence => Pane::Tree,
                 };
@@ -1842,7 +1847,8 @@ impl App {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Evidence,
                     Pane::Evidence => Pane::Artifacts,
-                    Pane::Artifacts => Pane::PullRequests,
+                    Pane::Artifacts => Pane::Missing,
+                    Pane::Missing => Pane::PullRequests,
                     Pane::PullRequests => Pane::Questions,
                     Pane::Questions => Pane::Demos,
                     Pane::Demos => Pane::Criteria,
@@ -2145,6 +2151,17 @@ impl App {
                         self.criteria_selected,
                     ),
                     KeyCode::Char('X') => self.check_now(),
+                    // the selected criterion's proof from the latest check
+                    KeyCode::Char('o') => {
+                        let proof = self
+                            .criterion_result(&it, self.criteria_selected)
+                            .and_then(|r| r.proof)
+                            .map(|f| crate::check::checks_dir(&it).join(f));
+                        match proof {
+                            Some(f) => self.open_in_chrome(&f),
+                            None => self.message = Some("no proof for this criterion yet".into()),
+                        }
+                    }
                     // acknowledge a criterion someone else added: the selected one, or all
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         let which: Vec<usize> = if k.code == KeyCode::Char('Y') {
@@ -2177,6 +2194,28 @@ impl App {
                                 index: self.question_selected,
                                 text: q.answer.clone().unwrap_or_default(),
                             };
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Pane::Missing => {
+                let rows = self.missing_rows(&it);
+                let last = rows.len().saturating_sub(1);
+                let selected = self.missing_selected.min(last);
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.missing_selected = (selected + 1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.missing_selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter => {
+                        if let Some((_, _, Some(path))) = rows.get(selected) {
+                            let path = path.clone();
+                            self.select_path(&path);
+                            self.focus = Pane::Tree;
                         }
                     }
                     _ => {}
@@ -3281,6 +3320,74 @@ impl App {
         });
     }
 
+    /// The missing items filed for `it`'s criteria: (mark, label, its file).
+    /// `✓` closed, `→` sent, `○` not yet; a deleted one is not listed.
+    fn missing_rows(&self, it: &Intent) -> Vec<(String, String, Option<PathBuf>)> {
+        let keys: Vec<String> = crate::store::criteria(&it.body)
+            .iter()
+            .map(|c| crate::store::criterion_key(&c.text))
+            .collect();
+        it.fm
+            .missing
+            .iter()
+            .filter_map(|l| {
+                let item = self.intent_by_stem(&l.stem)?;
+                let mark = if !crate::check::item_is_open(item) {
+                    "✓"
+                } else if item.fm.state == State::Sent {
+                    "→"
+                } else {
+                    "○"
+                };
+                let n = keys
+                    .iter()
+                    .position(|k| *k == l.key)
+                    .map(|i| (i + 1).to_string())
+                    .unwrap_or_else(|| "?".into());
+                Some((
+                    mark.to_string(),
+                    format!("{} (criterion {n})", item.fm.title),
+                    Some(item.path.clone()),
+                ))
+            })
+            .collect()
+    }
+
+    /// The latest check's result for criterion `index` (0-based), by wording.
+    fn criterion_result(&self, it: &Intent, index: usize) -> Option<crate::check::CriterionResult> {
+        let c = crate::store::criteria(&it.body).into_iter().nth(index)?;
+        let key = crate::store::criterion_key(&c.text);
+        crate::check::read_check(&crate::check::checks_dir(it))?
+            .results
+            .into_iter()
+            .find(|r| r.key == key)
+    }
+
+    /// The latest check's mark per criterion: `✓` confirmed, `✗` fails or
+    /// missing, `?` can't check.
+    fn check_marks(&self, it: &Intent) -> Vec<(usize, char)> {
+        use crate::check::Verdict;
+        let Some(rec) = crate::check::read_check(&crate::check::checks_dir(it)) else {
+            return Vec::new();
+        };
+        crate::store::criteria(&it.body)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let key = crate::store::criterion_key(&c.text);
+                let r = rec.results.iter().find(|r| r.key == key)?;
+                Some((
+                    i,
+                    match r.verdict {
+                        Verdict::Confirmed(_) => '✓',
+                        Verdict::Fails(_) | Verdict::Missing(_) => '✗',
+                        Verdict::CantCheck(_) => '?',
+                    },
+                ))
+            })
+            .collect()
+    }
+
     /// The selected intent's captures: from its attachments once kept there,
     /// else from its agent folder.
     fn evidence_rows(&self, it: &Intent) -> Vec<EvidenceRow> {
@@ -3289,12 +3396,13 @@ impl App {
             it.assets_dir().join("evidence"),
             crate::capture::evidence_dir(&polish_cwd(self.store.root(), &it.polish_name())),
         ];
+        let mut rows: Vec<EvidenceRow> = Vec::new();
         for dir in dirs {
             let recs = crate::capture::read_records_live(&dir);
             if recs.is_empty() {
                 continue;
             }
-            return recs
+            rows = recs
                 .iter()
                 .map(|r| {
                     let (mark, text) = match &r.outcome {
@@ -3322,8 +3430,26 @@ impl App {
                     }
                 })
                 .collect();
+            break;
         }
-        Vec::new()
+        // the latest completion check: one row per criterion, with its proof
+        let check_dir = crate::check::checks_dir(it);
+        if let Some(rec) = crate::check::read_check(&check_dir) {
+            use crate::check::Verdict;
+            rows.extend(rec.results.iter().map(|r| {
+                let (mark, text) = match &r.verdict {
+                    Verdict::Confirmed(t) => ("✓", t),
+                    Verdict::Fails(t) | Verdict::Missing(t) => ("✗", t),
+                    Verdict::CantCheck(t) => ("?", t),
+                };
+                EvidenceRow {
+                    label: format!("check · {} · {text}", r.number),
+                    file: r.proof.as_ref().map(|f| check_dir.join(f)),
+                    mark,
+                }
+            }));
+        }
+        rows
     }
 
     fn key_interview(&mut self, mut st: Box<InterviewScreen>, k: KeyEvent) -> Flow {
@@ -5226,6 +5352,12 @@ impl App {
                         .into_iter()
                         .map(|r| (r.mark.to_string(), r.label))
                         .collect();
+                    let marks = self.check_marks(intent);
+                    let missing: Vec<(String, String)> = self
+                        .missing_rows(intent)
+                        .into_iter()
+                        .map(|(m, l, _)| (m, l))
+                        .collect();
                     ui::render_intent(
                         &ui::DetailView {
                             intent,
@@ -5244,6 +5376,9 @@ impl App {
                             demos_selected: self.demos_selected,
                             evidence: &evidence,
                             evidence_selected: self.evidence_selected,
+                            results: &marks,
+                            missing: &missing,
+                            missing_selected: self.missing_selected,
                         },
                         right,
                         buf,
@@ -5286,7 +5421,21 @@ impl App {
                 (None, Pane::Tree) => "v list  Tab panes  a add  t title  e edit  p polish  m model  Q answer  C criteria  V artifacts  s send  R ready  K kind  n group  M move  A attach  r rescan  D delete  q quit".to_string(),
                 (None, Pane::Description) => "Description: j/k scroll · Enter edit · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Preconditions) => "Preconditions: j/k choose · Enter/space confirm · a add · Tab next pane · Esc tree".to_string(),
-                (None, Pane::Criteria) => "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Criteria) => {
+                    let finding = self.selected_intent().and_then(|it| {
+                        let r = self.criterion_result(it, self.criteria_selected)?;
+                        let text = match &r.verdict {
+                            crate::check::Verdict::Confirmed(t)
+                            | crate::check::Verdict::Fails(t)
+                            | crate::check::Verdict::Missing(t)
+                            | crate::check::Verdict::CantCheck(t) => t.clone(),
+                        };
+                        let at = crate::check::read_check(&crate::check::checks_dir(it))?.at;
+                        Some(format!("checked {}: {text} · o proof", at.format("%m-%d")))
+                    });
+                    finding.unwrap_or_else(|| "Criteria: j/k choose · Enter/space toggle · y acknowledge a new one · Y all · a add · X check · Tab next pane · Esc tree".to_string())
+                }
+                (None, Pane::Missing) => "Missing items: j/k choose · Enter go to it · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
@@ -8273,6 +8422,7 @@ mod tests {
             "demos",
             "questions",
             "pull requests",
+            "missing",
             "artifacts",
             "evidence",
         ] {
@@ -8297,7 +8447,7 @@ mod tests {
 
     /// Tab from the tree to the named section.
     fn tab_to(app: &mut App, pane: &str) {
-        for _ in 0..8 {
+        for _ in 0..12 {
             if app.view().focus == pane {
                 return;
             }
@@ -8418,6 +8568,8 @@ mod tests {
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "pull requests");
         key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "missing");
+        key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "artifacts");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "evidence");
@@ -8427,6 +8579,8 @@ mod tests {
         assert_eq!(fx.app.view().focus, "evidence");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "artifacts");
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "missing");
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "pull requests");
         key(&mut fx.app, KeyCode::Tab);
@@ -10278,6 +10432,159 @@ mod tests {
         fx.app.recheck_closed_items();
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(work_log(&fx), "");
+    }
+
+    // ---- showing check results ----------------------------------------------------
+
+    /// Alpha, sent, with a check that confirmed criterion 1 (with proof) and
+    /// failed criterion 2; returns its path.
+    fn checked_alpha(fx: &mut Fx) -> PathBuf {
+        use crate::check::{CheckRecord, CriterionResult, Verdict, write_check};
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = CRITERIA.into();
+        it.fm.state = State::Sent;
+        Store::save_force(&mut it).unwrap();
+        let dir = crate::check::checks_dir(&it);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("1.png"), "png").unwrap();
+        let key = |t: &str| crate::store::criterion_key(t);
+        let rec = CheckRecord {
+            at: chrono::Local::now(),
+            merged: vec![42],
+            results: vec![
+                CriterionResult {
+                    number: 1,
+                    key: key("the primary contact gets an email"),
+                    text: "the primary contact gets an email".into(),
+                    verdict: Verdict::Confirmed("only the contact got it".into()),
+                    proof: Some("1.png".into()),
+                },
+                CriterionResult {
+                    number: 2,
+                    key: key("the email names the meeting"),
+                    text: "the email names the meeting".into(),
+                    verdict: Verdict::Fails("no meeting name".into()),
+                    proof: None,
+                },
+            ],
+            warning: None,
+        };
+        write_check(&dir, &rec).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, "Alpha");
+        path
+    }
+
+    #[test]
+    fn criteria_show_check_results() {
+        let mut fx = setup("agy.jsonl");
+        checked_alpha(&mut fx);
+        key(&mut fx.app, KeyCode::Char('C'));
+        let shown = render(&fx.app, 100, 30);
+        assert!(
+            shown.contains("✓ the primary contact gets an email"),
+            "{shown}"
+        );
+        assert!(shown.contains("✗ the email names the meeting"), "{shown}");
+        assert!(
+            shown.contains("only the contact got it"),
+            "the selected one's finding: {shown}"
+        );
+    }
+
+    #[test]
+    fn o_opens_a_criterions_proof() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let path = checked_alpha(&mut fx);
+        key(&mut fx.app, KeyCode::Char('C'));
+        key(&mut fx.app, KeyCode::Char('o'));
+        let proof = checks_of(&path).join("1.png").display().to_string();
+        wait_for_log(&log, &proof);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('o'));
+        assert!(
+            fx.app
+                .view()
+                .message
+                .unwrap_or_default()
+                .contains("no proof"),
+            "{:?}",
+            fx.app.view().message
+        );
+    }
+
+    #[test]
+    fn evidence_lists_check_proof() {
+        let mut fx = setup("agy.jsonl");
+        let path = checked_alpha(&mut fx);
+        let rows = fx.app.view().evidence;
+        let one = rows
+            .iter()
+            .find(|r| r.label.starts_with("check · 1 · "))
+            .expect("criterion 1's row");
+        assert_eq!(one.mark, "✓");
+        assert_eq!(
+            one.file.as_deref(),
+            Some(checks_of(&path).join("1.png").as_path())
+        );
+        let two = rows
+            .iter()
+            .find(|r| r.label.starts_with("check · 2 · "))
+            .expect("criterion 2's row");
+        assert_eq!(two.mark, "✗");
+        assert!(two.label.contains("no meeting name"), "{two:?}");
+    }
+
+    #[test]
+    fn the_missing_section_follows_pull_requests() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, false);
+        select(&mut fx.app, "Alpha");
+        tab_to(&mut fx.app, "pull requests");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "missing");
+        let shown = render(&fx.app, 100, 30);
+        assert!(shown.contains("Missing items / Bugs (1)"), "{shown}");
+        assert!(
+            shown.contains("Missing meeting name (criterion 2)"),
+            "{shown}"
+        );
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "artifacts");
+    }
+
+    #[test]
+    fn enter_on_a_missing_item_selects_it() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = sent_with_criteria(&mut fx, "Alpha");
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, false);
+        select(&mut fx.app, "Alpha");
+        tab_to(&mut fx.app, "missing");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(
+            fx.app
+                .selected_intent()
+                .map(|i| i.fm.title.clone())
+                .as_deref(),
+            Some("Missing meeting name")
+        );
+    }
+
+    #[test]
+    fn completion_check_snapshot() {
+        let mut fx = setup("agy.jsonl");
+        let alpha = checked_alpha(&mut fx);
+        let key2 = crate::store::criterion_key("the email names the meeting");
+        missing_item(&mut fx, &alpha, &key2, false);
+        select(&mut fx.app, "Alpha");
+        key(&mut fx.app, KeyCode::Char('C'));
+        insta::assert_snapshot!(render(&fx.app, 80, 24));
     }
 
     #[test]

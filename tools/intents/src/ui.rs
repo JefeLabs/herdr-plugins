@@ -556,6 +556,7 @@ mod tests {
                 selected,
                 &[],
                 &[],
+                &[],
                 groups,
                 f.area(),
                 f.buffer_mut(),
@@ -589,6 +590,7 @@ mod tests {
                 "none",
                 false,
                 0,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -890,6 +892,9 @@ mod tests {
             demos_selected: 0,
             evidence: &[],
             evidence_selected: 0,
+            results: &[],
+            missing: &[],
+            missing_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| render_intent(&view, f.area(), f.buffer_mut()))
@@ -973,6 +978,9 @@ mod tests {
             demos_selected: selected,
             evidence: &[],
             evidence_selected: 0,
+            results: &[],
+            missing: &[],
+            missing_selected: 0,
         };
         let (w, h) = (80u16, 30u16);
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -1102,9 +1110,10 @@ mod tests {
         let desc = row_of(&rows, "The description.");
         assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 1, "{all}");
         assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 1);
-        assert_eq!(row_of(&rows, "▸ Demo Videos"), 19, "{all}");
-        assert_eq!(row_of(&rows, "▸ Open questions"), 20, "{all}");
-        assert_eq!(row_of(&rows, "▸ Pull requests"), 21, "{all}");
+        assert_eq!(row_of(&rows, "▸ Demo Videos"), 18, "{all}");
+        assert_eq!(row_of(&rows, "▸ Open questions"), 19, "{all}");
+        assert_eq!(row_of(&rows, "▸ Pull requests"), 20, "{all}");
+        assert_eq!(row_of(&rows, "▸ Missing items / Bugs"), 21, "{all}");
         assert_eq!(row_of(&rows, "▸ Artifacts"), 22, "{all}");
         assert_eq!(row_of(&rows, "▸ Evidence"), 23, "{all}");
 
@@ -1177,6 +1186,9 @@ mod tests {
             demos_selected: 0,
             evidence: &[],
             evidence_selected: 0,
+            results: &[],
+            missing: &[],
+            missing_selected: 0,
         };
         let mut t = Terminal::new(TestBackend::new(50, 30)).unwrap();
         t.draw(|f| render_intent(&view, f.area(), f.buffer_mut()))
@@ -1230,6 +1242,8 @@ pub enum Pane {
     Demos,
     Questions,
     PullRequests,
+    /// The missing items / bugs a completion check filed.
+    Missing,
     Artifacts,
     /// A bug's captures: before and after the fix.
     Evidence,
@@ -1359,6 +1373,11 @@ pub struct DetailView<'a> {
     /// The captures, as `(mark, label)`: before first, then after.
     pub evidence: &'a [(String, String)],
     pub evidence_selected: usize,
+    /// The latest check's mark per criterion (0-based index): `✓`, `✗`, `?`.
+    pub results: &'a [(usize, char)],
+    /// The missing items filed for its criteria, as `(mark, label)`.
+    pub missing: &'a [(String, String)],
+    pub missing_selected: usize,
 }
 
 /// A pull request in the detail view: linked by a `pr:` line or found by the
@@ -1404,6 +1423,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         Pane::Demos,
         Pane::Questions,
         Pane::PullRequests,
+        Pane::Missing,
         Pane::Artifacts,
         Pane::Evidence,
     ];
@@ -1556,12 +1576,26 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         ),
         format!("{} {pr_title}", marker(Pane::PullRequests)),
         format!(
+            "{} Missing items / Bugs ({})",
+            marker(Pane::Missing),
+            v.missing.len()
+        ),
+        format!(
             "{} {}",
             marker(Pane::Artifacts),
             count_title("Artifacts", &artifact_rows)
         ),
         format!("{} Evidence ({})", marker(Pane::Evidence), v.evidence.len()),
     ];
+    let missing_rows: Vec<ItemRow> = v
+        .missing
+        .iter()
+        .map(|(mark, label)| ItemRow {
+            tag: mark.clone(),
+            text: label.clone(),
+            found: false,
+        })
+        .collect();
     let evidence_rows: Vec<ItemRow> = v
         .evidence
         .iter()
@@ -1587,6 +1621,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 &[],
                 &[],
                 &[],
+                &[],
                 rect,
                 buf,
             ),
@@ -1606,6 +1641,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                     v.criteria_selected,
                     &demoed,
                     &fresh,
+                    v.results,
                     &crate::store::criteria_groups(&it.body),
                     rect,
                     buf,
@@ -1629,6 +1665,16 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 &pr_rows,
                 8,
                 "none yet — agents add a `pr:` line for each pull request they open (a adds one by hand)",
+                rect,
+                buf,
+            ),
+            Pane::Missing => render_items(
+                &titles[i],
+                v.focus == Pane::Missing,
+                v.missing_selected,
+                &missing_rows,
+                2,
+                "none — a completion check (X) files one for each criterion that does not hold",
                 rect,
                 buf,
             ),
@@ -1885,10 +1931,12 @@ fn render_checklist(
     selected: usize,
     marked: &[usize],
     fresh: &[usize],
+    results: &[(usize, char)],
     groups: &[(usize, String)],
     area: Rect,
     buf: &mut Buffer,
 ) {
+    let result = |i: usize| results.iter().find(|(n, _)| *n == i).map(|(_, m)| *m);
     let block = pane_block(&checklist_title(title, items, fresh), focused);
     let inner = block.inner(area);
     block.render(area, buf);
@@ -1907,7 +1955,10 @@ fn render_checklist(
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let extra = 2 * (usize::from(marked.contains(&i)) + usize::from(fresh.contains(&i)));
+            let extra = 2
+                * (usize::from(marked.contains(&i))
+                    + usize::from(fresh.contains(&i))
+                    + usize::from(result(i).is_some()));
             wrap_spans(
                 &crate::markdown::inline_spans(&c.text),
                 width.saturating_sub(extra),
@@ -1977,8 +2028,9 @@ fn render_checklist(
                 buf.set_style(rect, Style::default().add_modifier(Modifier::REVERSED));
             }
             let tags = format!(
-                "{}{}",
+                "{}{}{}",
                 if fresh.contains(&i) { "+ " } else { "" },
+                result(i).map(|m| format!("{m} ")).unwrap_or_default(),
                 if marked.contains(&i) { "▶ " } else { "" }
             );
             let lead = if j == 0 {
