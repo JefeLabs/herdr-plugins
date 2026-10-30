@@ -285,6 +285,10 @@ pub enum Job {
         check_dir: PathBuf,
         intent_path: PathBuf,
         root: PathBuf,
+        /// A check after a fold: a criterion that fails was most likely
+        /// described wrongly by the fold, so it files nothing.
+        #[serde(default)]
+        fold: bool,
     },
 }
 
@@ -850,7 +854,26 @@ fn run(
                 );
             }
         } else {
-            let verdicts = crate::check::require_proof(parsed, dir, since);
+            // after a fold, a criterion that fails was most likely described
+            // wrongly by the fold (the follow-up's own check proved the app)
+            let fold = matches!(req.job, Job::Check { fold: true, .. });
+            let verdicts: Vec<(usize, crate::check::Verdict)> =
+                crate::check::require_proof(parsed, dir, since)
+                    .into_iter()
+                    .map(|(n, v)| match v {
+                        crate::check::Verdict::Fails(t) | crate::check::Verdict::Missing(t)
+                            if fold =>
+                        {
+                            (
+                                n,
+                                crate::check::Verdict::CantCheck(format!(
+                                    "the fold may describe this wrongly: {t}"
+                                )),
+                            )
+                        }
+                        v => (n, v),
+                    })
+                    .collect();
             let results = items
                 .iter()
                 .zip(verdicts)

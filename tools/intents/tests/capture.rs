@@ -568,6 +568,7 @@ impl Fx {
                 check_dir: t.join("checks"),
                 intent_path: t.join("root/skoolscout/org/notify.md"),
                 root: t.join("root"),
+                fold: false,
             },
             ..self.request()
         }
@@ -750,6 +751,34 @@ fn a_launched_check_applies_its_results() {
     let crit = herdr_intents::store::criteria(&it.body);
     assert!(crit[0].done && !crit[1].done, "{}", it.body);
     assert_eq!(it.fm.missing.len(), 1, "the failing one has its item");
+}
+
+#[test]
+fn a_failure_after_a_fold_files_nothing() {
+    let mut fx = Fx::checking("1: confirmed: ok\n2: fails: no meeting name");
+    fx.set("FAKE_CLAUDE_PROOF", "1");
+    let mut req = fx.check_request(None);
+    if let Job::Check { fold, .. } = &mut req.job {
+        *fold = true;
+    }
+    let order = CaptureOrder {
+        req,
+        env: fx.env.clone(),
+        managed_mcp: false,
+    };
+    launch(&order).unwrap();
+    let checks = fx.tmp.path().join("checks");
+    fx.wait("the check to end", |_| !is_running(&checks));
+    let latest = read_check(&checks).expect("the results are kept");
+    assert_eq!(
+        latest.results[1].verdict,
+        Verdict::CantCheck("the fold may describe this wrongly: no meeting name".into())
+    );
+    let intent = fx.tmp.path().join("root/skoolscout/org/notify.md");
+    let it = herdr_intents::store::Store::load(&intent).unwrap();
+    let crit = herdr_intents::store::criteria(&it.body);
+    assert!(crit[0].done && !crit[1].done, "{}", it.body);
+    assert!(it.fm.missing.is_empty(), "a fold's failure files nothing");
 }
 
 #[test]

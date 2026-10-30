@@ -1133,13 +1133,19 @@ impl App {
         }
         for (path, merged, fold, result) in done {
             self.reconcile_jobs.remove(&path);
+            // a fold's check covers only the criteria it changed
+            let before = Store::load(&path).map(|it| it.body).unwrap_or_default();
+            let mut changed: Vec<String> = Vec::new();
             // Ok(title) when the rewrite was applied, Err(reason) otherwise
             let outcome: Result<String, String> = match result {
                 Ok(reply) => match reply.proposal {
                     Some(prop) => {
                         let body = merge_questions(&prop, &reply.questions);
                         crate::reconcile::apply(&path, &body, &merged, self.store.root())
-                            .map(|it| it.fm.title)
+                            .map(|it| {
+                                changed = crate::reconcile::changed_criteria(&before, &it.body);
+                                it.fm.title
+                            })
                             .map_err(|e| format!("reconcile not saved: {e:#}"))
                     }
                     None => Err("reconcile: the agent returned no proposal".into()),
@@ -1162,6 +1168,12 @@ impl App {
                         self.message = Some(format!(
                             "folded a follow-up into `{title}` (* until you read it, u undoes)"
                         ));
+                        // the original re-proves what the fold changed (with a guide)
+                        if !changed.is_empty()
+                            && let Ok(it) = Store::load(&path)
+                        {
+                            let _ = self.start_check(&it, Some(changed), Vec::new(), None, true);
+                        }
                     }
                     self.reload_tree();
                     // the merged set is reconciled: now it can be checked
@@ -1209,15 +1221,38 @@ impl App {
         }
     }
 
-    /// `u`: put back the version before the last reconcile.
+    /// `u`: put back the version before the last reconcile. When that was a
+    /// fold, the follow-up is declined: it never folds in again on its own.
     fn undo_reconcile(&mut self) {
         let Some(path) = self.selected_intent().map(|it| it.path.clone()) else {
             return;
         };
+        // the fold being undone: this version's, if the one before had another
+        let before_fold = Store::load(&crate::reconcile::backup_path(&path))
+            .ok()
+            .and_then(|b| b.fm.last_fold);
+        let undone_fold = Store::load(&path)
+            .ok()
+            .and_then(|it| it.fm.last_fold)
+            .filter(|stem| before_fold.as_ref() != Some(stem))
+            .and_then(|stem| self.intent_by_stem(&stem).cloned());
         self.message = Some(match crate::reconcile::undo(&path) {
             Ok(true) => {
+                let note = match undone_fold {
+                    Some(f) => match Store::update_meta(&f.path, |fm| fm.fold_declined = true) {
+                        Ok(_) => format!(
+                            "restored the version before the fold: `{}` won't fold again on its own",
+                            f.fm.title
+                        ),
+                        Err(e) => format!(
+                            "restored the version before the fold, but `{}` may fold again: {e:#}",
+                            f.fm.title
+                        ),
+                    },
+                    None => "restored the version before the reconcile".into(),
+                };
                 self.reload_tree();
-                "restored the version before the reconcile".into()
+                note
             }
             Ok(false) => "nothing to undo: no reconcile backup".into(),
             Err(e) => format!("undo failed: {e:#}"),
@@ -3160,7 +3195,7 @@ impl App {
             self.message = Some("a check is for sent intents".into());
             return;
         }
-        self.message = Some(match self.start_check(&it, None, Vec::new(), None) {
+        self.message = Some(match self.start_check(&it, None, Vec::new(), None, false) {
             Ok(()) => "checking: the card shows how far it got".into(),
             Err(e) => format!("check: {e}"),
         });
@@ -3175,6 +3210,7 @@ impl App {
         keys: Option<Vec<String>>,
         merged: Vec<u64>,
         after: Option<crate::capture::CaptureRecord>,
+        fold: bool,
     ) -> Result<(), String> {
         use crate::capture::{Phase, Shot};
         let repo = it.fm.repo.clone().or_else(|| self.current_repo());
@@ -3218,6 +3254,7 @@ impl App {
                 check_dir,
                 intent_path: it.path.clone(),
                 root: self.store.root().to_path_buf(),
+                fold,
             },
         };
         self.launch_capture(req)
@@ -3278,7 +3315,7 @@ impl App {
                     }
                 }
                 before => {
-                    let _ = self.start_check(it, None, it.fm.reconciled_for.clone(), before);
+                    let _ = self.start_check(it, None, it.fm.reconciled_for.clone(), before, false);
                 }
             }
         }
@@ -3300,7 +3337,7 @@ impl App {
                     continue;
                 }
                 if self
-                    .start_check(&orig, Some(vec![link.key.clone()]), Vec::new(), None)
+                    .start_check(&orig, Some(vec![link.key.clone()]), Vec::new(), None, false)
                     .is_ok()
                 {
                     self.recheck_tried.insert(tried);
@@ -11167,6 +11204,159 @@ mod tests {
                 .folded
         });
         assert_eq!(folds_asked(&fx), 2, "retried once");
+    }
+
+    /// The fold's rewrite of Notify: the follow-up's criterion added.
+    const FOLDED: &str = "```proposal\n## Description\nThe primary contact gets no prompt to book the intro meeting.\n\n## Acceptance criteria\n- [ ] gets an email\n- [ ] the email names the meeting\n\n## Artifacts\n- spec: docs/superpowers/specs/notify.md\n- pr: #42\n```\nquestions: none\n";
+
+    /// The fake agent answers every turn with `text`.
+    fn list_agent_says(fx: &mut ListFx, text: &str) {
+        let lines = [
+            serde_json::json!({"event": "init", "conversation_id": "conv-fold"}),
+            serde_json::json!({"event": "step_update", "step_update": {
+                "conversation_id": "conv-fold", "step_type": "agent_response", "text_delta": text}}),
+            serde_json::json!({"event": "result", "result": {
+                "conversation_id": "conv-fold", "status": "SUCCESS", "response": text}}),
+        ];
+        let file = fx.tmp.path().join("fold-reply.jsonl");
+        fs::write(
+            &file,
+            lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+        )
+        .unwrap();
+        fx.app.provider_env[0].1 = file.display().to_string();
+    }
+
+    #[test]
+    fn the_fold_starts_a_check_of_the_changed_criteria() {
+        let mut fx = list_fixture(true);
+        let t = fx.tmp.path().to_path_buf();
+        capture_setup(&t, &mut fx.app, true, true);
+        // Notify's own repo can be checked too
+        fs::create_dir_all(t.join("repo/.helmsmith")).unwrap();
+        fs::write(t.join("repo/.helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        list_agent_says(&mut fx, FOLDED);
+        fs::write(
+            t.join("capture-events.jsonl"),
+            "{\"type\":\"result\",\"result\":\"2: fails: no meeting name\"}\n",
+        )
+        .unwrap();
+        let (notify, _) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        settle_folds(&mut fx, |fx| {
+            Store::load(&fx.app.store.root().join("skoolscout/org/pr.md"))
+                .unwrap()
+                .fm
+                .last_fold
+                .is_some()
+        });
+        let work = t.join("work.log");
+        let start = Instant::now();
+        while !fs::read_to_string(&work)
+            .unwrap_or_default()
+            .contains("start --area")
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "no check started: {:?}\n{}",
+                fx.app.message,
+                Store::load(&notify).unwrap().body
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        wait_check_end(&notify);
+        let claude = fs::read_to_string(t.join("claude.log")).unwrap();
+        assert!(
+            claude.contains("2. the email names the meeting"),
+            "{claude}"
+        );
+        assert!(
+            !claude.contains("1. gets an email"),
+            "only what the fold changed: {claude}"
+        );
+        let latest = crate::check::read_check(&checks_of(&notify)).expect("results kept");
+        assert!(
+            matches!(&latest.results[0].verdict,
+                crate::check::Verdict::CantCheck(w) if w.starts_with("the fold may describe this wrongly")),
+            "a fold's check: {:?}",
+            latest.results
+        );
+        let it = Store::load(&notify).unwrap();
+        assert!(it.fm.missing.is_empty(), "nothing filed");
+        assert_eq!(
+            it.fm.checked_for,
+            vec![42],
+            "the original's own set stays checked"
+        );
+    }
+
+    #[test]
+    fn u_after_a_fold_declines_that_follow_up() {
+        let mut fx = list_fixture(true);
+        let (notify, f) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        settle_folds(&mut fx, |fx| {
+            Store::load(&fx.app.store.root().join("skoolscout/org/pr.md"))
+                .unwrap()
+                .fm
+                .last_fold
+                .is_some()
+        });
+        fx.app.reveal(&notify);
+        assert_eq!(
+            fx.app.selected_intent().map(|it| it.path.clone()),
+            Some(notify.clone())
+        );
+        key(&mut fx.app, KeyCode::Char('u'));
+        let msg = fx.app.view().message.unwrap_or_default();
+        assert!(msg.contains("won't fold again"), "{msg}");
+        assert!(Store::load(&f).unwrap().fm.fold_declined);
+        assert!(
+            !Store::load(&notify)
+                .unwrap()
+                .body
+                .contains("Parents who skip"),
+            "the version before the fold is back"
+        );
+        // a new session forgets which folds it tried; the decline stays
+        fx.app.fold_tried.clear();
+        for _ in 0..3 {
+            fx.app.rescan();
+            settle(&mut fx.app);
+        }
+        assert_eq!(
+            folds_asked(&fx),
+            1,
+            "declined: it never folds again on its own"
+        );
+    }
+
+    #[test]
+    fn u_after_a_later_reconcile_declines_nothing() {
+        let mut fx = list_fixture(true);
+        let (notify, f) = notify_with_a_done_follow_up(&mut fx, "Name the meeting too", true);
+        settle_folds(&mut fx, |fx| {
+            Store::load(&fx.app.store.root().join("skoolscout/org/pr.md"))
+                .unwrap()
+                .fm
+                .last_fold
+                .is_some()
+        });
+        // a regular reconcile after the fold: u undoes that one, not the fold
+        crate::reconcile::apply(
+            &notify,
+            "## Description\nlater\n",
+            &[42],
+            fx.app.store.root(),
+        )
+        .unwrap();
+        fx.app.rescan();
+        fx.app.reveal(&notify);
+        assert_eq!(
+            fx.app.selected_intent().map(|it| it.path.clone()),
+            Some(notify.clone())
+        );
+        key(&mut fx.app, KeyCode::Char('u'));
+        assert!(!Store::load(&f).unwrap().fm.fold_declined);
+        assert!(Store::load(&notify).unwrap().fm.follow_ups[0].folded);
     }
 
     // ---- showing check results ----------------------------------------------------
