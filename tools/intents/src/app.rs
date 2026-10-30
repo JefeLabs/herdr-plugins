@@ -2773,6 +2773,7 @@ impl App {
             // unique across intents capturing in the same area at once
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
             merged: Vec::new(),
+            job: crate::capture::Job::Capture,
         };
         if let Err(e) = self.launch_capture(req) {
             self.message = Some(format!("capture: {e}"));
@@ -2921,6 +2922,7 @@ impl App {
             before,
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
             merged,
+            job: crate::capture::Job::Capture,
         };
         self.launch_capture(req)
     }

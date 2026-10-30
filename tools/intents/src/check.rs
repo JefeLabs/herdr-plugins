@@ -255,6 +255,24 @@ pub fn log_paths(worktree: &Path, listed: &[String]) -> Result<Vec<PathBuf>, Str
         .collect()
 }
 
+/// What applying a check changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub ticked: usize,
+    pub unticked: usize,
+    pub created: Vec<PathBuf>,
+    pub updated: Vec<PathBuf>,
+}
+
+/// Applies a check's results to the intent as it is on disk (Task 4).
+pub fn apply(
+    _store: &crate::store::Store,
+    _intent_path: &Path,
+    _record: &CheckRecord,
+) -> anyhow::Result<Applied> {
+    Ok(Applied::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
