@@ -410,5 +410,122 @@ else
   flunk "nothing personal in the catalog" "$(grep -rnE 'JIRA_PROJECT|SKOOL|/Users/' toolbar/setup toolbar/tools.example.toml 2>&1)"
 fi
 
+# --- the walk-through: answers come from a file (TTY), one line per question
+unset LIBC REPOS TTY XTERM XGHOSTTY XKITTY
+answers() { # <file> <line>...: the answers, one per line
+  f=$1
+  shift
+  : > "$f"
+  for a in "$@"; do printf '%s\n' "$a" >> "$f"; done
+}
+default_order='^order *= *\["intents", "db", "files", "editor", "usage", "terminal"\]'
+
+# 20. Enter takes the defaults
+h="$work/h20"
+mkdir -p "$h"
+answers "$work/a20" "" ""
+TTY="$work/a20"
+run "$h" - "$work/good" --tools
+unset TTY
+if grep -q "$default_order" "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"[x] 1  Intents"*"[ ] 5  Jira"*) pass "walk-through: Enter takes the defaults" ;;
+    *) flunk "walk-through: Enter takes the defaults" "no list: $out" ;;
+  esac
+else
+  flunk "walk-through: Enter takes the defaults" "exit $status: $(cat "$(toml "$h")" 2>&1): $out"
+fi
+
+# 21. numbers switch tools on and off, and the list is shown again
+h="$work/h21"
+mkdir -p "$h"
+answers "$work/a21" "4" "" ""
+TTY="$work/a21"
+run "$h" - "$work/good" --tools
+unset TTY
+if grep -q '^order *= *\["intents", "db", "editor", "usage", "terminal"\]' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"[ ] 4  Files"*) pass "walk-through: numbers switch tools" ;;
+    *) flunk "walk-through: numbers switch tools" "list not shown again: $out" ;;
+  esac
+else
+  flunk "walk-through: numbers switch tools" "$(cat "$(toml "$h")" 2>&1): $out"
+fi
+
+# 22. junk answers are ignored with a note; "1 1" switches Intents off and on
+h="$work/h22"
+mkdir -p "$h"
+answers "$work/a22" "x" "42" "1 1" "*" "" ""
+TTY="$work/a22"
+run "$h" - "$work/good" --tools
+unset TTY
+case "$out" in
+  *"ignored: x"*"ignored: 42"*"ignored: *"*)
+    if grep -q "$default_order" "$(toml "$h")" 2>/dev/null; then
+      pass "walk-through: junk answers are ignored"
+    else
+      flunk "walk-through: junk answers are ignored" "$(cat "$(toml "$h")" 2>&1)"
+    fi ;;
+  *) flunk "walk-through: junk answers are ignored" "$out" ;;
+esac
+
+# 23. the icon answer wins over detection
+h="$work/h23"
+mkdir -p "$h"
+answers "$work/a23" "" "n"
+TTY="$work/a23" XTERM=xterm-ghostty
+run "$h" - "$work/good"
+unset TTY XTERM
+if grep -qF '"✎"' "$(toml "$h")" 2>/dev/null; then
+  case "$out" in
+    *"Nerd Font icons? [Y/n]"*) pass "walk-through: the icon answer wins" ;;
+    *) flunk "walk-through: the icon answer wins" "no [Y/n] question: $out" ;;
+  esac
+else
+  flunk "walk-through: the icon answer wins" "$(cat "$(toml "$h")" 2>&1)"
+fi
+
+# 24. an existing tools.toml is left alone, with no questions
+h="$work/h24"
+mkdir -p "$(dirname "$(toml "$h")")"
+printf '# mine\nprefix = "ctrl-b"\n' > "$(toml "$h")"
+cp "$(toml "$h")" "$work/h24-before.toml"
+answers "$work/a24" "" ""
+TTY="$work/a24"
+run "$h" - "$work/good"
+unset TTY
+if cmp -s "$(toml "$h")" "$work/h24-before.toml"; then
+  case "$out" in
+    *"which tools"*) flunk "an existing tools.toml is left alone" "asked anyway: $out" ;;
+    *) pass "an existing tools.toml is left alone" ;;
+  esac
+else
+  flunk "an existing tools.toml is left alone" "changed: $(diff "$work/h24-before.toml" "$(toml "$h")" 2>&1)"
+fi
+
+# 25. --setup asks again, backing the old file up each time
+answers "$work/a25" "" ""
+TTY="$work/a25"
+run "$h" - "$work/good" --setup
+first=$status
+run "$h" - "$work/good" --setup
+unset TTY
+cfg=$(dirname "$(toml "$h")")
+baks=$(find "$cfg" -name 'tools.toml.bak-*' | wc -l | tr -d ' ')
+originals=$(grep -l '^# mine' "$cfg"/tools.toml.bak-* 2>/dev/null | wc -l | tr -d ' ')
+# (no --tools here, so only the tools that need nothing installed)
+if [ "$first:$status:$baks:$originals" = "0:0:2:1" ] && grep -q '^order *= *\["intents", "terminal"\]' "$(toml "$h")"; then
+  pass "--setup twice keeps both backups"
+else
+  flunk "--setup twice keeps both backups" "exits $first/$status, backups $baks, with the original $originals: $(ls "$cfg"): $out"
+fi
+
+# 26. --setup needs a terminal to ask in
+run "$h" - "$work/good" --setup
+case "$status:$out" in
+  1:*"--setup needs a terminal to ask in"*) pass "--setup needs a terminal" ;;
+  *) flunk "--setup needs a terminal" "exit $status: $out" ;;
+esac
+
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"
 [ $failures -eq 0 ]

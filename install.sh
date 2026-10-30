@@ -19,6 +19,11 @@
 # already on PATH are left alone. Offline, put their archives in the --from
 # folder too.
 #
+# On a terminal it then walks you through the toolbar's tools: tick the ones
+# you want, and it writes the toolbar's tools.toml. A tools.toml you already
+# have is left alone; add --setup to be walked through again (the old file is
+# kept as tools.toml.bak-<date>).
+#
 # No sudo, Rust or compiler needed. Settings (environment variables):
 #   HERDR_PLUGINS_VERSION   a release tag such as v0.1.0 (default: the latest)
 #   HERDR_PLUGINS_DIR       where the plugins go (default: ~/.local/share/herdr-plugins)
@@ -28,10 +33,13 @@
 #   HERDR_PLUGINS_BASE_URL  download from here instead of GitHub (for testing)
 #   HERDR_PLUGINS_TOOLS_MANIFEST  a tools table to use instead of the one below (for testing)
 #   HERDR_PLUGINS_LIBC      glibc or musl, instead of detecting it (for testing)
+#   HERDR_PLUGINS_TTY       a file of answers for the walk-through, or none to
+#                           skip it (for testing; default: the terminal)
 set -eu
 
 from="${HERDR_PLUGINS_FROM:-}"
 tools="${HERDR_PLUGINS_TOOLS:-}"
+setup=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)
@@ -41,6 +49,10 @@ while [ $# -gt 0 ]; do
       ;;
     --tools)
       tools=1
+      shift
+      ;;
+    --setup)
+      setup=1
       shift
       ;;
     *)
@@ -64,6 +76,16 @@ fi
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'herdr-plugins: %s\n' "$*" >&2; exit 1; }
+
+# Where the walk-through reads its answers: the terminal (when piped from
+# curl, stdin is this script, so never stdin), a file for tests, or nowhere.
+answers_from=""
+case "${HERDR_PLUGINS_TTY:-}" in
+  none) ;;
+  "") if { : </dev/tty; } 2>/dev/null; then answers_from=/dev/tty; fi ;;
+  *) answers_from=$HERDR_PLUGINS_TTY ;;
+esac
+[ -z "$setup" ] || [ -n "$answers_from" ] || fail "--setup needs a terminal to ask in"
 
 command -v herdr >/dev/null 2>&1 || fail "Herdr is not installed: install it first (https://herdr.dev)"
 case "$(uname -s)" in
@@ -355,31 +377,101 @@ write_toolbar() { # <file> <nerd|text> <tool id>...
     done
   } > "$file.tmp" && mv "$file.tmp" "$file"
 }
+ask() { # <variable>: the next answer (empty once the answers run out)
+  if [ -z "${asking:-}" ]; then
+    exec 3<"$answers_from"
+    asking=1
+  fi
+  IFS= read -r "$1" <&3 || eval "$1="
+  # a typed answer ends its own line; one read from a file does not
+  [ "$answers_from" = /dev/tty ] || printf '\n'
+}
+missing_of() { awk -F'|' -v i="$1" '$1 == i { print $2 }' "$tmp/setup-missing"; }
+choose_tools() { # the list: numbers switch tools on and off until an empty answer
+  while :; do
+    say ""
+    say "Toolbar setup: which tools do you want on your bar?"
+    n=0
+    while IFS='|' read -r id name summary _ticked _needs _nerd _text; do
+      n=$((n + 1))
+      case "$ticks" in *" $id "*) mark=x ;; *) mark=" " ;; esac
+      missing=$(missing_of "$id")
+      printf '  [%s] %-2s %-20s %-22s%s\n' "$mark" "$n" "$name" "$summary" "${missing:+needs: $missing}"
+    done < "$tmp/setup-tools"
+    printf '%s ' "Type numbers to switch them on or off, Enter when done:"
+    ask reply
+    [ -n "$reply" ] || return 0
+    set -f
+    for word in $reply; do
+      k=$(printf '%s' "$word" | sed 's/^0*//')
+      case "$k" in
+        '' | *[!0-9]*) say "  ignored: $word" ;;
+        *)
+          if [ "$k" -le "$count" ]; then
+            id=$(sed -n "${k}p" "$tmp/setup-tools" | cut -d'|' -f1)
+            case "$ticks" in
+              *" $id "*) ticks=$(printf '%s' "$ticks" | sed "s/ $id / /") ;;
+              *) ticks="$ticks$id " ;;
+            esac
+          else
+            say "  ignored: $word"
+          fi
+          ;;
+      esac
+    done
+    set +f
+  done
+}
 setup_toolbar() {
-  chosen=""
-  while IFS='|' read -r id name _summary ticked needs _nerd _text; do
-    case "$id" in '' | '#'*) continue ;; esac
-    [ "$ticked" = 1 ] || continue
+  awk '!/^#/ && NF' "$catalog/tools" > "$tmp/setup-tools"
+  count=$(wc -l < "$tmp/setup-tools" | tr -d ' ')
+  : > "$tmp/setup-missing"
+  while IFS='|' read -r id _name _summary _ticked needs _nerd _text; do
     missing=""
     for program in $needs; do
       present "$program" </dev/null || missing="$missing${missing:+, }$program"
     done
+    printf '%s|%s\n' "$id" "$missing" >> "$tmp/setup-missing"
+  done < "$tmp/setup-tools"
+  ticks=" $(awk -F'|' '$4 == 1 { printf "%s ", $1 }' "$tmp/setup-tools")"
+  [ -z "$answers_from" ] || choose_tools
+  chosen=""
+  while IFS='|' read -r id name _summary _ticked _needs _nerd _text; do
+    case "$ticks" in *" $id "*) ;; *) continue ;; esac
+    missing=$(missing_of "$id")
     if [ -n "$missing" ]; then
       say "  left off: $name (needs $missing)"
     else
       chosen="$chosen $id"
     fi
-  done < "$catalog/tools"
+  done < "$tmp/setup-tools"
   if nerd_default; then mode=nerd; else mode=text; fi
+  if [ -n "$answers_from" ]; then
+    if [ "$mode" = nerd ]; then printf 'Nerd Font icons? [Y/n] '; else printf 'Nerd Font icons? [y/N] '; fi
+    ask reply
+    case "$reply" in [Yy]*) mode=nerd ;; [Nn]*) mode=text ;; esac
+  fi
   # shellcheck disable=SC2086 # the chosen ids, one argument each
   write_toolbar "$config/tools.toml" "$mode" $chosen
   # shellcheck disable=SC2086
   set -- $chosen
   say "Wrote $config/tools.toml ($# tools, $mode icons)"
 }
-if [ -n "$config" ] && [ ! -f "$config/tools.toml" ]; then
+if [ -n "$config" ] && { [ -n "$setup" ] || [ ! -f "$config/tools.toml" ]; }; then
   if [ -d "$catalog" ]; then
     mkdir -p "$config"
+    if [ -f "$config/tools.toml" ]; then
+      # --setup: keep the old file; a second run in the same second gets -2, -3, ...
+      bak="$config/tools.toml.bak-$(date +%Y%m%d-%H%M%S)"
+      keep=$bak
+      n=2
+      while [ -e "$keep" ]; do
+        keep="$bak-$n"
+        n=$((n + 1))
+      done
+      cp "$config/tools.toml" "$keep"
+      say "Kept your old tools.toml as $keep"
+    fi
     say ""
     say "Toolbar:"
     setup_toolbar
