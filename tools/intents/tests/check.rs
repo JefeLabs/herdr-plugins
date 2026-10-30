@@ -389,3 +389,35 @@ fn checked_for_records_the_merged_set() {
         "a check by hand leaves it"
     );
 }
+
+#[test]
+fn an_untick_made_in_the_editor_is_a_veto_too() {
+    let (_t, s) = store();
+    let it = sent(&s, false);
+    apply(
+        &s,
+        &it.path,
+        &record(
+            vec![result(&it, 1, Verdict::Confirmed("ok".into()), true)],
+            vec![],
+        ),
+    )
+    .unwrap();
+    // the owner unticks it by editing the body, not in the Criteria pane
+    let mut edited = Store::load(&it.path).unwrap();
+    edited.body = store::set_criteria_ticks(&edited.body, |_| false);
+    Store::save_force(&mut edited).unwrap();
+    apply(
+        &s,
+        &it.path,
+        &record(
+            vec![result(&it, 1, Verdict::Confirmed("ok".into()), true)],
+            vec![],
+        ),
+    )
+    .unwrap();
+    assert!(!ticks(&it.path)[0], "not ticked again");
+    let fm = Store::load(&it.path).unwrap().fm;
+    assert_eq!(fm.owner_unticked, [criterion_key(C1)]);
+    assert!(fm.check_ticks.is_empty());
+}

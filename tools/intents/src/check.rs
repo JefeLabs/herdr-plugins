@@ -93,7 +93,7 @@ pub fn check_prompt(
     if !guide.logs.is_empty() {
         p.push_str("For a criterion the screen cannot show (an email sent, a job run), search the app's logs with the `logs` tool: give it the criterion's number and a word or phrase to find. It returns only what was logged since you started, and keeps those lines as that criterion's proof.\n");
     }
-    p.push_str("A criterion counts as confirmed only with proof kept this way.\n\nThe criteria:\n");
+    p.push_str("A criterion counts as confirmed only with proof kept this way. For a criterion that fails or is missing, keep proof of what you see instead the same way (`screenshot` or `logs` with its number).\n\nThe criteria:\n");
     for it in items {
         p.push_str(&format!("{}. {}\n", it.number, it.text));
     }
@@ -217,6 +217,12 @@ pub fn proof_so_far(check_dir: &Path) -> usize {
     numbers.sort_unstable();
     numbers.dedup();
     numbers.len()
+}
+
+/// How long a check's agent may run: it grows with the criteria (and a bug's after).
+pub fn check_limit(criteria: usize, after: bool) -> std::time::Duration {
+    let minutes = 10 + 3 * criteria as u64 + if after { 5 } else { 0 };
+    std::time::Duration::from_secs(minutes * 60)
 }
 
 /// Where an intent's check results and proof live.
@@ -395,6 +401,14 @@ pub fn apply(
         let Some((_, done)) = present.iter().find(|(k, _)| *k == r.key) else {
             continue;
         };
+        // a check's tick no longer there was taken back by the owner (in the
+        // Criteria section, the editor, or by hand): a veto
+        if !done && it.fm.check_ticks.contains(&r.key) {
+            it.fm.check_ticks.retain(|k| *k != r.key);
+            if !it.fm.owner_unticked.contains(&r.key) {
+                it.fm.owner_unticked.push(r.key.clone());
+            }
+        }
         match &r.verdict {
             Verdict::Confirmed(_) if r.proof.is_some() => {
                 if !done && !it.fm.owner_unticked.contains(&r.key) {
@@ -453,6 +467,14 @@ pub fn apply(
     });
     if !record.merged.is_empty() {
         it.fm.checked_for = record.merged.clone();
+    }
+    // a closed item's criterion has now been checked again: its re-check is done
+    for link in it.fm.missing.iter_mut() {
+        let checked = record.results.iter().any(|r| r.key == link.key);
+        let closed = find_intent(store, &link.stem).is_none_or(|item| !item_is_open(&item));
+        if checked && closed {
+            link.rechecked = true;
+        }
     }
     Store::save_force(&mut it)?;
     Ok(applied)
@@ -548,6 +570,20 @@ mod tests {
         ] {
             assert!(p.contains(needle), "the bug's after: lacks {needle}: {p}");
         }
+    }
+
+    #[test]
+    fn the_prompt_asks_for_proof_of_a_gap_too() {
+        let p = check_prompt(&guide(), &items(BODY, None), "x", "https://h:3004", None);
+        assert!(p.contains("fails or is missing"), "{p}");
+    }
+
+    #[test]
+    fn the_time_limit_grows_with_the_criteria() {
+        let m = |s: u64| std::time::Duration::from_secs(s * 60);
+        assert_eq!(check_limit(1, false), m(13));
+        assert_eq!(check_limit(12, false), m(46));
+        assert_eq!(check_limit(12, true), m(51), "a bug's after takes longer");
     }
 
     #[test]

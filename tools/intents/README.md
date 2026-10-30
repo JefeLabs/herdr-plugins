@@ -216,7 +216,7 @@ Keep passwords out of it: the agent signs in the way a person does on a local st
 
 **The Evidence section.** It follows Artifacts in every intent's detail pane (`Tab` reaches it). One row per capture: `before` or `after`, `video` or `screenshot`, and the agent's line, marked `…` running, `✓` reproduced or fixed, `✗` still broken, `·` couldn't reproduce, `!` failed or interrupted; `⚠` adds anything to act on, such as a `work finish` that failed. `Enter` opens the file in Chrome (on Linux, with `xdg-open`). `c` copies the file itself: on macOS, ⌘V into a GitHub comment uploads it; over SSH, or off macOS, it copies the path. `Y` copies the path. `E` (here, in the tree or on a card) captures the selected bug again: a "before" until one reproduced it, then an "after". It refuses while a capture of that intent is running.
 
-**After the fix.** When every pull request of a sent bug has merged and its "before" reproduced the bug, the completion check that follows the reconcile (see Completion check) also runs the same steps on its fresh stack: an "after", once per merged set of pull requests. Its row reads `✓ after · … · fixed: …` or `✗ after · … · still broken: …`. Besides `pr:` lines and the spec and plan names, pull requests are found through the intent's `issue:` lines: the ones GitHub links as closing the issue ("Fixes #n").
+**After the fix.** When every pull request of a sent bug has merged and its "before" reproduced the bug, the completion check that follows the reconcile (see Completion check) also runs the same steps on its fresh stack: an "after", once per merged set of pull requests (a bug with no acceptance criteria gets the after on its own). Its row reads `✓ after · … · fixed: …` or `✗ after · … · still broken: …`. Besides `pr:` lines and the spec and plan names, pull requests are found through the intent's `issue:` lines: the ones GitHub links as closing the issue ("Fixes #n").
 
 **Where the files are.** Until the bug has an issue, its captures sit in its agent folder, `.polish/<name>/evidence/`: `before.mp4` or `before.png`, and `before.json` with the result and the `browser` calls the agent made (the same for `after`). Once an `issue:` line names the filed issue, they move into the intent's attachments, `<name>.assets/evidence/`. A hand-off lists the captures wherever they are, so the agent filing the issue can use the screenshot as the issue's picture and ask you to paste the video. `D` takes them to the trash with the intent.
 
@@ -237,7 +237,7 @@ The agent ends with one line per criterion:
 - `<n>: missing: …` (not built);
 - `<n>: can't check: …`.
 
-A `confirmed` counts only with proof kept in that run (the criterion's screenshot or log lines); otherwise it reads `can't check: no proof kept`.
+A `confirmed` counts only with proof kept in that run (the criterion's screenshot or log lines); otherwise it reads `can't check: no proof kept`. For a criterion that fails or is missing the agent keeps proof of what it saw instead, which goes to the missing item. A check's agent may run 10 minutes plus 3 per criterion (5 more when it records a bug's after). A run whose agent gives no answers at all (it timed out, or claude failed) applies nothing, so the check runs again later.
 
 **Ticks.**
 - A check ticks the criteria it confirmed and records that it did.
@@ -250,7 +250,7 @@ A `confirmed` counts only with proof kept in that run (the criterion's screensho
 - created as refining, with the criterion as its one criterion and the proof in its attachments;
 - listed in the original's **Missing items / Bugs** section, after Pull requests: `✓` closed, `→` sent, `○` not yet. Enter goes to it.
 
-A later check that fails the same criterion adds its proof to the open item instead of filing another; one that fails after the item was completed files a new one. Deleting a missing item (`D`) dismisses that gap: later checks do not file it again. Once an item closes (its criterion ticked, by its own check or by you), the original re-checks just that criterion, once.
+A later check that fails the same criterion adds its proof to the open item instead of filing another; one that fails after the item was completed files a new one. Deleting a missing item that is still open (`D`) dismisses that gap: later checks do not file it again. Deleting a done one only removes it, and a later failure of its criterion is filed anew. Once an item closes (its criterion ticked, by its own check or by you), the original re-checks just that criterion, once.
 
 **Where the results show.**
 - **Acceptance criteria:** the latest result sits beside each checkbox (`✓` confirmed, `✗` fails or missing, `?` can't check). The status line gives the selected criterion's finding and date, and `o` opens its proof.

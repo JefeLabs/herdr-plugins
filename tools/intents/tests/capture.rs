@@ -778,3 +778,21 @@ fn a_log_that_leads_out_of_the_worktree_is_refused() {
             .contains("finish --area")
     );
 }
+
+#[test]
+fn a_check_with_no_answers_spends_nothing() {
+    let fx = Fx::checking("I ran out of time before I could look.");
+    let (checked, rec) = fx.run_check(fx.check_request(None));
+    assert!(
+        checked.is_none(),
+        "nothing to apply: the merged set is not spent"
+    );
+    match rec.outcome {
+        Outcome::Failed(why) => assert!(why.contains("no answers"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        read_check(&fx.tmp.path().join("checks")).is_none(),
+        "no ? results written"
+    );
+}

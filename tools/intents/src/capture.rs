@@ -789,10 +789,14 @@ fn run(
     }
     // a watchdog: an agent that never finishes is stopped
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let limit = match req.job {
+        Job::Capture => AGENT_LIMIT,
+        Job::Check { .. } => crate::check::check_limit(items.len(), req.phase == Phase::After),
+    };
     {
         let done = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
-            let until = std::time::Instant::now() + AGENT_LIMIT;
+            let until = std::time::Instant::now() + limit;
             while std::time::Instant::now() < until {
                 if done.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -834,28 +838,40 @@ fn run(
         .map(str::to_string)
         .collect();
     if let Some(dir) = &check_dir {
-        let verdicts =
-            crate::check::require_proof(crate::check::parse_verdicts(&items, &result), dir, since);
-        let results = items
-            .iter()
-            .zip(verdicts)
-            .map(|(it, (_, verdict))| crate::check::CriterionResult {
-                number: it.number,
-                key: it.key.clone(),
-                text: it.text.clone(),
-                proof: crate::check::proof_file(dir, it.number, since),
-                verdict,
-            })
-            .collect();
-        let checked = crate::check::CheckRecord {
-            at: chrono::Local::now(),
-            merged: req.merged.clone(),
-            results,
-            warning: None,
-        };
-        let latest = crate::check::merge_check(crate::check::read_check(dir), checked.clone());
-        let _ = crate::check::write_check(dir, &latest);
-        let _ = tx.send(CaptureUpdate::Checked(checked));
+        let parsed = crate::check::parse_verdicts(&items, &result);
+        // no verdict at all (it timed out, or claude failed): nothing to apply,
+        // so the merged set is not spent and the check runs again later
+        let no_answer = crate::check::Verdict::CantCheck("no answer".into());
+        if parsed.iter().all(|(_, v)| *v == no_answer) {
+            // a bug's check keeps its after; the criteria wait for a later check
+            if req.phase != Phase::After {
+                return failed(
+                    "the agent gave no answers (it timed out or failed): X tries again".into(),
+                );
+            }
+        } else {
+            let verdicts = crate::check::require_proof(parsed, dir, since);
+            let results = items
+                .iter()
+                .zip(verdicts)
+                .map(|(it, (_, verdict))| crate::check::CriterionResult {
+                    number: it.number,
+                    key: it.key.clone(),
+                    text: it.text.clone(),
+                    proof: crate::check::proof_file(dir, it.number, since),
+                    verdict,
+                })
+                .collect();
+            let checked = crate::check::CheckRecord {
+                at: chrono::Local::now(),
+                merged: req.merged.clone(),
+                results,
+                warning: None,
+            };
+            let latest = crate::check::merge_check(crate::check::read_check(dir), checked.clone());
+            let _ = crate::check::write_check(dir, &latest);
+            let _ = tx.send(CaptureUpdate::Checked(checked));
+        }
     }
     let file = out_file.exists().then_some(name);
     record(parse_outcome(req.phase, &result), file, steps)
