@@ -16,7 +16,7 @@ herdr plugin link "$PWD/toolbar"
 herdr plugin install jefelabs/herdr-plugins/toolbar
 ```
 
-On first run the toolbar seeds `tools.toml` in its config dir from [`tools.example.toml`](tools.example.toml). Find that dir with:
+The installer writes `tools.toml` by walking you through the tools (see the main README; `install.sh --setup` asks again). Without it, the toolbar seeds `tools.toml` on first run from [`tools.example.toml`](tools.example.toml). Find that dir with:
 
 ```sh
 herdr plugin config-dir jefelabs.toolbar
