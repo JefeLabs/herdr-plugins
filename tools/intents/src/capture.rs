@@ -613,6 +613,9 @@ fn run(
         evidence: req.evidence.clone(),
         phase: req.phase,
         shot: req.shot,
+        mode: crate::capture_mcp::Mode::Capture,
+        check_dir: None,
+        logs: Vec::new(),
     };
     let config_file = req.evidence.join(".capture-mcp.json");
     let written = serde_json::to_string(&mcp_config)
@@ -632,7 +635,7 @@ fn run(
         }
     })
     .to_string();
-    let allowed = crate::capture_mcp::tool_names(req.shot)
+    let allowed = crate::capture_mcp::tool_names(&mcp_config)
         .iter()
         .map(|t| format!("mcp__{server}__{t}"))
         .collect::<Vec<_>>()

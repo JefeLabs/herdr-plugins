@@ -23,14 +23,106 @@ pub struct McpConfig {
     pub evidence: PathBuf,
     pub phase: Phase,
     pub shot: Shot,
+    /// A capture (the default) or a completion check.
+    #[serde(default)]
+    pub mode: Mode,
+    /// A check's proof folder (`<stem>.assets/checks`).
+    #[serde(default)]
+    pub check_dir: Option<PathBuf>,
+    /// The log files a check may search, each from its length at agent start.
+    #[serde(default)]
+    pub logs: Vec<LogFile>,
 }
 
-/// The tools the agent gets for this kind of capture.
-pub fn tool_names(shot: Shot) -> Vec<&'static str> {
-    match shot {
-        Shot::Video => vec!["browser", "record_start", "record_stop"],
-        Shot::Screenshot => vec!["browser", "screenshot"],
+/// What the agent is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Capture,
+    Check,
+}
+
+/// A log file and the byte offset the agent's run started at.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogFile {
+    pub path: PathBuf,
+    pub from: u64,
+}
+
+/// The tools the agent gets for this run.
+pub fn tool_names(cfg: &McpConfig) -> Vec<&'static str> {
+    match (cfg.mode, cfg.shot) {
+        (Mode::Capture, Shot::Video) => vec!["browser", "record_start", "record_stop"],
+        (Mode::Capture, Shot::Screenshot) => vec!["browser", "screenshot"],
+        (Mode::Check, _) => {
+            let mut t = vec!["browser", "screenshot"];
+            if !cfg.logs.is_empty() {
+                t.push("logs");
+            }
+            // a bug's check also records its after
+            if cfg.shot == Shot::Video && cfg.phase == Phase::After {
+                t.extend(["record_start", "record_stop"]);
+            }
+            t
+        }
     }
+}
+
+/// How many matches one `logs` call returns, the lines kept after each, and
+/// the longest line it shows.
+const LOG_MATCHES: usize = 40;
+const LOG_AFTER: usize = 3;
+const LOG_LINE: usize = 400;
+
+/// The lines of `files` logged since each one's offset (all of it when the
+/// file is now shorter: it was rotated or truncated) that contain `pattern`,
+/// ignoring case, each with the few lines after it.
+pub fn search_logs(files: &[LogFile], pattern: &str) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let needle = pattern.to_lowercase();
+    let mut out = String::new();
+    let mut matches = 0;
+    for f in files {
+        let Ok(mut file) = std::fs::File::open(&f.path) else {
+            continue;
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let from = if f.from <= len { f.from } else { 0 };
+        let mut bytes = Vec::new();
+        if file.seek(SeekFrom::Start(from)).is_err() || file.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut shown_until = 0;
+        let mut block = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if matches >= LOG_MATCHES {
+                break;
+            }
+            if !line.to_lowercase().contains(&needle) {
+                continue;
+            }
+            matches += 1;
+            let end = (i + 1 + LOG_AFTER).min(lines.len());
+            for l in &lines[i.max(shown_until)..end] {
+                let cut: String = l.chars().take(LOG_LINE).collect();
+                block.push_str(&cut);
+                block.push('\n');
+            }
+            shown_until = shown_until.max(end);
+        }
+        if !block.is_empty() {
+            let name = f
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            out.push_str(&format!("== {name} ==\n{block}"));
+        }
+    }
+    out
 }
 
 /// Where the server keeps the browser commands it ran, one per line.
@@ -258,9 +350,9 @@ fn step_line(command: &str, args: &[String], base: &str) -> String {
 
 const BROWSER_HELP: &str = "Drive the browser on the app being checked. `command` is one agent-browser command and `args` its arguments, one string each: open (a path on the app, e.g. /auth/sign-in), snapshot (-i lists the interactive elements as @e refs), click, dblclick, fill, type, press (e.g. Enter, Meta+u), select, check, uncheck, hover, focus, scroll, scrollintoview, drag, keyboard, mouse, wait (a selector, milliseconds, --text, --url, --load or --state), get, is, find, back, forward, reload.";
 
-fn tool_list(shot: Shot) -> serde_json::Value {
+fn tool_list(cfg: &McpConfig) -> serde_json::Value {
     let empty = serde_json::json!({"type": "object", "properties": {}});
-    let tools: Vec<serde_json::Value> = tool_names(shot)
+    let tools: Vec<serde_json::Value> = tool_names(cfg)
         .into_iter()
         .map(|name| match name {
             "browser" => serde_json::json!({
@@ -277,10 +369,40 @@ fn tool_list(shot: Shot) -> serde_json::Value {
             }),
             "record_start" => serde_json::json!({"name": name, "description": "Start recording the browser to this capture's video.", "inputSchema": empty}),
             "record_stop" => serde_json::json!({"name": name, "description": "Stop recording and save the video.", "inputSchema": empty}),
+            "screenshot" if cfg.mode == Mode::Check => serde_json::json!({
+                "name": name,
+                "description": "Save a screenshot of the page as the proof for one acceptance criterion.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"criterion": {"type": "integer", "description": "The criterion's number."}},
+                    "required": ["criterion"]
+                }
+            }),
+            "logs" => serde_json::json!({
+                "name": name,
+                "description": "Search the app's logs for a word or phrase (ignoring case). Returns only what was logged since you started, each match with the lines after it, and keeps those lines as the proof for the criterion.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "criterion": {"type": "integer", "description": "The criterion's number."},
+                        "pattern": {"type": "string"}
+                    },
+                    "required": ["criterion", "pattern"]
+                }
+            }),
             _ => serde_json::json!({"name": name, "description": "Save a screenshot of the page as this capture's picture.", "inputSchema": empty}),
         })
         .collect();
     serde_json::json!({ "tools": tools })
+}
+
+/// A tool call's `criterion` number (1 to 999).
+fn criterion(arguments: &serde_json::Value) -> Option<usize> {
+    arguments
+        .get("criterion")
+        .and_then(|c| c.as_u64())
+        .filter(|n| (1..=999).contains(n))
+        .map(|n| n as usize)
 }
 
 /// The server's state: the config and whether the window has its size yet.
@@ -337,7 +459,7 @@ impl Server {
 
     /// One `tools/call`: (is_error, text).
     fn call(&mut self, name: &str, arguments: &serde_json::Value) -> (bool, String) {
-        if !tool_names(self.cfg.shot).contains(&name) {
+        if !tool_names(&self.cfg).contains(&name) {
             return (true, format!("no tool `{name}` here"));
         }
         let out = self
@@ -348,7 +470,49 @@ impl Server {
         let (ok, text) = match name {
             "record_start" => self.run(&["record".into(), "start".into(), out]),
             "record_stop" => self.run(&["record".into(), "stop".into()]),
+            "screenshot" if self.cfg.mode == Mode::Check => {
+                let Some(n) = criterion(arguments) else {
+                    return (true, "screenshot needs the criterion's number".into());
+                };
+                let Some(dir) = self.cfg.check_dir.clone() else {
+                    return (true, "no folder for proof".into());
+                };
+                let shot = dir.join(format!("{n}.png")).display().to_string();
+                self.run(&["screenshot".into(), shot])
+            }
             "screenshot" => self.run(&["screenshot".into(), out]),
+            "logs" => {
+                let (Some(n), Some(pattern)) = (
+                    criterion(arguments),
+                    arguments
+                        .get("pattern")
+                        .and_then(|p| p.as_str())
+                        .filter(|p| !p.trim().is_empty()),
+                ) else {
+                    return (
+                        true,
+                        "logs needs the criterion's number and a pattern".into(),
+                    );
+                };
+                let found = search_logs(&self.cfg.logs, pattern);
+                if found.is_empty() {
+                    return (
+                        false,
+                        format!("no lines contain `{pattern}` since the check started"),
+                    );
+                }
+                if let Some(dir) = &self.cfg.check_dir {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join(format!("{n}.log.txt")))
+                    {
+                        let _ = write!(f, "{found}");
+                    }
+                }
+                (true, found)
+            }
             _ => {
                 let command = arguments
                     .get("command")
@@ -404,7 +568,7 @@ impl Server {
                 "serverInfo": {"name": SERVER, "version": env!("CARGO_PKG_VERSION")}
             }),
             "ping" => serde_json::json!({}),
-            "tools/list" => tool_list(self.cfg.shot),
+            "tools/list" => tool_list(&self.cfg),
             "tools/call" => {
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let arguments = params.get("arguments").cloned().unwrap_or_default();
@@ -562,12 +726,58 @@ mod tests {
         assert_eq!(ok("snapshot", &["-d", "3"]), ["snapshot", "-d", "3"]);
     }
 
+    fn cfg(mode: Mode, phase: Phase, shot: Shot, logs: bool) -> McpConfig {
+        McpConfig {
+            base_url: BASE.into(),
+            session: "s".into(),
+            evidence: PathBuf::from("/e"),
+            phase,
+            shot,
+            mode,
+            check_dir: Some(PathBuf::from("/c")),
+            logs: if logs {
+                vec![LogFile {
+                    path: PathBuf::from("/w/.logs/backend.log"),
+                    from: 0,
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
     #[test]
     fn video_gets_recording_and_screenshot_gets_a_shot() {
+        let capture = |shot| cfg(Mode::Capture, Phase::Before, shot, false);
         assert_eq!(
-            tool_names(Shot::Video),
+            tool_names(&capture(Shot::Video)),
             ["browser", "record_start", "record_stop"]
         );
-        assert_eq!(tool_names(Shot::Screenshot), ["browser", "screenshot"]);
+        assert_eq!(
+            tool_names(&capture(Shot::Screenshot)),
+            ["browser", "screenshot"]
+        );
+    }
+
+    #[test]
+    fn a_check_gets_a_screenshot_logs_and_a_bugs_after_recording() {
+        assert_eq!(
+            tool_names(&cfg(Mode::Check, Phase::Before, Shot::Screenshot, true)),
+            ["browser", "screenshot", "logs"]
+        );
+        assert_eq!(
+            tool_names(&cfg(Mode::Check, Phase::Before, Shot::Screenshot, false)),
+            ["browser", "screenshot"]
+        );
+        assert_eq!(
+            tool_names(&cfg(Mode::Check, Phase::After, Shot::Video, true)),
+            [
+                "browser",
+                "screenshot",
+                "logs",
+                "record_start",
+                "record_stop"
+            ]
+        );
     }
 }
