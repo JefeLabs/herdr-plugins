@@ -47,6 +47,8 @@ pub struct CaptureGuide {
     pub url: String,
     /// Instructions for the agent: signing in, what to avoid.
     pub body: String,
+    /// Log files a completion check may search, relative to the stack's worktree.
+    pub logs: Vec<String>,
 }
 
 /// One capture, as written beside the evidence (`<phase>.json`).
@@ -81,6 +83,8 @@ struct GuideFront {
     #[serde(default)]
     seed: Vec<String>,
     url: String,
+    #[serde(default)]
+    logs: Vec<String>,
 }
 
 /// Reads `<repo>/.helmsmith/capture.md`: YAML front matter, then the body.
@@ -102,6 +106,7 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
         seed: front.seed,
         url: front.url,
         body: rest[end + "\n---\n".len()..].to_string(),
+        logs: front.logs,
     })
 }
 
@@ -1051,6 +1056,7 @@ mod tests {
             seed: vec!["kathia-signup".into()],
             url: "https://demo-org.skoolscout.com.local:{port}".into(),
             body: "Sign in with Cmd+U.\n".into(),
+            logs: Vec::new(),
         }
     }
 
@@ -1076,6 +1082,20 @@ mod tests {
         assert_eq!(read_guide(tmp.path()).unwrap(), guide());
         let e = read_guide(&tmp.path().join("nowhere")).unwrap_err();
         assert!(format!("{e:#}").contains("capture.md"), "{e:#}");
+    }
+
+    #[test]
+    fn the_guide_lists_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".helmsmith")).unwrap();
+        std::fs::write(
+            tmp.path().join(".helmsmith/capture.md"),
+            "---\ndefault_area: org/social\nurl: https://x:{port}\nlogs: [.logs/backend.log]\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(read_guide(tmp.path()).unwrap().logs, [".logs/backend.log"]);
+        std::fs::write(tmp.path().join(".helmsmith/capture.md"), GUIDE).unwrap();
+        assert!(read_guide(tmp.path()).unwrap().logs.is_empty());
     }
 
     #[test]
