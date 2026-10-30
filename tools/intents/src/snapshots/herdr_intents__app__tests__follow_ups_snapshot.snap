@@ -1,0 +1,28 @@
+---
+source: tools/intents/src/app.rs
+expression: "render(&fx.app, 80, 24)"
+---
+▾ Inbox (1)            │# Alpha
+  ○ In the inbox ?2    │kind: idea   state: sent
+▾ skoolscout (3)       │ Description ───────────────────────────────────────────
+  → Alpha              │x
+  ○ Beta               │ ▸ Preconditions (0/0) ─────────────────────────────────
+  → Name the meeting to│ ▸ Acceptance criteria (0/2) ───────────────────────────
+                       │ ▸ Demo Videos (0) ─────────────────────────────────────
+                       │ ▸ Open questions (0 open) ─────────────────────────────
+                       │ ▸ Pull requests (0) ───────────────────────────────────
+                       │ ▸ Missing items / Bugs (0) ────────────────────────────
+                       │ ▾ Follow-ups (1) ──────────────────────────────────────
+                       │→ Name the meeting too
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │
+                       │ ▸ Artifacts (0) ───────────────────────────────────────
+                       │ ▸ Evidence (0) ────────────────────────────────────────
+Follow-ups: j/k choose · Enter go to it · F file another · Esc tree

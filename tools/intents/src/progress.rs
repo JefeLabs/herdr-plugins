@@ -134,6 +134,8 @@ pub struct Evidence {
     pub unacknowledged: usize,
     /// A completion check running: (criteria with proof so far, criteria).
     pub checking: Option<(usize, usize)>,
+    /// Follow-ups filed for it that are not yet complete.
+    pub open_follow_ups: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,6 +252,16 @@ const BUILDING: f32 = 3.0;
 const PR_OPEN: f32 = 7.0;
 const MERGED: f32 = 8.0;
 const VERIFIED: f32 = 2.0;
+
+/// `· 1 follow-up` / `· N follow-ups` after a label while follow-ups are open
+/// (not while a check runs).
+fn follow_up_note(label: String, ev: &Evidence) -> String {
+    match (ev.open_follow_ups, ev.checking) {
+        (0, _) | (_, Some(_)) => label,
+        (1, None) => format!("{label} · 1 follow-up"),
+        (n, None) => format!("{label} · {n} follow-ups"),
+    }
+}
 
 /// `None` unless the intent has been sent.
 pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
@@ -412,26 +424,29 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         plans,
         segments,
         fill: (base + verified).min(10.0),
-        label: match ev.checking {
-            Some((done, total)) => format!("checking {done}/{total}"),
-            None if complete => "✓ complete".to_string(),
-            None => {
-                let label = if all_ticked && shipped && ev.open_missing == 0 {
-                    format!(
-                        "✓ {n}/{n} · {} new to read",
-                        ev.unacknowledged,
-                        n = crit.len()
-                    )
-                } else {
-                    label
-                };
-                if ev.open_missing > 0 {
-                    format!("{label} · {} missing", ev.open_missing)
-                } else {
-                    label
+        label: follow_up_note(
+            match ev.checking {
+                Some((done, total)) => format!("checking {done}/{total}"),
+                None if complete => "✓ complete".to_string(),
+                None => {
+                    let label = if all_ticked && shipped && ev.open_missing == 0 {
+                        format!(
+                            "✓ {n}/{n} · {} new to read",
+                            ev.unacknowledged,
+                            n = crit.len()
+                        )
+                    } else {
+                        label
+                    };
+                    if ev.open_missing > 0 {
+                        format!("{label} · {} missing", ev.open_missing)
+                    } else {
+                        label
+                    }
                 }
-            }
-        },
+            },
+            ev,
+        ),
         complete,
     })
 }
@@ -941,6 +956,12 @@ pub enum Update {
         merged: Vec<u64>,
         prompt: String,
     },
+    /// A fold of a shipped follow-up into its original, gathered: the prompt.
+    Fold {
+        path: PathBuf,
+        follow_up: String,
+        prompt: String,
+    },
     /// Pull requests found mentioning each of the intent's spec or plan
     /// file names, per name.
     FoundPrs {
@@ -1054,7 +1075,7 @@ impl Poller {
     }
 
     /// Gather the spec, merged PRs and follow-ups for a reconcile, off the UI thread.
-    pub fn request_reconcile(&mut self, intent: Intent, merged: Vec<u64>) {
+    pub fn request_reconcile(&mut self, intent: Intent, merged: Vec<u64>, folded: Vec<Intent>) {
         let key = format!("reconcile:{}", intent.path.display());
         let Some(repo) = intent.fm.repo.clone() else {
             return;
@@ -1067,12 +1088,44 @@ impl Poller {
         std::thread::spawn(move || {
             let gh = tool_bin(&env, "GH_BIN_PATH", Some("gh")).unwrap_or_else(|| "gh".into());
             let ctx = crate::reconcile::gather(&repo, &intent, &merged, &gh, &env);
-            let prompt = crate::reconcile::reconcile_prompt(&intent, &ctx);
+            let prompt = crate::reconcile::reconcile_prompt(&intent, &ctx, &folded);
             let _ = tx.send((
                 key,
                 Update::Reconcile {
                     path: intent.path,
                     merged,
+                    prompt,
+                },
+            ));
+        });
+    }
+
+    /// Gather a shipped follow-up's merged pull requests and ask for its fold
+    /// into the original, off the UI thread.
+    pub fn request_fold(&mut self, original: Intent, follow_up: Intent, merged: Vec<u64>) {
+        let key = format!("fold:{}", original.path.display());
+        let Some(repo) = follow_up
+            .fm
+            .repo
+            .clone()
+            .or_else(|| original.fm.repo.clone())
+        else {
+            return;
+        };
+        if !self.in_flight.insert(key.clone()) {
+            return;
+        }
+        let env = self.env.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let gh = tool_bin(&env, "GH_BIN_PATH", Some("gh")).unwrap_or_else(|| "gh".into());
+            let ctx = crate::reconcile::gather(&repo, &follow_up, &merged, &gh, &env);
+            let prompt = crate::reconcile::fold_prompt(&original, &follow_up, &ctx.prs);
+            let _ = tx.send((
+                key,
+                Update::Fold {
+                    path: original.path,
+                    follow_up: follow_up.stem(),
                     prompt,
                 },
             ));

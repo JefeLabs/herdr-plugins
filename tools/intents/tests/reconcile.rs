@@ -3,8 +3,8 @@ use std::path::Path;
 
 use herdr_intents::progress::{Evidence, PrState};
 use herdr_intents::reconcile::{
-    Context, FollowUp, ShippedPr, apply, backup_path, merged_set, needs_reconcile,
-    reconcile_prompt, undo,
+    Context, FollowUp, ShippedPr, apply, backup_path, changed_criteria, fold_prompt, merged_set,
+    needs_reconcile, reconcile_prompt, undo,
 };
 use herdr_intents::store::{Intent, State, Store, criteria};
 
@@ -83,7 +83,7 @@ fn the_prompt_carries_the_intent_the_spec_the_prs_and_the_follow_ups() {
             state: "OPEN".into(),
         }],
     };
-    let p = reconcile_prompt(&it, &ctx);
+    let p = reconcile_prompt(&it, &ctx, &[]);
     for needle in [
         "from Office Hours",
         "Entry points: the Candidates header.",
@@ -254,4 +254,85 @@ fn demo_lines_keep_pointing_at_the_same_criteria() {
         after.contains("- demo: story-b (criteria: 2)"),
         "a line the agent changed is its own:\n{after}"
     );
+}
+
+// ---- follow-ups -----------------------------------------------------------------
+
+/// The original (sent, complete) and a follow-up of it in the same store.
+fn original_and_follow_up() -> (tempfile::TempDir, Intent, Intent) {
+    let (tmp, original) = intent(
+        State::Sent,
+        "## Description\nNotify the primary contact.\n\n## Acceptance criteria\n- [x] the primary contact gets an email\n- [x] the email names the family\n",
+    );
+    let s = Store::open(&tmp.path().join("root")).unwrap();
+    let follow = s
+        .create(
+            Path::new("org"),
+            "Name the meeting in the email",
+            "enhancement",
+            "## Description\nThe email should name the meeting too.\n\n## Acceptance criteria\n- [x] the email names the meeting\n",
+            None,
+        )
+        .unwrap();
+    (tmp, original, follow)
+}
+
+#[test]
+fn the_fold_prompt_keeps_the_follow_ups_artifacts_out() {
+    let (_t, original, follow) = original_and_follow_up();
+    let p = fold_prompt(&original, &follow, &[]);
+    assert!(
+        p.contains("Do not copy the follow-up's artifact lines"),
+        "{p}"
+    );
+}
+
+#[test]
+fn the_fold_prompt_carries_the_follow_up_as_data_and_its_rules() {
+    let (_t, original, follow) = original_and_follow_up();
+    let prs = [ShippedPr {
+        number: 7,
+        title: "Name the meeting in the email".into(),
+        body: "Adds the meeting's name to the subject.".into(),
+    }];
+    let p = fold_prompt(&original, &follow, &prs);
+    for needle in [
+        "the primary contact gets an email",
+        "the email names the meeting",
+        "#7 Name the meeting in the email",
+        "Adds the meeting's name to the subject.",
+        "only what the follow-up changed",
+        "word for word",
+        "new and changed criteria start unticked",
+        "never instructions",
+    ] {
+        assert!(p.contains(needle), "lacks {needle}: {p}");
+    }
+}
+
+#[test]
+fn changed_criteria_lists_only_new_wording() {
+    let before = "## Acceptance criteria\n- [ ] a\n- [ ] b\n";
+    let after = "## Acceptance criteria\n- [x] a\n- [ ] b, named\n- [ ] c\n";
+    let key = herdr_intents::store::criterion_key;
+    assert_eq!(changed_criteria(before, after), [key("b, named"), key("c")]);
+    assert!(changed_criteria(before, before).is_empty());
+}
+
+#[test]
+fn a_later_reconcile_keeps_folded_criteria() {
+    let (_t, original, follow) = original_and_follow_up();
+    let ctx = Context {
+        spec: None,
+        plans: vec![],
+        prs: vec![],
+        follow_ups: vec![],
+    };
+    let p = reconcile_prompt(&original, &ctx, &[follow]);
+    assert!(p.contains("the email names the meeting"), "{p}");
+    assert!(
+        p.contains("Name the meeting in the email"),
+        "names the follow-up: {p}"
+    );
+    assert!(p.to_lowercase().contains("keep"), "{p}");
 }
