@@ -283,7 +283,7 @@ A refinement asked for after an intent shipped is a follow-up: its own intent, l
 
 ## List view
 
-`v` flips the browser between the group tree and one full-screen list of every intent, across all groups (collapsed or not). The selection carries across both ways, and the layout, sort order and filter are remembered.
+`v` flips the browser between the group tree and one full-screen list of every intent, across all groups (collapsed or not). The tool always opens on that list (the card view), at its top card; the selection carries across both ways, and the sort order and filter are remembered.
 
 ```
 Intents · 7 · sorted by Updated

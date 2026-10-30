@@ -784,6 +784,14 @@ impl App {
             .min(self.list.len().saturating_sub(1));
     }
 
+    /// Starting the tool: the card view at its top card, whatever layout the
+    /// last session ended in (the sort order and filter stay as left).
+    pub(crate) fn open_in_cards(&mut self) {
+        self.layout = Layout::List;
+        self.poll_ticks = 0;
+        self.list_selected = 0;
+    }
+
     /// Switch layout, carrying the selected intent across.
     fn set_layout(&mut self, layout: Layout) {
         match layout {
@@ -6091,6 +6099,8 @@ fn run_with(cfg: Config, dirs: Dirs, capture: bool) -> anyhow::Result<()> {
     let mut app = App::new(cfg, dirs)?;
     if capture {
         app.start_capture();
+    } else {
+        app.open_in_cards();
     }
     let mut terminal = init_terminal();
 
@@ -7152,6 +7162,20 @@ mod tests {
         let v = again.view();
         assert_eq!(v.layout, "list");
         assert_eq!(v.sort, "Progress");
+    }
+
+    #[test]
+    fn the_tool_opens_in_the_card_view_at_the_top_card() {
+        let fx = setup("agy.jsonl");
+        // the last session ended in the tree, sorted by title
+        crate::config::save_view(&fx.app.dirs, "tree", "Title").unwrap();
+        let mut again = App::new(fx.app.cfg.clone(), fx.app.dirs.clone()).unwrap();
+        again.list_selected = 2;
+        again.open_in_cards();
+        let v = again.view();
+        assert_eq!(v.layout, "list");
+        assert_eq!(v.sort, "Title", "the sort order is still the last one");
+        assert_eq!(again.list_selected, 0, "the top card");
     }
 
     #[test]
