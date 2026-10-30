@@ -732,3 +732,22 @@ fn a_recheck_checks_only_its_criteria() {
         Verdict::Confirmed("names it now".into())
     );
 }
+
+#[test]
+fn a_launched_check_applies_its_results() {
+    let mut fx = Fx::checking("1: confirmed: ok\n2: fails: no meeting name");
+    fx.set("FAKE_CLAUDE_PROOF", "1");
+    let order = CaptureOrder {
+        req: fx.check_request(None),
+        env: fx.env.clone(),
+        managed_mcp: false,
+    };
+    launch(&order).unwrap();
+    let checks = fx.tmp.path().join("checks");
+    fx.wait("the check to end", |_| !is_running(&checks));
+    let intent = fx.tmp.path().join("root/skoolscout/org/notify.md");
+    let it = herdr_intents::store::Store::load(&intent).unwrap();
+    let crit = herdr_intents::store::criteria(&it.body);
+    assert!(crit[0].done && !crit[1].done, "{}", it.body);
+    assert_eq!(it.fm.missing.len(), 1, "the failing one has its item");
+}

@@ -264,13 +264,167 @@ pub struct Applied {
     pub updated: Vec<PathBuf>,
 }
 
-/// Applies a check's results to the intent as it is on disk (Task 4).
+/// The intent with this file stem anywhere under the root.
+pub fn find_intent(store: &crate::store::Store, stem: &str) -> Option<Intent> {
+    fn walk(g: &crate::store::Group, stem: &str) -> Option<Intent> {
+        g.intents
+            .iter()
+            .find(|i| i.stem() == stem)
+            .cloned()
+            .or_else(|| g.groups.iter().find_map(|sub| walk(sub, stem)))
+    }
+    walk(&store.scan().ok()?, stem)
+}
+
+/// A missing item is open until every criterion it has is ticked (by its own
+/// check, or by the owner) or it is deleted.
+pub fn item_is_open(item: &Intent) -> bool {
+    let crit = crate::store::criteria(&item.body);
+    crit.is_empty() || crit.iter().any(|c| !c.done)
+}
+
+/// Copies a criterion's proof into an item's attachments, dated so a later
+/// check's proof sits beside it.
+fn attach_proof(item: &Intent, check_dir: &Path, proof: Option<&str>) -> anyhow::Result<()> {
+    let Some(proof) = proof else {
+        return Ok(());
+    };
+    let dir = item.assets_dir();
+    std::fs::create_dir_all(&dir)?;
+    let stamp = Local::now().format("%Y%m%d-%H%M%S");
+    std::fs::copy(
+        check_dir.join(proof),
+        dir.join(format!("check-{stamp}-{proof}")),
+    )?;
+    Ok(())
+}
+
+/// Files a missing item (a bug for `fails`, a feature for `missing`) in the
+/// original's group, as refining, with the criterion as its one criterion.
+fn file_item(
+    store: &crate::store::Store,
+    original: &Intent,
+    result: &CriterionResult,
+    check_dir: &Path,
+) -> anyhow::Result<Intent> {
+    let (kind, gap, saw) = match &result.verdict {
+        Verdict::Fails(t) => ("issue", "does not hold", t.as_str()),
+        Verdict::Missing(t) => ("enhancement", "is not built", t.as_str()),
+        _ => anyhow::bail!("only a failing or missing criterion is filed"),
+    };
+    let group = original
+        .path
+        .parent()
+        .and_then(|p| p.strip_prefix(store.root()).ok())
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let title: String = result.text.chars().take(100).collect();
+    let body = format!(
+        "## Description\nFound by the completion check of “{}” on {}: criterion {}, “{}”, {gap}. The check saw: {saw}\n\n## Acceptance criteria\n- [ ] {}\n",
+        original.fm.title,
+        Local::now().format("%Y-%m-%d"),
+        result.number,
+        result.text,
+        result.text,
+    );
+    let item = store.create(&group, &title, kind, &body, original.fm.repo.clone())?;
+    let item = crate::store::Store::update_fields(&item.path, |fm| {
+        fm.state = crate::store::State::Refining;
+        fm.missing_for = Some(crate::store::MissingFor {
+            stem: original.stem(),
+            key: result.key.clone(),
+        });
+    })?;
+    attach_proof(&item, check_dir, result.proof.as_deref())?;
+    Ok(item)
+}
+
+/// Applies a check's results to the intent as it is on disk now (an edit
+/// made while the check ran is kept): ticks what was confirmed with proof,
+/// unless the owner took that tick back; unticks only ticks a check made;
+/// files a missing item per failing or missing criterion (or adds the proof
+/// to the one still open), unless the owner dismissed that gap. A result
+/// whose criterion was reworded meanwhile matches nothing and does nothing.
 pub fn apply(
-    _store: &crate::store::Store,
-    _intent_path: &Path,
-    _record: &CheckRecord,
+    store: &crate::store::Store,
+    intent_path: &Path,
+    record: &CheckRecord,
 ) -> anyhow::Result<Applied> {
-    Ok(Applied::default())
+    use crate::store::{MissingLink, Store, criterion_key};
+    let mut it = Store::load(intent_path)?;
+    let check_dir = checks_dir(&it);
+    let present: Vec<(String, bool)> = crate::store::criteria(&it.body)
+        .iter()
+        .map(|c| (criterion_key(&c.text), c.done))
+        .collect();
+    let mut applied = Applied::default();
+    let mut tick: Vec<String> = Vec::new();
+    let mut untick: Vec<String> = Vec::new();
+    for r in &record.results {
+        let Some((_, done)) = present.iter().find(|(k, _)| *k == r.key) else {
+            continue;
+        };
+        match &r.verdict {
+            Verdict::Confirmed(_) if r.proof.is_some() => {
+                if !done && !it.fm.owner_unticked.contains(&r.key) {
+                    tick.push(r.key.clone());
+                    if !it.fm.check_ticks.contains(&r.key) {
+                        it.fm.check_ticks.push(r.key.clone());
+                    }
+                    applied.ticked += 1;
+                }
+            }
+            Verdict::Fails(_) | Verdict::Missing(_) => {
+                if *done && it.fm.check_ticks.contains(&r.key) {
+                    untick.push(r.key.clone());
+                    it.fm.check_ticks.retain(|k| *k != r.key);
+                    applied.unticked += 1;
+                }
+                if it.fm.dismissed.contains(&r.key) {
+                    continue;
+                }
+                let open = it
+                    .fm
+                    .missing
+                    .iter()
+                    .filter(|l| l.key == r.key)
+                    .filter_map(|l| find_intent(store, &l.stem))
+                    .find(item_is_open);
+                match open {
+                    Some(item) => {
+                        attach_proof(&item, &check_dir, r.proof.as_deref())?;
+                        Store::update_meta(&item.path, |fm| fm.unread = true)?;
+                        applied.updated.push(item.path.clone());
+                    }
+                    None => {
+                        let item = file_item(store, &it, r, &check_dir)?;
+                        it.fm.missing.push(MissingLink {
+                            stem: item.stem(),
+                            key: r.key.clone(),
+                            rechecked: false,
+                        });
+                        applied.created.push(item.path);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    it.body = crate::store::set_criteria_ticks(&it.body, |text| {
+        let k = criterion_key(text);
+        if tick.contains(&k) {
+            true
+        } else if untick.contains(&k) {
+            false
+        } else {
+            present.iter().any(|(pk, done)| *pk == k && *done)
+        }
+    });
+    if !record.merged.is_empty() {
+        it.fm.checked_for = record.merged.clone();
+    }
+    Store::save_force(&mut it)?;
+    Ok(applied)
 }
 
 #[cfg(test)]

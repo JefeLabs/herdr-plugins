@@ -55,6 +55,25 @@ pub struct SentTo {
     pub at: DateTime<Local>,
 }
 
+/// A missing item filed for one of an intent's criteria (by the item's stem,
+/// which `M` keeps, so the link survives moves).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingLink {
+    pub stem: String,
+    /// The criterion's `criterion_key`.
+    pub key: String,
+    /// The original re-checked this criterion once the item closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rechecked: bool,
+}
+
+/// On a missing item: what it was filed for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingFor {
+    pub stem: String,
+    pub key: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontMatter {
     #[serde(default)]
@@ -102,6 +121,25 @@ pub struct FrontMatter {
     /// named only at the end; claude resumes only from the folder it began in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polish_dir: Option<String>,
+    /// The merged set of pull requests a completion check last ran for, so
+    /// each merged set is checked once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checked_for: Vec<u64>,
+    /// Keys (`criterion_key`) of the criteria a check ticked (with proof).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub check_ticks: Vec<String>,
+    /// Keys of check ticks the owner took back: no check ticks them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_unticked: Vec<String>,
+    /// The missing items / bugs a check filed for this intent's criteria.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<MissingLink>,
+    /// Keys of gaps the owner dismissed (by deleting their item).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed: Vec<String>,
+    /// On a missing item: the intent and criterion it was filed for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_for: Option<MissingFor>,
     /// Fields we do not know, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -379,6 +417,12 @@ impl Store {
             unread: false,
             acknowledged: None,
             polish_dir: None,
+            checked_for: Vec::new(),
+            check_ticks: Vec::new(),
+            owner_unticked: Vec::new(),
+            missing: Vec::new(),
+            dismissed: Vec::new(),
+            missing_for: None,
             extra: BTreeMap::new(),
         };
         let mut it = Intent {
