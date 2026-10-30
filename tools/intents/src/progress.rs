@@ -97,6 +97,8 @@ pub struct FoundPr {
     pub branch: String,
     /// Its title; empty when `gh` gave none.
     pub title: String,
+    /// The commit its merge made, once merged (a commit hash).
+    pub merge_commit: Option<String>,
 }
 
 /// Pull requests found per spec or plan file name.
@@ -136,6 +138,8 @@ pub struct Evidence {
     pub checking: Option<(usize, usize)>,
     /// Follow-ups filed for it that are not yet complete.
     pub open_follow_ups: usize,
+    /// Its automatic check waits until the merged code is pulled.
+    pub awaiting_pull: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -255,6 +259,15 @@ const VERIFIED: f32 = 2.0;
 
 /// `· 1 follow-up` / `· N follow-ups` after a label while follow-ups are open
 /// (not while a check runs).
+/// `· waiting for a pull` while its automatic check waits for the merged code.
+fn pull_note(label: String, ev: &Evidence) -> String {
+    if ev.awaiting_pull && ev.checking.is_none() {
+        format!("{label} · waiting for a pull")
+    } else {
+        label
+    }
+}
+
 fn follow_up_note(label: String, ev: &Evidence) -> String {
     match (ev.open_follow_ups, ev.checking) {
         (0, _) | (_, Some(_)) => label,
@@ -425,26 +438,29 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         segments,
         fill: (base + verified).min(10.0),
         label: follow_up_note(
-            match ev.checking {
-                Some((done, total)) => format!("checking {done}/{total}"),
-                None if complete => "✓ complete".to_string(),
-                None => {
-                    let label = if all_ticked && shipped && ev.open_missing == 0 {
-                        format!(
-                            "✓ {n}/{n} · {} new to read",
-                            ev.unacknowledged,
-                            n = crit.len()
-                        )
-                    } else {
-                        label
-                    };
-                    if ev.open_missing > 0 {
-                        format!("{label} · {} missing", ev.open_missing)
-                    } else {
-                        label
+            pull_note(
+                match ev.checking {
+                    Some((done, total)) => format!("checking {done}/{total}"),
+                    None if complete => "✓ complete".to_string(),
+                    None => {
+                        let label = if all_ticked && shipped && ev.open_missing == 0 {
+                            format!(
+                                "✓ {n}/{n} · {} new to read",
+                                ev.unacknowledged,
+                                n = crit.len()
+                            )
+                        } else {
+                            label
+                        };
+                        if ev.open_missing > 0 {
+                            format!("{label} · {} missing", ev.open_missing)
+                        } else {
+                            label
+                        }
                     }
-                }
-            },
+                },
+                ev,
+            ),
             ev,
         ),
         complete,
@@ -668,14 +684,12 @@ pub fn pr_state(gh: &Path, repo: &Path, target: &str, env: &[(String, String)]) 
     pr_info(gh, repo, target, env).0
 }
 
+/// A pull request's state, title and merge commit from `gh pr view`.
+pub type PrInfo = (PrState, Option<String>, Option<String>);
+
 /// A pull request's state and title from `gh pr view`; `Unknown` and no
 /// title when `gh` cannot say.
-pub fn pr_info(
-    gh: &Path,
-    repo: &Path,
-    target: &str,
-    env: &[(String, String)],
-) -> (PrState, Option<String>) {
+pub fn pr_info(gh: &Path, repo: &Path, target: &str, env: &[(String, String)]) -> PrInfo {
     let t = target.trim();
     let args: Vec<String> = if let Some(n) = t.strip_prefix('#') {
         vec![n.trim().to_string()]
@@ -684,10 +698,10 @@ pub fn pr_info(
     } else if let Some((slug, n)) = t.split_once('#') {
         vec![n.trim().to_string(), "-R".into(), slug.trim().to_string()]
     } else {
-        return (PrState::Unknown, None);
+        return (PrState::Unknown, None, None);
     };
     let view = ["pr".to_string(), "view".to_string(), args[0].clone()];
-    let rest: Vec<String> = ["--json".to_string(), "state,title".to_string()]
+    let rest: Vec<String> = ["--json".to_string(), "state,title,mergeCommit".to_string()]
         .into_iter()
         .chain(args[1..].iter().cloned())
         .collect();
@@ -699,10 +713,10 @@ pub fn pr_info(
         .stderr(Stdio::null())
         .output();
     let Ok(out) = out else {
-        return (PrState::Unknown, None);
+        return (PrState::Unknown, None, None);
     };
     if !out.status.success() {
-        return (PrState::Unknown, None);
+        return (PrState::Unknown, None, None);
     }
     let v = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok();
     let field = |k: &str| {
@@ -717,7 +731,11 @@ pub fn pr_info(
         Some("CLOSED") => PrState::Closed,
         _ => PrState::Unknown,
     };
-    (state, field("title").filter(|t| !t.trim().is_empty()))
+    (
+        state,
+        field("title").filter(|t| !t.trim().is_empty()),
+        commit_hash(v.as_ref().and_then(|v| v.get("mergeCommit"))),
+    )
 }
 
 /// One agent as `herdr agent list` reports it, plus where it is working.
@@ -775,7 +793,7 @@ pub fn prs_mentioning(
             "--search",
             &format!("\"{query}\""),
             "--json",
-            "number,state,headRefName,title",
+            "number,state,headRefName,title,mergeCommit",
             "--limit",
             "30",
         ])
@@ -798,7 +816,16 @@ pub fn prs_mentioning(
         .unwrap_or_default()
 }
 
-/// One pull request from `gh`'s JSON (`number`, `state`, `headRefName`, `title`).
+/// A commit hash from `gh` (`mergeCommit.oid`), or nothing: only hex is
+/// taken, so the value can never pass for an option of the `git` it goes to.
+pub fn commit_hash(v: Option<&serde_json::Value>) -> Option<String> {
+    let s = v?.get("oid")?.as_str()?;
+    (s.len() >= 7 && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| s.to_string())
+}
+
+/// One pull request from `gh`'s JSON (`number`, `state`, `headRefName`,
+/// `title`, `mergeCommit`).
 fn found_pr(p: &serde_json::Value) -> Option<FoundPr> {
     let number = p.get("number")?.as_u64()?;
     let state = match p.get("state")?.as_str()? {
@@ -818,6 +845,7 @@ fn found_pr(p: &serde_json::Value) -> Option<FoundPr> {
         state,
         branch: text("headRefName"),
         title: text("title"),
+        merge_commit: commit_hash(p.get("mergeCommit")),
     })
 }
 
@@ -868,7 +896,7 @@ pub fn prs_closing(gh: &Path, repo: &Path, issue: u64, env: &[(String, String)])
                 "view",
                 &target,
                 "--json",
-                "number,state,headRefName,title",
+                "number,state,headRefName,title,mergeCommit",
             ])?;
             if let Some(o) = pr.as_object_mut() {
                 o.entry("number").or_insert(number.into());
@@ -944,6 +972,8 @@ pub enum Update {
         target: String,
         state: PrState,
         title: Option<String>,
+        /// The commit its merge made, when `gh` said.
+        merge_commit: Option<String>,
     },
     /// Plan tasks for the intent at `path` (reading plans runs git).
     Plans {
@@ -1013,9 +1043,9 @@ impl Poller {
         let env = self.env.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let (state, title) = tool_bin(&env, "GH_BIN_PATH", Some("gh"))
+            let (state, title, merge_commit) = tool_bin(&env, "GH_BIN_PATH", Some("gh"))
                 .map(|gh| pr_info(&gh, &repo, &target, &env))
-                .unwrap_or((PrState::Unknown, None));
+                .unwrap_or((PrState::Unknown, None, None));
             let _ = tx.send((
                 key,
                 Update::Pr {
@@ -1023,6 +1053,7 @@ impl Poller {
                     target,
                     state,
                     title,
+                    merge_commit,
                 },
             ));
         });

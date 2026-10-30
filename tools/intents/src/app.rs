@@ -485,6 +485,10 @@ pub struct App {
     fold_tried: HashSet<(PathBuf, String)>,
     /// Fold checks started this session (original, keys): once each.
     fold_check_tried: HashSet<(PathBuf, Vec<String>)>,
+    /// Merge commits of linked pull requests, by (repo, `pr:` target).
+    pr_merge_commits: HashMap<(PathBuf, String), String>,
+    /// Intents whose automatic check waits for the merged code to be pulled.
+    awaiting_pull: HashSet<PathBuf>,
     /// The env captures run with (`*_BIN_PATH` included); empty in production.
     pub capture_env: Vec<(String, String)>,
     /// The repo intents are captured for; `None` means `send::capture_repo()`.
@@ -583,6 +587,8 @@ impl App {
             reconcile_jobs: HashMap::new(),
             fold_tried: HashSet::new(),
             fold_check_tried: HashSet::new(),
+            pr_merge_commits: HashMap::new(),
+            awaiting_pull: HashSet::new(),
             capture_env: Vec::new(),
             capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
@@ -972,6 +978,7 @@ impl App {
             unacknowledged,
             checking,
             open_follow_ups: 0,
+            awaiting_pull: self.awaiting_pull.contains(&it.path),
         }
     }
 
@@ -1377,7 +1384,12 @@ impl App {
                     target,
                     state,
                     title,
+                    merge_commit,
                 } => {
+                    if let Some(c) = merge_commit {
+                        self.pr_merge_commits
+                            .insert((repo.clone(), target.clone()), c);
+                    }
                     if let Some(t) = title {
                         self.pr_titles.insert((repo.clone(), target.clone()), t);
                     }
@@ -3468,6 +3480,63 @@ impl App {
         self.launch_capture(req)
     }
 
+    /// Whether the intent's repo has every merge commit of `set` checked out
+    /// (`git merge-base --is-ancestor`, locally: it never fetches or pulls).
+    /// A merge commit not known yet counts as not pulled.
+    pub(crate) fn pulled(&self, it: &Intent, set: &[u64]) -> bool {
+        let Some(repo) = it.fm.repo.as_ref() else {
+            return false;
+        };
+        set.iter().all(|n| {
+            self.merge_commit_of(it, *n).is_some_and(|sha| {
+                std::process::Command::new("git")
+                    .args(["merge-base", "--is-ancestor", &sha, "HEAD"])
+                    .current_dir(repo)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            })
+        })
+    }
+
+    /// A merged pull request's merge commit: from its `pr:` line's `gh pr
+    /// view`, else from the repo search that found it.
+    fn merge_commit_of(&self, it: &Intent, n: u64) -> Option<String> {
+        let repo = it.fm.repo.clone()?;
+        let linked = crate::store::artifacts(&it.body)
+            .into_iter()
+            .filter(|a| a.kind.eq_ignore_ascii_case("pr"))
+            .filter(|a| crate::progress::pr_number(&a.target) == Some(n))
+            .find_map(|a| {
+                self.pr_merge_commits
+                    .get(&(repo.clone(), a.target.trim().to_string()))
+                    .cloned()
+            });
+        linked.or_else(|| {
+            self.found_prs
+                .get(&it.path)
+                .into_iter()
+                .flatten()
+                .flat_map(|(_, prs)| prs)
+                .find(|f| f.number == n)
+                .and_then(|f| f.merge_commit.clone())
+        })
+    }
+
+    /// An automatic check of `it` waits for the pull: its run guide starts the
+    /// app from what is checked out (commands mode), and the merged code is
+    /// not there yet. Skoolscout's work slots merge develop themselves.
+    fn waits_for_pull(&self, it: &Intent) -> bool {
+        let commands = self
+            .run_repo_for(it.fm.repo.clone())
+            .ok()
+            .and_then(|r| crate::capture::read_guide(&r).ok())
+            .is_some_and(|g| matches!(g.mode, crate::capture::GuideMode::Commands { .. }));
+        commands && !self.pulled(it, &it.fm.reconciled_for)
+    }
+
     /// Starts the automatic check of each sent intent whose merged set was
     /// reconciled but not yet checked, once per set, one at a time per repo.
     /// A bug whose "before" reproduced it records its "after" in the same run.
@@ -3488,6 +3557,12 @@ impl App {
             if busy {
                 continue;
             }
+            // another project's app runs from the checkout: wait for the pull
+            if self.waits_for_pull(it) {
+                self.awaiting_pull.insert(it.path.clone());
+                continue;
+            }
+            self.awaiting_pull.remove(&it.path);
             if !self
                 .check_tried
                 .insert((it.path.clone(), it.fm.reconciled_for.clone()))
@@ -11192,6 +11267,124 @@ mod tests {
         );
     }
 
+    // ---- automatic checks wait for the pull (commands-mode spaces) ---------------------
+
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Alpha, sent, its repo a git repo with a run guide in commands mode, PR 42
+    /// merged and reconciled but not checked, its merge commit (returned) on a
+    /// side branch the checkout does not have yet.
+    fn merged_but_not_pulled(fx: &mut Fx) -> (PathBuf, PathBuf, String) {
+        with_capture(fx, false, true);
+        let repo = fx._tmp.path().join("app-repo");
+        fs::create_dir_all(repo.join(".helmsmith")).unwrap();
+        fs::write(
+            repo.join(".helmsmith/run.md"),
+            "---\nstart: exit 1\nurl: http://127.0.0.1:9\n---\n",
+        )
+        .unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "c0"]);
+        git_in(&repo, &["checkout", "-q", "-b", "side"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "c1"]);
+        let sha = git_in(&repo, &["rev-parse", "HEAD"]);
+        git_in(&repo, &["checkout", "-q", "main"]);
+        let alpha = sent_with_criteria(fx, "Alpha");
+        let mut it = Store::load(&alpha).unwrap();
+        it.fm.repo = Some(repo.clone());
+        it.fm.reconciled_for = vec![42];
+        it.body.push_str("\n## Artifacts\n- pr: #42\n");
+        Store::save_force(&mut it).unwrap();
+        fx.app.pr_states.insert(
+            (repo.clone(), "#42".into()),
+            crate::progress::PrState::Merged,
+        );
+        fx.app.rescan();
+        (alpha, repo, sha)
+    }
+
+    #[test]
+    fn an_automatic_check_waits_until_the_merge_is_pulled() {
+        let mut fx = setup("agy.jsonl");
+        let (alpha, repo, sha) = merged_but_not_pulled(&mut fx);
+        fx.app
+            .pr_merge_commits
+            .insert((repo.clone(), "#42".into()), sha);
+        fx.app.check_due();
+        assert!(
+            !fx.app.check_tried.iter().any(|(p, _)| *p == alpha),
+            "no check before the pull"
+        );
+        let it = Store::load(&alpha).unwrap();
+        assert!(it.fm.checked_for.is_empty(), "the merged set is not spent");
+        let label = crate::progress::progress(&it, &fx.app.evidence_for(&it))
+            .unwrap()
+            .label;
+        assert!(label.contains("waiting for a pull"), "{label}");
+        git_in(&repo, &["merge", "-q", "--ff-only", "side"]);
+        fx.app.check_due();
+        assert!(
+            fx.app.check_tried.contains(&(alpha.clone(), vec![42])),
+            "pulled: the check starts"
+        );
+        assert!(!fx.app.awaiting_pull.contains(&alpha));
+        wait_check_end(&alpha);
+    }
+
+    #[test]
+    fn a_merge_commit_not_yet_known_also_waits() {
+        let mut fx = setup("agy.jsonl");
+        let (alpha, _, _) = merged_but_not_pulled(&mut fx);
+        fx.app.check_due();
+        assert!(!fx.app.check_tried.iter().any(|(p, _)| *p == alpha));
+        assert!(fx.app.awaiting_pull.contains(&alpha));
+    }
+
+    #[test]
+    fn x_by_hand_is_not_gated() {
+        let mut fx = setup("agy.jsonl");
+        let (alpha, _, _) = merged_but_not_pulled(&mut fx);
+        fx.app.reveal(&alpha);
+        key(&mut fx.app, KeyCode::Char('X'));
+        assert!(
+            fx.app
+                .message
+                .clone()
+                .unwrap_or_default()
+                .contains("checking"),
+            "{:?}",
+            fx.app.message
+        );
+        wait_check_end(&alpha);
+    }
+
+    #[test]
+    fn work_mode_spaces_are_not_gated() {
+        let mut fx = setup("agy.jsonl");
+        let (alpha, repo, _) = merged_but_not_pulled(&mut fx);
+        fs::remove_file(repo.join(".helmsmith/run.md")).unwrap();
+        fs::write(repo.join(".helmsmith/capture.md"), CAPTURE_GUIDE).unwrap();
+        fx.app.check_due();
+        assert!(
+            fx.app.check_tried.contains(&(alpha.clone(), vec![42])),
+            "skoolscout's slots merge develop themselves"
+        );
+        wait_check_end(&alpha);
+    }
+
     // ---- follow-ups ------------------------------------------------------------------
 
     #[test]
@@ -11384,6 +11577,7 @@ mod tests {
                     state: crate::progress::PrState::Open,
                     branch: String::new(),
                     title: String::new(),
+                    merge_commit: None,
                 }],
             )],
         );
@@ -11809,6 +12003,7 @@ mod tests {
                     state: crate::progress::PrState::Open,
                     branch: String::new(),
                     title: String::new(),
+                    merge_commit: None,
                 }],
             )],
         );
@@ -11927,6 +12122,7 @@ mod tests {
             state: crate::progress::PrState::Merged,
             branch: String::new(),
             title: String::new(),
+            merge_commit: None,
         };
         // the original's search answered (and found the follow-up's #77);
         // the follow-up's has not

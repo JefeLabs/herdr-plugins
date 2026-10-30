@@ -371,12 +371,15 @@ fn pr_info_reads_the_title_too() {
     let gh = fixtures().join("fake-gh.sh");
     assert_eq!(
         pr_info(&gh, tmp.path(), "#7", &env),
-        (PrState::Merged, Some("Notify the family".to_string()))
+        (PrState::Merged, Some("Notify the family".to_string()), None)
     );
-    assert_eq!(pr_info(&gh, tmp.path(), "#9", &env), (PrState::Open, None));
+    assert_eq!(
+        pr_info(&gh, tmp.path(), "#9", &env),
+        (PrState::Open, None, None)
+    );
     assert_eq!(
         pr_info(&gh, tmp.path(), "#8", &env),
-        (PrState::Unknown, None)
+        (PrState::Unknown, None, None)
     );
 }
 
@@ -585,6 +588,7 @@ fn poller_reports_a_prs_state_and_title() {
             target: "#7".into(),
             state: PrState::Merged,
             title: Some("Notify the family".into()),
+            merge_commit: None,
         }]
     );
 }
@@ -737,13 +741,15 @@ fn prs_are_found_by_the_file_names_they_mention() {
                 number: 5828,
                 state: PrState::Merged,
                 branch: "feature/org/office-hours--meeting-request-backend".into(),
-                title: "Advisor meeting requests (backend)".into()
+                title: "Advisor meeting requests (backend)".into(),
+                merge_commit: None,
             },
             FoundPr {
                 number: 5832,
                 state: PrState::Open,
                 branch: String::new(),
-                title: String::new()
+                title: String::new(),
+                merge_commit: None,
             }
         ]
     );
@@ -950,4 +956,53 @@ fn the_card_counts_open_follow_ups() {
     };
     let (_, label, _) = p(ALL_TICKED_ONE_PR, &two);
     assert_eq!(label, "✓ complete · 2 follow-ups");
+}
+
+// ---- waiting for the pull: merge commits and the card -------------------------------
+
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[test]
+fn the_card_says_when_it_waits_for_a_pull() {
+    let ev = Evidence {
+        prs: vec![(42, PrState::Merged)],
+        awaiting_pull: true,
+        ..Default::default()
+    };
+    let (_, label, _) = p(
+        "## Acceptance criteria\n- [ ] works\n\n## Artifacts\n- pr: #42\n",
+        &ev,
+    );
+    assert!(label.ends_with(" · waiting for a pull"), "{label}");
+}
+
+#[test]
+fn pr_info_reads_the_merge_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("prs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("42"), "MERGED").unwrap();
+    fs::write(dir.join("42.merge"), SHA).unwrap();
+    let env = vec![("FAKE_GH_DIR".to_string(), dir.display().to_string())];
+    let gh = fixtures().join("fake-gh.sh");
+    let (state, _, merge) = herdr_intents::progress::pr_info(&gh, tmp.path(), "#42", &env);
+    assert_eq!(state, PrState::Merged);
+    assert_eq!(merge.as_deref(), Some(SHA));
+}
+
+#[test]
+fn found_prs_carry_their_merge_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("prs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("search-p.md.json"),
+        format!(r#"[{{"number":7,"state":"MERGED","mergeCommit":{{"oid":"{SHA}"}}}},{{"number":8,"state":"MERGED","mergeCommit":{{"oid":"--upload-pack=x"}}}}]"#),
+    )
+    .unwrap();
+    let env = vec![("FAKE_GH_DIR".to_string(), dir.display().to_string())];
+    let gh = fixtures().join("fake-gh.sh");
+    let found = prs_mentioning(&gh, tmp.path(), "p.md", &env);
+    assert_eq!(found[0].merge_commit.as_deref(), Some(SHA));
+    assert_eq!(found[1].merge_commit, None, "only a commit hash is taken");
 }
