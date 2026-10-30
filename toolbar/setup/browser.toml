@@ -1,0 +1,8 @@
+# Opens in a Herdr pane beside the work pane, at full size and speed;
+# selecting it again closes that pane.
+[[tool]]
+id      = "browser"
+name    = "Browser"
+icon    = "@ICON@"
+command = ["terminal-browser", "open"]
+open    = "pane"

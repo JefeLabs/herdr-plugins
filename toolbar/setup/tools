@@ -1,0 +1,14 @@
+# The toolbar's tools, in the order the installer's walk-through lists them
+# (the bar's own order is in `order`). One line each:
+#   id|name|summary|ticked (1/0)|needs (programs, see programs)|Nerd Font icon (a TOML escape)|text icon
+# Each tool's [[tool]] entry is <id>.toml beside this file.
+intents|Intents|capture and send intents|1||\uf0eb|✎
+issues|GitHub issues|gh dash|1|gh gh-dash|\U000F09EE|◉
+db|Database|lazysql|1|lazysql|\ueace|▤
+files|Files|yazi|1|yazi|\uea83|▭
+jira|Jira|jira|0|jira-cli|\uef56|◆
+browser|Browser|terminal-browser|1|terminal-browser|\uf488|◎
+web|Browser in toolbar|(experimental)|0|terminal-browser|\ueaae|◍
+editor|Editor|Neovim|1|neovim|\uf36f|◫
+usage|Usage|procs, oxker, dua|1|procs oxker dua|\uf463|▤
+terminal|Terminal|a shell in a pane|1||\uea85|▣

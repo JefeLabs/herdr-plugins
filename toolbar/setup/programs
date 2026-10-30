@@ -1,0 +1,17 @@
+# The programs the tools need, and how the walk-through installs each one:
+#   program|command it is found by|Homebrew formula (cask:<name> for a cask)|mise tool|curl
+# curl is `pinned` (a pinned download in install.sh, named by the command),
+# `script:<url>` (the program's own installer), `gh-ext:<repo>` (a gh
+# extension) or -. A - elsewhere means that installer has no way to get it.
+# mise names are mise registry names where it has one (gh is an alias of
+# github-cli); the rest use mise's GitHub-release backend.
+gh|gh|gh|gh|pinned
+gh-dash|gh-dash|-|-|gh-ext:dlvhdr/gh-dash
+lazysql|lazysql|lazysql|github:jorgerojas26/lazysql|pinned
+yazi|yazi|yazi|yazi|pinned
+jira-cli|jira|ankitpokhrel/jira-cli/jira-cli|github:ankitpokhrel/jira-cli|pinned
+terminal-browser|terminal-browser|cask:terminal-browser|-|script:https://terminal-browser.sh/install
+neovim|nvim|neovim|neovim|pinned
+procs|procs|procs|github:dalance/procs|pinned
+oxker|oxker|oxker|oxker|pinned
+dua|dua|dua-cli|dua|pinned

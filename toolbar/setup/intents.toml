@@ -1,0 +1,5 @@
+[[tool]]
+id      = "intents"
+name    = "Intents"
+icon    = "@ICON@"
+command = ["@INTENTS@"]

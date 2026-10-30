@@ -1,0 +1,5 @@
+[[tool]]
+id      = "issues"
+name    = "GitHub issues"
+icon    = "@ICON@"
+command = ["gh", "dash"]

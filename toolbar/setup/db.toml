@@ -1,0 +1,6 @@
+[[tool]]
+id      = "db"
+name    = "Database"
+icon    = "@ICON@"
+command = ["lazysql"]
+cwd     = "~"
