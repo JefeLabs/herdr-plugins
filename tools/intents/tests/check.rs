@@ -124,7 +124,7 @@ fn an_owners_tick_is_never_unticked() {
         ),
     )
     .unwrap();
-    assert_eq!(ticks(&it.path)[1], true, "the owner's tick stays");
+    assert!(ticks(&it.path)[1], "the owner's tick stays");
     assert_eq!(applied.created.len(), 1, "the gap is still filed");
 }
 
@@ -141,7 +141,7 @@ fn a_check_tick_is_unticked_when_it_later_fails() {
         ),
     )
     .unwrap();
-    assert_eq!(ticks(&it.path)[0], true);
+    assert!(ticks(&it.path)[0]);
     let applied = apply(
         &s,
         &it.path,
@@ -152,7 +152,7 @@ fn a_check_tick_is_unticked_when_it_later_fails() {
     )
     .unwrap();
     assert_eq!(applied.unticked, 1);
-    assert_eq!(ticks(&it.path)[0], false);
+    assert!(!ticks(&it.path)[0]);
     assert!(Store::load(&it.path).unwrap().fm.check_ticks.is_empty());
 }
 
@@ -170,7 +170,7 @@ fn an_owner_untick_is_never_ticked_again() {
         ),
     )
     .unwrap();
-    assert_eq!(ticks(&it.path)[0], false);
+    assert!(!ticks(&it.path)[0]);
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn applying_keeps_an_edit_made_during_the_check() {
         "{}",
         now.body
     );
-    assert_eq!(ticks(&it.path)[0], true);
+    assert!(ticks(&it.path)[0]);
 }
 
 #[test]
