@@ -439,13 +439,8 @@ fn every_handoff_says_edge_cases_are_the_agents_and_asks_for_pr_lines() {
             h.name
         );
         assert!(
-            p.contains("`- demo: <story-id> (criteria: <numbers>)`"),
-            "{}: {p}",
-            h.name
-        );
-        assert!(
-            p.contains("The numbers count this intent's own acceptance criteria from 1"),
-            "{}: {p}",
+            !p.contains("- demo:"),
+            "hand-offs no longer ask for app-demos lines: {}: {p}",
             h.name
         );
         assert!(

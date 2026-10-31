@@ -303,7 +303,6 @@ pub fn apply(path: &Path, body: &str, merged: &[u64], root: &Path) -> anyhow::Re
     rotate_backups(path)?;
     std::fs::copy(path, backup_path(path))?;
     let kept = keep_left_out(&it.body, body);
-    let kept = remap_demos(&it.body, &kept);
     let kept = remap_shows(&it.body, &kept);
     it.body = owner_ticks(&it.body, &kept);
     let own = path
@@ -490,52 +489,6 @@ pub fn own_artifacts(before: &str, after: &str) -> String {
         (None, None) => {}
     }
     join_sections(new)
-}
-
-/// `after` with each demo line that is unchanged from `before` renumbered to
-/// point at the same acceptance criteria (matched by wording) in `after`; a
-/// criterion that is gone drops out. Lines the agent wrote or changed stand.
-pub fn remap_demos(before: &str, after: &str) -> String {
-    use crate::store::{criteria, criterion_key};
-    let old: Vec<String> = criteria(before)
-        .iter()
-        .map(|c| criterion_key(&c.text))
-        .collect();
-    let new: Vec<String> = criteria(after)
-        .iter()
-        .map(|c| criterion_key(&c.text))
-        .collect();
-    let old_lines: Vec<&str> = before.lines().map(str::trim).collect();
-    let mut out: Vec<String> = Vec::new();
-    for line in after.lines() {
-        let target = line.trim().strip_prefix("- demo:").map(str::trim);
-        match target {
-            Some(t) if old_lines.contains(&line.trim()) => {
-                let (id, nums) = crate::demos::demo_target(t);
-                let moved: Vec<String> = nums
-                    .iter()
-                    .filter_map(|n| old.get(n.checked_sub(1)?))
-                    .filter_map(|key| new.iter().position(|k| k == key))
-                    .map(|i| (i + 1).to_string())
-                    .collect();
-                let indent = &line[..line.len() - line.trim_start().len()];
-                if moved.is_empty() {
-                    out.push(format!("{indent}- demo: {id}"));
-                } else {
-                    out.push(format!(
-                        "{indent}- demo: {id} (criteria: {})",
-                        moved.join(", ")
-                    ));
-                }
-            }
-            _ => out.push(line.to_string()),
-        }
-    }
-    let mut text = out.join("\n");
-    if after.ends_with('\n') {
-        text.push('\n');
-    }
-    text
 }
 
 /// `after` with each story's `- shows:` line that is unchanged from `before`

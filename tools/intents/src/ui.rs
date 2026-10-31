@@ -899,7 +899,6 @@ mod tests {
             open,
             prs: &[],
             prs_selected: 0,
-            demos_selected: 0,
             evidence: &[],
             evidence_selected: 0,
             results: &[],
@@ -967,16 +966,10 @@ mod tests {
     ) -> (Terminal<TestBackend>, Vec<String>) {
         let it = intent_with(LISTS_BODY);
         let prs = lists_prs();
-        let found = [
-            crate::store::Artifact {
-                kind: "demo".into(),
-                target: "story-b".into(),
-            },
-            crate::store::Artifact {
-                kind: "adr".into(),
-                target: "docs/adr/1.md".into(),
-            },
-        ];
+        let found = [crate::store::Artifact {
+            kind: "adr".into(),
+            target: "docs/adr/1.md".into(),
+        }];
         let view = DetailView {
             intent: &it,
             attachments: &[],
@@ -992,7 +985,6 @@ mod tests {
             open,
             prs: &prs,
             prs_selected: selected,
-            demos_selected: selected,
             evidence: &[],
             evidence_selected: 0,
             results: &[],
@@ -1022,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_requests_and_demos_have_their_own_sections() {
+    fn pull_requests_have_their_own_section_and_demos_none() {
         let (_t, rows) = lists_detail(Pane::Tree, Pane::Criteria, 0);
         let all = rows.join("\n");
         let titles = [
@@ -1031,12 +1023,12 @@ mod tests {
             "▸ Preconditions (1/1)",
             "▾ Acceptance criteria (1/2)",
             "▸ Stories & Videos (0)",
-            "▸ Demo Videos (1 linked, 1 found)",
-            "▸ Artifacts (3 linked, 1 found)",
+            "▸ Artifacts (4 linked, 1 found)",
             "▸ Pull requests (1/2 merged, 1 found)",
         ];
         let at: Vec<usize> = titles.iter().map(|t| row_of(&rows, t)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "in this order:\n{all}");
+        assert!(!all.contains("Demo Videos"), "{all}");
     }
 
     #[test]
@@ -1066,19 +1058,6 @@ mod tests {
     }
 
     #[test]
-    fn the_demos_section_lists_linked_then_found_stories() {
-        let (_t, rows) = lists_detail(Pane::Demos, Pane::Demos, 0);
-        let all = rows.join("\n");
-        let linked = row_of(&rows, "▶ story-a (criteria: 1)");
-        let found = row_of(&rows, "▶ story-b   (found · L links)");
-        assert!(linked < found, "{all}");
-        assert!(
-            !all.contains("#5828") && !all.contains("docs/spec.md"),
-            "{all}"
-        );
-    }
-
-    #[test]
     fn artifacts_keep_the_rest() {
         let (_t, rows) = lists_detail(Pane::Artifacts, Pane::Artifacts, 0);
         let all = rows.join("\n");
@@ -1086,25 +1065,24 @@ mod tests {
             "spec     docs/spec.md",
             "plan     docs/plan.md",
             "issue    #5833",
+            "demo     story-a (criteria: 1)",
             "adr?     docs/adr/1.md   (found · L links)",
         ] {
             assert!(rows.iter().any(|r| r == line), "missing {line:?}:\n{all}");
         }
-        for moved in ["#5828", "story-a", "story-b"] {
-            assert!(
-                !all.contains(moved),
-                "{moved:?} has its own section:\n{all}"
-            );
-        }
+        assert!(
+            !all.contains("#5828"),
+            "a pull request has its own section:\n{all}"
+        );
     }
 
     #[test]
-    fn empty_pull_request_and_demo_sections_say_so() {
+    fn an_empty_pull_requests_section_says_so() {
         let it = intent_with(SECTIONS_BODY.replace("- spec: docs/spec.md\n", "").as_str());
         let (_t, rows) = detail(&it, Pane::Tree, Pane::PullRequests, 80, 24);
         let all = rows.join("\n");
         assert!(all.contains("▾ Pull requests (0)"), "{all}");
-        assert!(all.contains("▸ Demo Videos (0)"), "{all}");
+        assert!(!all.contains("Demo Videos"), "{all}");
         assert!(all.contains("none yet"), "{all}");
     }
 
@@ -1138,9 +1116,9 @@ mod tests {
         assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 3, "{all}");
         assert_eq!(row_of(&rows, "▾ Acceptance criteria"), desc + 4, "{all}");
         // the stories, which name criteria by number, come right after them
-        assert_eq!(row_of(&rows, "▸ Stories"), 17, "{all}");
-        assert_eq!(row_of(&rows, "▸ Demo Videos"), 18, "{all}");
+        assert_eq!(row_of(&rows, "▸ Stories"), 18, "{all}");
         assert_eq!(row_of(&rows, "▸ Artifacts"), 19, "{all}");
+        assert!(!all.contains("Demo Videos"), "{all}");
         assert_eq!(row_of(&rows, "▸ Pull requests"), 20, "{all}");
         assert_eq!(row_of(&rows, "▸ Evidence"), 21, "{all}");
         assert_eq!(row_of(&rows, "▸ Missing items / Bugs"), 22, "{all}");
@@ -1213,7 +1191,6 @@ mod tests {
             open: Pane::Questions,
             prs: &[],
             prs_selected: 0,
-            demos_selected: 0,
             evidence: &[],
             evidence_selected: 0,
             results: &[],
@@ -1277,7 +1254,6 @@ pub enum Pane {
     Criteria,
     /// The intent's stories and their demo videos.
     Stories,
-    Demos,
     Questions,
     /// The decisions an agent recorded while settling the open questions.
     Decisions,
@@ -1412,7 +1388,6 @@ pub struct DetailView<'a> {
     /// Pull requests, linked first then found by the repo search.
     pub prs: &'a [PrRow],
     pub prs_selected: usize,
-    pub demos_selected: usize,
     /// The captures, as `(mark, label)`: before first, then after.
     pub evidence: &'a [(String, String)],
     pub evidence_selected: usize,
@@ -1481,7 +1456,6 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         Pane::Preconditions,
         Pane::Criteria,
         Pane::Stories,
-        Pane::Demos,
         Pane::Artifacts,
         Pane::PullRequests,
         Pane::Evidence,
@@ -1565,18 +1539,6 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             .filter(|a| list_section(&a.kind) == pane)
             .collect()
     };
-    let demo_rows: Vec<ItemRow> = [false, true]
-        .into_iter()
-        .flat_map(|found| {
-            in_section(Pane::Demos, found)
-                .into_iter()
-                .map(move |a| ItemRow {
-                    tag: "▶".into(),
-                    text: a.target.clone(),
-                    found,
-                })
-        })
-        .collect();
     let artifact_rows: Vec<ItemRow> = [false, true]
         .into_iter()
         .flat_map(|found| {
@@ -1660,11 +1622,6 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 "{} {}",
                 marker(Pane::Stories),
                 count_title("Stories & Videos", &story_rows)
-            ),
-            Pane::Demos => format!(
-                "{} {}",
-                marker(Pane::Demos),
-                count_title("Demo Videos", &demo_rows)
             ),
             Pane::Artifacts => format!(
                 "{} {}",
@@ -1755,12 +1712,10 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 buf,
             ),
             Pane::Criteria => {
-                // ▶ on the criteria an app-demo or a kept story video shows
-                let demoed: Vec<usize> = arts
+                // ▶ on the criteria a kept story video shows
+                let demoed: Vec<usize> = v
+                    .video_criteria
                     .iter()
-                    .filter(|a| a.kind.eq_ignore_ascii_case("demo"))
-                    .flat_map(|a| crate::demos::demo_target(&a.target).1)
-                    .chain(v.video_criteria.iter().copied())
                     .filter_map(|n| n.checked_sub(1))
                     .collect();
                 render_checklist(
@@ -1777,16 +1732,6 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                     buf,
                 )
             }
-            Pane::Demos => render_items(
-                &titles[i],
-                v.focus == Pane::Demos,
-                v.demos_selected,
-                &demo_rows,
-                2,
-                "none yet — app-demos stories that show the criteria working (a adds one: story-id (criteria: 1, 4))",
-                rect,
-                buf,
-            ),
             Pane::Questions => render_questions(v, &qs, &titles[i], rect, buf),
             Pane::PullRequests => render_items(
                 &titles[i],
@@ -1857,8 +1802,6 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
 pub fn list_section(kind: &str) -> Pane {
     if kind.eq_ignore_ascii_case("pr") {
         Pane::PullRequests
-    } else if kind.eq_ignore_ascii_case("demo") {
-        Pane::Demos
     } else {
         Pane::Artifacts
     }
