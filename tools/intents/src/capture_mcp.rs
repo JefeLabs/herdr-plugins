@@ -32,6 +32,9 @@ pub struct McpConfig {
     /// The log files a check may search, each from its length at agent start.
     #[serde(default)]
     pub logs: Vec<LogFile>,
+    /// A story take's cards and captions.
+    #[serde(default)]
+    pub take: Option<TakeConfig>,
 }
 
 /// What the agent is doing.
@@ -41,6 +44,48 @@ pub enum Mode {
     #[default]
     Capture,
     Check,
+    /// A story's demo video: one take, with cards and captions.
+    Story,
+}
+
+/// A story take: what its cards and captions say, and where it goes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeConfig {
+    /// The story's name, on the opening card.
+    pub title: String,
+    pub persona: String,
+    /// The criteria the story shows: (number, the intent's own text).
+    pub shows: Vec<(usize, String)>,
+    /// The story's folder: video.mp4, captions.json, steps.txt.
+    pub dir: PathBuf,
+    /// How long every card and caption stays (tests: 0); by default 3 s for
+    /// a card and 4 s for a caption.
+    #[serde(default)]
+    pub hold_ms: Option<u64>,
+}
+
+/// How long a card stays on screen, unless the take says.
+const CARD_MS: u64 = 3000;
+/// How long a caption stays on screen, unless the take says.
+const CAPTION_MS: u64 = 4000;
+/// The overlays' element ids: fixed, so each draw replaces the last.
+const CARD_ID: &str = "intents-take-card";
+const CAPTION_ID: &str = "intents-take-caption";
+const CARD_STYLE: &str = "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(14,14,20,.94);color:#fff;font:600 34px/1.35 system-ui,-apple-system,sans-serif;padding:8vw;white-space:pre-line;text-align:center;box-sizing:border-box";
+const CAPTION_STYLE: &str = "position:fixed;left:5vw;right:5vw;bottom:5vh;z-index:2147483647;background:rgba(14,14,20,.88);color:#fff;font:500 24px/1.4 system-ui,-apple-system,sans-serif;padding:16px 22px;border-radius:12px;white-space:pre-line;box-sizing:border-box";
+
+/// The page script that shows `text` in the overlay `id`: the text goes in
+/// as a JSON string literal through `textContent`, so it is never markup.
+fn overlay_script(id: &str, style: &str, text: &str) -> String {
+    let text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(() => {{ let d = document.getElementById('{id}'); if (!d) {{ d = document.createElement('div'); d.id = '{id}'; document.documentElement.appendChild(d); }} d.setAttribute('style', '{style}'); d.textContent = {text}; }})()"
+    )
+}
+
+/// The page script that takes the overlay `id` away.
+fn remove_script(id: &str) -> String {
+    format!("(() => {{ const d = document.getElementById('{id}'); if (d) d.remove(); }})()")
 }
 
 /// A log file and the byte offset the agent's run started at.
@@ -66,6 +111,7 @@ pub fn tool_names(cfg: &McpConfig) -> Vec<&'static str> {
             }
             t
         }
+        (Mode::Story, _) => vec!["browser", "take_start", "caption", "take_stop"],
     }
 }
 
@@ -386,6 +432,17 @@ fn tool_list(cfg: &McpConfig) -> serde_json::Value {
                     "required": ["criterion"]
                 }
             }),
+            "take_start" => serde_json::json!({"name": name, "description": "Start the take: recording begins with the story's opening card. Call it only once you are signed in, the starting data is set up and the page is where step 1 begins.", "inputSchema": empty}),
+            "caption" => serde_json::json!({
+                "name": name,
+                "description": "Show one acceptance criterion's caption on the recording, at the moment it is visible on the page. Only the criteria this story shows.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"criterion": {"type": "integer", "description": "The criterion's number."}},
+                    "required": ["criterion"]
+                }
+            }),
+            "take_stop" => serde_json::json!({"name": name, "description": "End the take: the closing card, then the recording stops.", "inputSchema": empty}),
             "logs" => serde_json::json!({
                 "name": name,
                 "description": "Search the app's logs for a word or phrase (ignoring case). Returns only what was logged since you started, each match with the lines after it, and keeps those lines as the proof for the criterion.",
@@ -418,6 +475,10 @@ struct Server {
     cfg: McpConfig,
     agent_browser: PathBuf,
     sized: bool,
+    /// A story take: started, and the criteria captioned so far.
+    taking: bool,
+    take_over: bool,
+    captioned: Vec<usize>,
 }
 
 impl Server {
@@ -465,6 +526,95 @@ impl Server {
         }
     }
 
+    /// Draws `text` in the overlay `id`, holds it, then takes it away.
+    fn show(&mut self, id: &str, style: &str, text: &str, ms: u64) {
+        self.run(&["eval".into(), overlay_script(id, style, text)]);
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        self.run(&["eval".into(), remove_script(id)]);
+    }
+
+    /// `take_start`, `caption` and `take_stop`: (is_error, text).
+    fn take(&mut self, name: &str, arguments: &serde_json::Value) -> (bool, String) {
+        let Some(t) = self.cfg.take.clone() else {
+            return (true, "no take here".into());
+        };
+        let hold = |default: u64| t.hold_ms.unwrap_or(default);
+        let save_captions = |captioned: &[usize]| {
+            let _ = std::fs::write(
+                t.dir.join("captions.json"),
+                serde_json::to_string(captioned).unwrap_or_else(|_| "[]".into()),
+            );
+        };
+        match name {
+            "take_start" => {
+                if self.taking || self.take_over {
+                    return (true, "the take has already started".into());
+                }
+                let _ = std::fs::create_dir_all(&t.dir);
+                let _ = std::fs::write(t.dir.join("steps.txt"), "");
+                save_captions(&[]);
+                let video = t.dir.join("video.mp4").display().to_string();
+                let (ok, text) = self.run(&["record".into(), "start".into(), video]);
+                if !ok {
+                    return (true, format!("could not start recording: {text}"));
+                }
+                self.taking = true;
+                self.show(
+                    CARD_ID,
+                    CARD_STYLE,
+                    &format!("{}\n\n{}", t.title, t.persona),
+                    hold(CARD_MS),
+                );
+                (
+                    false,
+                    "recording: follow the steps, and call caption as each criterion shows".into(),
+                )
+            }
+            "caption" => {
+                if !self.taking {
+                    return (
+                        true,
+                        "call take_start first: captions belong to the take".into(),
+                    );
+                }
+                let Some(n) = criterion(arguments) else {
+                    return (true, "caption needs the criterion's number".into());
+                };
+                let Some((_, text)) = t.shows.iter().find(|(c, _)| *c == n) else {
+                    return (true, format!("criterion {n} is not one this story shows"));
+                };
+                self.show(CAPTION_ID, CAPTION_STYLE, text, hold(CAPTION_MS));
+                self.captioned.push(n);
+                save_captions(&self.captioned);
+                (false, format!("captioned criterion {n}"))
+            }
+            _ => {
+                if !self.taking {
+                    return (true, "no take is running".into());
+                }
+                let shown: Vec<String> = t
+                    .shows
+                    .iter()
+                    .filter(|(c, _)| self.captioned.contains(c))
+                    .map(|(c, text)| format!("{c}. {text}"))
+                    .collect();
+                self.show(
+                    CARD_ID,
+                    CARD_STYLE,
+                    &format!("Shown\n\n{}", shown.join("\n")),
+                    hold(CARD_MS),
+                );
+                let (ok, text) = self.run(&["record".into(), "stop".into()]);
+                self.taking = false;
+                self.take_over = true;
+                if !ok {
+                    return (true, format!("could not stop recording: {text}"));
+                }
+                (false, "the take is over".into())
+            }
+        }
+    }
+
     /// One `tools/call`: (is_error, text).
     fn call(&mut self, name: &str, arguments: &serde_json::Value) -> (bool, String) {
         if !tool_names(&self.cfg).contains(&name) {
@@ -476,6 +626,7 @@ impl Server {
             .join(out_name(self.cfg.phase, self.cfg.shot));
         let out = out.display().to_string();
         let (ok, text) = match name {
+            "take_start" | "caption" | "take_stop" => return self.take(name, arguments),
             "record_start" => self.run(&["record".into(), "start".into(), out]),
             "record_stop" => self.run(&["record".into(), "stop".into()]),
             "screenshot" if self.cfg.mode == Mode::Check => {
@@ -544,13 +695,19 @@ impl Server {
                     Err(why) => return (true, format!("refused: {why}")),
                 };
                 let (ok, text) = self.run(&checked);
-                if ok {
+                // a take keeps only its own steps; setup and rehearsal are not kept
+                let steps = match (&self.cfg.take, self.cfg.mode) {
+                    (Some(t), Mode::Story) => self.taking.then(|| t.dir.join("steps.txt")),
+                    (_, Mode::Story) => None,
+                    _ => Some(steps_path(&self.cfg.evidence, self.cfg.phase)),
+                };
+                if ok && let Some(steps) = steps {
                     use std::io::Write;
                     let line = step_line(command, &checked[1..], &self.cfg.base_url);
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(steps_path(&self.cfg.evidence, self.cfg.phase))
+                        .open(steps)
                     {
                         let _ = writeln!(f, "{line}");
                     }
@@ -607,6 +764,9 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         cfg,
         agent_browser,
         sized: false,
+        taking: false,
+        take_over: false,
+        captioned: Vec::new(),
     };
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -751,6 +911,7 @@ mod tests {
             } else {
                 Vec::new()
             },
+            take: None,
         }
     }
 

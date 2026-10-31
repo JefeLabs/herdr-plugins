@@ -1331,6 +1331,7 @@ fn run(
                 from: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
             })
             .collect(),
+        take: None,
     };
     let config_file = req.evidence.join(".capture-mcp.json");
     let written = serde_json::to_string(&mcp_config)

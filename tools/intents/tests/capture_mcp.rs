@@ -343,3 +343,127 @@ fn a_symlinked_log_is_not_followed() {
     let (_, text) = s.call("logs", json!({"criterion": 1, "pattern": "secret"}));
     assert!(!text.contains("Subject: secret"), "{text}");
 }
+
+// ---- a story's take ---------------------------------------------------------
+
+const MARKUP: &str = "say \"hi\" </div><script>alert(1)</script>";
+
+/// A story take's server: shows criteria 1 and 3, holds nothing (tests).
+fn take_server() -> Server {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("with space/evidence");
+    let mut s = Server::spawn(
+        tmp,
+        "video",
+        json!({"mode": "story", "take": {
+            "title": "Mark reinstates Maya's withdrawn application",
+            "persona": "Mark, a tenant admin",
+            "shows": [[1, "an admin can reinstate it"], [3, MARKUP]],
+            "dir": dir,
+            "hold_ms": 0
+        }}),
+    );
+    s.open();
+    s
+}
+
+fn read_captions(s: &Server) -> Vec<u64> {
+    serde_json::from_str::<Vec<u64>>(
+        &fs::read_to_string(s.evidence.join("captions.json")).unwrap_or_else(|_| "[]".into()),
+    )
+    .unwrap()
+}
+
+fn evals(s: &Server) -> Vec<String> {
+    s.log()
+        .into_iter()
+        .filter(|l| l.contains("[eval]"))
+        .collect()
+}
+
+#[test]
+fn a_take_has_four_tools() {
+    let mut s = take_server();
+    assert_eq!(s.tools(), ["browser", "take_start", "caption", "take_stop"]);
+}
+
+#[test]
+fn a_caption_before_the_take_is_refused() {
+    let mut s = take_server();
+    let (err, t) = s.call("caption", json!({"criterion": 1}));
+    assert!(err && t.contains("take_start"), "{t}");
+}
+
+#[test]
+fn a_caption_for_a_criterion_the_story_does_not_show_is_refused() {
+    let mut s = take_server();
+    assert!(!s.call("take_start", json!({})).0);
+    let (err, t) = s.call("caption", json!({"criterion": 2}));
+    assert!(err, "{t}");
+    assert!(read_captions(&s).is_empty());
+}
+
+#[test]
+fn captions_are_recorded_in_order() {
+    let mut s = take_server();
+    assert!(!s.call("take_start", json!({})).0);
+    assert!(!s.call("caption", json!({"criterion": 3})).0);
+    assert!(!s.call("caption", json!({"criterion": 1})).0);
+    assert!(!s.call("take_stop", json!({})).0);
+    assert_eq!(read_captions(&s), vec![3, 1]);
+    let log = s.log().join("\n");
+    assert!(
+        log.contains("[record][start]") && log.contains("video.mp4"),
+        "{log}"
+    );
+    assert!(log.contains("[record][stop]"), "{log}");
+    let (err, t) = s.call("caption", json!({"criterion": 1}));
+    assert!(err, "no caption after the take: {t}");
+}
+
+#[test]
+fn a_caption_with_markup_is_shown_as_text() {
+    let mut s = take_server();
+    s.call("take_start", json!({}));
+    s.call("caption", json!({"criterion": 3}));
+    let shown = evals(&s)
+        .into_iter()
+        .find(|l| l.contains("alert(1)"))
+        .expect("the caption's script");
+    assert!(shown.contains("textContent"), "{shown}");
+    assert!(!shown.contains("innerHTML"), "{shown}");
+    assert!(
+        shown.contains(&serde_json::to_string(MARKUP).unwrap()),
+        "the text goes in as a string literal: {shown}"
+    );
+}
+
+#[test]
+fn the_cards_name_the_story_and_what_it_showed() {
+    let mut s = take_server();
+    s.call("take_start", json!({}));
+    s.call("caption", json!({"criterion": 1}));
+    s.call("take_stop", json!({}));
+    let scripts = evals(&s).join("\n");
+    assert!(scripts.contains("Mark reinstates Maya"), "{scripts}");
+    assert!(scripts.contains("Mark, a tenant admin"), "{scripts}");
+    assert!(scripts.contains("an admin can reinstate it"), "{scripts}");
+}
+
+#[test]
+fn the_agent_still_cannot_eval() {
+    let mut s = take_server();
+    let (err, _) = s.browser("eval", &["1"]);
+    assert!(err);
+}
+
+#[test]
+fn only_the_take_is_in_the_steps() {
+    let mut s = take_server();
+    assert!(!s.browser("open", &["/applications"]).0);
+    s.call("take_start", json!({}));
+    assert!(!s.browser("click", &["@e1"]).0);
+    s.call("take_stop", json!({}));
+    let steps = fs::read_to_string(s.evidence.join("steps.txt")).unwrap();
+    assert_eq!(steps.lines().collect::<Vec<_>>(), vec!["click @e1"]);
+}
