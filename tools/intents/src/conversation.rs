@@ -347,7 +347,7 @@ pub fn stories_prompt(
         p.push_str(&rule);
         p.push_str("\n\n");
     }
-    p.push_str("Reply with one fenced ```proposal block that holds only the `## Stories` section: change no other section and repeat none of them. Criteria numbers are the intent's own, counted from 1 in order across groups. If the author asks for changes, reply again the same way.\n");
+    p.push_str("When the intent already has stories, re-evaluate each against all of this: keep a story that still fits as it is, fix one that no longer matches the intent, drop one that no longer belongs, and add stories for the criteria no story shows. Reply with one fenced ```proposal block that holds only the complete `## Stories` section: change no other section and repeat none of them. Criteria numbers are the intent's own, counted from 1 in order across groups.\n");
     p
 }
 

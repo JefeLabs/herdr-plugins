@@ -1385,6 +1385,19 @@ pub fn shown_criteria(body: &str, s: &IntentStory) -> (Vec<(usize, String)>, Vec
     (shown, dropped)
 }
 
+/// The Stories section as written, heading included, when the body has one.
+pub fn stories_section(body: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim().eq_ignore_ascii_case(STORIES_HEADING))?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("## "))
+        .map_or(lines.len(), |i| start + 1 + i);
+    Some(format!("{}\n", lines[start..end].join("\n").trim_end()))
+}
+
 /// `body` with its Stories section replaced by the one in `proposal` (or the
 /// proposal itself, given without its heading), added after the acceptance
 /// criteria when there was none. Every other section stays as it is, and any
