@@ -25,6 +25,12 @@ title = "Intents"
 placement = "split"
 command = ["../../target/release/herdr-intents"]
 
+# A workspace opened in a meta repo's folder (its .helmsmith/intents/ names a
+# space) takes the space's name and opens its intents. See src/open_space.rs.
+[[events]]
+on = "workspace.created"
+command = ["../../target/release/herdr-intents", "open-space"]
+
 [[actions]]
 id = "add"
 title = "Intents: capture"

@@ -75,6 +75,25 @@ fn main() -> ExitCode {
             with_config(|cfg, dirs| app::add(cfg, dirs, title, popup, piped))
         }
         Mode::CaptureMcp(config) => herdr_intents::capture_mcp::serve(&config),
+        Mode::OpenSpace => {
+            // Herdr's workspace.created hook; the line lands in its plugin log
+            use herdr_intents::open_space;
+            let get = |k: &str| std::env::var(k).ok();
+            let event = get("HERDR_PLUGIN_EVENT_JSON");
+            let line = match open_space::event_workspace(
+                event.as_deref(),
+                get("HERDR_WORKSPACE_ID").as_deref(),
+            ) {
+                Some(id) => {
+                    let bin = get("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+                    let outcome = open_space::open(&id, open_space::cli(bin.into()));
+                    open_space::describe(&id, &outcome)
+                }
+                None => "open-space: the event names no workspace".to_string(),
+            };
+            let _ = writeln!(std::io::stdout(), "{line}");
+            Ok(())
+        }
         Mode::CaptureRun(order) => herdr_intents::capture::run_order(&order),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-intents ");
