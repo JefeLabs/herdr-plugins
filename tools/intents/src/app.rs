@@ -444,6 +444,7 @@ pub struct App {
     /// section and stays when focus leaves for the tree or the description.
     open: Pane,
     description_scroll: u16,
+    decisions_scroll: u16,
     /// mtime of our own binary at startup; a newer one on disk means a rebuild
     /// is waiting for a restart of the slot.
     pub binary_stamp: Option<std::time::SystemTime>,
@@ -541,6 +542,7 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Criteria => "criteria",
         Pane::Stories => "stories",
         Pane::Questions => "questions",
+        Pane::Decisions => "decisions",
         Pane::Artifacts => "artifacts",
         Pane::Evidence => "evidence",
         Pane::Missing => "missing",
@@ -579,6 +581,7 @@ impl App {
             focus: Pane::Tree,
             open: Pane::Criteria,
             description_scroll: 0,
+            decisions_scroll: 0,
             binary_stamp: binary_mtime(),
             newer_build: false,
             ticks: 0,
@@ -1825,6 +1828,7 @@ impl App {
 
     fn reset_pane_cursors(&mut self) {
         self.description_scroll = 0;
+        self.decisions_scroll = 0;
         self.preconditions_selected = 0;
         self.criteria_selected = 0;
         self.question_selected = 0;
@@ -2042,6 +2046,7 @@ impl App {
         if matches!(
             self.focus,
             Pane::Preconditions
+                | Pane::Decisions
                 | Pane::Criteria
                 | Pane::Stories
                 | Pane::Demos
@@ -2127,33 +2132,35 @@ impl App {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Description,
-                    Pane::Description => Pane::Preconditions,
-                    Pane::Preconditions => Pane::Criteria,
-                    Pane::Criteria => Pane::Stories,
-                    Pane::Stories => Pane::Demos,
-                    Pane::Demos => Pane::Questions,
-                    Pane::Questions => Pane::PullRequests,
-                    Pane::PullRequests => Pane::Missing,
+                    Pane::Description => Pane::Questions,
+                    Pane::Questions => Pane::Decisions,
+                    Pane::Decisions => Pane::Preconditions,
+                    Pane::Preconditions => Pane::Stories,
+                    Pane::Stories => Pane::Criteria,
+                    Pane::Criteria => Pane::Demos,
+                    Pane::Demos => Pane::Artifacts,
+                    Pane::Artifacts => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Evidence,
+                    Pane::Evidence => Pane::Missing,
                     Pane::Missing => Pane::FollowUps,
-                    Pane::FollowUps => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Evidence,
-                    Pane::Evidence => Pane::Tree,
+                    Pane::FollowUps => Pane::Tree,
                 };
                 return Flow::Continue;
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Pane::Tree => Pane::Evidence,
-                    Pane::Evidence => Pane::Artifacts,
-                    Pane::Artifacts => Pane::FollowUps,
+                    Pane::Tree => Pane::FollowUps,
                     Pane::FollowUps => Pane::Missing,
-                    Pane::Missing => Pane::PullRequests,
-                    Pane::PullRequests => Pane::Questions,
-                    Pane::Questions => Pane::Demos,
-                    Pane::Demos => Pane::Stories,
-                    Pane::Stories => Pane::Criteria,
-                    Pane::Criteria => Pane::Preconditions,
-                    Pane::Preconditions => Pane::Description,
+                    Pane::Missing => Pane::Evidence,
+                    Pane::Evidence => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Artifacts,
+                    Pane::Artifacts => Pane::Demos,
+                    Pane::Demos => Pane::Criteria,
+                    Pane::Criteria => Pane::Stories,
+                    Pane::Stories => Pane::Preconditions,
+                    Pane::Preconditions => Pane::Decisions,
+                    Pane::Decisions => Pane::Questions,
+                    Pane::Questions => Pane::Description,
                     Pane::Description => Pane::Tree,
                 };
                 return Flow::Continue;
@@ -2407,6 +2414,20 @@ impl App {
             return Flow::Continue;
         }
         match self.focus {
+            Pane::Decisions => match k.code {
+                KeyCode::Esc => self.focus = Pane::Tree,
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                    self.decisions_scroll = self
+                        .decisions_scroll
+                        .saturating_add(if k.code == KeyCode::PageDown { 5 } else { 1 })
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                    self.decisions_scroll = self
+                        .decisions_scroll
+                        .saturating_sub(if k.code == KeyCode::PageUp { 5 } else { 1 })
+                }
+                _ => {}
+            },
             Pane::Description => match k.code {
                 KeyCode::Esc => self.focus = Pane::Tree,
                 KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
@@ -6383,6 +6404,7 @@ impl App {
                             attachments: &attachments,
                             focus: self.focus,
                             description_scroll: self.description_scroll,
+                            decisions_scroll: self.decisions_scroll,
                             preconditions_selected: self.preconditions_selected,
                             criteria_selected: self.criteria_selected,
                             question_selected: self.question_selected,
@@ -6461,6 +6483,7 @@ impl App {
                 (None, Pane::Missing) => "Missing items: j/k choose · Enter go to it · Esc tree".to_string(),
                 (None, Pane::FollowUps) => "Follow-ups: j/k choose · Enter go to it · F file another · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Decisions) => "Decisions: j/k scroll · Esc tree".to_string(),
                 (None, Pane::Stories) => "Stories: j/k choose · o play the video · c copy the file · Y copy its path · O show it in Finder · r record it again · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
@@ -9896,16 +9919,17 @@ mod tests {
             "the description leaves it open"
         );
         for pane in [
-            "preconditions",
-            "criteria",
-            "stories",
-            "demos",
             "questions",
+            "decisions",
+            "preconditions",
+            "stories",
+            "criteria",
+            "demos",
+            "artifacts",
             "pull requests",
+            "evidence",
             "missing",
             "follow-ups",
-            "artifacts",
-            "evidence",
         ] {
             key(&mut fx.app, KeyCode::Tab);
             assert_eq!(fx.app.view().focus, pane);
@@ -9913,17 +9937,17 @@ mod tests {
         }
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
-        assert_eq!(fx.app.view().open, "evidence", "the last one stays open");
+        assert_eq!(fx.app.view().open, "follow-ups", "the last one stays open");
         select(&mut fx.app, "Alpha");
         assert_eq!(
             fx.app.view().open,
-            "evidence",
+            "follow-ups",
             "and stays open on the next intent"
         );
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "evidence");
+        assert_eq!(fx.app.view().open, "follow-ups");
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "artifacts");
+        assert_eq!(fx.app.view().open, "missing");
     }
 
     /// Tab from the tree to the named section.
@@ -10036,42 +10060,33 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
         assert_eq!(fx.app.view().focus, "tree");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "description");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "preconditions");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "criteria");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "stories");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "demos");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "questions");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "pull requests");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "missing");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "follow-ups");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "artifacts");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "evidence");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "tree");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "evidence");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "artifacts");
+        let order = [
+            "description",
+            "questions",
+            "decisions",
+            "preconditions",
+            "stories",
+            "criteria",
+            "demos",
+            "artifacts",
+            "pull requests",
+            "evidence",
+            "missing",
+            "follow-ups",
+            "tree",
+        ];
+        for pane in order {
+            key(&mut fx.app, KeyCode::Tab);
+            assert_eq!(fx.app.view().focus, pane);
+        }
+        // and back, from the tree
+        for pane in order.iter().rev().skip(1).chain(["tree"].iter()) {
+            key(&mut fx.app, KeyCode::BackTab);
+            assert_eq!(fx.app.view().focus, *pane);
+        }
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "follow-ups");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "missing");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "pull requests");
-        key(&mut fx.app, KeyCode::Tab);
-        // j/k in the tree still move the selection only while the tree has focus
+        // j/k in a section never move the tree's selection
         key(&mut fx.app, KeyCode::Char('j'));
         assert_eq!(
             fx.app.view().rows[fx.app.view().selected].label,
@@ -10195,6 +10210,36 @@ mod tests {
     }
 
     #[test]
+    fn decisions_have_their_own_section_and_leave_the_description() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body =
+            "## Description\nalpha body\n\n## Decisions\n\n- D1 (owner): paid goes to Accepted.\n"
+                .into();
+        Store::save(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        let text = render(&fx.app, 100, 30);
+        assert!(
+            !text.contains("D1 (owner)"),
+            "not in the description: {text}"
+        );
+        // tree → description → questions → decisions
+        for _ in 0..3 {
+            key(&mut fx.app, KeyCode::Tab);
+        }
+        assert_eq!(fx.app.view().focus, "decisions");
+        let text = render(&fx.app, 100, 30);
+        assert!(text.contains("Decisions"), "{text}");
+        assert!(
+            text.contains("D1 (owner): paid goes to Accepted."),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn detail_shows_every_section_title_and_opens_one() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
@@ -10210,8 +10255,8 @@ mod tests {
             assert!(text.contains(title), "pane {title} missing: {text}");
         }
         assert!(!text.contains("? a?"), "questions start collapsed: {text}");
-        // tree → description → preconditions → criteria → stories → demos → questions
-        for _ in 0..6 {
+        // tree → description → questions
+        for _ in 0..2 {
             key(&mut fx.app, KeyCode::Tab);
         }
         let text = render(&fx.app, 100, 24);
@@ -12531,7 +12576,11 @@ mod tests {
         assert!(shown.contains("Follow-ups (1)"), "{shown}");
         assert!(shown.contains("→ Name the meeting too"), "{shown}");
         key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "artifacts");
+        assert_eq!(
+            fx.app.view().focus,
+            "tree",
+            "follow-ups is the last section"
+        );
     }
 
     #[test]
@@ -13388,13 +13437,13 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_section_follows_pull_requests() {
+    fn the_missing_section_follows_evidence() {
         let mut fx = setup("agy.jsonl");
         let alpha = sent_with_criteria(&mut fx, "Alpha");
         let key2 = crate::store::criterion_key("the email names the meeting");
         missing_item(&mut fx, &alpha, &key2, false);
         select(&mut fx.app, "Alpha");
-        tab_to(&mut fx.app, "pull requests");
+        tab_to(&mut fx.app, "evidence");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "missing");
         let shown = render(&fx.app, 100, 30);

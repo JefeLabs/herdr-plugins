@@ -1,14 +1,17 @@
 ---
 source: tools/intents/src/app.rs
-assertion_line: 13359
+assertion_line: 13481
 expression: "render(&fx.app, 80, 24)"
 ---
 ▾ Inbox (1)            │# Alpha
   ○ In the inbox ?2    │kind: idea   state: sent
 ▾ skoolscout (3)       │ Description ───────────────────────────────────────────
   → Alpha              │x
-  ○ Beta               │ ▸ Preconditions (0/0) ─────────────────────────────────
-  ◐ Missing meeting nam│ ▾ Acceptance criteria (0/2) ───────────────────────────
+  ○ Beta               │ ▸ Open questions (0 open) ─────────────────────────────
+  ◐ Missing meeting nam│ ▸ Decisions (none) ────────────────────────────────────
+                       │ ▸ Preconditions (0/0) ─────────────────────────────────
+                       │ ▸ Stories (0) ─────────────────────────────────────────
+                       │ ▾ Acceptance criteria (0/2) ───────────────────────────
                        │[ ] ✓ the primary contact gets an email
                        │[ ] ✗ the email names the meeting
                        │
@@ -17,13 +20,10 @@ expression: "render(&fx.app, 80, 24)"
                        │
                        │
                        │
-                       │
-                       │ ▸ Stories (0) ─────────────────────────────────────────
                        │ ▸ Demo Videos (0) ─────────────────────────────────────
-                       │ ▸ Open questions (0 open) ─────────────────────────────
+                       │ ▸ Artifacts (0) ───────────────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────
+                       │ ▸ Evidence (2) ────────────────────────────────────────
                        │ ▸ Missing items / Bugs (1) ────────────────────────────
                        │ ▸ Follow-ups (0) ──────────────────────────────────────
-                       │ ▸ Artifacts (0) ───────────────────────────────────────
-                       │ ▸ Evidence (2) ────────────────────────────────────────
 checked 10-30: only the contact got it · o proof
