@@ -1053,8 +1053,23 @@ impl CaptureJob {
     /// default), `work env`, the guide's seed stories, the agent (claude,
     /// limited to agent-browser), then `work finish`, whatever happened.
     pub fn spawn(req: CaptureRequest, env: Vec<(String, String)>, managed_mcp: bool) -> CaptureJob {
+        let env = with_nvm_path(env);
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        // a bare name is found on that PATH (nvm's default Node first), so the
+        // programs a global npm install put under nvm are found too
         let bin = |key: &str, default: &str| {
-            crate::progress::tool_bin(&env, key, Some(default)).unwrap_or_else(|| default.into())
+            let b = crate::progress::tool_bin(&env, key, Some(default))
+                .unwrap_or_else(|| default.into());
+            if b.components().count() == 1 {
+                find_on_path(&path, &b.to_string_lossy()).unwrap_or(b)
+            } else {
+                b
+            }
         };
         let intents = crate::progress::tool_bin(&env, "INTENTS_BIN_PATH", None)
             .or_else(|| std::env::current_exe().ok())
@@ -1250,7 +1265,12 @@ fn run(
                         }
                         return failed(format!("work start: {code}"));
                     }
-                    Err(e) => return failed(format!("work start: {e}")),
+                    Err(e) => {
+                        return failed(format!(
+                            "work start: {}",
+                            spawn_error(&r.work, &e, "npm i -g @helmsmith/workbrokr")
+                        ));
+                    }
                 }
             }
             let Some(area) = area else {
@@ -1594,7 +1614,12 @@ fn run_agent(
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return Err(format!("claude: {e}")),
+        Err(e) => {
+            return Err(format!(
+                "claude: {}",
+                spawn_error(&r.claude, &e, "install Claude Code")
+            ));
+        }
     };
     let pgid = child.id() as i32;
     // registered under the lock cancel() reads: either it sees the agent and
@@ -1995,6 +2020,111 @@ fn runner_pid(evidence: &Path) -> Option<i32> {
         .parse()
         .ok()?;
     (pid > 0 && pid_alive(pid)).then_some(pid)
+}
+
+/// The `bin` folder of nvm's default Node, when nvm is installed (`NVM_DIR`,
+/// else `~/.nvm`), from the job's environment or this process's.
+fn nvm_default_bin(env: &[(String, String)]) -> Option<PathBuf> {
+    let get = |k: &str| {
+        env.iter()
+            .find(|(x, _)| x == k)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(k).ok())
+            .filter(|v| !v.is_empty())
+    };
+    let dir = get("NVM_DIR")
+        .map(PathBuf::from)
+        .or_else(|| get("HOME").map(|h| Path::new(&h).join(".nvm")))?;
+    nvm_bin(&dir)
+}
+
+/// The `bin` folder of the Node version nvm's `default` alias names, in the
+/// nvm folder `nvm_dir`: an exact version (`v24.18.0`), a partial one (`24`,
+/// the newest installed match), `node`/`stable` (the newest installed), or
+/// another alias (`lts/*`), followed a few hops. `None` when nothing matches.
+pub fn nvm_bin(nvm_dir: &Path) -> Option<PathBuf> {
+    let alias = nvm_dir.join("alias");
+    let mut want = std::fs::read_to_string(alias.join("default"))
+        .ok()?
+        .trim()
+        .to_string();
+    for _ in 0..4 {
+        match std::fs::read_to_string(alias.join(&want)) {
+            Ok(next) if !next.trim().is_empty() => want = next.trim().to_string(),
+            _ => break,
+        }
+    }
+    let parse = |v: &str| -> Option<Vec<u64>> {
+        v.trim_start_matches('v')
+            .split('.')
+            .map(|n| n.parse().ok())
+            .collect()
+    };
+    let installed = nvm_dir.join("versions/node");
+    let mut versions: Vec<(Vec<u64>, String)> = std::fs::read_dir(&installed)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            parse(&name).map(|v| (v, name))
+        })
+        .collect();
+    versions.sort();
+    let chosen = if matches!(want.as_str(), "node" | "stable") {
+        versions.last()
+    } else {
+        let prefix = parse(&want)?;
+        versions.iter().rev().find(|(v, _)| v.starts_with(&prefix))
+    }?;
+    let bin = installed.join(&chosen.1).join("bin");
+    bin.is_dir().then_some(bin)
+}
+
+/// `env` with nvm's default Node first on `PATH`, when nvm is installed and
+/// it is not already there. Herdr starts the tool without the shell's nvm
+/// setup, so `work` and the other global npm tools would not be found.
+fn with_nvm_path(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    let Some(bin) = nvm_default_bin(&env) else {
+        return env;
+    };
+    let path = env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    if path.split(':').any(|p| Path::new(p) == bin) {
+        return env;
+    }
+    env.retain(|(k, _)| k != "PATH");
+    env.push(("PATH".into(), format!("{}:{path}", bin.display())));
+    env
+}
+
+/// The first executable file called `name` in the folders of `path`.
+fn find_on_path(path: &str, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join(name))
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// A program that could not be started, in words: a missing one says where
+/// the tool looked and how to install it.
+fn spawn_error(bin: &Path, e: &std::io::Error, install: &str) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "no `{}` program found, neither on the PATH Herdr gave this tool nor in nvm's default Node ({install})",
+            bin.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+        )
+    } else {
+        e.to_string()
+    }
 }
 
 /// A check's or a story run's current stage, kept in its folder for the card.

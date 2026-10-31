@@ -152,6 +152,8 @@ pub struct Evidence {
     pub check_stage: Option<String>,
     /// A story recording by hand running: what it is doing now.
     pub story_stage: Option<String>,
+    /// Why its last check could not run (no stack, no `work`, …), while none runs.
+    pub check_failure: Option<String>,
     /// Follow-ups filed for it that are not yet complete.
     pub open_follow_ups: usize,
     /// Its automatic check waits until the merged code is pulled.
@@ -277,6 +279,12 @@ const VERIFIED: f32 = 2.0;
 /// (not while a check runs).
 /// `· waiting for a pull` while its automatic check waits for the merged code.
 fn pull_note(label: String, ev: &Evidence) -> String {
+    // a check that could not run says so on the card, not only in Evidence
+    let label = if ev.check_failure.is_some() && activity(ev).is_none() {
+        format!("{label} · check couldn't run")
+    } else {
+        label
+    };
     if ev.awaiting_pull && ev.checking.is_none() {
         format!("{label} · waiting for a pull")
     } else {
