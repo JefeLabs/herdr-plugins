@@ -124,6 +124,50 @@ pub const READY_TIMEOUT_SECS: u64 = 600;
 /// How long the guide's `stop` may take, unless the guide says.
 pub const STOP_TIMEOUT_SECS: u64 = 60;
 
+/// The run guide's `## Stories` section: the personas stories may use, and
+/// the section itself (what setup may create, other rules) for the agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuideStories {
+    /// The names under `### Personas`, from `- <Name>: …` lines.
+    pub personas: Vec<String>,
+    /// The whole section, heading included.
+    pub text: String,
+}
+
+/// The guide's Stories section, when it has one that names a persona.
+pub fn guide_stories(guide: &CaptureGuide) -> Option<GuideStories> {
+    let mut text = String::new();
+    let mut inside = false;
+    for line in guide.body.lines() {
+        if line.starts_with("## ") {
+            inside = line.trim().eq_ignore_ascii_case("## Stories");
+        }
+        if inside {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    let mut personas = Vec::new();
+    let mut in_personas = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("### ") {
+            in_personas = t.eq_ignore_ascii_case("### Personas");
+            continue;
+        }
+        if in_personas
+            && let Some((name, _)) = t.strip_prefix("- ").and_then(|r| r.split_once(':'))
+            && !name.trim().is_empty()
+        {
+            personas.push(name.trim().to_string());
+        }
+    }
+    (!personas.is_empty()).then(|| GuideStories {
+        personas,
+        text: text.trim_end().to_string() + "\n",
+    })
+}
+
 /// Reads `<repo>/.helmsmith/run.md` (else the older `capture.md`): YAML front
 /// matter, then the body. `start` makes it any project's commands; else
 /// `default_area` makes it skoolscout's work slots.

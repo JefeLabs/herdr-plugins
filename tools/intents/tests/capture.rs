@@ -22,6 +22,30 @@ fn guide_in(files: &[(&str, &str)]) -> tempfile::TempDir {
 }
 
 #[test]
+fn a_guide_names_its_story_personas() {
+    use herdr_intents::capture::{guide_stories, read_guide};
+    let run = "---\nstart: ./serve\nurl: http://127.0.0.1:{port}\n---\nSign in at /auth.\n\n## Stories\n### Personas\n- Mark: tenant admin, signs in as mark@example.test\n- Pat: a parent, signs in as pat@example.test\n### Setup may create\n- applications and notes, never people\n\n## Avoid\n- billing\n";
+    let tmp = guide_in(&[("run.md", run)]);
+    let s = guide_stories(&read_guide(tmp.path()).unwrap()).unwrap();
+    assert_eq!(s.personas, vec!["Mark", "Pat"]);
+    assert!(s.text.starts_with("## Stories"), "{}", s.text);
+    assert!(s.text.contains("never people"));
+    assert!(
+        !s.text.contains("billing"),
+        "only its own section: {}",
+        s.text
+    );
+}
+
+#[test]
+fn a_guide_without_a_stories_section_has_no_personas() {
+    use herdr_intents::capture::{guide_stories, read_guide};
+    let run = "---\nstart: ./serve\nurl: http://127.0.0.1:{port}\n---\nSign in at /auth.\n";
+    let tmp = guide_in(&[("run.md", run)]);
+    assert_eq!(guide_stories(&read_guide(tmp.path()).unwrap()), None);
+}
+
+#[test]
 fn run_md_wins_and_capture_md_still_works() {
     use herdr_intents::capture::{GuideMode, read_guide};
     let old =
