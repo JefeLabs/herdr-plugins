@@ -534,6 +534,7 @@ fn pane_name(p: Pane) -> &'static str {
 impl App {
     pub fn new(cfg: Config, dirs: Dirs) -> anyhow::Result<Self> {
         let store = Store::open(&cfg.root)?;
+        let notice = cfg.notice.clone();
         let tree = store.scan()?.scoped(cfg.scope.as_deref());
         let mut app = Self {
             exit_on_browse: false,
@@ -548,7 +549,7 @@ impl App {
             screen: Screen::Browse,
             editor: TextArea::default(),
             editing: None,
-            message: None,
+            message: notice,
             provider_env: Vec::new(),
             herdr_env: Vec::new(),
             parked_chat: None,
@@ -6578,6 +6579,11 @@ mod tests {
     /// Two groups, three intents: Inbox/"In the inbox" (issue, 2 open questions),
     /// skoolscout/"Alpha" (idea), skoolscout/"Beta" (enhancement).
     fn setup(events: &str) -> Fx {
+        setup_with(events, |_| {})
+    }
+
+    /// `setup`, with the config adjusted before the app starts.
+    fn setup_with(events: &str, tune: impl FnOnce(&mut Config)) -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs {
             config: tmp.path().join("cfg"),
@@ -6586,6 +6592,7 @@ mod tests {
         let mut cfg = load_or_init(&dirs).unwrap();
         cfg.providers.insert("fake".into(), fake_spec());
         cfg.polish_provider = "fake".into();
+        tune(&mut cfg);
         let store = Store::open(&dirs.root).unwrap();
         store
             .create(
@@ -6629,6 +6636,22 @@ mod tests {
             app,
             log,
         }
+    }
+
+    #[test]
+    fn the_start_up_notice_is_shown() {
+        let fx = setup_with("agy.jsonl", |c| {
+            c.notice =
+                Some("moved your intents from /h/intents to /h/.helmsmith/intents/spaces".into())
+        });
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("moved your intents")),
+            "{:?}",
+            fx.app.message
+        );
     }
 
     /// Move the selected intent out of `raw` so the send gate lets it through.

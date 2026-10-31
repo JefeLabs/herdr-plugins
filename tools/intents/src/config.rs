@@ -86,7 +86,8 @@ pub struct Dirs {
 }
 
 /// Config dir: `INTENTS_CONFIG_DIR`, else this plugin's `HERDR_PLUGIN_CONFIG_DIR`,
-/// else `~/.config/herdr/plugins/config/jefelabs.intents`. Root from config or `~/intents`.
+/// else `~/.config/herdr/plugins/config/jefelabs.intents`. Root from config or
+/// `~/.helmsmith/intents/spaces` (see `storage`).
 pub fn resolve_dirs(
     get: impl Fn(&str) -> Option<String>,
     home: &Path,
@@ -104,7 +105,7 @@ pub fn resolve_dirs(
     let root = match (get("INTENTS_ROOT"), cfg_root) {
         (Some(env_root), _) => PathBuf::from(expand_home(&env_root, home)),
         (None, Some(r)) => PathBuf::from(expand_home(r, home)),
-        (None, None) => home.join("intents"),
+        (None, None) => crate::storage::default_root(home),
     };
     Dirs { config, root }
 }
@@ -302,6 +303,9 @@ pub struct Config {
     pub workbrokr: Option<bool>,
     pub providers: BTreeMap<String, ProviderSpec>,
     pub handoffs: Vec<Handoff>,
+    /// Said once at start-up (the intents moved). Set by the caller from
+    /// `storage::settle_root`.
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -487,7 +491,10 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/"));
     let root = match &raw.root {
-        Some(r) if r != "~/intents" => PathBuf::from(expand_home(r, &home)),
+        // either default line means the default: the old one follows the move
+        Some(r) if r != crate::storage::OLD_ROOT && r != crate::storage::DEFAULT_ROOT => {
+            PathBuf::from(expand_home(r, &home))
+        }
         _ => dirs.root.clone(),
     };
 
@@ -567,6 +574,7 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
     Ok(Config {
         root,
         scope: None,
+        notice: None,
         editor: raw.editor.unwrap_or_else(|| "$EDITOR".to_string()),
         send_provider,
         polish_provider: raw.polish_provider.unwrap_or_else(|| "agy".to_string()),
@@ -1143,7 +1151,7 @@ mod tests {
         let home = Path::new("/home/u");
         let d = resolve_dirs(lookup(&[("INTENTS_CONFIG_DIR", "/c/env")]), home, None);
         assert_eq!(d.config, Path::new("/c/env"));
-        assert_eq!(d.root, Path::new("/home/u/intents"));
+        assert_eq!(d.root, Path::new("/home/u/.helmsmith/intents/spaces"));
 
         let d = resolve_dirs(
             lookup(&[
@@ -1328,6 +1336,25 @@ mod tests {
                     .any(|a| a == "read-only")
         );
         assert!(has(&cfg.providers["copilot"], "--deny-tool"));
+    }
+
+    #[test]
+    fn both_default_root_lines_mean_the_default() {
+        for line in ["~/intents", "~/.helmsmith/intents/spaces"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dirs = Dirs {
+                config: tmp.path().join("cfg"),
+                root: tmp.path().join("default-root"),
+            };
+            std::fs::create_dir_all(&dirs.config).unwrap();
+            std::fs::write(
+                dirs.config.join("intents.toml"),
+                format!("root = \"{line}\"\n"),
+            )
+            .unwrap();
+            let cfg = load_or_init(&dirs).unwrap();
+            assert_eq!(cfg.root, dirs.root, "{line} is the default");
+        }
     }
 
     #[test]

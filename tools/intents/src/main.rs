@@ -24,6 +24,10 @@ fn with_config(
         );
     }
     let mut cfg = load_or_init(&dirs)?;
+    // intents moved from ~/intents to ~/.helmsmith/intents/spaces: once
+    let settled = herdr_intents::storage::settle_root(&home, &cfg.root);
+    cfg.root = settled.root;
+    cfg.notice = settled.notice;
     // one Herdr workspace sees one top-level group: the one named like it
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
     cfg.scope = scope::resolve(
