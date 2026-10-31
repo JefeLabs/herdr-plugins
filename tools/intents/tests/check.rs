@@ -518,3 +518,44 @@ fn a_check_with_no_proof_or_no_answer_does_not_pass() {
         assert!(!herdr_intents::check::passes(&r, BODY_TWO), "{fallback}");
     }
 }
+
+// ---- why a check does not pass (said when r is refused) --------------------
+
+#[test]
+fn with_no_check_yet_it_says_x_runs_one() {
+    let why = herdr_intents::check::why_not_passing(None, BODY_TWO).unwrap();
+    assert!(why.contains("no completion check has run yet"), "{why}");
+    assert!(why.contains("X runs one"), "{why}");
+}
+
+#[test]
+fn a_check_that_does_not_pass_names_each_criterion_holding_it_back() {
+    let body = "## Acceptance criteria\n- [ ] one\n- [ ] two\n- [ ] three\n- [ ] four\n";
+    let r = rec(&[
+        (1, "one", Verdict::Confirmed("yes".into())),
+        (2, "two", Verdict::Fails("no button".into())),
+        (3, "three", Verdict::CantCheck("no proof kept".into())),
+    ]);
+    let why = herdr_intents::check::why_not_passing(Some(&r), body).unwrap();
+    for part in [
+        "criterion 2 fails",
+        "criterion 3 kept no proof",
+        "criterion 4 has not been checked",
+    ] {
+        assert!(why.contains(part), "{part:?} in {why}");
+    }
+    assert!(!why.contains("criterion 1"), "{why}");
+}
+
+#[test]
+fn a_passing_check_has_nothing_holding_it_back() {
+    let r = rec(&[
+        (1, "one", Verdict::Confirmed("yes".into())),
+        (2, "two", Verdict::CantCheck("log only".into())),
+    ]);
+    assert_eq!(
+        herdr_intents::check::why_not_passing(Some(&r), BODY_TWO),
+        None
+    );
+    assert!(herdr_intents::check::passes(&r, BODY_TWO));
+}

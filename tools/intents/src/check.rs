@@ -299,26 +299,59 @@ pub fn merge_check(old: Option<CheckRecord>, new: CheckRecord) -> CheckRecord {
 /// criterion has a result, and none fails or is missing ("can't check" does
 /// not hold it back).
 pub fn passes(latest: &CheckRecord, body: &str) -> bool {
-    // the tool's own fallbacks prove nothing: no answer, no proof kept, or a
-    // failure the fold softened; only the agent's own "can't check" may stand
-    let proven = |v: &Verdict| match v {
-        Verdict::Confirmed(_) => true,
-        Verdict::CantCheck(why) => {
-            why != NO_ANSWER && why != NO_PROOF && !why.starts_with(FOLD_DOUBT)
-        }
-        Verdict::Fails(_) | Verdict::Missing(_) => false,
+    why_not_passing(Some(latest), body).is_none()
+}
+
+/// What holds the check back, in words for the person; `None` when it passes.
+/// The tool's own fallbacks (no answer, no proof kept, a failure a fold
+/// softened) prove nothing; only the agent's own "can't check" may stand.
+pub fn why_not_passing(latest: Option<&CheckRecord>, body: &str) -> Option<String> {
+    let Some(latest) = latest else {
+        return Some(
+            "no completion check has run yet: X runs one, and its stories record in the same run if it passes"
+                .into(),
+        );
     };
-    let keys: Vec<String> = crate::store::criteria(body)
+    let criteria = crate::store::criteria(body);
+    if criteria.is_empty() {
+        return Some("it has no acceptance criteria to check".into());
+    }
+    let held: Vec<String> = criteria
         .iter()
-        .map(|c| crate::store::criterion_key(&c.text))
-        .collect();
-    !keys.is_empty()
-        && keys.iter().all(|k| {
-            latest
-                .results
-                .iter()
-                .any(|r| r.key == *k && proven(&r.verdict))
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let n = i + 1;
+            let key = crate::store::criterion_key(&c.text);
+            let found = latest.results.iter().find(|r| r.key == key);
+            match found.map(|r| &r.verdict) {
+                None => Some(format!("criterion {n} has not been checked")),
+                Some(Verdict::Confirmed(_)) => None,
+                Some(Verdict::Fails(_)) => Some(format!("criterion {n} fails")),
+                Some(Verdict::Missing(_)) => Some(format!("criterion {n} is missing")),
+                Some(Verdict::CantCheck(why)) if why == NO_ANSWER => {
+                    Some(format!("criterion {n} got no answer"))
+                }
+                Some(Verdict::CantCheck(why)) if why == NO_PROOF => {
+                    Some(format!("criterion {n} kept no proof"))
+                }
+                Some(Verdict::CantCheck(why)) if why.starts_with(FOLD_DOUBT) => {
+                    Some(format!("criterion {n} may be described wrongly by a fold"))
+                }
+                Some(Verdict::CantCheck(_)) => None,
+            }
         })
+        .collect();
+    if held.is_empty() {
+        return None;
+    }
+    const SHOWN: usize = 4;
+    let mut list = held[..held.len().min(SHOWN)].join(", ");
+    if held.len() > SHOWN {
+        list.push_str(&format!(", and {} more", held.len() - SHOWN));
+    }
+    Some(format!(
+        "the completion check hasn't passed: {list} (X checks again)"
+    ))
 }
 
 /// The guide's log files under the stack's worktree; an absolute path or one
