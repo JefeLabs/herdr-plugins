@@ -469,7 +469,6 @@ pub struct App {
     stories_selected: usize,
     follow_ups_selected: usize,
     prs_selected: usize,
-    demos_selected: usize,
     /// PR titles from `gh`, keyed like `pr_states`.
     pr_titles: HashMap<(PathBuf, String), String>,
     /// Artifacts found in the selected intent's repo, cached per path.
@@ -530,11 +529,6 @@ pub struct App {
     pub capture_repo: Option<PathBuf>,
     /// How long a reconcile may run before it is stopped and reported.
     reconcile_limit: std::time::Duration,
-    /// What opens files and links outside (tests set a fake); `None`: the
-    /// system's (`open` on macOS, else `xdg-open`).
-    opener: Option<String>,
-    /// The port `make demos-open` serves the demos page on.
-    demos_port: u16,
     /// Merged sets already started this session, so a failure is not retried in a loop.
     reconcile_tried: HashSet<(PathBuf, Vec<u64>)>,
     /// Bugs whose "after" was considered for a merged set (once per set).
@@ -563,7 +557,6 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Evidence => "evidence",
         Pane::Missing => "missing",
         Pane::FollowUps => "follow-ups",
-        Pane::Demos => "demos",
         Pane::PullRequests => "pull requests",
     }
 }
@@ -610,7 +603,6 @@ impl App {
             stories_selected: 0,
             follow_ups_selected: 0,
             prs_selected: 0,
-            demos_selected: 0,
             pr_titles: HashMap::new(),
             found_cache: None,
             unread_cache: std::cell::RefCell::new(HashMap::new()),
@@ -639,8 +631,6 @@ impl App {
             capture_env: Vec::new(),
             capture_repo: None,
             reconcile_limit: std::time::Duration::from_secs(600),
-            opener: None,
-            demos_port: 4400,
             reconcile_tried: HashSet::new(),
             check_tried: HashSet::new(),
             recheck_tried: HashSet::new(),
@@ -1990,7 +1980,6 @@ impl App {
         self.question_selected = 0;
         self.artifacts_selected = 0;
         self.prs_selected = 0;
-        self.demos_selected = 0;
     }
 
     fn select_path(&mut self, p: &Path) {
@@ -2020,9 +2009,7 @@ impl App {
                     .into_iter()
                     .map(|a| a.target)
                     .collect();
-                let mut found = crate::store::discover_artifacts(repo, &it.fm.title, &already);
-                found.extend(crate::demos::discover_demos(repo, &it.fm.title, &already));
-                found
+                crate::store::discover_artifacts(repo, &it.fm.title, &already)
             }
             _ => Vec::new(),
         };
@@ -2165,7 +2152,6 @@ impl App {
     fn list_selected(&mut self, pane: Pane) -> &mut usize {
         match pane {
             Pane::PullRequests => &mut self.prs_selected,
-            Pane::Demos => &mut self.demos_selected,
             _ => &mut self.artifacts_selected,
         }
     }
@@ -2205,7 +2191,6 @@ impl App {
                 | Pane::Decisions
                 | Pane::Criteria
                 | Pane::Stories
-                | Pane::Demos
                 | Pane::Questions
                 | Pane::PullRequests
                 | Pane::Missing
@@ -2293,8 +2278,7 @@ impl App {
                     Pane::Decisions => Pane::Preconditions,
                     Pane::Preconditions => Pane::Criteria,
                     Pane::Criteria => Pane::Stories,
-                    Pane::Stories => Pane::Demos,
-                    Pane::Demos => Pane::Artifacts,
+                    Pane::Stories => Pane::Artifacts,
                     Pane::Artifacts => Pane::PullRequests,
                     Pane::PullRequests => Pane::Evidence,
                     Pane::Evidence => Pane::Missing,
@@ -2310,8 +2294,7 @@ impl App {
                     Pane::Missing => Pane::Evidence,
                     Pane::Evidence => Pane::PullRequests,
                     Pane::PullRequests => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Demos,
-                    Pane::Demos => Pane::Stories,
+                    Pane::Artifacts => Pane::Stories,
                     Pane::Stories => Pane::Criteria,
                     Pane::Criteria => Pane::Preconditions,
                     Pane::Preconditions => Pane::Decisions,
@@ -2556,10 +2539,6 @@ impl App {
                     "new pull request: #number or URL",
                     InputAction::AddArtifact { kind: "pr" },
                 ),
-                Pane::Demos => (
-                    "new demo: story-id (criteria: 1, 4)",
-                    InputAction::AddArtifact { kind: "demo" },
-                ),
                 _ => return Flow::Continue,
             };
             self.screen = Screen::Input {
@@ -2800,7 +2779,7 @@ impl App {
                     _ => {}
                 }
             }
-            Pane::Artifacts | Pane::Demos | Pane::PullRequests => {
+            Pane::Artifacts | Pane::PullRequests => {
                 let pane = self.focus;
                 let (linked, found) = self.section_lists(&it, pane);
                 let total = linked.len() + found.len();
@@ -2850,10 +2829,6 @@ impl App {
 
     /// Enter reads a Markdown file in the tool; tickets, URLs and `o` open externally.
     fn open_artifact(&mut self, it: &Intent, a: &crate::store::Artifact, external: bool) {
-        if a.kind.eq_ignore_ascii_case("demo") {
-            self.open_demo(it, &a.target, external);
-            return;
-        }
         let target = a.target.trim();
         let is_ref = target.starts_with('#')
             || target.starts_with("http://")
@@ -2912,73 +2887,6 @@ impl App {
             }
             Err(e) => self.message = Some(format!("cannot read {}: {e}", path.display())),
         }
-    }
-
-    /// A demo line: Enter shows its app-demos story in the reader; `o` plays
-    /// the newest recorded video, else opens the demos site at the story.
-    fn open_demo(&mut self, it: &Intent, target: &str, external: bool) {
-        let (id, criteria) = crate::demos::demo_target(target);
-        if !crate::demos::safe_story_id(&id) {
-            self.message = Some(format!("`{id}` is not a story id (letters, digits, . _ -)"));
-            return;
-        }
-        let roots: Vec<PathBuf> = it
-            .fm
-            .repo
-            .as_deref()
-            .filter(|r| r.is_dir())
-            .map(crate::send::worktrees)
-            .unwrap_or_default();
-        if external {
-            // the newest take; else the demos page, only while it runs
-            let arg = match crate::demos::video_for(&roots, &id) {
-                Some(take) => take.display().to_string(),
-                None if crate::demos::site_running(self.demos_port) => {
-                    crate::demos::site_url(self.demos_port, &id)
-                }
-                None => {
-                    self.message = Some(format!(
-                        "no recorded video of `{id}` yet: record one with `make demos STORY={id}` in app-demos, on a slot stack"
-                    ));
-                    return;
-                }
-            };
-            let opener = self.opener.clone().unwrap_or_else(|| {
-                if cfg!(target_os = "macos") {
-                    "open".into()
-                } else {
-                    "xdg-open".into()
-                }
-            });
-            self.message = Some(
-                match std::process::Command::new(&opener)
-                    .arg(&arg)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
-                    Ok(_) => format!("opened {arg}"),
-                    Err(e) => format!("cannot open {arg}: {e}"),
-                },
-            );
-            return;
-        }
-        let Some(story) = crate::demos::find_story(&roots, &id) else {
-            self.message = Some(format!(
-                "no app-demos story `{id}` in the intent's repo (o opens the demos site)"
-            ));
-            return;
-        };
-        let cs = crate::store::criteria(&it.body);
-        let shows: Vec<(usize, String)> = criteria
-            .iter()
-            .filter_map(|n| cs.get(n.checked_sub(1)?).map(|c| (*n, c.text.clone())))
-            .collect();
-        self.screen = Screen::Reader {
-            title: story.title.clone(),
-            lines: crate::markdown::render_markdown(&crate::demos::story_markdown(&story, &shows)),
-            scroll: 0,
-        };
     }
 
     /// Relative targets resolve against the intent's repo, else its own folder.
@@ -6847,7 +6755,6 @@ impl App {
                             open: self.open,
                             prs: &prs,
                             prs_selected: self.prs_selected,
-                            demos_selected: self.demos_selected,
                             evidence: &evidence,
                             evidence_selected: self.evidence_selected,
                             results: &marks,
@@ -6922,7 +6829,6 @@ impl App {
                 (None, Pane::Stories) => "Stories: j/k choose · d draft the stories · o play the video · c copy the file · Y copy its path · O show it in Finder · r record it again · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
-                (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::PullRequests) => "Pull requests: j/k choose · Enter/o open in the browser · L link a found one · a add · Esc tree".to_string(),
             },
         };
@@ -8155,120 +8061,27 @@ mod tests {
     }
 
     #[test]
-    fn a_demo_line_opens_its_story_and_marks_the_criteria_it_shows() {
+    fn a_demo_line_is_a_plain_artifact_now() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
         let path = fx.app.selected_intent().unwrap().path.clone();
-        let repo = fx._tmp.path().join("repo");
-        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
-        fs::write(
-            repo.join("app-demos/stories/a.yaml"),
-            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
-        )
-        .unwrap();
         let mut it = Store::load(&path).unwrap();
-        it.fm.repo = Some(repo);
         it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n- [ ] second thing\n\n## Artifacts\n- demo: alex-shows-alpha (criteria: 2)\n".into();
         Store::save_force(&mut it).unwrap();
         fx.app.rescan();
         let shown = render(&fx.app, 100, 24);
-        assert!(shown.contains("[ ] ▶ second thing"), "{shown}");
-        assert!(shown.contains("[ ] first thing"), "{shown}");
-        // demos have their own section
-        tab_to(&mut fx.app, "demos");
-        key(&mut fx.app, KeyCode::Enter);
-        let v = fx.app.view();
-        assert_eq!(v.screen, "reader", "{v:?}");
-        assert_eq!(v.reader_title, "Alex shows Alpha working");
-    }
-
-    /// Alpha with a demo line for `alex-shows-alpha` in its repo, the Demo
-    /// Videos section focused, a fake opener that logs what it is asked to
-    /// open, and no demos page running; returns (the repo, the opener's log).
-    fn alpha_with_a_demo(fx: &mut Fx) -> (PathBuf, PathBuf) {
-        select(&mut fx.app, "Alpha");
-        let path = fx.app.selected_intent().unwrap().path.clone();
-        let t = fx._tmp.path().to_path_buf();
-        let repo = t.join("repo");
-        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
-        fs::write(
-            repo.join("app-demos/stories/a.yaml"),
-            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
-        )
-        .unwrap();
-        let mut it = Store::load(&path).unwrap();
-        it.fm.repo = Some(repo.clone());
-        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n\n## Artifacts\n- demo: alex-shows-alpha (criteria: 1)\n".into();
-        Store::save_force(&mut it).unwrap();
-        fx.app.rescan();
-        let log = t.join("opened.log");
-        let opener = t.join("opener.sh");
-        fs::write(
-            &opener,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&opener, fs::Permissions::from_mode(0o755)).unwrap();
-        fx.app.opener = Some(opener.display().to_string());
-        // a port nothing listens on
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        fx.app.demos_port = free.local_addr().unwrap().port();
-        drop(free);
-        tab_to(&mut fx.app, "demos");
-        (repo, log)
-    }
-
-    fn opened(log: &Path) -> String {
-        let start = Instant::now();
-        loop {
-            let s = fs::read_to_string(log).unwrap_or_default();
-            if !s.is_empty() || start.elapsed() > Duration::from_secs(3) {
-                return s;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    #[test]
-    fn o_on_a_demo_without_a_take_or_page_says_how_to_record_it() {
-        let mut fx = setup("agy.jsonl");
-        let (_, log) = alpha_with_a_demo(&mut fx);
-        key(&mut fx.app, KeyCode::Char('o'));
-        let msg = fx.app.view().message.unwrap_or_default();
+        assert!(shown.contains("[ ] second thing"), "{shown}");
         assert!(
-            msg.contains("no recorded video of `alex-shows-alpha`"),
-            "{msg}"
+            !shown.contains("▶"),
+            "only a kept story video marks a criterion: {shown}"
         );
-        assert!(msg.contains("make demos STORY=alex-shows-alpha"), "{msg}");
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            fs::read_to_string(&log).unwrap_or_default(),
-            "",
-            "no dead link opened"
+        assert!(!shown.contains("Demo Videos"), "{shown}");
+        tab_to(&mut fx.app, "artifacts");
+        let shown = render(&fx.app, 120, 40);
+        assert!(
+            shown.contains("demo     alex-shows-alpha (criteria: 2)"),
+            "{shown}"
         );
-    }
-
-    #[test]
-    fn o_on_a_demo_opens_the_demos_page_when_it_runs() {
-        let mut fx = setup("agy.jsonl");
-        let (_, log) = alpha_with_a_demo(&mut fx);
-        let page = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        fx.app.demos_port = page.local_addr().unwrap().port();
-        key(&mut fx.app, KeyCode::Char('o'));
-        let url = format!("http://localhost:{}/#alex-shows-alpha", fx.app.demos_port);
-        assert!(opened(&log).contains(&url), "{}", opened(&log));
-    }
-
-    #[test]
-    fn o_on_a_demo_with_a_take_opens_the_file() {
-        let mut fx = setup("agy.jsonl");
-        let (repo, log) = alpha_with_a_demo(&mut fx);
-        let take = repo.join("app-demos/videos/alex-shows-alpha/take-1.webm");
-        fs::create_dir_all(take.parent().unwrap()).unwrap();
-        fs::write(&take, b"webm").unwrap();
-        key(&mut fx.app, KeyCode::Char('o'));
-        assert!(opened(&log).contains("take-1.webm"), "{}", opened(&log));
     }
 
     /// Alpha, sent, with one criterion from its refinement transcript and two
@@ -10359,7 +10172,6 @@ mod tests {
             "preconditions",
             "criteria",
             "stories",
-            "demos",
             "artifacts",
             "pull requests",
             "evidence",
@@ -10434,7 +10246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_in_pull_requests_and_demos_adds_a_line_of_that_kind() {
+    fn a_in_pull_requests_adds_a_pr_line() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Alpha");
         let path = fx.app.selected_intent().unwrap().path.clone();
@@ -10443,51 +10255,8 @@ mod tests {
         type_str(&mut fx.app, "#77");
         key(&mut fx.app, KeyCode::Enter);
         assert_eq!(fx.app.view().focus, "pull requests");
-        tab_to(&mut fx.app, "demos");
-        key(&mut fx.app, KeyCode::Char('a'));
-        type_str(&mut fx.app, "story-x (criteria: 2)");
-        key(&mut fx.app, KeyCode::Enter);
-        assert_eq!(fx.app.view().focus, "demos");
         let body = Store::load(&path).unwrap().body;
         assert!(body.contains("- pr: #77"), "{body}");
-        assert!(body.contains("- demo: story-x (criteria: 2)"), "{body}");
-    }
-
-    #[test]
-    fn the_demo_videos_help_line_names_the_section() {
-        let mut fx = setup("agy.jsonl");
-        select(&mut fx.app, "Alpha");
-        tab_to(&mut fx.app, "demos");
-        let shown = render(&fx.app, 140, 30);
-        assert!(shown.contains("Demo Videos: j/k choose"), "{shown}");
-    }
-
-    #[test]
-    fn reading_a_demo_returns_to_the_demos_section() {
-        let mut fx = setup("agy.jsonl");
-        select(&mut fx.app, "Alpha");
-        let path = fx.app.selected_intent().unwrap().path.clone();
-        let repo = fx._tmp.path().join("repo");
-        fs::create_dir_all(repo.join("app-demos/stories")).unwrap();
-        fs::write(
-            repo.join("app-demos/stories/a.yaml"),
-            "stories:\n  - id: alex-shows-alpha\n    title: Alex shows Alpha working\n    actor: alex\n    steps:\n      - signIn: alex\n",
-        )
-        .unwrap();
-        let mut it = Store::load(&path).unwrap();
-        it.fm.repo = Some(repo);
-        it.body = "## Description\nx\n\n## Acceptance criteria\n- [ ] first thing\n\n## Artifacts\n- spec: docs/x.md\n- demo: alex-shows-alpha (criteria: 1)\n".into();
-        Store::save_force(&mut it).unwrap();
-        fx.app.rescan();
-        tab_to(&mut fx.app, "demos");
-        key(&mut fx.app, KeyCode::Enter);
-        assert_eq!(
-            fx.app.view().screen,
-            "reader",
-            "the section's first row is the demo"
-        );
-        key(&mut fx.app, KeyCode::Esc);
-        assert_eq!(fx.app.view().focus, "demos");
     }
 
     #[test]
@@ -10502,7 +10271,6 @@ mod tests {
             "preconditions",
             "criteria",
             "stories",
-            "demos",
             "artifacts",
             "pull requests",
             "evidence",
@@ -14982,7 +14750,7 @@ mod tests {
             key(&mut fx.app, KeyCode::Tab);
             order.push(fx.app.view().focus);
         }
-        assert_eq!(order, ["criteria", "stories", "demos"]);
+        assert_eq!(order, ["criteria", "stories", "artifacts"]);
         key(&mut fx.app, KeyCode::BackTab);
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "criteria");

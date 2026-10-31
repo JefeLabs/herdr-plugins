@@ -33,7 +33,7 @@ pub const NO_PROOF: &str = "no proof kept";
 pub const FOLD_DOUBT: &str = "the fold may describe this wrongly";
 
 /// One acceptance criterion as the check numbers it: from 1, in order across
-/// area groups, as demo lines count them.
+/// area groups, as a story's `shows:` counts them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckItem {
     pub number: usize,

@@ -238,21 +238,16 @@ fn undo_steps_back_through_several_reconciles() {
 }
 
 #[test]
-fn demo_lines_keep_pointing_at_the_same_criteria() {
-    let before = "## Acceptance criteria\n- [ ] first\n- [ ] second\n- [ ] third\n\n## Artifacts\n- demo: story-a (criteria: 2, 3)\n- demo: story-b (criteria: 1)\n";
+fn a_reconcile_leaves_demo_lines_as_written() {
+    let before = "## Acceptance criteria\n- [ ] first\n- [ ] second\n- [ ] third\n\n## Artifacts\n- demo: story-a (criteria: 2, 3)\n";
     let (t, it) = intent(State::Sent, before);
     let root = t.path().join("root");
-    // a new criterion first, "third" dropped; story-a's line kept as it was,
-    // story-b's line rewritten by the agent
-    let rewrite = "## Acceptance criteria\n- [ ] new one\n- [ ] first\n- [ ] second\n\n## Artifacts\n- demo: story-a (criteria: 2, 3)\n- demo: story-b (criteria: 2)\n";
+    // a new criterion first; the demo line is plain text now, not renumbered
+    let rewrite = "## Acceptance criteria\n- [ ] new one\n- [ ] first\n- [ ] second\n\n## Artifacts\n- demo: story-a (criteria: 2, 3)\n";
     let after = apply(&it.path, rewrite, &[1], &root).unwrap().body;
     assert!(
-        after.contains("- demo: story-a (criteria: 3)"),
-        "second moved to 3, third is gone:\n{after}"
-    );
-    assert!(
-        after.contains("- demo: story-b (criteria: 2)"),
-        "a line the agent changed is its own:\n{after}"
+        after.contains("- demo: story-a (criteria: 2, 3)"),
+        "{after}"
     );
 }
 

@@ -12,12 +12,12 @@ expression: "render(&fx.app, 80, 24)"
                        │ ▸ Preconditions (0/0) ─────────────────────────────────
                        │ ▸ Acceptance criteria (0/0) ───────────────────────────
                        │ ▸ Stories & Videos (0) ────────────────────────────────
-                       │ ▸ Demo Videos (0) ─────────────────────────────────────
                        │ ▸ Artifacts (0) ───────────────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────
                        │ ▾ Evidence (2) ────────────────────────────────────────
                        │✓ before · video · the email goes to every admin
                        │✗ after · video · admins still get it
+                       │
                        │
                        │
                        │

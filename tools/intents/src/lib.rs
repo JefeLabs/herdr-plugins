@@ -6,7 +6,6 @@ pub mod capture_mcp;
 pub mod check;
 pub mod config;
 pub mod conversation;
-pub mod demos;
 pub mod editor;
 pub mod interview;
 pub mod markdown;
