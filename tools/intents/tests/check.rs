@@ -559,3 +559,41 @@ fn a_passing_check_has_nothing_holding_it_back() {
     );
     assert!(herdr_intents::check::passes(&r, BODY_TWO));
 }
+
+#[test]
+fn a_check_that_confirmed_nothing_does_not_pass() {
+    let r = rec(&[
+        (
+            1,
+            "one",
+            Verdict::CantCheck("the browser tool fails before opening the app".into()),
+        ),
+        (
+            2,
+            "two",
+            Verdict::CantCheck("a repo file, not in the app".into()),
+        ),
+    ]);
+    assert!(!herdr_intents::check::passes(&r, BODY_TWO));
+    let why = herdr_intents::check::why_not_passing(Some(&r), BODY_TWO).unwrap();
+    for part in [
+        "nothing was confirmed",
+        "criterion 1: the browser tool fails before opening the app",
+        "X checks again",
+    ] {
+        assert!(why.contains(part), "{part:?} in {why}");
+    }
+}
+
+#[test]
+fn a_long_cant_check_reason_is_shortened() {
+    let long = "the browser tool fails ".repeat(30);
+    let r = rec(&[
+        (1, "one", Verdict::CantCheck(long.clone())),
+        (2, "two", Verdict::CantCheck("log only".into())),
+    ]);
+    let why = herdr_intents::check::why_not_passing(Some(&r), BODY_TWO).unwrap();
+    assert!(!why.contains(long.trim_end()), "{why}");
+    assert!(why.contains("the browser tool fails"), "{why}");
+    assert!(why.contains("…)"), "{why}");
+}

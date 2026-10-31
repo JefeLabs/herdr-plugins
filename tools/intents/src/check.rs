@@ -342,7 +342,7 @@ pub fn why_not_passing(latest: Option<&CheckRecord>, body: &str) -> Option<Strin
         })
         .collect();
     if held.is_empty() {
-        return None;
+        return nothing_confirmed(&criteria, latest);
     }
     const SHOWN: usize = 4;
     let mut list = held[..held.len().min(SHOWN)].join(", ");
@@ -351,6 +351,44 @@ pub fn why_not_passing(latest: Option<&CheckRecord>, body: &str) -> Option<Strin
     }
     Some(format!(
         "the completion check hasn't passed: {list} (X checks again)"
+    ))
+}
+
+/// When no criterion was confirmed, the check proved nothing (every one came
+/// back "can't check", often because the browser never opened): what the
+/// agent said about the first, shortened to fit the status line.
+fn nothing_confirmed(criteria: &[crate::store::Criterion], latest: &CheckRecord) -> Option<String> {
+    let verdicts: Vec<(usize, &Verdict)> = criteria
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let key = crate::store::criterion_key(&c.text);
+            let r = latest.results.iter().find(|r| r.key == key)?;
+            Some((i + 1, &r.verdict))
+        })
+        .collect();
+    if verdicts
+        .iter()
+        .any(|(_, v)| matches!(v, Verdict::Confirmed(_)))
+    {
+        return None;
+    }
+    const REASON: usize = 80;
+    let first = verdicts.iter().find_map(|(n, v)| match v {
+        Verdict::CantCheck(why) => {
+            let short: String = why.chars().take(REASON).collect();
+            let why = if short.len() < why.len() {
+                format!("{}…", short.trim_end())
+            } else {
+                short
+            };
+            Some(format!("criterion {n}: {why}"))
+        }
+        _ => None,
+    });
+    Some(format!(
+        "the completion check hasn't passed: nothing was confirmed, every criterion came back \"can't check\"{} (X checks again)",
+        first.map(|f| format!(" ({f})")).unwrap_or_default()
     ))
 }
 
