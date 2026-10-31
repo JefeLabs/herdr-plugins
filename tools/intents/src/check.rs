@@ -288,6 +288,22 @@ pub fn merge_check(old: Option<CheckRecord>, new: CheckRecord) -> CheckRecord {
     }
 }
 
+/// Whether the check passes, counting every check so far: each current
+/// criterion has a result, and none fails or is missing ("can't check" does
+/// not hold it back).
+pub fn passes(latest: &CheckRecord, body: &str) -> bool {
+    let keys: Vec<String> = crate::store::criteria(body)
+        .iter()
+        .map(|c| crate::store::criterion_key(&c.text))
+        .collect();
+    !keys.is_empty()
+        && keys.iter().all(|k| {
+            latest.results.iter().any(|r| {
+                r.key == *k && !matches!(r.verdict, Verdict::Fails(_) | Verdict::Missing(_))
+            })
+        })
+}
+
 /// The guide's log files under the stack's worktree; an absolute path or one
 /// that climbs out (`..`) is refused.
 pub fn log_paths(worktree: &Path, listed: &[String]) -> Result<Vec<PathBuf>, String> {

@@ -1449,3 +1449,225 @@ fn a_check_with_no_answers_spends_nothing() {
         "no ? results written"
     );
 }
+
+// ---- recording the stories ---------------------------------------------------
+
+const STORY_INTENT: &str = "---\ntitle: Reinstate a withdrawn application\nkind: enhancement\nstate: sent\n---\n## Description\nx\n\n## Acceptance criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\n## Stories\n### Mark reinstates Maya\n- persona: Mark\n- shows: 1, 3\n- starting data: Maya's application, withdrawn\n1. Open it\n2. Reinstate it\n### Pat sees it back\n- persona: Pat\n- shows: 2\n- starting data: a reinstated application\n1. Open applications\n";
+const STORY_GUIDE: &str = "---\ndefault_area: org/social\nseed: [kathia-signup]\nurl: https://demo-org.skoolscout.com.local:{port}\nlogs: [.logs/backend.log]\n---\nSign in with Cmd+U.\n\n## Stories\n### Personas\n- Mark: tenant admin, signs in as mark@example.test\n- Pat: a parent, signs in as pat@example.test\n### Setup may create\n- applications, never people\n";
+const ALL_CONFIRMED: &str = "1: confirmed: a\n2: confirmed: b\n3: confirmed: c";
+
+impl Fx {
+    /// A check of a three-criterion intent with two stories, whose guide
+    /// names their personas; every story agent leaves captions 1, 3 and 2.
+    fn stories(result: &str) -> Fx {
+        let mut fx = Fx::checking(result);
+        let t = fx.tmp.path().to_path_buf();
+        fs::write(t.join("repo/.helmsmith/capture.md"), STORY_GUIDE).unwrap();
+        fs::write(t.join("root/skoolscout/org/notify.md"), STORY_INTENT).unwrap();
+        fx.set("FAKE_CLAUDE_PROOF", "1,2,3");
+        fx.set("FAKE_CLAUDE_CAPTIONS", "1,3,2");
+        fx
+    }
+
+    fn stories_dir(&self) -> std::path::PathBuf {
+        self.tmp
+            .path()
+            .join("root/skoolscout/org/notify.assets/stories")
+    }
+
+    fn story(&self, n: usize) -> std::path::PathBuf {
+        self.stories_dir().join(match n {
+            1 => "1-mark-reinstates-maya",
+            _ => "2-pat-sees-it-back",
+        })
+    }
+
+    fn story_request(&self, numbers: Vec<usize>) -> CaptureRequest {
+        let t = self.tmp.path();
+        CaptureRequest {
+            phase: Phase::Before,
+            shot: Shot::Video,
+            evidence: self.stories_dir(),
+            job: Job::Story {
+                numbers,
+                intent_path: t.join("root/skoolscout/org/notify.md"),
+                root: t.join("root"),
+                stories_dir: self.stories_dir(),
+            },
+            ..self.request()
+        }
+    }
+}
+
+#[test]
+fn a_passing_check_records_each_story_in_the_same_run() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let fx = Fx::stories(ALL_CONFIRMED);
+    fx.run_check(fx.check_request(None));
+    assert_eq!(
+        read_story(&fx.story(1)).unwrap().outcome,
+        StoryOutcome::Kept
+    );
+    assert_eq!(
+        read_story(&fx.story(2)).unwrap().outcome,
+        StoryOutcome::Kept
+    );
+    assert!(fx.story(1).join("video.mp4").is_file());
+    let work = fx.log("work.log");
+    assert_eq!(
+        work.lines().filter(|l| l.contains("start --area")).count(),
+        1,
+        "one app for the check and the takes: {work}"
+    );
+    let claude = fx.log("claude.log");
+    assert!(
+        claude.contains("mcp__intents-capture__take_start"),
+        "{claude}"
+    );
+}
+
+#[test]
+fn a_story_whose_criterion_did_not_show_keeps_no_video() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let mut fx = Fx::stories(ALL_CONFIRMED);
+    fx.set("FAKE_CLAUDE_CAPTIONS", "1");
+    fx.run_check(fx.check_request(None));
+    assert_eq!(
+        read_story(&fx.story(1)).unwrap().outcome,
+        StoryOutcome::NotShown(vec![3])
+    );
+    assert!(!fx.story(1).join("video.mp4").exists());
+}
+
+#[test]
+fn a_failing_check_records_no_story() {
+    let fx = Fx::stories("1: confirmed: a\n2: fails: no\n3: confirmed: c");
+    fx.run_check(fx.check_request(None));
+    assert!(
+        !fx.stories_dir().exists() || fs::read_dir(fx.stories_dir()).unwrap().next().is_none(),
+        "nothing recorded"
+    );
+}
+
+#[test]
+fn a_re_check_records_again_only_the_stories_it_touched() {
+    use herdr_intents::capture::read_story;
+    let mut fx = Fx::stories(ALL_CONFIRMED);
+    fx.run_check(fx.check_request(None));
+    let first = (
+        read_story(&fx.story(1)).unwrap().at,
+        read_story(&fx.story(2)).unwrap().at,
+    );
+    // criterion 3 is checked again alone: story 1 shows it, story 2 does not
+    fx.set("FAKE_CLAUDE_PROOF", "3");
+    let events = fx.tmp.path().join("check-events.jsonl");
+    fs::write(
+        &events,
+        "{\"type\":\"result\",\"result\":\"3: confirmed: c\"}\n",
+    )
+    .unwrap();
+    fx.run_check(fx.check_request(Some(vec![herdr_intents::store::criterion_key("three")])));
+    assert!(
+        read_story(&fx.story(1)).unwrap().at > first.0,
+        "recorded again"
+    );
+    assert_eq!(read_story(&fx.story(2)).unwrap().at, first.1, "left alone");
+}
+
+#[test]
+fn a_guide_without_personas_records_nothing_and_says_why() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let fx = Fx::stories(ALL_CONFIRMED);
+    fs::write(
+        fx.tmp.path().join("repo/.helmsmith/capture.md"),
+        STORY_GUIDE.split("\n## Stories").next().unwrap(),
+    )
+    .unwrap();
+    fx.run_check(fx.check_request(None));
+    assert_eq!(
+        read_story(&fx.story(1)).unwrap().outcome,
+        StoryOutcome::Failed("the run guide lists no personas for stories".into())
+    );
+    assert!(!fx.log("claude.log").contains("take_start"), "no take ran");
+}
+
+#[test]
+fn a_persona_the_guide_does_not_list_fails_that_story() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let fx = Fx::stories(ALL_CONFIRMED);
+    fs::write(
+        fx.tmp.path().join("root/skoolscout/org/notify.md"),
+        STORY_INTENT.replace("- persona: Pat", "- persona: Zed"),
+    )
+    .unwrap();
+    fx.run_check(fx.check_request(None));
+    assert_eq!(
+        read_story(&fx.story(1)).unwrap().outcome,
+        StoryOutcome::Kept
+    );
+    assert!(
+        matches!(read_story(&fx.story(2)).unwrap().outcome, StoryOutcome::Failed(w) if w.contains("Zed"))
+    );
+}
+
+#[test]
+fn a_cancelled_take_keeps_no_video() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let mut fx = Fx::stories(ALL_CONFIRMED);
+    fx.set("FAKE_CLAUDE_HANG_TAKE", "1");
+    let mut job = CaptureJob::spawn(fx.story_request(vec![1]), fx.env.clone(), false);
+    let start = Instant::now();
+    while !fx.story(1).join("video.mp4").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the take never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    job.cancel();
+    fx.wait_done(&job);
+    assert!(read_story(&fx.story(1)).is_none_or(|r| r.outcome != StoryOutcome::Kept));
+    assert!(!fx.story(1).join("video.mp4").exists());
+}
+
+#[test]
+fn a_story_job_records_the_chosen_story() {
+    use herdr_intents::capture::read_story;
+    let fx = Fx::stories(ALL_CONFIRMED);
+    let job = CaptureJob::spawn(fx.story_request(vec![2]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    assert!(read_story(&fx.story(2)).is_some());
+    assert!(read_story(&fx.story(1)).is_none());
+}
+
+#[test]
+fn the_story_prompt_orders_setup_rehearsal_and_take() {
+    use herdr_intents::capture::{guide_stories, read_guide, story_prompt};
+    let fx = Fx::stories(ALL_CONFIRMED);
+    let guide = read_guide(&fx.tmp.path().join("repo")).unwrap();
+    let story = &herdr_intents::store::stories(STORY_INTENT)[0];
+    let shows = vec![(1, "one".to_string()), (3, "three".to_string())];
+    let text = guide_stories(&guide).unwrap().text;
+    let p = story_prompt(
+        &guide,
+        story,
+        &shows,
+        "Reinstate",
+        "http://127.0.0.1:1",
+        &text,
+    );
+    let at = |s: &str| p.find(s).unwrap_or_else(|| panic!("no {s:?} in {p}"));
+    assert!(at("sign in as Mark") < at("rehearse"));
+    assert!(at("rehearse") < at("set up fresh"));
+    assert!(at("set up fresh") < at("take_start"));
+    assert!(p.contains("never sign in, type a password or a code after take_start"));
+    assert!(
+        p.contains("fresh records with new names"),
+        "leftovers from an earlier run"
+    );
+    assert!(
+        p.contains("1. one") && p.contains("3. three"),
+        "the criteria to caption"
+    );
+    assert!(p.contains("never people"), "the guide's rules");
+}

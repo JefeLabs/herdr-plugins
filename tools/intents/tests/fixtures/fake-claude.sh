@@ -16,5 +16,16 @@ echo --- >> "$FAKE_CLAUDE_LOG"
 [ -n "${FAKE_CLAUDE_STEPS:-}" ] && printf '%s\n' "$FAKE_CLAUDE_STEPS" > .steps-before.txt
 for n in $(printf '%s' "${FAKE_CLAUDE_PROOF:-}" | tr , ' '); do printf png > "$FAKE_CHECK_DIR/$n.png"; done
 [ "${FAKE_CLAUDE_HANG:-0}" = 1 ] && sleep 30
+# a story's take (its agent has take_start): FAKE_CLAUDE_HANG_TAKE=1 runs for
+# 30 s; FAKE_CLAUDE_CAPTIONS=<n,…> leaves those captions and a video in the
+# story's folder (the agent's working folder), as the take tools would
+case "$*" in *take_start*)
+  [ "${FAKE_CLAUDE_HANG_TAKE:-0}" = 1 ] && { printf 'partial' > video.mp4; sleep 30; }
+  if [ -n "${FAKE_CLAUDE_CAPTIONS+x}" ]; then
+    printf '[%s]' "$FAKE_CLAUDE_CAPTIONS" > captions.json
+    printf 'video' > video.mp4
+  fi
+  ;;
+esac
 [ -n "${FAKE_CLAUDE_EVENTS:-}" ] && cat "$FAKE_CLAUDE_EVENTS"
 exit 0
