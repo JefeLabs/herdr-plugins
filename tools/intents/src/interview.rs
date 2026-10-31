@@ -333,6 +333,9 @@ pub struct InterviewScreen {
     pub provider: String,
     pub model: Option<String>,
     pub conv_id: Option<String>,
+    /// The running or last turn resumed `conv_id`: when it fails, it is
+    /// started once more as a fresh turn carrying the whole context.
+    pub resumed: bool,
     /// `<root>/.polish/new-xxxxxxxx`, where the agent runs.
     pub folder: std::path::PathBuf,
     /// Where `a` would add today: the group a save falls back to.

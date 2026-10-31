@@ -79,6 +79,9 @@ pub struct ChatState {
     pub scroll: u16,
     /// Model chosen in the picker, if the provider offers any.
     pub model: Option<String>,
+    /// While a resumed turn runs: the whole-context prompt to start again
+    /// with if the conversation cannot be resumed.
+    pub fresh: Option<String>,
 }
 
 /// What the agent picker is choosing right now.
@@ -3070,6 +3073,7 @@ impl App {
             input: String::new(),
             provider: last.provider,
             model: last.model,
+            resumed: false,
             conv_id: None,
             folder,
             fallback,
@@ -3107,6 +3111,7 @@ impl App {
             return;
         }
         let resumable = st.conv_id.is_some() && !spec.resume.is_empty();
+        st.resumed = resumable;
         let prompt = st.iv.prompt(step, resumable, &message);
         match Turn::start(
             &spec,
@@ -4390,6 +4395,17 @@ impl App {
         if let Some(result) = done {
             st.turn = None;
             match result {
+                // a conversation that cannot resume (it ran in a folder that
+                // moved, or the provider forgot it) starts once more, fresh
+                Err(_) if st.resumed => {
+                    st.conv_id = None;
+                    // the failed turn's reply, whatever it streamed
+                    if st.transcript.last().is_some_and(|(who, _)| who == "agent") {
+                        st.transcript.pop();
+                    }
+                    let (step, message) = (st.step, st.message.clone());
+                    self.start_interview_turn(&mut st, step, message, false);
+                }
                 Err(e) => st.awaiting = Awaiting::Retry(e),
                 Ok(reply) => self.interview_reply(&mut st, reply),
             }
@@ -4739,6 +4755,7 @@ impl App {
             from_editor,
             scroll: 0,
             model,
+            fresh: None,
         };
         self.select_path(&intent.path);
         let shown = match selection.as_deref() {
@@ -4753,14 +4770,34 @@ impl App {
             ),
             None => "polish".to_string(),
         };
-        self.start_turn(&mut st, &intent, &seed, &shown);
+        self.start_turn(&mut st, &intent, &seed, &shown, Some(seed.clone()));
         self.screen = Screen::Chat(st);
     }
 
-    fn start_turn(&mut self, st: &mut ChatState, intent: &Intent, prompt: &str, shown: &str) {
+    /// Starts the chat's turn on `prompt`; `fresh` is what to send instead
+    /// if a resumed conversation turns out not to resume.
+    fn start_turn(
+        &mut self,
+        st: &mut ChatState,
+        intent: &Intent,
+        prompt: &str,
+        shown: &str,
+        fresh: Option<String>,
+    ) {
+        st.fresh = st.conv_id.as_ref().and(fresh);
+        if self.launch_turn(st, intent, prompt) {
+            st.transcript.push(("user".into(), shown.to_string()));
+            st.transcript.push(("agent".into(), String::new()));
+            let _ = Store::append_transcript(intent, "user", shown);
+        }
+    }
+
+    /// Runs the provider on `prompt` in the intent's polish folder; false,
+    /// with the reason as the hint, when it cannot start.
+    fn launch_turn(&mut self, st: &mut ChatState, intent: &Intent, prompt: &str) -> bool {
         let Some(mut spec) = self.cfg.providers.get(&st.provider).cloned() else {
             st.hint = Some(format!("unknown provider `{}`", st.provider));
-            return;
+            return false;
         };
         if let Some(m) = &st.model {
             spec.extra.extend([spec.model_flag.clone(), m.clone()]);
@@ -4769,7 +4806,7 @@ impl App {
         let cwd = polish_cwd(self.store.root(), &intent.polish_name());
         if let Err(e) = std::fs::create_dir_all(&cwd) {
             st.hint = Some(format!("cannot create {}: {e}", cwd.display()));
-            return;
+            return false;
         }
         match Turn::start(
             &spec,
@@ -4779,15 +4816,16 @@ impl App {
             &self.provider_env,
         ) {
             Ok(turn) => {
-                st.transcript.push(("user".into(), shown.to_string()));
-                st.transcript.push(("agent".into(), String::new()));
                 st.latest = None;
                 st.hint = None;
                 st.scroll = 0;
                 st.turn = Some(turn);
-                let _ = Store::append_transcript(intent, "user", shown);
+                true
             }
-            Err(e) => st.hint = Some(format!("{e:#}")),
+            Err(e) => {
+                st.hint = Some(format!("{e:#}"));
+                false
+            }
         }
     }
 
@@ -4828,7 +4866,8 @@ impl App {
                             .map(|p| !p.resume.is_empty())
                             .unwrap_or(false);
                     let prompt = follow_up_prompt(&st.seed, &st.transcript, &text, resumable);
-                    self.start_turn(&mut st, &it, &prompt, &text);
+                    let fresh = follow_up_prompt(&st.seed, &st.transcript, &text, false);
+                    self.start_turn(&mut st, &it, &prompt, &text, Some(fresh));
                 }
                 self.screen = Screen::Chat(st);
             }
@@ -5464,6 +5503,7 @@ impl App {
         let Some(turn) = st.turn.as_ref() else { return };
         let path = st.intent_path.clone();
         let mut finished = false;
+        let mut retry: Option<String> = None;
         while let Some(msg) = turn.try_recv() {
             match msg {
                 TurnMsg::Delta(d) => {
@@ -5494,13 +5534,39 @@ impl App {
                     finished = true;
                 }
                 TurnMsg::Failed(e) => {
-                    st.hint = Some(e);
+                    match st.fresh.take() {
+                        Some(prompt) => retry = Some(prompt),
+                        None => st.hint = Some(e),
+                    }
                     finished = true;
                 }
             }
         }
         if finished {
             st.turn = None;
+            st.fresh = None;
+            if let Some(prompt) = retry {
+                // the conversation cannot resume (it ran in a folder that
+                // moved, or the provider forgot it): forget it, start fresh
+                st.conv_id = None;
+                // the failed turn's reply, whatever it streamed
+                if st.transcript.last().is_some_and(|(who, _)| who == "agent") {
+                    st.transcript.pop();
+                }
+                let provider = st.provider.clone();
+                let _ = Store::update_meta(&path, |fm| {
+                    fm.conversations.remove(&provider);
+                });
+                if let Screen::Chat(mut st) = std::mem::replace(&mut self.screen, Screen::Browse) {
+                    if let Ok(it) = Store::load(&path)
+                        && self.launch_turn(&mut st, &it, &prompt)
+                    {
+                        st.transcript.push(("agent".into(), String::new()));
+                    }
+                    self.screen = Screen::Chat(st);
+                }
+                return;
+            }
             self.rescan_keep_screen();
         }
     }
@@ -8722,6 +8788,82 @@ mod tests {
         );
     }
 
+    /// The invocation after the first `--resume=<id>` one, as the fake logged it.
+    fn after_first_resume(log: &str, id: &str) -> String {
+        let at = log
+            .find(&format!("--resume={id}"))
+            .unwrap_or_else(|| panic!("no resume: {log}"));
+        let next = log[at..]
+            .find("\n--prompt=")
+            .unwrap_or_else(|| panic!("nothing after the resume: {log}"));
+        let rest = &log[at + next + 1..];
+        // the next invocation's line starts with --prompt= or --resume=
+        let end = ["\n--prompt=", "\n--resume="]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn a_chat_that_cannot_resume_starts_fresh_with_its_context() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_meta(&path, |fm| {
+            fm.conversations.insert("fake".into(), "gone".into());
+        })
+        .unwrap();
+        fx.app.rescan();
+        fx.app
+            .provider_env
+            .push(("FAKE_RESUME_FAILS".into(), "1".into()));
+        polish(&mut fx.app);
+        wait_until(&mut fx.app, "the fresh turn", |a| {
+            !a.view().turn_running && a.view().transcript_len >= 2
+        });
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert_eq!(log.matches("--resume=gone").count(), 1, "tried once: {log}");
+        let fresh = after_first_resume(&log, "gone");
+        assert!(!fresh.contains("--resume="), "then fresh: {log}");
+        assert!(fresh.contains("alpha body"), "with the intent: {fresh}");
+        assert_eq!(fx.app.view().transcript_len, 2, "one exchange, not two");
+        let it = Store::load(&path).unwrap();
+        assert_ne!(
+            it.fm.conversations.get("fake").map(String::as_str),
+            Some("gone"),
+            "the dead conversation is forgotten"
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_cannot_resume_starts_fresh_with_its_context() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('f'));
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        // the restatement gave conv-int; every resume of it now fails
+        fx.app
+            .provider_env
+            .push(("FAKE_RESUME_FAILS".into(), "1".into()));
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review", "{:?}", fx.app.view().hint);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        let fresh = after_first_resume(&log, "conv-int");
+        assert!(!fresh.contains("--resume="), "then fresh: {log}");
+        assert!(
+            fresh.contains("The author's words:"),
+            "with the whole context: {fresh}"
+        );
+    }
+
     #[test]
     fn esc_cancels_running_turn() {
         let mut fx = setup("agy.jsonl");
@@ -10267,10 +10409,11 @@ mod tests {
         let mut other = fake_spec();
         other.name = "fake2".into();
         fx.app.cfg.providers.insert("fake2".into(), other);
-        agent_replies(&mut fx, &[RESTATE, "", RESTATE]);
+        agent_replies(&mut fx, &[RESTATE, "", "", RESTATE]);
         reply_fails(&fx, 2);
+        reply_fails(&fx, 3); // and its fresh retry
         start_bug_in_skoolscout(&mut fx); // conv-int from the first agent
-        key(&mut fx.app, KeyCode::Enter); // that's right → the ask fails
+        key(&mut fx.app, KeyCode::Enter); // that's right → the ask fails, twice
         wait_turn(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "retry");
         key(&mut fx.app, KeyCode::Char('m'));

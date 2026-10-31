@@ -4,6 +4,13 @@
 # can); FAKE_MODE=midturn streams all but the result line and never exits (a
 # turn still in progress); FAKE_MODE=garbage prints non-JSON lines first.
 [ -n "$FAKE_PROVIDER_LOG" ] && printf '%s\n' "$*" >> "$FAKE_PROVIDER_LOG"
+# FAKE_RESUME_FAILS=1: a resume fails, as claude's does when the conversation
+# ran in another folder (it is not consumed from the reply queue)
+if [ "${FAKE_RESUME_FAILS:-}" = 1 ]; then
+  for a in "$@"; do
+    case "$a" in --resume=*) echo "No conversation found with session ID" >&2; exit 1 ;; esac
+  done
+fi
 if [ "${FAKE_MODE:-}" = garbage ]; then
   echo "warning: model warming up"
   echo "not json at all"
