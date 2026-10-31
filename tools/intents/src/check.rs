@@ -350,7 +350,8 @@ pub fn why_not_passing(latest: Option<&CheckRecord>, body: &str) -> Option<Strin
         list.push_str(&format!(", and {} more", held.len() - SHOWN));
     }
     Some(format!(
-        "the completion check hasn't passed: {list} (X checks again)"
+        "the last check ({}) hasn't passed: {list}. X checks again",
+        when(latest.at, Local::now())
     ))
 }
 
@@ -387,9 +388,21 @@ fn nothing_confirmed(criteria: &[crate::store::Criterion], latest: &CheckRecord)
         _ => None,
     });
     Some(format!(
-        "the completion check hasn't passed: nothing was confirmed, every criterion came back \"can't check\"{} (X checks again)",
+        "the last check ({}) confirmed nothing: every criterion came back \"can't check\"{}. X checks again",
+        when(latest.at, Local::now()),
         first.map(|f| format!(" ({f})")).unwrap_or_default()
     ))
+}
+
+/// When a check ran, for a message about it: the time for a check from
+/// today (`08:57`), the day too for an older one (`Mar 4 08:57`), so an old
+/// reason doesn't read as a new one.
+fn when(at: DateTime<Local>, now: DateTime<Local>) -> String {
+    if at.date_naive() == now.date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%b %-d %H:%M").to_string()
+    }
 }
 
 /// The guide's log files under the stack's worktree; an absolute path or one

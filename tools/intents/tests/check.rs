@@ -577,12 +577,52 @@ fn a_check_that_confirmed_nothing_does_not_pass() {
     assert!(!herdr_intents::check::passes(&r, BODY_TWO));
     let why = herdr_intents::check::why_not_passing(Some(&r), BODY_TWO).unwrap();
     for part in [
-        "nothing was confirmed",
+        "confirmed nothing",
         "criterion 1: the browser tool fails before opening the app",
         "X checks again",
     ] {
         assert!(why.contains(part), "{part:?} in {why}");
     }
+}
+
+/// The record at a local time on a given day.
+fn at(r: &mut CheckRecord, day: chrono::NaiveDate) {
+    r.at = day
+        .and_hms_opt(8, 57, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .single()
+        .unwrap();
+}
+
+#[test]
+fn a_refusal_says_when_the_last_check_ran() {
+    let today = chrono::Local::now().date_naive();
+    let mut nothing = rec(&[
+        (1, "one", Verdict::CantCheck("socket path too long".into())),
+        (2, "two", Verdict::CantCheck("log only".into())),
+    ]);
+    at(&mut nothing, today);
+    let why = herdr_intents::check::why_not_passing(Some(&nothing), BODY_TWO).unwrap();
+    assert!(
+        why.starts_with("the last check (08:57) confirmed nothing: every criterion came back \"can't check\" (criterion 1: socket path too long)"),
+        "{why}"
+    );
+    assert!(why.ends_with(". X checks again"), "{why}");
+
+    let mut failing = rec(&[
+        (1, "one", Verdict::Confirmed("yes".into())),
+        (2, "two", Verdict::Fails("no".into())),
+    ]);
+    at(
+        &mut failing,
+        chrono::NaiveDate::from_ymd_opt(2025, 3, 4).unwrap(),
+    );
+    let why = herdr_intents::check::why_not_passing(Some(&failing), BODY_TWO).unwrap();
+    assert_eq!(
+        why,
+        "the last check (Mar 4 08:57) hasn't passed: criterion 2 fails. X checks again"
+    );
 }
 
 #[test]
