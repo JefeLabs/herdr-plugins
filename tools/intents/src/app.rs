@@ -4132,15 +4132,38 @@ impl App {
         if !group.as_os_str().is_empty() {
             out.push(("Where it is filed".into(), group.display().to_string()));
         }
-        // linked documents: never a file outside the intent's repo
+        // linked documents go to the agent's provider: `repo:` is part of the
+        // intent (any agent can rewrite it), so it must be a real git repository,
+        // never the home folder or `/`, and a link must be a relative path to a
+        // Markdown or text file, with no `..` and no hidden part
+        let home = dirs_home().and_then(|h| std::fs::canonicalize(h).ok());
         let repo = it
             .fm
             .repo
             .as_deref()
-            .and_then(|r| std::fs::canonicalize(r).ok());
+            .filter(|r| r.join(".git").exists())
+            .and_then(|r| std::fs::canonicalize(r).ok())
+            .filter(|r| r.parent().is_some() && Some(r) != home.as_ref());
+        let safe_link = |target: &str| {
+            let rel = Path::new(target.trim());
+            !target.trim().starts_with('~')
+                && rel.is_relative()
+                && rel.components().all(|c| match c {
+                    std::path::Component::Normal(part) => !part.to_string_lossy().starts_with('.'),
+                    std::path::Component::CurDir => true,
+                    _ => false,
+                })
+                && matches!(
+                    rel.extension().and_then(|e| e.to_str()),
+                    Some("md" | "markdown" | "txt")
+                )
+        };
         let mut budget = DOCS;
         for a in crate::store::artifacts(&it.body) {
-            if budget == 0 || !matches!(a.kind.to_lowercase().as_str(), "spec" | "plan" | "adr") {
+            if budget == 0
+                || !matches!(a.kind.to_lowercase().as_str(), "spec" | "plan" | "adr")
+                || !safe_link(&a.target)
+            {
                 continue;
             }
             let Ok(file) = std::fs::canonicalize(self.resolve_artifact_path(it, &a.target)) else {
@@ -14350,6 +14373,7 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         let repo = fx._tmp.path().join("intent-repo");
         fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
         fs::write(
             repo.join("docs/reinstate.md"),
             "SPEC: a paid application lands on Accepted\n",
@@ -14390,6 +14414,58 @@ mod tests {
             !log.contains("SECRET"),
             "nothing from outside the repo: {log}"
         );
+    }
+
+    /// Beta linking `links` (artifact lines) in `repo`; d pressed; the
+    /// drafting prompt as the fake provider logged it.
+    fn drafting_prompt_with(fx: &mut Fx, repo: &Path, links: &str) -> String {
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = format!(
+            "## Description\nbeta body\n\n## Acceptance criteria\n- [ ] one\n\n## Artifacts\n{links}"
+        );
+        it.fm.repo = Some(repo.to_path_buf());
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        focus_stories(&mut fx.app);
+        agent_replies(fx, &[DRAFTED]);
+        key(&mut fx.app, KeyCode::Char('d'));
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        fs::read_to_string(&fx.log).unwrap()
+    }
+
+    #[test]
+    fn d_never_reads_an_absolute_hidden_or_non_text_link() {
+        let mut fx = setup("agy.jsonl");
+        let repo = fx._tmp.path().join("intent-repo");
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("docs/spec.md"), "SPEC: kept\n").unwrap();
+        fs::write(repo.join("docs/abs.md"), "ABSOLUTE: never sent\n").unwrap();
+        fs::write(repo.join(".env.md"), "HIDDEN: never sent\n").unwrap();
+        fs::write(repo.join("docs/key.pem"), "KEY: never sent\n").unwrap();
+        let links = format!(
+            "- spec: docs/spec.md\n- spec: {}\n- spec: .env.md\n- plan: docs/key.pem\n- adr: docs/../docs/spec.md\n",
+            repo.join("docs/abs.md").display()
+        );
+        let log = drafting_prompt_with(&mut fx, &repo, &links);
+        assert!(log.contains("SPEC: kept"), "{log}");
+        for never in ["ABSOLUTE", "HIDDEN", "KEY:"] {
+            assert!(!log.contains(never), "{never} was sent: {log}");
+        }
+        assert_eq!(log.matches("SPEC: kept").count(), 1, "no `..` path: {log}");
+    }
+
+    #[test]
+    fn d_reads_nothing_from_a_repo_that_is_not_a_git_repository() {
+        let mut fx = setup("agy.jsonl");
+        let folder = fx._tmp.path().join("just-a-folder");
+        fs::create_dir_all(folder.join("docs")).unwrap();
+        fs::write(folder.join("docs/spec.md"), "LOOSE: never sent\n").unwrap();
+        let log = drafting_prompt_with(&mut fx, &folder, "- spec: docs/spec.md\n");
+        assert!(!log.contains("LOOSE"), "{log}");
     }
 
     #[test]
