@@ -147,6 +147,8 @@ struct StoryRow {
     mark: &'static str,
     label: String,
     video: Option<PathBuf>,
+    /// The criteria its kept video shows (by number), from the take's record.
+    shown: Vec<usize>,
 }
 
 /// What the chat asks once the last open question of a feature or bug is answered.
@@ -4499,6 +4501,7 @@ impl App {
                 } else {
                     ""
                 };
+                let mut shown: Vec<usize> = Vec::new();
                 let (mark, state) = if s.waits {
                     ("…", crate::store::STORIES_WAIT.to_string())
                 } else if now == Some(s.number) || preparing.contains(&s.number) {
@@ -4506,8 +4509,16 @@ impl App {
                 } else if queued.contains(&s.number) {
                     ("◌", "queued".to_string())
                 } else {
-                    match crate::capture::read_story(&folder).map(|r| r.outcome) {
-                        Some(StoryOutcome::Kept) if video.is_some() => ("▶", "video".to_string()),
+                    let record = crate::capture::read_story(&folder);
+                    match record.as_ref().map(|r| &r.outcome) {
+                        Some(StoryOutcome::Kept) if video.is_some() => {
+                            // the criteria this video shows, as an app-demo line names its own
+                            let shows =
+                                record.as_ref().map(|r| r.shows.clone()).unwrap_or_default();
+                            let list: Vec<String> = shows.iter().map(|n| n.to_string()).collect();
+                            shown = shows;
+                            ("▶", format!("video (criteria: {})", list.join(", ")))
+                        }
                         Some(StoryOutcome::NotShown(ns)) => {
                             let list: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
                             let which = if ns.len() == 1 {
@@ -4529,8 +4540,13 @@ impl App {
                 StoryRow {
                     number: s.number,
                     mark,
-                    label: format!("{}. {} · {state}", s.number, s.name),
+                    label: format!(
+                        "{}. {} · {state}",
+                        s.number,
+                        crate::store::story_title(&s.name)
+                    ),
                     video,
+                    shown,
                 }
             })
             .collect()
@@ -6800,8 +6816,13 @@ impl App {
                         .into_iter()
                         .map(|(m, t, _)| (m, t))
                         .collect();
-                    let stories: Vec<(String, String)> = self
-                        .story_rows(intent)
+                    let story_rows = self.story_rows(intent);
+                    // ▶ in Acceptance criteria: what the kept story videos show
+                    let mut video_criteria: Vec<usize> =
+                        story_rows.iter().flat_map(|r| r.shown.clone()).collect();
+                    video_criteria.sort_unstable();
+                    video_criteria.dedup();
+                    let stories: Vec<(String, String)> = story_rows
                         .into_iter()
                         .map(|r| (r.mark.to_string(), r.label))
                         .collect();
@@ -6836,6 +6857,7 @@ impl App {
                             follow_ups_selected: self.follow_ups_selected,
                             stories: &stories,
                             stories_selected: self.stories_selected,
+                            video_criteria: &video_criteria,
                             activity: crate::progress::activity(&self.evidence_for(intent)),
                         },
                         right,
@@ -14900,6 +14922,52 @@ mod tests {
     }
 
     #[test]
+    fn a_story_video_marks_the_criteria_it_shows() {
+        let mut fx = setup("agy.jsonl");
+        // story 1 kept a video showing 1 and 3; story 2's take missed 2
+        beta_with_stories(&mut fx);
+        let row = story_row(&fx, 1);
+        assert_eq!(row, "1. Mark reinstates Maya · video (criteria: 1, 3)");
+        assert!(
+            !story_row(&fx, 2).contains("(criteria:"),
+            "{}",
+            story_row(&fx, 2)
+        );
+        for _ in 0..12 {
+            if fx.app.view().focus == "criteria" {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Tab);
+        }
+        let screen = screen_text(&fx.app, 120, 60);
+        assert!(screen.contains("[ ] ▶ one"), "{screen}");
+        assert!(screen.contains("[ ] ▶ three"), "{screen}");
+        assert!(
+            !screen.contains("▶ two"),
+            "no kept video shows it: {screen}"
+        );
+        assert!(screen.contains("Stories & Videos"), "{screen}");
+    }
+
+    #[test]
+    fn a_story_named_as_a_slug_reads_as_words_in_its_row() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = it
+            .body
+            .replace("### Mark reinstates Maya", "### mark-reinstates-maya");
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        assert!(
+            story_row(&fx, 1).starts_with("1. Mark Reinstates Maya · video"),
+            "{}",
+            story_row(&fx, 1)
+        );
+    }
+
+    #[test]
     fn the_criteria_come_before_the_stories() {
         let mut fx = setup("agy.jsonl");
         beta_with_stories(&mut fx);
@@ -15059,7 +15127,7 @@ mod tests {
         );
         // the check is not recording story 1
         assert!(
-            story_row(&fx, 1).ends_with(" · video"),
+            story_row(&fx, 1).ends_with(" · video (criteria: 1, 3)"),
             "{}",
             story_row(&fx, 1)
         );
