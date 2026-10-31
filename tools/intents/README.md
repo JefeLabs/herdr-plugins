@@ -234,6 +234,42 @@ It is filled in for you the first time the tool starts in a workspace whose fold
 
 **Skoolscout's way.** A guide with `default_area` in place of `start` keeps skoolscout's own steps: a `work` slot, e2e seed stories and logs in the slot's worktree, as the next sections describe.
 
+## Stories and demo videos
+
+A feature or a bug carries the user stories its demo videos will show, in a `## Stories` section after the acceptance criteria:
+
+```markdown
+## Stories
+### Mark reinstates Maya's withdrawn application
+- persona: Mark, a tenant admin
+- shows: 1, 3
+- starting data: Maya has a submitted application, then withdrawn
+1. Open Maya's application from Applications
+2. Choose Reinstate and confirm
+3. See the application back under Submitted
+```
+
+`shows:` names acceptance criteria by number, counted from 1 across groups (a reconcile or fold that renumbers criteria renumbers it too). Polish drafts the section: while open questions remain, each story has only its name, persona and `shows:`, with `drafts wait for the open questions`; once every question has its answer it adds the starting data and the steps. Answering the last open question with `Q` opens the chat on that drafting turn. The section goes to the coding agent with the rest of the intent, so it builds knowing what will be shown. Refactors and ideas have no stories.
+
+**The run guide names the personas.** Its instructions get a `## Stories` section; the guide's rules win over a story:
+
+```markdown
+## Stories
+### Personas
+- Mark: tenant admin, signs in as mark@example.test
+- Pat: a parent, signs in as pat@example.test
+### Setup may create
+- applications and notes, never people
+```
+
+Drafting picks personas from that list (`unknown` when none fits). With no such section stories are still drafted, but none is recorded: the row says `the run guide lists no personas for stories`.
+
+**When videos are recorded.** Once the completion check passes (no criterion failing or missing, counting every check so far; "can't check" does not hold it back), the same run records each story with no kept video, and records again any story showing a criterion that check looked at. Each story gets its own confined agent and browser session, which signs in, sets up the starting data through the app, rehearses the steps once unrecorded, sets up fresh data, then calls `take_start`: the video starts with a card naming the story and its persona, shows each criterion's own text as a caption when the agent says it is visible, and ends on a card listing what it showed. A video is kept only when every criterion the story shows got its caption; a re-take that fails keeps the earlier video. Nothing about signing in is ever on video.
+
+Each story's folder is `<stem>.assets/stories/<n>-<name>/`: `video.mp4`, `steps.txt` (the take's browser steps), `captions.json` and `story.json` (how the last take ended).
+
+**Keys in the Stories section** (Tab to it): `o` or Enter plays the video, `c` copies the file (it pastes into Slack or Messages on a Mac; elsewhere the path), `Y` copies its path, `O` shows it in Finder, `r` records it again once the check has passed. Each row reads `<n>. <name> · video`, `recording…`, `criterion 3 didn't show`, `couldn't record: <why>`, `drafts wait for the open questions` or `not recorded yet`.
+
 ## Evidence for bugs
 
 A bug can carry proof: a screenshot or a video of it happening on a local stack, recorded by an agent, and the same steps again once the fix has merged. It needs a run guide (see Spaces and the run guide; with skoolscout's work mode, also `work` (workbrokr)), a `claude` recent enough to have `--restricted` and `--permission-mode dontAsk` (an older one is refused before any stack starts), and `agent-browser` (`npm i -g agent-browser` or `brew install agent-browser`, then `agent-browser install` for its browser).

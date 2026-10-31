@@ -1520,7 +1520,7 @@ fn run_agent(
 ) -> Result<String, String> {
     let written = serde_json::to_string(mcp_config)
         .map_err(|e| e.to_string())
-        .and_then(|t| std::fs::write(&config_file, t).map_err(|e| e.to_string()));
+        .and_then(|t| std::fs::write(config_file, t).map_err(|e| e.to_string()));
     if let Err(e) = written {
         return Err(format!("cannot write {}: {e}", config_file.display()));
     }
