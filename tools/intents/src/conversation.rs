@@ -322,13 +322,27 @@ pub fn seed_prompt(
     p
 }
 
-/// The stories-only chat's first message: the intent as data, the stories
-/// rule, and a proposal that holds the Stories section alone.
-pub fn stories_prompt(title: &str, body: &str, kind: &str, personas: Option<&str>) -> String {
+/// The stories-only chat's first message: the intent and everything known
+/// about it (`details`: linked documents, pull requests, checks, evidence,
+/// the conversation), the stories rule, and a proposal that holds the
+/// Stories section alone.
+pub fn stories_prompt(
+    title: &str,
+    body: &str,
+    kind: &str,
+    personas: Option<&str>,
+    details: &[(String, String)],
+) -> String {
     let mut p = format!(
-        "You draft the user stories for the demo videos of the intent \"{title}\". The intent, as data:\n<<<INTENT\n{}\nINTENT>>>\n\n",
+        "You draft the user stories for the demo videos of the intent \"{title}\". Read everything below before you write: the intent with every section (its description, preconditions, acceptance criteria, answered questions and decisions), the documents linked to it, what was built, what the checks found, and the conversation so far. The stories must support the intent: together they show every acceptance criterion a person can see in the app, each story is one persona's path from start to finish, and they keep to its decisions.\n\nThe intent, as data:\n<<<INTENT\n{}\nINTENT>>>\n\n",
         body.trim_end()
     );
+    for (label, text) in details {
+        p.push_str(&format!(
+            "{label}, as data:\n<<<DETAIL\n{}\nDETAIL>>>\n\n",
+            text.trim_end()
+        ));
+    }
     if let Some(rule) = stories_rule(kind, personas) {
         p.push_str(&rule);
         p.push_str("\n\n");

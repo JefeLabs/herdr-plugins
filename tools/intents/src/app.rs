@@ -4109,6 +4109,109 @@ impl App {
         });
     }
 
+    /// Everything known about `it` beyond its own text, for drafting its
+    /// stories: where it is filed, the specs, plans and ADRs it links (only
+    /// files inside its repo, each capped), its pull requests, the latest
+    /// check, a bug's captured evidence, and the end of its conversation.
+    fn story_details(&self, it: &Intent) -> Vec<(String, String)> {
+        const DOC: usize = 24_000;
+        const DOCS: usize = 72_000;
+        const CHAT: usize = 12_000;
+        let cut_end = |text: &str, cap: usize| -> String {
+            if text.len() <= cap {
+                return text.to_string();
+            }
+            let mut at = cap;
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            format!("{}\n[… cut]", &text[..at])
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        let group = self.rel(it.path.parent().unwrap_or(self.store.root()));
+        if !group.as_os_str().is_empty() {
+            out.push(("Where it is filed".into(), group.display().to_string()));
+        }
+        // linked documents: never a file outside the intent's repo
+        let repo = it
+            .fm
+            .repo
+            .as_deref()
+            .and_then(|r| std::fs::canonicalize(r).ok());
+        let mut budget = DOCS;
+        for a in crate::store::artifacts(&it.body) {
+            if budget == 0 || !matches!(a.kind.to_lowercase().as_str(), "spec" | "plan" | "adr") {
+                continue;
+            }
+            let Ok(file) = std::fs::canonicalize(self.resolve_artifact_path(it, &a.target)) else {
+                continue;
+            };
+            if !repo.as_ref().is_some_and(|r| file.starts_with(r)) || !file.is_file() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let text = cut_end(&text, DOC.min(budget));
+            budget = budget.saturating_sub(text.len());
+            out.push((format!("The linked {} {}", a.kind, a.target), text));
+        }
+        let prs: Vec<String> = self
+            .pr_rows(it)
+            .iter()
+            .map(|r| {
+                format!(
+                    "- {} {}: {}",
+                    r.target,
+                    format!("{:?}", r.state).to_lowercase(),
+                    r.title.as_deref().unwrap_or("")
+                )
+            })
+            .collect();
+        if !prs.is_empty() {
+            out.push(("Pull requests".into(), prs.join("\n")));
+        }
+        if let Some(rec) = crate::check::read_check(&crate::check::checks_dir(it)) {
+            use crate::check::Verdict;
+            let lines: Vec<String> = rec
+                .results
+                .iter()
+                .map(|r| {
+                    let (word, why) = match &r.verdict {
+                        Verdict::Confirmed(t) => ("confirmed", t),
+                        Verdict::Fails(t) => ("fails", t),
+                        Verdict::Missing(t) => ("missing", t),
+                        Verdict::CantCheck(t) => ("can't check", t),
+                    };
+                    format!("- criterion {} ({}): {word}: {why}", r.number, r.text)
+                })
+                .collect();
+            out.push(("The latest completion check".into(), lines.join("\n")));
+        }
+        let evidence: Vec<String> = self
+            .evidence_rows(it)
+            .into_iter()
+            .map(|r| format!("- {}", r.label))
+            .collect();
+        if !evidence.is_empty() {
+            out.push(("Captured evidence".into(), evidence.join("\n")));
+        }
+        if let Ok(chat) = std::fs::read_to_string(it.transcript_path())
+            && !chat.trim().is_empty()
+        {
+            let start = chat.len().saturating_sub(CHAT);
+            let mut at = start;
+            while !chat.is_char_boundary(at) {
+                at += 1;
+            }
+            out.push((
+                "The polish conversation (its end)".into(),
+                chat[at..].to_string(),
+            ));
+        }
+        out
+    }
+
     /// Why a run of `it` cannot start now: a check, a capture or a story
     /// recording of it is running.
     fn run_of(&self, it: &Intent) -> Option<&'static str> {
@@ -5054,6 +5157,7 @@ impl App {
                 &intent.body,
                 &intent.fm.kind,
                 personas.as_deref(),
+                &self.story_details(&intent),
             )
         } else {
             seed_prompt(
@@ -14238,6 +14342,53 @@ mod tests {
             it.fm.conversations.get("fake").map(String::as_str),
             Some("polish-conv"),
             "the polish conversation is kept"
+        );
+    }
+
+    #[test]
+    fn d_reads_the_linked_documents_and_the_conversation() {
+        let mut fx = setup("agy.jsonl");
+        let repo = fx._tmp.path().join("intent-repo");
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(
+            repo.join("docs/reinstate.md"),
+            "SPEC: a paid application lands on Accepted\n",
+        )
+        .unwrap();
+        let outside = fx._tmp.path().join("secret.md");
+        fs::write(&outside, "SECRET: never sent\n").unwrap();
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = format!(
+            "## Description\nbeta body\n\n## Acceptance criteria\n- [ ] one\n\n## Artifacts\n- spec: docs/reinstate.md\n- spec: {}\n",
+            outside.display()
+        );
+        it.fm.repo = Some(repo.clone());
+        Store::save_force(&mut it).unwrap();
+        fs::write(
+            it.transcript_path(),
+            "**user:** the owner says paid goes straight to Accepted\n",
+        )
+        .unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        focus_stories(&mut fx.app);
+        agent_replies(&mut fx, &[DRAFTED]);
+        key(&mut fx.app, KeyCode::Char('d'));
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(
+            log.contains("SPEC: a paid application lands on Accepted"),
+            "{log}"
+        );
+        assert!(
+            log.contains("paid goes straight to Accepted"),
+            "the conversation: {log}"
+        );
+        assert!(
+            !log.contains("SECRET"),
+            "nothing from outside the repo: {log}"
         );
     }
 

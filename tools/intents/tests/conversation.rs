@@ -459,8 +459,47 @@ fn the_stories_prompt_asks_for_the_stories_section_only() {
         "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n",
         "enhancement",
         Some("## Stories\n### Personas\n- Mark: admin\n"),
+        &[],
     );
     assert!(p.contains("- [ ] one"), "the intent: {p}");
     assert!(p.contains("only the `## Stories` section"), "{p}");
     assert!(p.contains("- Mark: admin"), "the guide's personas: {p}");
+}
+
+#[test]
+fn the_stories_prompt_carries_every_detail_and_says_to_read_it() {
+    let details = vec![
+        (
+            "The linked spec docs/reinstate.md".to_string(),
+            "SPEC: a paid application lands on Accepted".to_string(),
+        ),
+        (
+            "Pull requests".to_string(),
+            "- #5864 merged: Reinstate a withdrawn application".to_string(),
+        ),
+    ];
+    let p = herdr_intents::conversation::stories_prompt(
+        "Reinstate a withdrawn application",
+        "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n\n## Decisions\n- D1 (owner): paid goes to Accepted\n",
+        "enhancement",
+        None,
+        &details,
+    );
+    assert!(p.contains("Read everything below before you write"), "{p}");
+    assert!(
+        p.contains("D1 (owner): paid goes to Accepted"),
+        "the decisions: {p}"
+    );
+    assert!(p.contains("The linked spec docs/reinstate.md"), "{p}");
+    assert!(
+        p.contains("SPEC: a paid application lands on Accepted"),
+        "{p}"
+    );
+    assert!(
+        p.contains("- #5864 merged: Reinstate a withdrawn application"),
+        "{p}"
+    );
+    let read_at = p.find("Read everything below").unwrap();
+    let reply_at = p.find("Reply with one fenced").unwrap();
+    assert!(p.find("SPEC:").unwrap() < reply_at && read_at < reply_at);
 }
