@@ -62,6 +62,204 @@ pub struct TakeConfig {
     /// a card and 4 s for a caption.
     #[serde(default)]
     pub hold_ms: Option<u64>,
+    /// The intent the story belongs to, on the splash.
+    #[serde(default)]
+    pub intent_title: String,
+    #[serde(default)]
+    pub intent_id: Option<String>,
+    #[serde(default)]
+    pub version: Option<u32>,
+    /// The guide's logo and colors for the cards and captions.
+    #[serde(default)]
+    pub look: crate::capture::CardLook,
+}
+
+/// How long the splash stays: long enough to read what the video covers.
+fn splash_ms(criteria: usize) -> u64 {
+    (4000 + 2000 * criteria as u64).min(12_000)
+}
+
+/// One piece of a card: an image or a line of text, its style, and (one
+/// level down) the pieces of a line.
+#[derive(Serialize)]
+struct Piece {
+    tag: &'static str,
+    style: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    src: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    parts: Vec<Piece>,
+}
+
+impl Piece {
+    fn text(style: impl Into<String>, text: impl Into<String>) -> Piece {
+        Piece {
+            tag: "div",
+            style: style.into(),
+            text: Some(text.into()),
+            src: None,
+            parts: Vec::new(),
+        }
+    }
+}
+
+/// The page script that draws a card in the overlay `id`: every piece goes
+/// in as JSON data, text through `textContent` and the logo as an image's
+/// `src`, so nothing on a card is ever markup.
+fn card_script(id: &str, style: &str, pieces: &[Piece]) -> String {
+    let pieces = serde_json::to_string(pieces).unwrap_or_else(|_| "[]".into());
+    let style = serde_json::to_string(style).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(() => {{ const old = document.getElementById('{id}'); if (old) old.remove(); const build = (p) => {{ const e = document.createElement(p.tag); e.setAttribute('style', p.style); if (p.text !== undefined) e.textContent = p.text; if (p.src !== undefined) e.src = p.src; for (const c of (p.parts || [])) e.appendChild(build(c)); return e; }}; const d = document.createElement('div'); d.id = '{id}'; d.setAttribute('style', {style}); for (const p of {pieces}) d.appendChild(build(p)); document.documentElement.appendChild(d); }})()"
+    )
+}
+
+/// A color from the look, or `fallback` when it isn't `#rgb` / `#rrggbb`.
+fn color<'a>(v: &'a str, fallback: &'a str) -> &'a str {
+    if crate::capture::is_hex_color(v) {
+        v
+    } else {
+        fallback
+    }
+}
+
+/// `#142b57` as `rgba(20,43,87,0.88)`, for a see-through caption bar.
+fn translucent(hex: &str, alpha: &str) -> String {
+    let h = color(hex, "#0e0e14").trim_start_matches('#');
+    let full: String = if h.len() == 3 {
+        h.chars().flat_map(|c| [c, c]).collect()
+    } else {
+        h.to_string()
+    };
+    let at = |i: usize| u8::from_str_radix(&full[i..i + 2], 16).unwrap_or(0);
+    format!("rgba({},{},{},{alpha})", at(0), at(2), at(4))
+}
+
+/// The card's own box: the whole page, in the guide's colors.
+fn card_style(look: &crate::capture::CardLook) -> String {
+    format!(
+        "position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:{};color:{};font:500 24px/1.4 system-ui,-apple-system,sans-serif;padding:6vh 8vw 10vh;text-align:center;box-sizing:border-box",
+        color(&look.background, "#0e0e14"),
+        color(&look.text, "#ffffff"),
+    )
+}
+
+/// The caption bar, in the guide's colors.
+fn caption_style(look: &crate::capture::CardLook) -> String {
+    format!(
+        "position:fixed;left:5vw;right:5vw;bottom:5vh;z-index:2147483647;background:{};color:{};font:500 24px/1.4 system-ui,-apple-system,sans-serif;padding:16px 22px;border-radius:12px;white-space:pre-line;box-sizing:border-box",
+        translucent(&look.background, "0.88"),
+        color(&look.text, "#ffffff"),
+    )
+}
+
+/// The logo at the top of a card, `height` pixels high at most.
+fn logo_piece(look: &crate::capture::CardLook, height: u32) -> Option<Piece> {
+    look.logo.as_ref().map(|src| Piece {
+        tag: "img",
+        style: format!("max-height:{height}px;max-width:50vw;margin-bottom:10px"),
+        text: None,
+        src: Some(src.clone()),
+        parts: Vec::new(),
+    })
+}
+
+/// The cards' last line: `k7q2 · v3 · recorded 2026-10-31 10:42`.
+fn footer(t: &TakeConfig, at: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(id) = &t.intent_id {
+        parts.push(id.clone());
+    }
+    if let Some(v) = t.version {
+        parts.push(format!("v{v}"));
+    }
+    parts.push(format!("recorded {at}"));
+    parts.join(" · ")
+}
+
+fn footer_piece(look: &crate::capture::CardLook, text: String) -> Piece {
+    Piece::text(
+        format!(
+            "position:absolute;bottom:4vh;left:0;right:0;color:{};font-size:16px;letter-spacing:.04em",
+            color(&look.accent, "#7aa2ff")
+        ),
+        text,
+    )
+}
+
+/// The opening card, which is also the video's first frame (its cover): the
+/// logo, the intent, the story and persona, each criterion it covers, and
+/// the id, version and time.
+fn splash_pieces(t: &TakeConfig, at: &str) -> Vec<Piece> {
+    let accent = color(&t.look.accent, "#7aa2ff").to_string();
+    let mut out: Vec<Piece> = logo_piece(&t.look, 72).into_iter().collect();
+    if !t.intent_title.is_empty() {
+        out.push(Piece::text("font-size:22px;opacity:.8", &t.intent_title));
+    }
+    out.push(Piece::text(
+        "font:700 40px/1.25 system-ui,-apple-system,sans-serif",
+        &t.title,
+    ));
+    out.push(Piece::text(
+        "font-size:22px;opacity:.85",
+        format!("as {}", t.persona),
+    ));
+    out.push(Piece {
+        tag: "div",
+        style: format!("width:96px;height:4px;border-radius:2px;background:{accent};margin:6px 0"),
+        text: None,
+        src: None,
+        parts: Vec::new(),
+    });
+    out.push(Piece::text(
+        format!("color:{accent};font-size:16px;font-weight:700;letter-spacing:.08em;text-transform:uppercase"),
+        "This video shows",
+    ));
+    for (n, text) in &t.shows {
+        out.push(Piece {
+            tag: "div",
+            style: "max-width:80vw;text-align:left".into(),
+            text: None,
+            src: None,
+            parts: vec![
+                Piece::text(
+                    format!("display:inline;color:{accent};font-weight:700"),
+                    format!("{n}. "),
+                ),
+                Piece::text("display:inline", text),
+            ],
+        });
+    }
+    out.push(footer_piece(&t.look, footer(t, at)));
+    out
+}
+
+/// The closing card: what the take showed, by the captions it got.
+fn closing_pieces(t: &TakeConfig, captioned: &[usize], at: &str) -> Vec<Piece> {
+    let accent = color(&t.look.accent, "#7aa2ff").to_string();
+    let mut out: Vec<Piece> = logo_piece(&t.look, 40).into_iter().collect();
+    out.push(Piece::text(
+        format!("color:{accent};font-size:16px;font-weight:700;letter-spacing:.08em;text-transform:uppercase"),
+        "Shown in this video",
+    ));
+    let shown: Vec<&(usize, String)> = t
+        .shows
+        .iter()
+        .filter(|(c, _)| captioned.contains(c))
+        .collect();
+    if shown.is_empty() {
+        out.push(Piece::text("opacity:.85", "No criterion was shown"));
+    }
+    for (n, text) in shown {
+        out.push(Piece::text(
+            "max-width:80vw;text-align:left",
+            format!("✓ {n}. {text}"),
+        ));
+    }
+    out.push(footer_piece(&t.look, footer(t, at)));
+    out
 }
 
 /// How long a card stays on screen, unless the take says.
@@ -71,8 +269,6 @@ const CAPTION_MS: u64 = 4000;
 /// The overlays' element ids: fixed, so each draw replaces the last.
 const CARD_ID: &str = "intents-take-card";
 const CAPTION_ID: &str = "intents-take-caption";
-const CARD_STYLE: &str = "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(14,14,20,.94);color:#fff;font:600 34px/1.35 system-ui,-apple-system,sans-serif;padding:8vw;white-space:pre-line;text-align:center;box-sizing:border-box";
-const CAPTION_STYLE: &str = "position:fixed;left:5vw;right:5vw;bottom:5vh;z-index:2147483647;background:rgba(14,14,20,.88);color:#fff;font:500 24px/1.4 system-ui,-apple-system,sans-serif;padding:16px 22px;border-radius:12px;white-space:pre-line;box-sizing:border-box";
 
 /// The page script that shows `text` in the overlay `id`: the text goes in
 /// as a JSON string literal through `textContent`, so it is never markup.
@@ -479,6 +675,8 @@ struct Server {
     taking: bool,
     take_over: bool,
     captioned: Vec<usize>,
+    /// When the take started, for its cards' footer.
+    recorded_at: String,
 }
 
 impl Server {
@@ -554,21 +752,29 @@ impl Server {
                 let _ = std::fs::write(t.dir.join("steps.txt"), "");
                 let _ = std::fs::remove_file(t.dir.join("take.stopped"));
                 save_captions(&[]);
+                self.recorded_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+                // the splash goes up before the recording starts: the video's
+                // first frame is its cover
+                let splash = card_script(
+                    CARD_ID,
+                    &card_style(&t.look),
+                    &splash_pieces(&t, &self.recorded_at),
+                );
+                self.run(&["eval".into(), splash]);
                 // the take is kept as video.mp4 only if it ends cleanly and shows
                 // everything; the pointer is drawn on it
                 let take = t.dir.join("take.mp4").display().to_string();
                 let (ok, text) =
                     self.run(&["record".into(), "start".into(), take, "--cursor".into()]);
                 if !ok {
+                    self.run(&["eval".into(), remove_script(CARD_ID)]);
                     return (true, format!("could not start recording: {text}"));
                 }
                 self.taking = true;
-                self.show(
-                    CARD_ID,
-                    CARD_STYLE,
-                    &format!("{}\n\n{}", t.title, t.persona),
-                    hold(CARD_MS),
-                );
+                std::thread::sleep(std::time::Duration::from_millis(hold(splash_ms(
+                    t.shows.len(),
+                ))));
+                self.run(&["eval".into(), remove_script(CARD_ID)]);
                 (
                     false,
                     "recording: follow the steps, and call caption as each criterion shows".into(),
@@ -587,7 +793,7 @@ impl Server {
                 let Some((_, text)) = t.shows.iter().find(|(c, _)| *c == n) else {
                     return (true, format!("criterion {n} is not one this story shows"));
                 };
-                self.show(CAPTION_ID, CAPTION_STYLE, text, hold(CAPTION_MS));
+                self.show(CAPTION_ID, &caption_style(&t.look), text, hold(CAPTION_MS));
                 self.captioned.push(n);
                 save_captions(&self.captioned);
                 (false, format!("captioned criterion {n}"))
@@ -596,18 +802,14 @@ impl Server {
                 if !self.taking {
                     return (true, "no take is running".into());
                 }
-                let shown: Vec<String> = t
-                    .shows
-                    .iter()
-                    .filter(|(c, _)| self.captioned.contains(c))
-                    .map(|(c, text)| format!("{c}. {text}"))
-                    .collect();
-                self.show(
+                let closing = card_script(
                     CARD_ID,
-                    CARD_STYLE,
-                    &format!("Shown\n\n{}", shown.join("\n")),
-                    hold(CARD_MS),
+                    &card_style(&t.look),
+                    &closing_pieces(&t, &self.captioned, &self.recorded_at),
                 );
+                self.run(&["eval".into(), closing]);
+                std::thread::sleep(std::time::Duration::from_millis(hold(CARD_MS)));
+                self.run(&["eval".into(), remove_script(CARD_ID)]);
                 let (ok, text) = self.run(&["record".into(), "stop".into()]);
                 self.taking = false;
                 self.take_over = true;
@@ -786,6 +988,7 @@ pub fn serve(config: &Path) -> anyhow::Result<()> {
         taking: false,
         take_over: false,
         captioned: Vec::new(),
+        recorded_at: String::new(),
     };
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

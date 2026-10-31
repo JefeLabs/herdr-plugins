@@ -3585,6 +3585,14 @@ impl App {
 
     /// Starts a capture in its own process: it outlives this one.
     fn launch_capture(&self, req: crate::capture::CaptureRequest) -> Result<(), String> {
+        // a check or a recording names the intent's id and version on video
+        if let crate::capture::Job::Story { intent_path, .. }
+        | crate::capture::Job::Check { intent_path, .. } = &req.job
+        {
+            self.store
+                .stamp_for_run(intent_path)
+                .map_err(|e| format!("{}: {e}", intent_path.display()))?;
+        }
         crate::capture::launch(&crate::capture::CaptureOrder {
             req,
             env: self.capture_env.clone(),
@@ -14865,6 +14873,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         message
+    }
+
+    #[test]
+    fn a_run_stamps_the_intents_id_and_version_first() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        beta_with_stories(&mut fx);
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_meta(&path, |fm| fm.id = None).unwrap();
+        let v = Store::load(&path).unwrap().fm.version.unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            text.replace(
+                "## Description\nx\n",
+                "## Description\nchanged in the editor\n",
+            ),
+        )
+        .unwrap();
+        fx.app.rescan();
+        record_second_story(&mut fx);
+        let it = Store::load(&path).unwrap();
+        assert!(it.fm.id.is_some(), "an id before the run");
+        assert_eq!(it.fm.version, Some(v + 1), "the editor's change counted");
     }
 
     #[test]

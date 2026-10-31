@@ -70,6 +70,136 @@ pub struct CaptureGuide {
     pub body: String,
     /// Log files a completion check may search, relative to the stack's worktree.
     pub logs: Vec<String>,
+    /// How a story video's cards look (`splash:`); see `card_look`.
+    pub splash: GuideSplash,
+}
+
+/// The guide's `splash:` block, as written: a logo (a path in the repo) and
+/// the colors of a story video's cards and captions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct GuideSplash {
+    #[serde(default)]
+    pub logo: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub accent: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// How a take's cards and captions look, checked and ready to draw.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardLook {
+    /// The logo as a `data:` URL, when the guide names a usable one.
+    #[serde(default)]
+    pub logo: Option<String>,
+    /// Colors, each `#rgb` or `#rrggbb`.
+    pub background: String,
+    pub accent: String,
+    pub text: String,
+}
+
+impl Default for CardLook {
+    fn default() -> Self {
+        CardLook {
+            logo: None,
+            background: "#0e0e14".into(),
+            accent: "#7aa2ff".into(),
+            text: "#ffffff".into(),
+        }
+    }
+}
+
+/// The largest logo a card carries (it goes to the browser as one argument).
+const LOGO_MAX: u64 = 256 * 1024;
+
+/// The cards' look from the guide's `splash:` block, with what was skipped
+/// and why. Colors must be hex (they go into the overlay's style); the logo
+/// must be a png, svg or jpeg inside `repo`, at most 256 KB.
+pub fn card_look(splash: &GuideSplash, repo: &Path) -> (CardLook, Vec<String>) {
+    let mut look = CardLook::default();
+    let mut warnings = Vec::new();
+    for (name, value, slot) in [
+        ("background", &splash.background, &mut look.background),
+        ("accent", &splash.accent, &mut look.accent),
+        ("text", &splash.text, &mut look.text),
+    ] {
+        if let Some(v) = value {
+            if is_hex_color(v) {
+                *slot = v.clone();
+            } else {
+                warnings.push(format!(
+                    "the splash's {name} `{v}` is not a color like #1462e1: the default is used"
+                ));
+            }
+        }
+    }
+    if let Some(logo) = &splash.logo {
+        match logo_data(logo, repo) {
+            Ok(data) => look.logo = Some(data),
+            Err(why) => warnings.push(format!("the splash's logo `{logo}` {why}: no logo")),
+        }
+    }
+    (look, warnings)
+}
+
+pub(crate) fn is_hex_color(v: &str) -> bool {
+    v.strip_prefix('#')
+        .is_some_and(|h| matches!(h.len(), 3 | 6) && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The logo file as a `data:` URL, or why it can't be one.
+fn logo_data(logo: &str, repo: &Path) -> Result<String, String> {
+    use std::path::Component;
+    let rel = Path::new(logo);
+    if !rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return Err("is outside the repo".into());
+    }
+    let file = std::fs::canonicalize(repo.join(rel)).map_err(|e| format!("can't be read ({e})"))?;
+    let root = std::fs::canonicalize(repo).map_err(|e| format!("can't be read ({e})"))?;
+    if !file.starts_with(&root) {
+        return Err("is outside the repo".into());
+    }
+    let ext = file
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => return Err("is not a png, svg or jpeg".into()),
+    };
+    let len = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    if len > LOGO_MAX {
+        return Err("is over 256 KB".into());
+    }
+    let bytes = std::fs::read(&file).map_err(|e| format!("can't be read ({e})"))?;
+    Ok(format!("data:{mime};base64,{}", base64(&bytes)))
+}
+
+/// Standard base64, with padding.
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// One capture, as written beside the evidence (`<phase>.json`).
@@ -117,6 +247,8 @@ struct GuideFront {
     url: String,
     #[serde(default)]
     logs: Vec<String>,
+    #[serde(default)]
+    splash: GuideSplash,
 }
 
 /// How long the app gets to answer, unless the guide says.
@@ -214,6 +346,7 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
         url: front.url,
         body: rest[end + "\n---\n".len()..].to_string(),
         logs: front.logs,
+        splash: front.splash,
     })
 }
 
@@ -1776,6 +1909,9 @@ fn record_stories(
         })
         .collect();
     let personas = guide_stories(guide);
+    // the cards' logo and colors, from the guide; what was skipped goes in
+    // each story's run log
+    let (look, look_warnings) = card_look(&guide.splash, &r.repo);
     // the chosen stories, then each one queued with `r` meanwhile, on this app
     let mut pending: std::collections::VecDeque<usize> = chosen.iter().map(|s| s.number).collect();
     loop {
@@ -1839,6 +1975,13 @@ fn record_stories(
         for f in ["captions.json", "steps.txt", "run.log"] {
             let _ = std::fs::remove_file(dir.join(f));
         }
+        if !look_warnings.is_empty() {
+            let lines: String = look_warnings
+                .iter()
+                .map(|w| format!("the tool: {w}\n"))
+                .collect();
+            let _ = std::fs::write(dir.join("run.log"), lines);
+        }
         let mcp_config = crate::capture_mcp::McpConfig {
             base_url: base_url.to_string(),
             session: format!("{}-s{}", r.browser, story.number),
@@ -1854,6 +1997,10 @@ fn record_stories(
                 shows: shows.clone(),
                 dir: dir.clone(),
                 hold_ms: None,
+                intent_title: it.fm.title.clone(),
+                intent_id: it.fm.id.clone(),
+                version: it.fm.version,
+                look: look.clone(),
             }),
         };
         progress(format!("recording story {}: {}", story.number, story.name));
@@ -2668,6 +2815,7 @@ mod tests {
             url: "https://demo-org.skoolscout.com.local:{port}".into(),
             body: "Sign in with Cmd+U.\n".into(),
             logs: Vec::new(),
+            splash: Default::default(),
         }
     }
 

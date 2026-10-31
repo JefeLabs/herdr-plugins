@@ -916,3 +916,146 @@ fn trash_moves_an_intent_and_everything_it_owns_out_of_the_tree() {
     let dest2 = s.trash(&again).unwrap();
     assert_ne!(dest, dest2);
 }
+
+// ---- the intent's id and version -------------------------------------------
+
+fn is_id(id: &str) -> bool {
+    id.len() == 4
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+#[test]
+fn a_new_intent_gets_a_four_character_id_and_version_1() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(
+            Path::new("g"),
+            "Reinstate",
+            "feature",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    let id = it.fm.id.clone().unwrap();
+    assert!(is_id(&id), "{id}");
+    assert_eq!(it.fm.version, Some(1));
+    let back = Store::load(&it.path).unwrap();
+    assert_eq!(back.fm.id.as_deref(), Some(id.as_str()), "saved");
+    assert_eq!(back.fm.version, Some(1));
+}
+
+#[test]
+fn a_drawn_id_is_four_lowercase_letters_or_digits() {
+    for _ in 0..200 {
+        let id = herdr_intents::store::draw_id();
+        assert!(is_id(&id), "{id}");
+    }
+}
+
+#[test]
+fn an_id_already_taken_is_drawn_again() {
+    let taken: std::collections::HashSet<String> = ["aaaa".to_string()].into();
+    let mut draws = vec!["bbbb".to_string(), "aaaa".to_string()];
+    let id = herdr_intents::store::unique_id(&taken, || draws.pop().unwrap());
+    assert_eq!(id, "bbbb");
+}
+
+#[test]
+fn ensure_id_gives_an_intent_without_one_or_with_a_twin_its_own() {
+    let (_tmp, s) = store();
+    let a = s
+        .create(Path::new("g"), "One", "feature", "x\n", None)
+        .unwrap();
+    let b = s
+        .create(Path::new("g"), "Two", "feature", "x\n", None)
+        .unwrap();
+    // an intent from before ids: none
+    Store::update_meta(&b.path, |fm| fm.id = None).unwrap();
+    let b = s.ensure_id(&b.path).unwrap();
+    let b_id = b.fm.id.clone().unwrap();
+    assert!(is_id(&b_id));
+    assert_ne!(Some(b_id.clone()), a.fm.id);
+    // a copied file: the same id as another intent
+    Store::update_meta(&b.path, |fm| fm.id = a.fm.id.clone()).unwrap();
+    let b = s.ensure_id(&b.path).unwrap();
+    assert_ne!(b.fm.id, a.fm.id);
+    // a unique id stays
+    let again = s.ensure_id(&b.path).unwrap();
+    assert_eq!(again.fm.id, b.fm.id);
+}
+
+#[test]
+fn the_version_counts_text_changes_only() {
+    let (_tmp, s) = store();
+    let body = "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n";
+    let it = s
+        .create(Path::new("g"), "Versioned", "feature", body, None)
+        .unwrap();
+    let v = |p: &Path| Store::load(p).unwrap().fm.version;
+    assert_eq!(v(&it.path), Some(1));
+    // bookkeeping: a state change, a tick, a link, trailing spaces
+    Store::update_fields(&it.path, |fm| fm.state = State::Sent).unwrap();
+    let mut x = Store::load(&it.path).unwrap();
+    x.body = format!(
+        "{}\n## Artifacts\n- pr: #12\n",
+        x.body.replace("- [ ] one", "- [x] one  ")
+    );
+    Store::save_force(&mut x).unwrap();
+    assert_eq!(v(&it.path), Some(1), "nothing the video proves changed");
+    // the text: the description
+    let mut x = Store::load(&it.path).unwrap();
+    x.body = x.body.replace("x\n", "the admin reinstates it\n");
+    Store::save_force(&mut x).unwrap();
+    assert_eq!(v(&it.path), Some(2));
+    // an edit in the editor counts the next time the tool writes the file
+    let text = fs::read_to_string(&it.path).unwrap();
+    fs::write(&it.path, text.replace("- [x] one", "- [x] one, by email")).unwrap();
+    Store::update_meta(&it.path, |fm| fm.unread = true).unwrap();
+    assert_eq!(v(&it.path), Some(3));
+}
+
+#[test]
+fn an_intent_from_before_versions_starts_at_1() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(Path::new("g"), "Old", "feature", "x\n", None)
+        .unwrap();
+    Store::update_meta(&it.path, |fm| {
+        fm.version = None;
+        fm.version_of = None;
+    })
+    .unwrap();
+    // update_meta itself starts the count
+    assert_eq!(Store::load(&it.path).unwrap().fm.version, Some(1));
+}
+
+#[test]
+fn a_run_stamps_an_id_and_counts_an_edit_made_in_the_editor() {
+    let (_tmp, s) = store();
+    let it = s
+        .create(
+            Path::new("g"),
+            "Stamped",
+            "feature",
+            "## Description\nx\n",
+            None,
+        )
+        .unwrap();
+    Store::update_meta(&it.path, |fm| fm.id = None).unwrap();
+    let text = fs::read_to_string(&it.path).unwrap();
+    fs::write(&it.path, text.replace("x\n", "the admin reinstates it\n")).unwrap();
+    let stamped = s.stamp_for_run(&it.path).unwrap();
+    assert!(stamped.fm.id.as_deref().is_some_and(is_id));
+    assert_eq!(
+        stamped.fm.version,
+        Some(2),
+        "the editor's change is counted"
+    );
+    // nothing new: the file is left as it is
+    let before = fs::read_to_string(&it.path).unwrap();
+    let again = s.stamp_for_run(&it.path).unwrap();
+    assert_eq!(again.fm.version, Some(2));
+    assert_eq!(fs::read_to_string(&it.path).unwrap(), before);
+}

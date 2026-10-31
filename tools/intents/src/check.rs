@@ -642,6 +642,7 @@ mod tests {
             url: "https://h:{port}".into(),
             body: "Sign in with Cmd+U.\n".into(),
             logs: vec![".logs/backend.log".into()],
+            splash: Default::default(),
         }
     }
 
