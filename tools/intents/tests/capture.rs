@@ -1819,6 +1819,57 @@ fn a_story_take_carries_the_intent_and_the_guides_look() {
 }
 
 #[test]
+fn a_take_gets_plain_words_for_its_cards() {
+    let fx = Fx::stories(ALL_CONFIRMED);
+    let intent = fx.tmp.path().join("root/skoolscout/org/notify.md");
+    let text = fs::read_to_string(&intent).unwrap();
+    fs::write(
+        &intent,
+        text.replace("### Mark reinstates Maya", "### mark-reinstates-maya")
+            .replace("- [ ] one", "- [ ] one `POST /approve` **now**"),
+    )
+    .unwrap();
+    let job = CaptureJob::spawn(fx.story_request(vec![1]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fx.story(1).join(".capture-mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["take"]["title"], "Mark Reinstates Maya");
+    assert_eq!(config["take"]["shows"][0][1], "one POST /approve now");
+}
+
+#[test]
+fn a_story_with_no_take_says_the_agents_reason() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let mut fx = Fx::stories(
+        "Not recorded: Reinstate can't reach **Accepted** on this stack. The Demo Organization has no registration fee set up.",
+    );
+    fx.env.retain(|(k, _)| k != "FAKE_CLAUDE_CAPTIONS");
+    let job = CaptureJob::spawn(fx.story_request(vec![2]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    match read_story(&fx.story(2)).unwrap().outcome {
+        StoryOutcome::Failed(why) => assert_eq!(
+            why,
+            "Reinstate can't reach Accepted on this stack. The Demo Organization has no registration fee set up."
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_story_with_no_take_and_no_reason_says_so() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let mut fx = Fx::stories("");
+    fx.env.retain(|(k, _)| k != "FAKE_CLAUDE_CAPTIONS");
+    let job = CaptureJob::spawn(fx.story_request(vec![2]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    assert_eq!(
+        read_story(&fx.story(2)).unwrap().outcome,
+        StoryOutcome::Failed("no video was recorded".into())
+    );
+}
+
+#[test]
 fn the_story_prompt_orders_setup_rehearsal_and_take() {
     use herdr_intents::capture::{guide_stories, read_guide, story_prompt};
     let fx = Fx::stories(ALL_CONFIRMED);

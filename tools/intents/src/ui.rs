@@ -1027,8 +1027,8 @@ mod tests {
             "▸ Open questions (1 open)",
             "▸ Decisions (none)",
             "▸ Preconditions (1/1)",
-            "▸ Stories (0)",
             "▾ Acceptance criteria (1/2)",
+            "▸ Stories (0)",
             "▸ Demo Videos (1 linked, 1 found)",
             "▸ Artifacts (3 linked, 1 found)",
             "▸ Pull requests (1/2 merged, 1 found)",
@@ -1134,8 +1134,9 @@ mod tests {
         assert_eq!(row_of(&rows, "▸ Open questions"), desc + 1, "{all}");
         assert_eq!(row_of(&rows, "▸ Decisions"), desc + 2, "{all}");
         assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 3, "{all}");
-        assert_eq!(row_of(&rows, "▸ Stories"), desc + 4, "{all}");
-        assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 4);
+        assert_eq!(row_of(&rows, "▾ Acceptance criteria"), desc + 4, "{all}");
+        // the stories, which name criteria by number, come right after them
+        assert_eq!(row_of(&rows, "▸ Stories"), 17, "{all}");
         assert_eq!(row_of(&rows, "▸ Demo Videos"), 18, "{all}");
         assert_eq!(row_of(&rows, "▸ Artifacts"), 19, "{all}");
         assert_eq!(row_of(&rows, "▸ Pull requests"), 20, "{all}");
@@ -1465,14 +1466,15 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
     // gets the rest, the others a title line each
     let desc_rows = wrap_text(&desc, area.width as usize).len() as u16;
     let desc_h = (desc_rows + 1).clamp(2, (area.height / 3).max(4));
-    // what has to be settled, what must hold, what it shows and checks, then
-    // what was built and what came of it
+    // what has to be settled, what must hold, the criteria and then the
+    // stories that show them (they name criteria by number), then what was
+    // built and what came of it
     let sections = [
         Pane::Questions,
         Pane::Decisions,
         Pane::Preconditions,
-        Pane::Stories,
         Pane::Criteria,
+        Pane::Stories,
         Pane::Demos,
         Pane::Artifacts,
         Pane::PullRequests,

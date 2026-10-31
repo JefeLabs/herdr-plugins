@@ -2289,9 +2289,9 @@ impl App {
                     Pane::Description => Pane::Questions,
                     Pane::Questions => Pane::Decisions,
                     Pane::Decisions => Pane::Preconditions,
-                    Pane::Preconditions => Pane::Stories,
-                    Pane::Stories => Pane::Criteria,
-                    Pane::Criteria => Pane::Demos,
+                    Pane::Preconditions => Pane::Criteria,
+                    Pane::Criteria => Pane::Stories,
+                    Pane::Stories => Pane::Demos,
                     Pane::Demos => Pane::Artifacts,
                     Pane::Artifacts => Pane::PullRequests,
                     Pane::PullRequests => Pane::Evidence,
@@ -2309,9 +2309,9 @@ impl App {
                     Pane::Evidence => Pane::PullRequests,
                     Pane::PullRequests => Pane::Artifacts,
                     Pane::Artifacts => Pane::Demos,
-                    Pane::Demos => Pane::Criteria,
-                    Pane::Criteria => Pane::Stories,
-                    Pane::Stories => Pane::Preconditions,
+                    Pane::Demos => Pane::Stories,
+                    Pane::Stories => Pane::Criteria,
+                    Pane::Criteria => Pane::Preconditions,
                     Pane::Preconditions => Pane::Decisions,
                     Pane::Decisions => Pane::Questions,
                     Pane::Questions => Pane::Description,
@@ -10335,8 +10335,8 @@ mod tests {
             "questions",
             "decisions",
             "preconditions",
-            "stories",
             "criteria",
+            "stories",
             "demos",
             "artifacts",
             "pull requests",
@@ -10478,8 +10478,8 @@ mod tests {
             "questions",
             "decisions",
             "preconditions",
-            "stories",
             "criteria",
+            "stories",
             "demos",
             "artifacts",
             "pull requests",
@@ -14897,6 +14897,35 @@ mod tests {
         let it = Store::load(&path).unwrap();
         assert!(it.fm.id.is_some(), "an id before the run");
         assert_eq!(it.fm.version, Some(v + 1), "the editor's change counted");
+    }
+
+    #[test]
+    fn the_criteria_come_before_the_stories() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        for _ in 0..12 {
+            if fx.app.view().focus == "preconditions" {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Tab);
+        }
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            key(&mut fx.app, KeyCode::Tab);
+            order.push(fx.app.view().focus);
+        }
+        assert_eq!(order, ["criteria", "stories", "demos"]);
+        key(&mut fx.app, KeyCode::BackTab);
+        key(&mut fx.app, KeyCode::BackTab);
+        assert_eq!(fx.app.view().focus, "criteria");
+        let screen = screen_text(&fx.app, 120, 60);
+        let at = |title: &str| {
+            screen
+                .lines()
+                .position(|l| l.contains(title))
+                .unwrap_or_else(|| panic!("{title} in\n{screen}"))
+        };
+        assert!(at("Acceptance criteria") < at("Stories"), "{screen}");
     }
 
     #[test]

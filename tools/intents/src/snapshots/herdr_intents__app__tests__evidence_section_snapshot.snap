@@ -1,6 +1,5 @@
 ---
 source: tools/intents/src/app.rs
-assertion_line: 14335
 expression: "render(&fx.app, 80, 24)"
 ---
 ▾ Inbox (1)            │# In the inbox
@@ -11,8 +10,8 @@ expression: "render(&fx.app, 80, 24)"
                        │ ▸ Open questions (2 open) ─────────────────────────────
                        │ ▸ Decisions (none) ────────────────────────────────────
                        │ ▸ Preconditions (0/0) ─────────────────────────────────
-                       │ ▸ Stories (0) ─────────────────────────────────────────
                        │ ▸ Acceptance criteria (0/0) ───────────────────────────
+                       │ ▸ Stories (0) ─────────────────────────────────────────
                        │ ▸ Demo Videos (0) ─────────────────────────────────────
                        │ ▸ Artifacts (0) ───────────────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────
