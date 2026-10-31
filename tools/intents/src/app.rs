@@ -1002,12 +1002,22 @@ impl App {
                 crate::store::criteria(&it.body).len(),
             )
         });
+        // what a running check or story recording is doing now
+        let check_stage = checking
+            .is_some()
+            .then(|| crate::capture::read_stage(&check_dir))
+            .flatten();
+        let stories = crate::capture::stories_dir(it);
+        let story_stage = crate::capture::is_running(&stories)
+            .then(|| crate::capture::read_stage(&stories).unwrap_or_else(|| "starting".into()));
         crate::progress::Evidence {
             plans,
             prs,
             open_missing,
             unacknowledged,
             checking,
+            check_stage,
+            story_stage,
             open_follow_ups: 0,
             awaiting_pull: self.awaiting_pull.contains(&it.path),
         }
@@ -2538,6 +2548,11 @@ impl App {
             };
             return Flow::Continue;
         }
+        // X checks the intent from whichever section has focus
+        if k.code == KeyCode::Char('X') {
+            self.check_now();
+            return Flow::Continue;
+        }
         match self.focus {
             Pane::Decisions => match k.code {
                 KeyCode::Esc => self.focus = Pane::Tree,
@@ -2605,7 +2620,6 @@ impl App {
                         crate::store::CRITERIA_HEADING,
                         self.criteria_selected,
                     ),
-                    KeyCode::Char('X') => self.check_now(),
                     // the selected criterion's proof from the latest check
                     KeyCode::Char('o') => {
                         let proof = self
@@ -2762,7 +2776,6 @@ impl App {
                         None => self.message = Some("no file for this capture yet".into()),
                     },
                     KeyCode::Char('E') => self.capture_again(),
-                    KeyCode::Char('X') => self.check_now(),
                     _ => {}
                 }
             }
@@ -6685,6 +6698,7 @@ impl App {
                             follow_ups_selected: self.follow_ups_selected,
                             stories: &stories,
                             stories_selected: self.stories_selected,
+                            activity: crate::progress::activity(&self.evidence_for(intent)),
                         },
                         right,
                         buf,
@@ -14589,6 +14603,34 @@ mod tests {
             fx.app.view().message.as_deref(),
             Some("stories are for features and bugs: K changes the kind")
         );
+    }
+
+    #[test]
+    fn the_detail_view_says_what_a_running_check_is_doing() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        let it = fx.app.selected_intent().unwrap().clone();
+        let dir = crate::check::checks_dir(&it);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".capture.lock"), std::process::id().to_string()).unwrap();
+        fs::write(dir.join(".stage"), "seeding: kathia-signup").unwrap();
+        let text = render(&fx.app, 140, 40);
+        let _ = fs::remove_file(dir.join(".capture.lock"));
+        assert!(
+            text.contains("checking 0/3 · seeding: kathia-signup"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn x_checks_from_the_stories_section_too() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        fx.app.message = None;
+        key(&mut fx.app, KeyCode::Char('X'));
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("check"), "X is heard here: {m:?}");
     }
 
     #[test]

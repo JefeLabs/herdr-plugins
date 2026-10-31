@@ -1133,7 +1133,15 @@ fn run(
         warning: None,
     };
     let failed = |why: String| record(Outcome::Failed(why), None, Vec::new());
+    // a check's or a story run's stage is also kept in its folder, for the card
+    let stage_file = (req.job != Job::Capture).then(|| req.run_dir().join(STAGE));
+    if let Some(f) = &stage_file {
+        let _ = std::fs::remove_file(f);
+    }
     let progress = |m: String| {
+        if let Some(f) = &stage_file {
+            let _ = std::fs::write(f, &m);
+        }
         let _ = tx.send(CaptureUpdate::Progress(m));
     };
 
@@ -1989,6 +1997,18 @@ fn runner_pid(evidence: &Path) -> Option<i32> {
     (pid > 0 && pid_alive(pid)).then_some(pid)
 }
 
+/// A check's or a story run's current stage, kept in its folder for the card.
+const STAGE: &str = ".stage";
+
+/// What a check or story run in `dir` is doing now ("seeding: …", "the agent
+/// is checking the criteria", "recording story 2: …"); read only while it runs.
+pub fn read_stage(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(STAGE))
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 /// Whether a capture is running for this evidence folder: its runner is
 /// alive, or it was claimed a moment ago and its pid is not written yet.
 pub fn is_running(evidence: &Path) -> bool {
@@ -2252,6 +2272,7 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
     let lock = dir.join(LOCK);
     if std::fs::read_to_string(&lock).is_ok_and(|t| t.trim() == std::process::id().to_string()) {
         let _ = std::fs::remove_file(&lock);
+        let _ = std::fs::remove_file(dir.join(STAGE));
     }
     let _ = std::fs::remove_file(order_file);
     Ok(())

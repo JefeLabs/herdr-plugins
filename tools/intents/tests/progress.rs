@@ -927,6 +927,29 @@ fn the_card_says_checking_while_a_check_runs() {
 }
 
 #[test]
+fn the_card_says_what_a_running_check_is_doing() {
+    let ev = Evidence {
+        prs: vec![(1, PrState::Merged)],
+        checking: Some((0, 9)),
+        check_stage: Some("seeding: kathia-signup".into()),
+        ..Default::default()
+    };
+    let (_, label, _) = p(ALL_TICKED_ONE_PR, &ev);
+    assert_eq!(label, "checking 0/9 · seeding: kathia-signup");
+}
+
+#[test]
+fn the_card_says_what_a_story_recording_is_doing() {
+    let ev = Evidence {
+        prs: vec![(1, PrState::Merged)],
+        story_stage: Some("recording story 2: Pat sees it back".into()),
+        ..Default::default()
+    };
+    let (_, label, _) = p(ALL_TICKED_ONE_PR, &ev);
+    assert_eq!(label, "recording · recording story 2: Pat sees it back");
+}
+
+#[test]
 fn the_card_counts_open_missing_items() {
     let ev = Evidence {
         prs: vec![(1, PrState::Merged)],

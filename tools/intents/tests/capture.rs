@@ -1736,3 +1736,27 @@ fn a_take_keeps_its_run_log() {
     let log = fs::read_to_string(fx.story(1).join("run.log")).unwrap_or_default();
     assert!(log.contains("1: confirmed: a"), "the agent's reply: {log}");
 }
+
+#[test]
+fn a_check_writes_its_stage_while_it_runs() {
+    let mut fx = Fx::checking("1: confirmed: a\n2: confirmed: b");
+    fx.set("FAKE_CLAUDE_HANG", "1");
+    let mut job = CaptureJob::spawn(fx.check_request(None), fx.env.clone(), false);
+    let checks = fx.tmp.path().join("checks");
+    let start = Instant::now();
+    loop {
+        if herdr_intents::capture::read_stage(&checks).as_deref()
+            == Some("the agent is checking the criteria")
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no stage: {:?}",
+            herdr_intents::capture::read_stage(&checks)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    job.cancel();
+    fx.wait_done(&job);
+}
