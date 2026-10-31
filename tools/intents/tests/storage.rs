@@ -157,3 +157,17 @@ fn a_failed_move_keeps_the_old_folder() {
     assert!(s.notice.unwrap().contains("could not move"));
     assert!(h.old.join("skoolscout/a.md").is_file());
 }
+
+#[test]
+fn a_link_to_somewhere_else_is_used_and_named() {
+    let h = home();
+    let elsewhere = h.home.join("Dropbox/intents");
+    put(&elsewhere.join("skoolscout/a.md"), "# a\n");
+    std::os::unix::fs::symlink(&elsewhere, &h.old).unwrap();
+    let s = settle_root(&h.home, &h.new);
+    assert_eq!(s.root, h.old, "keeps using the link");
+    let n = s.notice.unwrap();
+    assert!(n.contains(&elsewhere.display().to_string()), "{n}");
+    assert!(!h.new.exists(), "nothing made at the new root");
+    assert!(elsewhere.join("skoolscout/a.md").is_file());
+}

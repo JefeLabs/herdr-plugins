@@ -35,10 +35,31 @@ pub fn settle_root(home: &Path, root: &Path) -> Settled {
         return keep(root, None);
     }
     let old = home.join("intents");
-    let old_is_folder = std::fs::symlink_metadata(&old)
-        .map(|m| m.file_type().is_dir())
-        .unwrap_or(false);
-    if !old_is_folder {
+    let Ok(found) = std::fs::symlink_metadata(&old) else {
+        return keep(root, None);
+    };
+    if found.file_type().is_symlink() {
+        // the link this move left behind needs nothing
+        let ours = match (std::fs::canonicalize(&old), std::fs::canonicalize(root)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if ours || std::fs::symlink_metadata(root).is_ok() {
+            return keep(root, None);
+        }
+        // a link of the person's own (to a synced folder, say): keep using it
+        let target = std::fs::read_link(&old).unwrap_or_default();
+        return keep(
+            &old,
+            Some(format!(
+                "{old} is a link to {target}: still using it; set root = \"{target}\" in intents.toml to keep it there, or move it to {new} by hand",
+                old = old.display(),
+                target = target.display(),
+                new = root.display()
+            )),
+        );
+    }
+    if !found.file_type().is_dir() {
         return keep(root, None);
     }
     if std::fs::symlink_metadata(root).is_ok() {

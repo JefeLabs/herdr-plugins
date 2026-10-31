@@ -1736,6 +1736,25 @@ impl App {
         Ok(visible_tree(&self.store, &self.cfg, &self.dirs)?.0)
     }
 
+    /// True (and says why) when a move's destination, typed from the root,
+    /// lies in a space whose storage the tool cannot write to yet.
+    fn refuse_blocked_target(&mut self, value: &str) -> bool {
+        let Some(first) = Path::new(value.trim())
+            .components()
+            .find(|c| matches!(c, std::path::Component::Normal(_)))
+        else {
+            return false;
+        };
+        let space = first.as_os_str().to_string_lossy();
+        match crate::space::storage_block(&self.dirs, &space) {
+            Some(why) => {
+                self.message = Some(why);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// True (and says why) when this space's storage is not one the tool can
     /// write to yet: nothing is added or created anywhere else instead.
     fn refuse_in_blocked_space(&mut self) -> bool {
@@ -5348,6 +5367,7 @@ impl App {
                     }
                 }
             }
+            InputAction::MoveTo if self.refuse_blocked_target(value) => {}
             InputAction::MoveTo => {
                 if let Some(it) = self.selected_intent().cloned() {
                     match self.store.move_intent(&it, Path::new(value)) {
@@ -5431,6 +5451,7 @@ impl App {
                     .unwrap_or(1);
                 *self.list_selected(pane) = linked.saturating_sub(1);
             }
+            InputAction::MoveGroup { .. } if self.refuse_blocked_target(value) => {}
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
                 match self.store.move_group(&rel, Path::new(value)) {
@@ -6564,16 +6585,36 @@ fn visible_tree(
     if cfg.scope.is_some() {
         return Ok((tree, None));
     }
-    let mut left_out = Vec::new();
-    tree.groups.retain(|g| {
-        let blocked = crate::space::storage_block(dirs, &g.name).is_some();
-        if blocked {
-            left_out.push(g.name.clone());
-        }
-        !blocked
-    });
-    let note = (!left_out.is_empty())
-        .then(|| format!("left out: {}: storage not built yet", left_out.join(", ")));
+    // groups left out: those set to a placeholder storage, and those whose
+    // setting is broken, each named with its own reason
+    let mut placeholders: Vec<String> = Vec::new();
+    let mut broken: Vec<(String, Vec<String>)> = Vec::new();
+    tree.groups
+        .retain(|g| match crate::space::storage_for(dirs, &g.name) {
+            Ok(crate::space::Storage::Profile) => true,
+            Ok(_) => {
+                placeholders.push(g.name.clone());
+                false
+            }
+            Err(why) => {
+                match broken.iter_mut().find(|(w, _)| *w == why) {
+                    Some((_, names)) => names.push(g.name.clone()),
+                    None => broken.push((why, vec![g.name.clone()])),
+                }
+                false
+            }
+        });
+    let mut parts: Vec<String> = broken
+        .into_iter()
+        .map(|(why, names)| format!("{why} (left out: {})", names.join(", ")))
+        .collect();
+    if !placeholders.is_empty() {
+        parts.push(format!(
+            "left out: {}: storage not built yet",
+            placeholders.join(", ")
+        ));
+    }
+    let note = (!parts.is_empty()).then(|| parts.join(" · "));
     Ok((tree, note))
 }
 
@@ -6873,6 +6914,61 @@ mod tests {
             "{:?}",
             fx.app.message
         );
+    }
+
+    /// The fixture's whole tree, with `spaces.toml` holding `text`.
+    fn whole_tree_with_spaces(text: &'static str) -> Fx {
+        setup_with("agy.jsonl", move |c| {
+            let cfg_dir = c.root.parent().unwrap().join("cfg");
+            fs::write(cfg_dir.join("spaces.toml"), text).unwrap();
+        })
+    }
+
+    #[test]
+    fn a_broken_spaces_file_is_named_in_the_whole_tree() {
+        let fx = whole_tree_with_spaces("[spaces.x\nstorage = ");
+        let m = fx.app.message.clone().unwrap_or_default();
+        assert!(m.contains("spaces.toml"), "{m}");
+        assert!(!m.contains("not built yet"), "{m}");
+    }
+
+    #[test]
+    fn an_unknown_storage_word_is_named_in_the_whole_tree() {
+        let fx = whole_tree_with_spaces("[spaces.skoolscout]\nstorage = \"cloud\"\n");
+        let m = fx.app.message.clone().unwrap_or_default();
+        assert!(m.contains("cloud"), "{m}");
+        assert!(!m.contains("not built yet"), "{m}");
+    }
+
+    #[test]
+    fn moving_into_a_space_whose_storage_is_not_built_is_refused() {
+        let mut fx = whole_tree_with_spaces("[spaces.alpha]\nstorage = \"meta\"\n");
+        let root = fx.app.store.root().to_path_buf();
+        select(&mut fx.app, "In the inbox");
+        let before = fx.app.selected_intent().unwrap().path.clone();
+        key(&mut fx.app, KeyCode::Char('M'));
+        type_str(&mut fx.app, "alpha");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(before.is_file(), "the intent stayed");
+        assert!(!root.join("alpha").exists());
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("not built yet")),
+            "{:?}",
+            fx.app.message
+        );
+        // and a whole group (the row above)
+        key(&mut fx.app, KeyCode::Char('k'));
+        assert_eq!(fx.app.view().rows[fx.app.view().selected].label, "Inbox");
+        // the placeholder space may still have a profile folder from before
+        fs::create_dir_all(root.join("alpha")).unwrap();
+        key(&mut fx.app, KeyCode::Char('M'));
+        type_str(&mut fx.app, "alpha");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(root.join("Inbox").is_dir(), "the group stayed");
+        assert!(!root.join("alpha/Inbox").exists());
     }
 
     #[test]
