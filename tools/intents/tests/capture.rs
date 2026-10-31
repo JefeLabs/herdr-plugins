@@ -45,6 +45,90 @@ fn a_guide_without_a_stories_section_has_no_personas() {
     assert_eq!(guide_stories(&read_guide(tmp.path()).unwrap()), None);
 }
 
+// ---- the splash: the guide's logo and colors for a story video's cards ----------
+
+const SPLASH_GUIDE: &str = "---\nstart: ./serve\nurl: http://127.0.0.1:{port}\nsplash:\n  logo: brand/logo.png\n  background: \"#142b57\"\n  accent: \"#59b7ff\"\n  text: \"#fafafa\"\n---\nbody\n";
+
+#[test]
+fn a_guide_reads_its_splash_block() {
+    use herdr_intents::capture::read_guide;
+    let tmp = guide_in(&[("run.md", SPLASH_GUIDE)]);
+    let g = read_guide(tmp.path()).unwrap();
+    assert_eq!(g.splash.logo.as_deref(), Some("brand/logo.png"));
+    assert_eq!(g.splash.background.as_deref(), Some("#142b57"));
+    assert_eq!(g.splash.accent.as_deref(), Some("#59b7ff"));
+    assert_eq!(g.splash.text.as_deref(), Some("#fafafa"));
+}
+
+#[test]
+fn the_cards_take_the_guides_colors_and_its_logo_as_data() {
+    use herdr_intents::capture::{card_look, read_guide};
+    let tmp = guide_in(&[("run.md", SPLASH_GUIDE)]);
+    fs::create_dir_all(tmp.path().join("brand")).unwrap();
+    fs::write(tmp.path().join("brand/logo.png"), "foobar").unwrap();
+    let (look, warnings) = card_look(&read_guide(tmp.path()).unwrap().splash, tmp.path());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(look.logo.as_deref(), Some("data:image/png;base64,Zm9vYmFy"));
+    assert_eq!(look.background, "#142b57");
+    assert_eq!(look.accent, "#59b7ff");
+    assert_eq!(look.text, "#fafafa");
+}
+
+#[test]
+fn an_svg_logo_is_data_too() {
+    use herdr_intents::capture::{GuideSplash, card_look};
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("logo.svg"), "fo").unwrap();
+    let splash = GuideSplash {
+        logo: Some("logo.svg".into()),
+        ..Default::default()
+    };
+    let (look, _) = card_look(&splash, tmp.path());
+    assert_eq!(look.logo.as_deref(), Some("data:image/svg+xml;base64,Zm8="));
+}
+
+#[test]
+fn without_a_splash_block_the_cards_keep_their_own_look() {
+    use herdr_intents::capture::{CardLook, GuideSplash, card_look};
+    let tmp = tempfile::tempdir().unwrap();
+    let (look, warnings) = card_look(&GuideSplash::default(), tmp.path());
+    assert_eq!(look, CardLook::default());
+    assert!(look.logo.is_none());
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn a_color_or_logo_that_could_inject_or_escape_is_skipped_and_said() {
+    use herdr_intents::capture::{CardLook, GuideSplash, card_look};
+    let tmp = tempfile::tempdir().unwrap();
+    let inside = tmp.path().join("repo");
+    fs::create_dir_all(&inside).unwrap();
+    fs::write(tmp.path().join("outside.png"), "x").unwrap();
+    fs::write(inside.join("anim.gif"), "x").unwrap();
+    fs::write(inside.join("huge.png"), vec![0u8; 300 * 1024]).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("outside.png"), inside.join("link.png")).unwrap();
+    for (logo, why) in [
+        ("../outside.png", "outside"),
+        ("link.png", "outside"),
+        ("/etc/hosts", "outside"),
+        ("anim.gif", "png, svg or jpeg"),
+        ("huge.png", "256 KB"),
+        ("gone.png", "gone.png"),
+    ] {
+        let splash = GuideSplash {
+            logo: Some(logo.into()),
+            background: Some("red;position:static".into()),
+            ..Default::default()
+        };
+        let (look, warnings) = card_look(&splash, &inside);
+        assert!(look.logo.is_none(), "{logo}");
+        assert_eq!(look.background, CardLook::default().background, "{logo}");
+        let said = warnings.join(" | ");
+        assert!(said.contains(why), "{logo}: {said}");
+        assert!(said.contains("red;position:static"), "{said}");
+    }
+}
+
 #[test]
 fn run_md_wins_and_capture_md_still_works() {
     use herdr_intents::capture::{GuideMode, read_guide};
@@ -1695,6 +1779,43 @@ fn queued_stories_say_why_when_the_app_cannot_start() {
         }
     }
     assert_eq!(queued_stories(&fx.stories_dir()), Vec::<usize>::new());
+}
+
+#[test]
+fn a_story_take_carries_the_intent_and_the_guides_look() {
+    let fx = Fx::stories(ALL_CONFIRMED);
+    let t = fx.tmp.path();
+    let guide = STORY_GUIDE.replace(
+        "logs: [.logs/backend.log]\n",
+        "logs: [.logs/backend.log]\nsplash:\n  logo: brand/logo.png\n  background: \"#142b57\"\n  accent: \"url(x)\"\n",
+    );
+    fs::write(t.join("repo/.helmsmith/capture.md"), guide).unwrap();
+    fs::create_dir_all(t.join("repo/brand")).unwrap();
+    fs::write(t.join("repo/brand/logo.png"), "foobar").unwrap();
+    let intent = t.join("root/skoolscout/org/notify.md");
+    let text = fs::read_to_string(&intent).unwrap();
+    fs::write(
+        &intent,
+        text.replacen("---\n", "---\nid: k7q2\nversion: 3\n", 1),
+    )
+    .unwrap();
+    let job = CaptureJob::spawn(fx.story_request(vec![1]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fx.story(1).join(".capture-mcp.json")).unwrap())
+            .unwrap();
+    let take = &config["take"];
+    assert_eq!(take["intent_title"], "Reinstate a withdrawn application");
+    assert_eq!(take["intent_id"], "k7q2");
+    assert_eq!(take["version"], 3);
+    assert_eq!(take["look"]["background"], "#142b57");
+    assert_eq!(take["look"]["logo"], "data:image/png;base64,Zm9vYmFy");
+    assert_eq!(
+        take["look"]["accent"], "#7aa2ff",
+        "a bad color keeps the default"
+    );
+    let log = fs::read_to_string(fx.story(1).join("run.log")).unwrap();
+    assert!(log.contains("the splash's accent `url(x)`"), "{log}");
 }
 
 #[test]

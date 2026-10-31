@@ -458,6 +458,129 @@ fn the_cards_name_the_story_and_what_it_showed() {
     assert!(scripts.contains("an admin can reinstate it"), "{scripts}");
 }
 
+/// A take whose intent has an id and version, with the guide's splash.
+fn branded_take_server() -> Server {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("with space/evidence");
+    let mut s = Server::spawn(
+        tmp,
+        "video",
+        json!({"mode": "story", "take": {
+            "title": "Mark reinstates Maya",
+            "persona": "Mark",
+            "shows": [[1, "an admin can reinstate it"], [3, MARKUP]],
+            "dir": dir,
+            "hold_ms": 0,
+            "intent_title": "Admin can reinstate a withdrawn application",
+            "intent_id": "k7q2",
+            "version": 3,
+            "look": {
+                "logo": "data:image/png;base64,Zm9vYmFy",
+                "background": "#142b57",
+                "accent": "#59b7ff",
+                "text": "#fafafa"
+            }
+        }}),
+    );
+    s.open();
+    s
+}
+
+#[test]
+fn the_splash_is_the_first_frame() {
+    let mut s = branded_take_server();
+    assert!(!s.call("take_start", json!({})).0);
+    let log = s.log();
+    let splash = log
+        .iter()
+        .position(|l| l.contains("[eval]") && l.contains("This video shows"))
+        .expect("a splash");
+    let record = log
+        .iter()
+        .position(|l| l.contains("[record][start]"))
+        .expect("a recording");
+    assert!(splash < record, "drawn before recording starts: {log:?}");
+}
+
+#[test]
+fn the_splash_says_what_the_video_covers_and_for_which_version() {
+    let mut s = branded_take_server();
+    s.call("take_start", json!({}));
+    let splash = evals(&s)
+        .into_iter()
+        .find(|l| l.contains("This video shows"))
+        .unwrap();
+    for part in [
+        "Admin can reinstate a withdrawn application",
+        "Mark reinstates Maya",
+        "as Mark",
+        "an admin can reinstate it",
+        "k7q2 · v3 · recorded 20",
+    ] {
+        assert!(splash.contains(part), "{part:?} in {splash}");
+    }
+}
+
+#[test]
+fn the_splash_carries_the_logo_and_the_brand_colors_as_data() {
+    let mut s = branded_take_server();
+    s.call("take_start", json!({}));
+    let splash = evals(&s)
+        .into_iter()
+        .find(|l| l.contains("This video shows"))
+        .unwrap();
+    for part in [
+        "data:image/png;base64,Zm9vYmFy",
+        "#142b57",
+        "#59b7ff",
+        "#fafafa",
+    ] {
+        assert!(splash.contains(part), "{part:?} in {splash}");
+    }
+    assert!(splash.contains("textContent"), "{splash}");
+    assert!(!splash.contains("innerHTML"), "{splash}");
+    let markup = serde_json::to_string(MARKUP).unwrap();
+    assert!(
+        splash.contains(&markup[1..markup.len() - 1]),
+        "a criterion goes in as data, never markup: {splash}"
+    );
+}
+
+#[test]
+fn captions_and_the_closing_card_take_the_brand_colors() {
+    let mut s = branded_take_server();
+    s.call("take_start", json!({}));
+    s.call("caption", json!({"criterion": 1}));
+    s.call("take_stop", json!({}));
+    let scripts = evals(&s);
+    let caption = scripts
+        .iter()
+        .find(|l| {
+            l.contains("an admin can reinstate it")
+                && !l.contains("This video shows")
+                && !l.contains("Shown in this video")
+        })
+        .unwrap();
+    assert!(caption.contains("rgba(20,43,87,0.88)"), "{caption}");
+    assert!(caption.contains("#fafafa"), "{caption}");
+    let closing = scripts
+        .iter()
+        .find(|l| l.contains("Shown in this video"))
+        .unwrap();
+    for part in [
+        "✓ 1. an admin can reinstate it",
+        "data:image/png;base64,Zm9vYmFy",
+        "k7q2 · v3 · recorded 20",
+        "#142b57",
+    ] {
+        assert!(closing.contains(part), "{part:?} in {closing}");
+    }
+    assert!(
+        !closing.contains("✓ 3."),
+        "only what was captioned: {closing}"
+    );
+}
+
 #[test]
 fn the_agent_still_cannot_eval() {
     let mut s = take_server();

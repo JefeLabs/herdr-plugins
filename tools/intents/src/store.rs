@@ -87,6 +87,16 @@ pub struct MissingFor {
 pub struct FrontMatter {
     #[serde(default)]
     pub title: String,
+    /// A short id, unique under the root: 4 lowercase letters or digits.
+    /// Given at creation, or the first time a run starts for an older intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Counts changes to the intent's text (`text_fingerprint`), from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// The fingerprint `version` was counted at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_of: Option<String>,
     #[serde(default = "default_kind")]
     pub kind: String,
     #[serde(default)]
@@ -427,6 +437,9 @@ impl Store {
         let ts = Local::now();
         let fm = FrontMatter {
             title: title.to_string(),
+            id: Some(unique_id(&self.ids_except(None), draw_id)),
+            version: None,
+            version_of: None,
             kind: kind.to_string(),
             state: State::Raw,
             created: ts,
@@ -460,9 +473,59 @@ impl Store {
             body: body.to_string(),
             loaded_updated: ts,
         };
+        count_version(&mut it);
         write_intent(&it)?;
         it.loaded_updated = stamp(&it);
         Ok(it)
+    }
+
+    /// Every intent id under the root, but `path`'s own.
+    fn ids_except(&self, path: Option<&Path>) -> std::collections::HashSet<String> {
+        fn walk(g: &Group, skip: Option<&Path>, out: &mut std::collections::HashSet<String>) {
+            for it in &g.intents {
+                if Some(it.path.as_path()) != skip
+                    && let Some(id) = &it.fm.id
+                {
+                    out.insert(id.clone());
+                }
+            }
+            for sub in &g.groups {
+                walk(sub, skip, out);
+            }
+        }
+        let mut out = std::collections::HashSet::new();
+        if let Ok(tree) = self.scan() {
+            walk(&tree, path, &mut out);
+        }
+        out
+    }
+
+    /// Before a run: the intent's id (see `ensure_id`) and its version, counted
+    /// again in case the text changed outside the tool. A file with nothing
+    /// to change is left as it is.
+    pub fn stamp_for_run(&self, path: &Path) -> anyhow::Result<Intent> {
+        let it = self.ensure_id(path)?;
+        let current = it.fm.version.is_some()
+            && it.fm.version_of.as_deref() == Some(text_fingerprint(&it.body).as_str());
+        if current {
+            Ok(it)
+        } else {
+            Store::update_meta(path, |_| {})
+        }
+    }
+
+    /// Gives the intent at `path` an id when it has none, or when another
+    /// intent under the root has the same one (a copied file).
+    pub fn ensure_id(&self, path: &Path) -> anyhow::Result<Intent> {
+        let it = Store::load(path)?;
+        let others = self.ids_except(Some(path));
+        match &it.fm.id {
+            Some(id) if !others.contains(id) => Ok(it),
+            _ => {
+                let id = unique_id(&others, draw_id);
+                Store::update_meta(path, |fm| fm.id = Some(id))
+            }
+        }
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Intent> {
@@ -502,6 +565,7 @@ impl Store {
 
     pub fn save_force(intent: &mut Intent) -> anyhow::Result<()> {
         intent.fm.updated = Some(Local::now());
+        count_version(intent);
         write_intent(intent)?;
         intent.loaded_updated = stamp(intent);
         Ok(())
@@ -522,6 +586,7 @@ impl Store {
     pub fn update_meta(path: &Path, f: impl FnOnce(&mut FrontMatter)) -> anyhow::Result<Intent> {
         let mut it = Store::load(path)?;
         f(&mut it.fm);
+        count_version(&mut it);
         write_intent(&it)?;
         it.loaded_updated = stamp(&it);
         Ok(it)
@@ -662,6 +727,75 @@ pub fn stamp(intent: &Intent) -> DateTime<Local> {
         .and_then(|m| m.modified())
         .map(DateTime::<Local>::from)
         .unwrap_or_else(|_| Local::now())
+}
+
+/// The letters an intent id is drawn from.
+const ID_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// A random intent id: 4 lowercase letters or digits.
+pub fn draw_id() -> String {
+    uuid::Uuid::new_v4().as_bytes()[..4]
+        .iter()
+        .map(|b| ID_CHARS[usize::from(*b) % ID_CHARS.len()] as char)
+        .collect()
+}
+
+/// The first id `draw` gives that no other intent has.
+pub fn unique_id(
+    taken: &std::collections::HashSet<String>,
+    mut draw: impl FnMut() -> String,
+) -> String {
+    loop {
+        let id = draw();
+        if !taken.contains(&id) {
+            return id;
+        }
+    }
+}
+
+/// What the version counts: the intent's text, leaving out the Artifacts
+/// section (links agents add), reading every checkbox as unticked, and
+/// ignoring trailing spaces and blank lines. Ticks and links don't change
+/// what a video proves.
+pub fn text_fingerprint(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut kept = String::new();
+    let mut skipping = false;
+    for line in body.lines() {
+        if line.starts_with("## ") {
+            skipping = line.trim().eq_ignore_ascii_case(ARTIFACTS_HEADING);
+        }
+        if skipping {
+            continue;
+        }
+        let line = line.trim_end();
+        let line = match line.trim_start().get(..5) {
+            Some("- [x]") | Some("- [X]") => line
+                .replacen("- [x]", "- [ ]", 1)
+                .replacen("- [X]", "- [ ]", 1),
+            _ => line.to_string(),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        kept.push_str(&line);
+        kept.push('\n');
+    }
+    format!("{:x}", Sha256::digest(kept.as_bytes()))[..12].to_string()
+}
+
+/// Counts a change to the intent's text since the version was last counted
+/// (an intent from before versions starts at 1).
+fn count_version(it: &mut Intent) {
+    let now = text_fingerprint(&it.body);
+    match it.fm.version {
+        Some(v) if it.fm.version_of.as_deref() != Some(now.as_str()) => {
+            it.fm.version = Some(v + 1);
+        }
+        Some(_) => return,
+        None => it.fm.version = Some(1),
+    }
+    it.fm.version_of = Some(now);
 }
 
 fn write_intent(intent: &Intent) -> anyhow::Result<()> {
