@@ -82,6 +82,8 @@ pub struct ChatState {
     /// While a resumed turn runs: the whole-context prompt to start again
     /// with if the conversation cannot be resumed.
     pub fresh: Option<String>,
+    /// A stories-only chat (`d` in the Stories section).
+    pub stories_only: bool,
 }
 
 /// What the agent picker is choosing right now.
@@ -130,6 +132,9 @@ pub struct PendingChat {
     pub from_editor: bool,
     /// A first message the chat sends on its own (with the seed).
     pub ask: Option<String>,
+    /// Drafts the Stories section alone: applying replaces only that section,
+    /// and the intent's polish conversation is left alone.
+    pub stories: bool,
 }
 
 /// A story in the detail view: its mark, `<n>. <name> · <state>`, and its
@@ -2341,6 +2346,7 @@ impl App {
                         selection: None,
                         from_editor: false,
                         ask: None,
+                        stories: false,
                     });
                 }
             }
@@ -2603,6 +2609,21 @@ impl App {
                     KeyCode::Char('r') => {
                         if let Some(n) = number {
                             self.record_story(&it, n);
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if matches!(it.fm.kind.as_str(), "enhancement" | "issue") {
+                            self.polish(PendingChat {
+                                intent: it.clone(),
+                                selection: None,
+                                from_editor: false,
+                                ask: None,
+                                stories: true,
+                            });
+                        } else {
+                            self.message = Some(
+                                "stories are for features and bugs: K changes the kind".into(),
+                            );
                         }
                     }
                     _ => {}
@@ -2941,6 +2962,7 @@ impl App {
                                                     selection: None,
                                                     from_editor: false,
                                                     ask: Some(DRAFT_STORIES.into()),
+                                                    stories: false,
                                                 });
                                             }
                                         }
@@ -2976,6 +2998,7 @@ impl App {
                         selection: sel,
                         from_editor: true,
                         ask: None,
+                        stories: false,
                     });
                 }
             }
@@ -5013,19 +5036,34 @@ impl App {
             selection,
             from_editor,
             ask,
+            stories,
         } = pending;
         self.remember_agent(provider, model.clone());
-        let conv_id = intent.fm.conversations.get(provider).cloned();
+        // a stories-only chat starts its own conversation and keeps it to itself
+        let conv_id = if stories {
+            None
+        } else {
+            intent.fm.conversations.get(provider).cloned()
+        };
         let tpl = template(&self.dirs, &intent.fm.kind, true)
             .unwrap_or_else(|_| "Refine this intent.".to_string());
         let personas = self.story_personas(intent.fm.repo.clone());
-        let seed = seed_prompt(
-            &tpl,
-            &intent.body,
-            selection.as_deref(),
-            &intent.fm.kind,
-            personas.as_deref(),
-        );
+        let seed = if stories {
+            crate::conversation::stories_prompt(
+                &intent.fm.title,
+                &intent.body,
+                &intent.fm.kind,
+                personas.as_deref(),
+            )
+        } else {
+            seed_prompt(
+                &tpl,
+                &intent.body,
+                selection.as_deref(),
+                &intent.fm.kind,
+                personas.as_deref(),
+            )
+        };
         let mut st = ChatState {
             turn: None,
             transcript: Vec::new(),
@@ -5041,9 +5079,11 @@ impl App {
             scroll: 0,
             model,
             fresh: None,
+            stories_only: stories,
         };
         self.select_path(&intent.path);
         let shown = match selection.as_deref() {
+            _ if stories => "draft the stories".to_string(),
             Some(s) => format!(
                 "polish (focus: {})",
                 s.lines()
@@ -5164,6 +5204,24 @@ impl App {
             // apply and dismiss live on Ctrl so a message starting with "a" or "d" is just typed (C1)
             (KeyCode::Char('a'), true) if st.turn.is_none() => {
                 match st.latest.as_ref().and_then(|r| r.proposal.clone()) {
+                    // stories only: the intent as it is now, with its Stories section replaced
+                    Some(proposal) if st.stories_only => match Store::load(&st.intent_path) {
+                        Ok(it) => {
+                            let proposal = crate::store::replace_stories(&it.body, &proposal);
+                            self.parked_chat = Some(st);
+                            self.screen = Screen::Diff {
+                                proposal,
+                                questions: Vec::new(),
+                                title: None,
+                                kind: None,
+                                scroll: 0,
+                            };
+                        }
+                        Err(e) => {
+                            st.hint = Some(format!("cannot read the intent: {e:#}"));
+                            self.screen = Screen::Chat(st);
+                        }
+                    },
                     Some(proposal) => {
                         let questions = st
                             .latest
@@ -5283,7 +5341,8 @@ impl App {
         let path = st.intent_path.clone();
         let opened = st.opened_stamp;
         let provider = st.provider.clone();
-        let conv_id = st.conv_id.clone();
+        // a stories-only chat's conversation is not the intent's polish one
+        let conv_id = st.conv_id.clone().filter(|_| !st.stories_only);
         let mut it = match Store::load(&path) {
             Ok(it) => it,
             Err(e) => {
@@ -5805,11 +5864,14 @@ impl App {
                 }
                 TurnMsg::ConversationId(id) => {
                     st.conv_id = Some(id.clone());
-                    // bookkeeping only: reload, record, no `updated` bump (C2)
-                    let provider = st.provider.clone();
-                    let _ = Store::update_meta(&path, |fm| {
-                        fm.conversations.insert(provider, id);
-                    });
+                    // bookkeeping only: reload, record, no `updated` bump (C2);
+                    // a stories-only chat never replaces the polish conversation
+                    if !st.stories_only {
+                        let provider = st.provider.clone();
+                        let _ = Store::update_meta(&path, |fm| {
+                            fm.conversations.insert(provider, id);
+                        });
+                    }
                 }
                 TurnMsg::Finished(reply) => {
                     if let Ok(it) = Store::load(&path)
@@ -6484,7 +6546,7 @@ impl App {
                 (None, Pane::FollowUps) => "Follow-ups: j/k choose · Enter go to it · F file another · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
                 (None, Pane::Decisions) => "Decisions: j/k scroll · Esc tree".to_string(),
-                (None, Pane::Stories) => "Stories: j/k choose · o play the video · c copy the file · Y copy its path · O show it in Finder · r record it again · Esc tree".to_string(),
+                (None, Pane::Stories) => "Stories: j/k choose · d draft the stories · o play the video · c copy the file · Y copy its path · O show it in Finder · r record it again · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
@@ -14117,6 +14179,73 @@ mod tests {
         ] {
             assert!(text.contains(row), "{row:?} in\n{text}");
         }
+    }
+
+    const DRAFTED: &str = "Here are the stories.\n```proposal\n## Description\nreworded by the agent\n\n## Stories\n### Mark reinstates Maya\n- persona: Mark\n- shows: 1\n- starting data: a withdrawn application\n1. Open it\n2. Reinstate it\n```\n";
+
+    #[test]
+    fn d_drafts_only_the_stories_section() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = "## Description\nbeta body\n\n## Acceptance criteria\n- [x] one\n\n## Decisions\n- D1 (owner): yes\n\n## Artifacts\n- pr: #5\n".into();
+        it.fm.state = State::Sent;
+        it.fm
+            .conversations
+            .insert("fake".into(), "polish-conv".into());
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        focus_stories(&mut fx.app);
+        agent_replies(&mut fx, &[DRAFTED]);
+        key(&mut fx.app, KeyCode::Char('d'));
+        assert_eq!(fx.app.view().screen, "chat");
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(
+            !log.contains("--resume=polish-conv"),
+            "not the polish conversation: {log}"
+        );
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&path).unwrap();
+        assert!(it.body.contains("### Mark reinstates Maya"), "{}", it.body);
+        assert!(
+            it.body.contains("beta body") && !it.body.contains("reworded"),
+            "{}",
+            it.body
+        );
+        assert!(
+            it.body.contains("- [x] one"),
+            "criteria untouched: {}",
+            it.body
+        );
+        assert!(
+            it.body.contains("## Decisions\n- D1 (owner): yes"),
+            "{}",
+            it.body
+        );
+        assert!(it.body.contains("- pr: #5"), "{}", it.body);
+        assert_eq!(it.fm.state, State::Sent);
+        assert_eq!(
+            it.fm.conversations.get("fake").map(String::as_str),
+            Some("polish-conv"),
+            "the polish conversation is kept"
+        );
+    }
+
+    #[test]
+    fn d_on_an_idea_says_how_to_change_the_kind() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('d'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("stories are for features and bugs: K changes the kind")
+        );
     }
 
     #[test]

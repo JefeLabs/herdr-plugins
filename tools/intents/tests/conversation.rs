@@ -451,3 +451,16 @@ fn stories_never_carry_sign_in_details() {
     .unwrap();
     assert!(rule.contains("never how it signs in"), "{rule}");
 }
+
+#[test]
+fn the_stories_prompt_asks_for_the_stories_section_only() {
+    let p = herdr_intents::conversation::stories_prompt(
+        "Reinstate a withdrawn application",
+        "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n",
+        "enhancement",
+        Some("## Stories\n### Personas\n- Mark: admin\n"),
+    );
+    assert!(p.contains("- [ ] one"), "the intent: {p}");
+    assert!(p.contains("only the `## Stories` section"), "{p}");
+    assert!(p.contains("- Mark: admin"), "the guide's personas: {p}");
+}

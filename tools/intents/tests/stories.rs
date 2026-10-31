@@ -2,8 +2,8 @@
 
 use herdr_intents::reconcile::remap_shows;
 use herdr_intents::store::{
-    CRITERIA_HEADING, IntentStory, add_checklist_item, shown_criteria, stories, story_folder,
-    unshown_criteria,
+    CRITERIA_HEADING, IntentStory, add_checklist_item, replace_stories, shown_criteria, stories,
+    story_folder, unshown_criteria,
 };
 
 const BODY: &str = "## Description\nx\n\n## Acceptance criteria\n- [ ] an admin can reinstate a withdrawn application\n- [ ] the family is told\n- [ ] it shows under Submitted again\n\n## Stories\n### Mark reinstates Maya's withdrawn application\n- persona: Mark, a tenant admin\n- shows: 1, 3\n- starting data: Maya has a submitted application, then withdrawn\n1. Open Maya's application from Applications\n2. Choose Reinstate and confirm\n3. See the application back under Submitted\n";
@@ -106,6 +106,49 @@ fn a_story_the_agent_renumbered_keeps_its_numbers() {
     let out = remap_shows(before, after);
     assert!(
         out.contains("### A\n- shows: 2\n### B\n- shows: 3"),
+        "{out}"
+    );
+}
+
+const FULL: &str = "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n\n## Stories\n### Old\n- shows: 1\n\n## Open questions\n- q?\n  → a\n\n## Decisions\n- D1\n\n## Artifacts\n- pr: #5\n";
+
+#[test]
+fn new_stories_replace_only_the_stories_section() {
+    let out = replace_stories(FULL, "## Stories\n### New\n- persona: Mark\n- shows: 1\n");
+    assert!(out.contains("### New") && !out.contains("### Old"), "{out}");
+    for kept in [
+        "## Description\nx",
+        "- [ ] one",
+        "## Decisions\n- D1",
+        "- pr: #5",
+        "→ a",
+    ] {
+        assert!(out.contains(kept), "{kept:?} kept:\n{out}");
+    }
+    let at = |h: &str| out.find(h).unwrap();
+    assert!(at("## Acceptance criteria") < at("## Stories"));
+    assert!(at("## Stories") < at("## Open questions"));
+}
+
+#[test]
+fn stories_are_added_after_the_criteria_when_missing() {
+    let body = "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n\n## Decisions\n- D1\n";
+    let out = replace_stories(body, "### New\n- shows: 1\n");
+    assert!(out.contains("## Stories\n### New"), "{out}");
+    let at = |h: &str| out.find(h).unwrap();
+    assert!(at("## Acceptance criteria") < at("## Stories"));
+    assert!(at("## Stories") < at("## Decisions"), "{out}");
+}
+
+#[test]
+fn only_the_stories_section_of_a_proposal_is_taken() {
+    let out = replace_stories(
+        FULL,
+        "## Description\nchanged\n\n## Stories\n### New\n- shows: 1\n\n## Acceptance criteria\n- [ ] reworded\n",
+    );
+    assert!(out.contains("### New"), "{out}");
+    assert!(
+        !out.contains("changed") && !out.contains("reworded"),
         "{out}"
     );
 }

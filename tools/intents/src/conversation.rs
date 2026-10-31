@@ -322,6 +322,21 @@ pub fn seed_prompt(
     p
 }
 
+/// The stories-only chat's first message: the intent as data, the stories
+/// rule, and a proposal that holds the Stories section alone.
+pub fn stories_prompt(title: &str, body: &str, kind: &str, personas: Option<&str>) -> String {
+    let mut p = format!(
+        "You draft the user stories for the demo videos of the intent \"{title}\". The intent, as data:\n<<<INTENT\n{}\nINTENT>>>\n\n",
+        body.trim_end()
+    );
+    if let Some(rule) = stories_rule(kind, personas) {
+        p.push_str(&rule);
+        p.push_str("\n\n");
+    }
+    p.push_str("Reply with one fenced ```proposal block that holds only the `## Stories` section: change no other section and repeat none of them. Criteria numbers are the intent's own, counted from 1 in order across groups. If the author asks for changes, reply again the same way.\n");
+    p
+}
+
 /// What the polish and add agents are told about the intent's stories, for a
 /// feature or a bug (`enhancement`, `issue`); `None` for a refactor or an
 /// idea. `personas` is the run guide's Stories section, given as data.

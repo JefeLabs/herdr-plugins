@@ -1385,6 +1385,67 @@ pub fn shown_criteria(body: &str, s: &IntentStory) -> (Vec<(usize, String)>, Vec
     (shown, dropped)
 }
 
+/// `body` with its Stories section replaced by the one in `proposal` (or the
+/// proposal itself, given without its heading), added after the acceptance
+/// criteria when there was none. Every other section stays as it is, and any
+/// other section the proposal holds is ignored.
+pub fn replace_stories(body: &str, proposal: &str) -> String {
+    let heading = |l: &str| l.starts_with("## ");
+    let is_stories = |l: &str| l.trim().eq_ignore_ascii_case(STORIES_HEADING);
+    // the new section's lines
+    let plines: Vec<&str> = proposal.lines().collect();
+    let from = plines
+        .iter()
+        .position(|l| is_stories(l))
+        .map_or(0, |i| i + 1);
+    let to = plines[from..]
+        .iter()
+        .position(|l| heading(l))
+        .map_or(plines.len(), |i| from + i);
+    let inner = plines[from..to].join("\n");
+    let section = format!("{STORIES_HEADING}\n{}", inner.trim());
+    // the body without its old section
+    let mut lines: Vec<&str> = body.lines().collect();
+    if let Some(start) = lines.iter().position(|l| is_stories(l)) {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| heading(l))
+            .map_or(lines.len(), |i| start + 1 + i);
+        lines.drain(start..end);
+    }
+    // where it goes: after the criteria, else before the open questions, else last
+    let after_criteria = lines
+        .iter()
+        .position(|l| l.trim().eq_ignore_ascii_case(CRITERIA_HEADING))
+        .map(|c| {
+            lines[c + 1..]
+                .iter()
+                .position(|l| heading(l))
+                .map_or(lines.len(), |i| c + 1 + i)
+        });
+    let at = after_criteria
+        .or_else(|| {
+            lines
+                .iter()
+                .position(|l| l.trim().eq_ignore_ascii_case(QUESTIONS_HEADING))
+        })
+        .unwrap_or(lines.len());
+    let before = lines[..at].join("\n");
+    let after = lines[at..].join("\n");
+    let mut out = before.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&section);
+    out.push('\n');
+    if !after.trim().is_empty() {
+        out.push('\n');
+        out.push_str(after.trim_start());
+        out.push('\n');
+    }
+    out
+}
+
 /// The criteria (from 1) no story shows.
 pub fn unshown_criteria(body: &str) -> Vec<usize> {
     let shown: Vec<usize> = stories(body).iter().flat_map(|s| s.shows.clone()).collect();
