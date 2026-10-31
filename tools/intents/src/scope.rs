@@ -1,21 +1,28 @@
 //! Which top-level group a Herdr workspace sees.
 //!
-//! One Herdr workspace per project: a workspace named `skoolscout` sees the
-//! `skoolscout` group of the intents root as its whole tree.
+//! One Herdr workspace per project: a workspace in skoolscout's meta repo, or
+//! one named `skoolscout`, sees the `skoolscout` group of the intents root as
+//! its whole tree.
 
 use std::path::Path;
 use std::process::Command;
 
 /// The group this run sees. `INTENTS_SCOPE` when set (empty means the
-/// whole tree); else the name of the Herdr workspace the tool runs in, asked
-/// fresh through `label_of(workspace id)` and falling back to the plugin
-/// context Herdr passed at start; else none: outside Herdr, the whole tree.
+/// whole tree); else the space named by the meta repo the tool runs in
+/// (`repo_space`); else the name of the Herdr workspace the tool runs in,
+/// asked fresh through `label_of(workspace id)` and falling back to the
+/// plugin context Herdr passed at start; else none: outside Herdr, the
+/// whole tree.
 pub fn resolve(
     get: impl Fn(&str) -> Option<String>,
     label_of: impl Fn(&str) -> Option<String>,
+    repo_space: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
     if let Some(set) = get("INTENTS_SCOPE") {
         return group_name(&set);
+    }
+    if let Some(space) = repo_space() {
+        return Some(space);
     }
     let context = get("HERDR_PLUGIN_CONTEXT_JSON")
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
@@ -48,11 +55,15 @@ pub fn current_workspace(get: impl Fn(&str) -> Option<String>) -> Option<String>
 }
 
 /// A workspace name usable as one folder name: trimmed, not empty, no path
-/// separator, not `.`-led. Anything else is no scope rather than a path.
+/// separator, not `.`-led, not `~`-led (Herdr names a workspace started in
+/// the home folder `~`). Anything else is no scope rather than a path.
 pub fn group_name(name: &str) -> Option<String> {
     let name = name.trim();
-    let one_folder =
-        !name.is_empty() && !name.starts_with('.') && !name.contains('/') && !name.contains('\\');
+    let one_folder = !name.is_empty()
+        && !name.starts_with('.')
+        && !name.starts_with('~')
+        && !name.contains('/')
+        && !name.contains('\\');
     one_folder.then(|| name.to_string())
 }
 
@@ -109,20 +120,28 @@ mod tests {
 
     #[test]
     fn inside_herdr_the_workspace_name_is_the_scope() {
-        let s = resolve(env(&[("HERDR_WORKSPACE_ID", "w5")]), |id| {
-            (id == "w5").then(|| "skoolscout".to_string())
-        });
+        let s = resolve(
+            env(&[("HERDR_WORKSPACE_ID", "w5")]),
+            |id| (id == "w5").then(|| "skoolscout".to_string()),
+            || None,
+        );
         assert_eq!(s.as_deref(), Some("skoolscout"));
     }
 
     #[test]
     fn the_plugin_context_names_the_workspace_when_herdr_cannot_be_asked() {
         let ctx = r#"{"workspace_id":"w7","workspace_label":"jefelabs","tab_id":"w7:t1"}"#;
-        let s = resolve(env(&[("HERDR_PLUGIN_CONTEXT_JSON", ctx)]), |_| None);
+        let s = resolve(
+            env(&[("HERDR_PLUGIN_CONTEXT_JSON", ctx)]),
+            |_| None,
+            || None,
+        );
         assert_eq!(s.as_deref(), Some("jefelabs"));
-        let asked = resolve(env(&[("HERDR_PLUGIN_CONTEXT_JSON", ctx)]), |id| {
-            (id == "w7").then(|| "renamed".to_string())
-        });
+        let asked = resolve(
+            env(&[("HERDR_PLUGIN_CONTEXT_JSON", ctx)]),
+            |id| (id == "w7").then(|| "renamed".to_string()),
+            || None,
+        );
         assert_eq!(asked.as_deref(), Some("renamed"), "a fresh answer wins");
     }
 
@@ -135,23 +154,51 @@ mod tests {
                 ("HERDR_WORKSPACE_ID", "w5"),
             ]),
             herdr,
+            || Some("skoolscout".to_string()),
         );
         assert_eq!(set.as_deref(), Some("tourneyseason"));
         let all = resolve(
             env(&[("INTENTS_SCOPE", ""), ("HERDR_WORKSPACE_ID", "w5")]),
             herdr,
+            || Some("skoolscout".to_string()),
         );
         assert_eq!(all, None);
     }
 
     #[test]
     fn outside_herdr_there_is_no_scope() {
-        assert_eq!(resolve(env(&[]), |_| Some("x".to_string())), None);
+        assert_eq!(resolve(env(&[]), |_| Some("x".to_string()), || None), None);
+    }
+
+    #[test]
+    fn a_workspace_in_a_meta_repo_sees_that_repos_space() {
+        // Herdr names a workspace after its folder: `skoolscout-com`
+        let s = resolve(
+            env(&[("HERDR_WORKSPACE_ID", "w5")]),
+            |_| Some("skoolscout-com".to_string()),
+            || Some("skoolscout".to_string()),
+        );
+        assert_eq!(s.as_deref(), Some("skoolscout"));
+        let outside = resolve(env(&[]), |_| None, || Some("skoolscout".to_string()));
+        assert_eq!(outside.as_deref(), Some("skoolscout"), "outside Herdr too");
+    }
+
+    #[test]
+    fn a_workspace_in_the_home_folder_sees_the_whole_tree() {
+        // Herdr started in ~ names its workspace `~`: no space is called that
+        let s = resolve(
+            env(&[("HERDR_WORKSPACE_ID", "wC")]),
+            |_| Some("~".to_string()),
+            || None,
+        );
+        assert_eq!(s, None);
     }
 
     #[test]
     fn a_name_that_is_not_one_folder_is_no_scope() {
-        for bad in ["a/b", "a\\b", "..", ".", ".hidden", "   ", ""] {
+        for bad in [
+            "a/b", "a\\b", "..", ".", ".hidden", "~", "~edwin", "   ", "",
+        ] {
             assert_eq!(group_name(bad), None, "{bad:?}");
         }
         assert_eq!(group_name("  skoolscout ").as_deref(), Some("skoolscout"));

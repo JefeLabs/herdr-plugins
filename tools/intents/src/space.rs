@@ -125,6 +125,61 @@ pub fn missing(space: &Space) -> Vec<&SpaceRepo> {
     space.repos.iter().filter(|r| !r.path.is_dir()).collect()
 }
 
+/// The folder in a meta repo that holds its space's intents configuration.
+pub const INTENTS_DIR: &str = ".helmsmith/intents";
+
+/// A repo that anchors a space: its `.helmsmith/` has an `intents/` folder or
+/// a `space.toml`.
+pub fn is_meta(repo: &Path) -> bool {
+    repo.join(INTENTS_DIR).is_dir() || repo.join(".helmsmith").join("space.toml").is_file()
+}
+
+/// What a meta repo's `.helmsmith/intents/config.toml` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentsConfig {
+    /// The space's name, its folder in the intents storage: `space = "…"`,
+    /// else the repo's folder name.
+    pub space: String,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct IntentsFile {
+    #[serde(default)]
+    space: Option<String>,
+}
+
+/// Reads `<meta>/.helmsmith/intents/config.toml`. No file reads as the space
+/// named after the repo's folder.
+pub fn read_intents_config(meta: &Path) -> Result<IntentsConfig, String> {
+    let file = meta.join(INTENTS_DIR).join("config.toml");
+    let parsed: IntentsFile = match std::fs::read_to_string(&file) {
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => IntentsFile::default(),
+        Err(e) => return Err(format!("{}: {e}", file.display())),
+    };
+    let space = match parsed.space {
+        Some(name) => crate::scope::group_name(&name).ok_or_else(|| {
+            format!(
+                "{}: space = \"{name}\" is not one folder name",
+                file.display()
+            )
+        })?,
+        None => meta
+            .file_name()
+            .and_then(|n| crate::scope::group_name(&n.to_string_lossy()))
+            .ok_or_else(|| format!("{}: name the space with space = \"…\"", file.display()))?,
+    };
+    Ok(IntentsConfig { space })
+}
+
+/// The space a repo's intents folder names, when it has one; `Err` says why
+/// its config cannot be read.
+pub fn intents_space(repo: &Path) -> Option<Result<String, String>> {
+    repo.join(INTENTS_DIR)
+        .is_dir()
+        .then(|| read_intents_config(repo).map(|c| c.space))
+}
+
 /// Each person's pointers, `<config dir>/spaces.toml`:
 /// `[spaces.<name>] meta = "<path>"`, `storage = "profile"`, `url = "…"`.
 #[derive(Default, serde::Serialize, serde::Deserialize)]

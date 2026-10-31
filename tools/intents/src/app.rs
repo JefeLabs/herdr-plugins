@@ -3417,8 +3417,9 @@ impl App {
         Ok(repo)
     }
 
-    /// On start: a workspace with no meta repo yet, started in a repo that has
-    /// a space file, records that repo as its meta repo.
+    /// On start: a workspace with no meta repo yet, started in a meta repo
+    /// (an intents folder or a space file), records that repo as its meta
+    /// repo.
     pub(crate) fn remember_space_meta(&mut self) {
         let Some(name) = self.cfg.scope.clone() else {
             return;
@@ -3429,7 +3430,13 @@ impl App {
         let Some(here) = self.current_repo() else {
             return;
         };
-        if crate::space::read_space(&here).is_err() {
+        if !crate::space::is_meta(&here) {
+            return;
+        }
+        // an intents folder that names another space is not this one's
+        if let Some(Ok(space)) = crate::space::intents_space(&here)
+            && !space.eq_ignore_ascii_case(&name)
+        {
             return;
         }
         self.message = Some(
@@ -12376,6 +12383,29 @@ mod tests {
                 .contains("meta repo"),
             "{:?}",
             fx.app.message
+        );
+    }
+
+    #[test]
+    fn an_intents_folder_marks_the_meta_repo_of_the_space_it_names() {
+        let mut fx = setup("agy.jsonl");
+        let meta = fx._tmp.path().join("skoolscout-com");
+        fs::create_dir_all(meta.join(".helmsmith/intents")).unwrap();
+        fs::write(
+            meta.join(".helmsmith/intents/config.toml"),
+            "space = \"skoolscout\"\n",
+        )
+        .unwrap();
+        fx.app.capture_repo = Some(meta.clone());
+        // a workspace for another space started here records nothing
+        fx.app.cfg.scope = Some("tourneyseason".into());
+        fx.app.remember_space_meta();
+        assert_eq!(crate::space::meta_for(&fx.app.dirs, "tourneyseason"), None);
+        fx.app.cfg.scope = Some("skoolscout".into());
+        fx.app.remember_space_meta();
+        assert_eq!(
+            crate::space::meta_for(&fx.app.dirs, "skoolscout"),
+            Some(meta)
         );
     }
 

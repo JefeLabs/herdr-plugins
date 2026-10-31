@@ -25,7 +25,7 @@ Standalone runs use the same directory, so the toolbar and a plain terminal alwa
 
 ## One workspace per project
 
-Inside Herdr the tree is scoped to the workspace: a workspace named `skoolscout` sees only the root's top-level `skoolscout` group, with its sub-groups as the tree, and nothing from other projects' groups. Name a workspace after its project's group (`herdr workspace rename <id> skoolscout`) and keep one workspace per project. The name matches the group's folder whatever its case. A workspace whose group does not exist yet shows it empty, and the first capture there creates it. Quick captures, `a` with nothing selected and an empty list all add at the top of the workspace's group. Paths are unchanged: areas and `M` still use paths from the root (`skoolscout/discover-schools/org/candidates`). The name is read from Herdr when the tool starts, so restart the tool after renaming a workspace. Outside Herdr the whole tree shows. `INTENTS_SCOPE=<group>` chooses the group yourself, and `INTENTS_SCOPE=` (empty) shows the whole tree inside Herdr too.
+Inside Herdr the tree is scoped to the workspace: a workspace named `skoolscout` sees only the root's top-level `skoolscout` group, with its sub-groups as the tree, and nothing from other projects' groups. A workspace whose folder is in a meta repo with a `.helmsmith/intents/` folder sees that repo's space instead, whatever the workspace is called (see [Spaces and the run guide](#spaces-and-the-run-guide)). Otherwise, name a workspace after its project's group (`herdr workspace rename <id> skoolscout`) and keep one workspace per project. A workspace Herdr started in your home folder is named `~`: it sees the whole tree, never a group called `~`. The name matches the group's folder whatever its case. A workspace whose group does not exist yet shows it empty, and the first capture there creates it. Quick captures, `a` with nothing selected and an empty list all add at the top of the workspace's group. Paths are unchanged: areas and `M` still use paths from the root (`skoolscout/discover-schools/org/candidates`). The name is read from Herdr when the tool starts, so restart the tool after renaming a workspace. Outside Herdr the whole tree shows. `INTENTS_SCOPE=<group>` chooses the group yourself, and `INTENTS_SCOPE=` (empty) shows the whole tree inside Herdr too.
 
 ## In the toolbar
 
@@ -233,7 +233,15 @@ meta = "~/code/shop-meta"
 storage = "profile"      # where the space's intents live; the default
 ```
 
-It is filled in for you the first time the tool starts in a workspace whose folder has `.helmsmith/space.toml`.
+It is filled in for you the first time the tool starts in a workspace whose folder is a meta repo: its `.helmsmith/` has an `intents/` folder or a `space.toml`. A meta repo whose intents folder names another space is not recorded for this one.
+
+**Naming the space in the meta repo.** A meta repo's `.helmsmith/intents/` folder holds the space's intents configuration, shared through git. Its `config.toml` names the space:
+
+```toml
+space = "shop"           # the space's group; without it, the repo's folder name
+```
+
+The folder alone makes the repo a meta repo, so a workspace in it (or in one of its worktrees) sees that space even when Herdr named the workspace after the folder (`shop-meta`); a file that does not read says where when the tool starts. The space's area tree stays in your own storage: its groups are the folders under `~/.helmsmith/intents/spaces/<space>/`.
 
 **Where a space's intents live.** `storage = "profile"` (the default, also with no line) keeps them in your own folder, `~/.helmsmith/intents/spaces/<space>/`. `meta` (the meta repo's `.helmsmith/intents/`, shared through git) and `remote` (a REST API, with `url = "…"`) are placeholders for now: the space then shows no intents, says `meta storage is not built yet` (or `remote …`), and refuses to add one, rather than writing them anywhere else. Outside a space, the whole tree leaves such a space's group out and names it. Any other word is an error that names `spaces.toml`. The run guide is looked for in the space's meta repo, then in the intent's own repo; with neither, the tool says where to add one.
 

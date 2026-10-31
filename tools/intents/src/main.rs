@@ -28,12 +28,27 @@ fn with_config(
     let settled = herdr_intents::storage::settle_root(&home, &cfg.root);
     cfg.root = settled.root;
     cfg.notice = settled.notice;
-    // one Herdr workspace sees one top-level group: the one named like it
+    // one Herdr workspace sees one top-level group: its meta repo's space,
+    // else the one named like it
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
+    let mut unreadable = None;
     cfg.scope = scope::resolve(
         |k| std::env::var(k).ok(),
         |id| scope::herdr_label(std::path::Path::new(&herdr), id),
+        || {
+            let repo = herdr_intents::send::capture_repo()?;
+            match herdr_intents::space::intents_space(&repo)? {
+                Ok(space) => Some(space),
+                Err(why) => {
+                    unreadable = Some(why);
+                    None
+                }
+            }
+        },
     );
+    if cfg.notice.is_none() {
+        cfg.notice = unreadable;
+    }
     // a space whose storage is not built yet shows no intents and takes none
     cfg.storage_block = cfg
         .scope
