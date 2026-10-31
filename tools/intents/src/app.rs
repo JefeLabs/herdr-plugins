@@ -13540,6 +13540,12 @@ mod tests {
     fn completion_check_snapshot() {
         let mut fx = setup("agy.jsonl");
         let alpha = checked_alpha(&mut fx);
+        // a fixed day, so the snapshot's "checked 10-30" does not change with the date
+        let dir = crate::check::checks_dir(&Store::load(&alpha).unwrap());
+        let mut rec = crate::check::read_check(&dir).unwrap();
+        rec.at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 10, 30, 12, 0, 0).unwrap();
+        crate::check::write_check(&dir, &rec).unwrap();
         let key2 = crate::store::criterion_key("the email names the meeting");
         missing_item(&mut fx, &alpha, &key2, false);
         select(&mut fx.app, "Alpha");
