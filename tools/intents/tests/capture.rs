@@ -1650,6 +1650,54 @@ fn a_story_job_records_the_chosen_story() {
 }
 
 #[test]
+fn a_story_run_records_the_stories_queued_while_it_runs() {
+    use herdr_intents::capture::{queue_story, queued_stories, read_story};
+    let fx = Fx::stories(ALL_CONFIRMED);
+    queue_story(&fx.stories_dir(), 1).unwrap();
+    let job = CaptureJob::spawn(fx.story_request(vec![2]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    assert!(read_story(&fx.story(2)).is_some(), "the chosen story");
+    assert!(read_story(&fx.story(1)).is_some(), "the queued story");
+    assert_eq!(queued_stories(&fx.stories_dir()), Vec::<usize>::new());
+    let work = fx.log("work.log");
+    assert_eq!(
+        work.lines().filter(|l| l.contains("start --area")).count(),
+        1,
+        "one app for both takes: {work}"
+    );
+}
+
+#[test]
+fn a_failing_check_still_records_the_stories_queued_by_hand() {
+    use herdr_intents::capture::{queue_story, queued_stories, read_story};
+    let fx = Fx::stories("1: confirmed: a\n2: fails: no\n3: confirmed: c");
+    queue_story(&fx.stories_dir(), 2).unwrap();
+    fx.run_check(fx.check_request(None));
+    assert!(read_story(&fx.story(2)).is_some(), "asked for by hand");
+    assert!(read_story(&fx.story(1)).is_none(), "not passing: no others");
+    assert_eq!(queued_stories(&fx.stories_dir()), Vec::<usize>::new());
+}
+
+#[test]
+fn queued_stories_say_why_when_the_app_cannot_start() {
+    use herdr_intents::capture::{StoryOutcome, queue_story, queued_stories, read_story};
+    let mut fx = Fx::stories(ALL_CONFIRMED);
+    fx.set("FAKE_WORK_REFUSE", "org/team:HEALTH_TIMEOUT");
+    queue_story(&fx.stories_dir(), 1).unwrap();
+    let job = CaptureJob::spawn(fx.story_request(vec![2]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    for n in [1, 2] {
+        match read_story(&fx.story(n)).map(|r| r.outcome) {
+            Some(StoryOutcome::Failed(why)) => {
+                assert!(why.contains("HEALTH_TIMEOUT"), "{n}: {why}")
+            }
+            other => panic!("story {n}: {other:?}"),
+        }
+    }
+    assert_eq!(queued_stories(&fx.stories_dir()), Vec::<usize>::new());
+}
+
+#[test]
 fn the_story_prompt_orders_setup_rehearsal_and_take() {
     use herdr_intents::capture::{guide_stories, read_guide, story_prompt};
     let fx = Fx::stories(ALL_CONFIRMED);
