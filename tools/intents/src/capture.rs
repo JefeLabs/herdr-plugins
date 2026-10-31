@@ -483,20 +483,14 @@ impl Runner {
     }
 }
 
-/// An agent-browser session name from the intent's folder name and the
-/// capture's number.
-fn browser_session(stem: &str, n: u32) -> String {
-    let clean: String = stem
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("capture-{clean}-{n}")
+/// An agent-browser session name from a short hash of the intent's folder
+/// name and the capture's number. agent-browser keeps a socket at
+/// `~/.agent-browser/<session>.sock` and macOS refuses a socket path over 103
+/// bytes, so the title itself can't be in the name.
+pub fn browser_session(stem: &str, n: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(stem.as_bytes()));
+    format!("intent-{}-{n}", &hash[..8])
 }
 
 /// The app a commands-mode run started: its process group, how to stop it,
@@ -2448,6 +2442,22 @@ pub fn handoff_note(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_browser_session_name_stays_short_for_any_title() {
+        let long = "2026-10-26-admin-can-change-application-status-throughout-lifecycle".repeat(3);
+        let name = browser_session(&long, u32::MAX);
+        // macOS caps a socket path at 103 bytes and agent-browser puts it at
+        // ~/.agent-browser/<session>.sock; a story take adds "-s<n>"
+        assert!(name.len() <= 32, "{name}");
+        assert!(
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "{name}"
+        );
+        assert_eq!(name, browser_session(&long, u32::MAX), "the same each time");
+        assert_ne!(name, browser_session(&format!("{long}x"), u32::MAX));
+        assert_ne!(browser_session("a", 1), browser_session("a", 2));
+    }
 
     #[test]
     fn handoff_note_lists_each_capture_with_its_result() {

@@ -835,7 +835,7 @@ fn the_agent_gets_no_shell_only_the_browser_tools() {
         config["base_url"],
         "https://demo-org.skoolscout.com.local:3004"
     );
-    assert_eq!(config["session"], "capture-new-ab12cd34-1");
+    assert_eq!(config["session"], session());
 }
 
 #[test]
@@ -854,6 +854,11 @@ fn an_older_claude_fails_closed_before_any_stack() {
     );
 }
 
+/// The fixture capture's browser session (intent `new-ab12cd34`, capture 1).
+fn session() -> String {
+    herdr_intents::capture::browser_session("new-ab12cd34", 1)
+}
+
 #[test]
 fn the_browser_session_is_closed_after_the_agent() {
     let fx = Fx::new();
@@ -861,7 +866,7 @@ fn the_browser_session_is_closed_after_the_agent() {
     let ab = fx.log("ab.log");
     assert!(
         ab.lines()
-            .any(|l| l == "[--session][capture-new-ab12cd34-1][close]"),
+            .any(|l| l == format!("[--session][{}][close]", session())),
         "{ab}"
     );
 }
@@ -1004,7 +1009,7 @@ fn cancel_stops_the_agent_and_finishes_the_effort() {
     let start = Instant::now();
     while !fx
         .log("ab.log")
-        .contains("[--session][capture-new-ab12cd34-1][close]")
+        .contains(&format!("[--session][{}][close]", session()))
     {
         assert!(
             start.elapsed() < Duration::from_secs(5),
