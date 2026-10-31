@@ -950,6 +950,17 @@ fn the_card_says_what_a_story_recording_is_doing() {
 }
 
 #[test]
+fn the_card_says_when_a_check_could_not_run() {
+    let ev = Evidence {
+        prs: vec![(1, PrState::Merged)],
+        check_failure: Some("work start: no work program".into()),
+        ..Default::default()
+    };
+    let (_, label, _) = p(ALL_TICKED_ONE_PR, &ev);
+    assert!(label.ends_with("· check couldn't run"), "{label}");
+}
+
+#[test]
 fn the_card_counts_open_missing_items() {
     let ev = Evidence {
         prs: vec![(1, PrState::Merged)],

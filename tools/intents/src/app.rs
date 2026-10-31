@@ -502,6 +502,8 @@ pub struct App {
     reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant, Option<String>)>,
     /// `d`: stories being drafted (or re-evaluated) in the background, by intent.
     story_drafts: HashMap<PathBuf, (Turn, std::time::Instant)>,
+    /// Checks started with `X`, until their end is reported in the status line.
+    checks_by_hand: HashSet<PathBuf>,
     /// Folds started this session (original, follow-up stem): once each, until `r`.
     fold_tried: HashSet<(PathBuf, String)>,
     /// Fold checks started this session (original, keys): once each.
@@ -616,6 +618,7 @@ impl App {
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
             story_drafts: HashMap::new(),
+            checks_by_hand: HashSet::new(),
             fold_tried: HashSet::new(),
             fold_check_tried: HashSet::new(),
             pr_merge_commits: HashMap::new(),
@@ -1010,6 +1013,10 @@ impl App {
         let stories = crate::capture::stories_dir(it);
         let story_stage = crate::capture::is_running(&stories)
             .then(|| crate::capture::read_stage(&stories).unwrap_or_else(|| "starting".into()));
+        let check_failure = checking
+            .is_none()
+            .then(|| crate::check::read_failure(&check_dir))
+            .flatten();
         crate::progress::Evidence {
             plans,
             prs,
@@ -1018,6 +1025,7 @@ impl App {
             checking,
             check_stage,
             story_stage,
+            check_failure,
             open_follow_ups: 0,
             awaiting_pull: self.awaiting_pull.contains(&it.path),
         }
@@ -3704,9 +3712,44 @@ impl App {
             return;
         }
         self.message = Some(match self.start_check(&it, None, Vec::new(), None, false) {
-            Ok(()) => "checking: the card shows how far it got".into(),
+            Ok(()) => {
+                self.checks_by_hand.insert(it.path.clone());
+                "checking: the card shows how far it got".into()
+            }
             Err(e) => format!("check: {e}"),
         });
+    }
+
+    /// When a check started with `X` ends, the status line says how: it could
+    /// not run (and why), or what holds it back, or that it passed.
+    fn report_checks_by_hand(&mut self) {
+        let ended: Vec<PathBuf> = self
+            .checks_by_hand
+            .iter()
+            .filter(|p| {
+                Store::load(p).map_or(true, |it| {
+                    !crate::capture::is_running(&crate::check::checks_dir(&it))
+                })
+            })
+            .cloned()
+            .collect();
+        for path in ended {
+            self.checks_by_hand.remove(&path);
+            let Ok(it) = Store::load(&path) else {
+                continue;
+            };
+            let dir = crate::check::checks_dir(&it);
+            self.message = Some(match crate::check::read_failure(&dir) {
+                Some(why) => format!("check couldn't run: {why}"),
+                None => match crate::check::why_not_passing(
+                    crate::check::read_check(&dir).as_ref(),
+                    &it.body,
+                ) {
+                    Some(why) => why,
+                    None => format!("check passed: `{}`", it.fm.title),
+                },
+            });
+        }
     }
 
     /// Starts a completion check of `it` in its own process: all criteria, or
@@ -6043,6 +6086,7 @@ impl App {
         self.drain_polls();
         self.poll_reconciles();
         self.poll_story_drafts();
+        self.report_checks_by_hand();
         // pull requests, plans and searches are checked in either layout (a
         // merge must reconcile from the tree too); agent states only matter
         // to the cards, so they poll only while the list shows
@@ -12032,6 +12076,26 @@ mod tests {
         fx.app.check_due();
         wait_for_work(&fx, "start --area");
         wait_check_end(&path);
+    }
+
+    #[test]
+    fn a_check_by_hand_that_could_not_run_says_why() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        fx.app.capture_env.retain(|(k, _)| k != "WORK_BIN_PATH");
+        fx.app
+            .capture_env
+            .push(("WORK_BIN_PATH".into(), "/nonexistent/work".into()));
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        key(&mut fx.app, KeyCode::Char('X'));
+        wait_check_end(&path);
+        wait_until(&mut fx.app, "the reason", |a| {
+            a.message
+                .as_deref()
+                .is_some_and(|m| m.contains("couldn't run"))
+        });
+        let m = fx.app.message.clone().unwrap_or_default();
+        assert!(m.contains("workbrokr"), "{m}");
     }
 
     #[test]

@@ -1760,3 +1760,62 @@ fn a_check_writes_its_stage_while_it_runs() {
     job.cancel();
     fx.wait_done(&job);
 }
+
+// ---- programs installed under nvm (Herdr's PATH does not load nvm) ----------
+
+#[test]
+fn nvms_default_node_is_found() {
+    use herdr_intents::capture::nvm_bin;
+    let tmp = tempfile::tempdir().unwrap();
+    let nvm = tmp.path();
+    for v in ["v22.1.0", "v24.2.0", "v24.18.0"] {
+        fs::create_dir_all(nvm.join(format!("versions/node/{v}/bin"))).unwrap();
+    }
+    fs::create_dir_all(nvm.join("alias/lts")).unwrap();
+    let set = |a: &str| fs::write(nvm.join("alias/default"), a).unwrap();
+    let bin = |v: &str| Some(nvm.join(format!("versions/node/{v}/bin")));
+    set("24\n");
+    assert_eq!(nvm_bin(nvm), bin("v24.18.0"), "the newest 24");
+    set("v22.1.0");
+    assert_eq!(nvm_bin(nvm), bin("v22.1.0"));
+    set("node");
+    assert_eq!(nvm_bin(nvm), bin("v24.18.0"), "the newest installed");
+    set("lts/*");
+    fs::write(nvm.join("alias/lts/*"), "lts/jod").unwrap();
+    fs::write(nvm.join("alias/lts/jod"), "v22.1.0").unwrap();
+    assert_eq!(nvm_bin(nvm), bin("v22.1.0"), "an alias of an alias");
+    set("19");
+    assert_eq!(nvm_bin(nvm), None, "not installed");
+    fs::remove_file(nvm.join("alias/default")).unwrap();
+    assert_eq!(nvm_bin(nvm), None, "no default");
+}
+
+#[test]
+fn a_check_finds_work_in_nvms_default_node() {
+    let mut fx = Fx::checking("1: confirmed: a\n2: confirmed: b");
+    fx.env.retain(|(k, _)| k != "WORK_BIN_PATH");
+    let nvm = fx.tmp.path().join("nvm");
+    let bin = nvm.join("versions/node/v24.0.0/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::copy(fixture("fake-work.sh"), bin.join("work")).unwrap();
+    fs::create_dir_all(nvm.join("alias")).unwrap();
+    fs::write(nvm.join("alias/default"), "24").unwrap();
+    fx.set("NVM_DIR", &nvm.display().to_string());
+    fx.run_check(fx.check_request(None));
+    let work = fx.log("work.log");
+    assert!(work.contains("start --area"), "{work}");
+}
+
+#[test]
+fn a_missing_work_says_how_to_get_it() {
+    let mut fx = Fx::checking("1: confirmed: a\n2: confirmed: b");
+    fx.set("WORK_BIN_PATH", "/nonexistent/work");
+    let (_, rec) = fx.run_check(fx.check_request(None));
+    match rec.outcome {
+        Outcome::Failed(why) => {
+            assert!(why.contains("npm i -g @helmsmith/workbrokr"), "{why}");
+            assert!(why.contains("nvm"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
