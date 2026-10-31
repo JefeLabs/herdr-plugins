@@ -729,6 +729,69 @@ pub fn stamp(intent: &Intent) -> DateTime<Local> {
         .unwrap_or_else(|_| Local::now())
 }
 
+/// Markdown's marks taken out, for text shown on a video's cards and
+/// captions: code ticks, bold and links (`[text](url)` keeps the text).
+/// A single `*` or `_` stays: it is more often part of a word than emphasis.
+pub fn plain_text(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find("](").and_then(|close| {
+            after[close + 2..]
+                .find(')')
+                .map(|end| (close, close + 2 + end))
+        }) {
+            Some((close, end)) => {
+                out.push_str(&after[..close]);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_string()
+}
+
+/// A story's name as a card shows it: a slug (`mark-reinstates-maya`) as
+/// words in title case, anything else as plain text.
+pub fn story_title(name: &str) -> String {
+    let t = name.trim();
+    let slug = t.contains('-')
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !slug {
+        return plain_text(t);
+    }
+    const SMALL: &[&str] = &[
+        "a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to",
+        "with",
+    ];
+    t.split('-')
+        .filter(|w| !w.is_empty())
+        .enumerate()
+        .map(|(i, w)| {
+            if i > 0 && SMALL.contains(&w) {
+                w.to_string()
+            } else {
+                let mut c = w.chars();
+                c.next()
+                    .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                    .unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The letters an intent id is drawn from.
 const ID_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 

@@ -1992,12 +1992,16 @@ fn record_stories(
             check_dir: None,
             logs: Vec::new(),
             take: Some(crate::capture_mcp::TakeConfig {
-                title: story.name.clone(),
+                title: crate::store::story_title(&story.name),
                 persona: persona_name,
-                shows: shows.clone(),
+                // the cards and captions show plain words, never Markdown
+                shows: shows
+                    .iter()
+                    .map(|(n, t)| (*n, crate::store::plain_text(t)))
+                    .collect(),
                 dir: dir.clone(),
                 hold_ms: None,
-                intent_title: it.fm.title.clone(),
+                intent_title: crate::store::plain_text(&it.fm.title),
                 intent_id: it.fm.id.clone(),
                 version: it.fm.version,
                 look: look.clone(),
@@ -2039,7 +2043,7 @@ fn record_stories(
         }
         let outcome = match ran {
             Err(why) => StoryOutcome::Failed(why),
-            Ok(_) if !take.is_file() => StoryOutcome::Failed("no video was recorded".into()),
+            Ok(reply) if !take.is_file() => StoryOutcome::Failed(no_take_reason(&reply)),
             Ok(_) if !stopped.is_file() => {
                 StoryOutcome::Failed("the take did not end with take_stop".into())
             }
@@ -2353,6 +2357,41 @@ pub fn fail_stories(
             },
         );
     }
+}
+
+/// Why a story has no video, in the agent's own words (its one-line reply,
+/// as plain text, without a leading "Not recorded:"); "no video was
+/// recorded" when it gave none.
+fn no_take_reason(reply: &str) -> String {
+    let line = reply
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut why = crate::store::plain_text(line);
+    for prefix in [
+        "not recorded:",
+        "couldn't record:",
+        "could not record:",
+        "no video:",
+    ] {
+        if why
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            why = why[prefix.len()..].trim().to_string();
+        }
+    }
+    let said = why.trim_end_matches(['.', '!']).trim().to_lowercase();
+    if said.is_empty() || said == "done" {
+        return "no video was recorded".into();
+    }
+    const MAX: usize = 200;
+    if why.chars().count() > MAX {
+        let cut: String = why.chars().take(MAX).collect();
+        why = format!("{}…", cut.trim_end());
+    }
+    why
 }
 
 /// The stories asked for with `r` while a run of the intent was going, one

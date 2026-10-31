@@ -1059,3 +1059,38 @@ fn a_run_stamps_an_id_and_counts_an_edit_made_in_the_editor() {
     assert_eq!(again.fm.version, Some(2));
     assert_eq!(fs::read_to_string(&it.path).unwrap(), before);
 }
+
+// ---- plain words for a video's cards ----------------------------------------
+
+#[test]
+fn cards_show_plain_text_not_markdown() {
+    use herdr_intents::store::plain_text;
+    assert_eq!(
+        plain_text("the server refuses `POST /approve` with **409**"),
+        "the server refuses POST /approve with 409"
+    );
+    assert_eq!(
+        plain_text("see [the spec](docs/spec.md) and __this__"),
+        "see the spec and this"
+    );
+    assert_eq!(
+        plain_text("snake_case and a * b stay"),
+        "snake_case and a * b stay"
+    );
+}
+
+#[test]
+fn a_story_named_as_a_slug_reads_as_words() {
+    use herdr_intents::store::story_title;
+    assert_eq!(story_title("mark-reinstates-maya"), "Mark Reinstates Maya");
+    assert_eq!(
+        story_title("mark-reinstates-withdrawn-draft-to-incomplete"),
+        "Mark Reinstates Withdrawn Draft to Incomplete"
+    );
+    assert_eq!(
+        story_title("Mark reinstates Maya"),
+        "Mark reinstates Maya",
+        "words stay as written"
+    );
+    assert_eq!(story_title("Pat sees **it** back"), "Pat sees it back");
+}
