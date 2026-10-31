@@ -4473,14 +4473,20 @@ impl App {
     }
 
     /// `r` on a story: records it again, once the completion check has passed.
+    /// `r`: records the story now. A completion check that hasn't passed is
+    /// named, not waited for (`X` records every story after one passes).
     fn record_story(&mut self, it: &Intent, number: usize) {
         let latest = crate::check::read_check(&crate::check::checks_dir(it));
-        if let Some(why) = crate::check::why_not_passing(latest.as_ref(), &it.body) {
-            self.message = Some(why);
-            return;
-        }
+        // the reason's head ("the last check (08:57) hasn't passed"), which
+        // never holds ": " itself; the detail is the list after it
+        let note = crate::check::why_not_passing(latest.as_ref(), &it.body)
+            .map(|why| {
+                let head = why.split_once(": ").map_or(why.as_str(), |(h, _)| h);
+                format!(" ({head})")
+            })
+            .unwrap_or_default();
         self.message = Some(match self.start_story(it, number) {
-            Ok(()) => format!("recording story {number}: its row shows how it went"),
+            Ok(()) => format!("recording story {number}{note}: its row shows how it went"),
             Err(e) => format!("record: {e}"),
         });
     }
@@ -14756,20 +14762,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recording_by_hand_waits_for_a_passing_check() {
-        let mut fx = setup("agy.jsonl");
-        beta_with_stories(&mut fx);
+    /// Presses `r` on Beta's second story and waits until that story runs.
+    fn record_second_story(fx: &mut Fx) -> String {
         focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        let it = fx.app.selected_intent().unwrap().clone();
+        let second = crate::capture::stories_dir(&it).join("2-pat-sees-it-back");
+        let before = crate::capture::read_story(&second).unwrap().at;
         key(&mut fx.app, KeyCode::Char('r'));
-        let m = fx.app.view().message.unwrap_or_default();
-        assert!(m.contains("no completion check has run yet"), "{m}");
-        assert!(m.contains("X runs one"), "{m}");
+        let message = fx.app.view().message.unwrap_or_default();
+        let start = Instant::now();
+        while crate::capture::read_story(&second).is_none_or(|r| r.at == before) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "story 2 never ran: {message}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        message
     }
 
     #[test]
-    fn recording_by_hand_names_what_holds_the_check_back() {
+    fn r_records_a_story_before_any_check() {
         let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        beta_with_stories(&mut fx);
+        assert_eq!(
+            record_second_story(&mut fx),
+            "recording story 2 (no completion check has run yet): its row shows how it went"
+        );
+    }
+
+    #[test]
+    fn r_records_a_story_whose_check_has_not_passed_and_says_so() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
         beta_with_stories(&mut fx);
         let it = fx.app.selected_intent().unwrap().clone();
         let dir = crate::check::checks_dir(&it);
@@ -14796,10 +14823,12 @@ mod tests {
             },
         )
         .unwrap();
-        focus_stories(&mut fx.app);
-        key(&mut fx.app, KeyCode::Char('r'));
-        let m = fx.app.view().message.unwrap_or_default();
-        assert!(m.contains("criterion 2 fails"), "{m}");
+        let m = record_second_story(&mut fx);
+        assert!(m.starts_with("recording story 2 (the last check ("), "{m}");
+        assert!(
+            m.ends_with(" hasn't passed): its row shows how it went"),
+            "{m}"
+        );
     }
 
     #[test]
