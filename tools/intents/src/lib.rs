@@ -9,6 +9,7 @@ pub mod conversation;
 pub mod editor;
 pub mod interview;
 pub mod markdown;
+pub mod open_space;
 pub mod progress;
 pub mod provider;
 pub mod reconcile;
