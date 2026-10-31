@@ -441,3 +441,13 @@ fn polish_asks_for_stories_too() {
     );
     assert!(!seed_prompt("template", "body", None, "refactor", None).contains("## Stories"));
 }
+
+#[test]
+fn stories_never_carry_sign_in_details() {
+    let rule = herdr_intents::conversation::stories_rule(
+        "enhancement",
+        Some("## Stories\n### Personas\n- Mark: admin, signs in as mark@example.test\n"),
+    )
+    .unwrap();
+    assert!(rule.contains("never how it signs in"), "{rule}");
+}

@@ -98,3 +98,14 @@ fn adding_a_criterion_keeps_stories_after_the_criteria() {
     let stories_at = out.find("## Stories").unwrap();
     assert!(criteria < stories_at, "{out}");
 }
+
+#[test]
+fn a_story_the_agent_renumbered_keeps_its_numbers() {
+    let before = "## Acceptance criteria\n- [ ] a\n- [ ] b\n\n## Stories\n### A\n- shows: 1\n### B\n- shows: 2\n";
+    let after = "## Acceptance criteria\n- [ ] new\n- [ ] a\n- [ ] b\n\n## Stories\n### A\n- shows: 2\n### B\n- shows: 3\n";
+    let out = remap_shows(before, after);
+    assert!(
+        out.contains("### A\n- shows: 2\n### B\n- shows: 3"),
+        "{out}"
+    );
+}

@@ -25,6 +25,13 @@ pub enum Verdict {
     CantCheck(String),
 }
 
+/// The check's own "can't check" when the agent gave no verdict for a criterion.
+pub const NO_ANSWER: &str = "no answer";
+/// The check's own "can't check" when a verdict kept no proof.
+pub const NO_PROOF: &str = "no proof kept";
+/// How a check after a fold softens a failure (the fold may be wrong, not the app).
+pub const FOLD_DOUBT: &str = "the fold may describe this wrongly";
+
 /// One acceptance criterion as the check numbers it: from 1, in order across
 /// area groups, as demo lines count them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,7 +182,7 @@ pub fn parse_verdicts(items: &[CheckItem], text: &str) -> Vec<(usize, Verdict)> 
         .map(|it| {
             let v = found
                 .remove(&it.number)
-                .unwrap_or_else(|| Verdict::CantCheck("no answer".into()));
+                .unwrap_or_else(|| Verdict::CantCheck(NO_ANSWER.into()));
             (it.number, v)
         })
         .collect()
@@ -202,7 +209,7 @@ pub fn require_proof(
         .into_iter()
         .map(|(n, v)| match v {
             Verdict::Confirmed(_) if proof_file(check_dir, n, since).is_none() => {
-                (n, Verdict::CantCheck("no proof kept".into()))
+                (n, Verdict::CantCheck(NO_PROOF.into()))
             }
             v => (n, v),
         })
@@ -292,15 +299,25 @@ pub fn merge_check(old: Option<CheckRecord>, new: CheckRecord) -> CheckRecord {
 /// criterion has a result, and none fails or is missing ("can't check" does
 /// not hold it back).
 pub fn passes(latest: &CheckRecord, body: &str) -> bool {
+    // the tool's own fallbacks prove nothing: no answer, no proof kept, or a
+    // failure the fold softened; only the agent's own "can't check" may stand
+    let proven = |v: &Verdict| match v {
+        Verdict::Confirmed(_) => true,
+        Verdict::CantCheck(why) => {
+            why != NO_ANSWER && why != NO_PROOF && !why.starts_with(FOLD_DOUBT)
+        }
+        Verdict::Fails(_) | Verdict::Missing(_) => false,
+    };
     let keys: Vec<String> = crate::store::criteria(body)
         .iter()
         .map(|c| crate::store::criterion_key(&c.text))
         .collect();
     !keys.is_empty()
         && keys.iter().all(|k| {
-            latest.results.iter().any(|r| {
-                r.key == *k && !matches!(r.verdict, Verdict::Fails(_) | Verdict::Missing(_))
-            })
+            latest
+                .results
+                .iter()
+                .any(|r| r.key == *k && proven(&r.verdict))
         })
 }
 

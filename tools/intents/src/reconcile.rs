@@ -552,11 +552,46 @@ pub fn remap_shows(before: &str, after: &str) -> String {
         .iter()
         .map(|c| criterion_key(&c.text))
         .collect();
-    let old_lines: Vec<&str> = before.lines().map(str::trim).collect();
+    // each story's shows line in `before`, by its position in the section
+    let shows_of = |body: &str| -> Vec<Option<String>> {
+        let mut out: Vec<Option<String>> = Vec::new();
+        let mut inside = false;
+        for line in body.lines() {
+            if line.starts_with("## ") {
+                inside = line
+                    .trim()
+                    .eq_ignore_ascii_case(crate::store::STORIES_HEADING);
+            } else if inside && line.trim().starts_with("### ") {
+                out.push(None);
+            } else if inside
+                && line.trim().starts_with("- shows:")
+                && let Some(last) = out.last_mut()
+            {
+                *last = Some(line.trim().to_string());
+            }
+        }
+        out
+    };
+    let old_shows = shows_of(before);
+    let mut inside = false;
+    let mut story = 0usize;
     let mut out: Vec<String> = Vec::new();
     for line in after.lines() {
+        if line.starts_with("## ") {
+            inside = line
+                .trim()
+                .eq_ignore_ascii_case(crate::store::STORIES_HEADING);
+        } else if inside && line.trim().starts_with("### ") {
+            story += 1;
+        }
+        // unchanged from the same story's line before: renumber it
+        let unchanged = inside
+            && story > 0
+            && old_shows
+                .get(story - 1)
+                .is_some_and(|old| old.as_deref() == Some(line.trim()));
         match line.trim().strip_prefix("- shows:") {
-            Some(list) if old_lines.contains(&line.trim()) => {
+            Some(list) if unchanged => {
                 let moved: Vec<String> = list
                     .split(',')
                     .filter_map(|n| n.trim().parse::<usize>().ok())

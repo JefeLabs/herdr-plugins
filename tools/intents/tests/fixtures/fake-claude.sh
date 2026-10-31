@@ -19,11 +19,13 @@ for n in $(printf '%s' "${FAKE_CLAUDE_PROOF:-}" | tr , ' '); do printf png > "$F
 # a story's take (its agent has take_start): FAKE_CLAUDE_HANG_TAKE=1 runs for
 # 30 s; FAKE_CLAUDE_CAPTIONS=<n,…> leaves those captions and a video in the
 # story's folder (the agent's working folder), as the take tools would
+# (take.mp4, and take.stopped unless FAKE_CLAUDE_NO_STOP=1)
 case "$*" in *take_start*)
-  [ "${FAKE_CLAUDE_HANG_TAKE:-0}" = 1 ] && { printf 'partial' > video.mp4; sleep 30; }
+  [ "${FAKE_CLAUDE_HANG_TAKE:-0}" = 1 ] && { printf 'partial' > take.mp4; sleep 30; }
   if [ -n "${FAKE_CLAUDE_CAPTIONS+x}" ]; then
     printf '[%s]' "$FAKE_CLAUDE_CAPTIONS" > captions.json
-    printf 'video' > video.mp4
+    printf 'video' > take.mp4
+    [ "${FAKE_CLAUDE_NO_STOP:-0}" = 1 ] || : > take.stopped
   fi
   ;;
 esac

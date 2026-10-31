@@ -552,9 +552,13 @@ impl Server {
                 }
                 let _ = std::fs::create_dir_all(&t.dir);
                 let _ = std::fs::write(t.dir.join("steps.txt"), "");
+                let _ = std::fs::remove_file(t.dir.join("take.stopped"));
                 save_captions(&[]);
-                let video = t.dir.join("video.mp4").display().to_string();
-                let (ok, text) = self.run(&["record".into(), "start".into(), video]);
+                // the take is kept as video.mp4 only if it ends cleanly and shows
+                // everything; the pointer is drawn on it
+                let take = t.dir.join("take.mp4").display().to_string();
+                let (ok, text) =
+                    self.run(&["record".into(), "start".into(), take, "--cursor".into()]);
                 if !ok {
                     return (true, format!("could not start recording: {text}"));
                 }
@@ -610,6 +614,7 @@ impl Server {
                 if !ok {
                     return (true, format!("could not stop recording: {text}"));
                 }
+                let _ = std::fs::write(t.dir.join("take.stopped"), "");
                 (false, "the take is over".into())
             }
         }
@@ -626,7 +631,21 @@ impl Server {
             .join(out_name(self.cfg.phase, self.cfg.shot));
         let out = out.display().to_string();
         let (ok, text) = match name {
-            "take_start" | "caption" | "take_stop" => return self.take(name, arguments),
+            "take_start" | "caption" | "take_stop" => {
+                let (err, text) = self.take(name, arguments);
+                // a take's own log: why a take went wrong, for the person
+                if err && let Some(t) = &self.cfg.take {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(t.dir.join("run.log"))
+                    {
+                        let _ = writeln!(f, "{name}: {text}");
+                    }
+                }
+                return (err, text);
+            }
             "record_start" => self.run(&["record".into(), "start".into(), out]),
             "record_stop" => self.run(&["record".into(), "stop".into()]),
             "screenshot" if self.cfg.mode == Mode::Check => {

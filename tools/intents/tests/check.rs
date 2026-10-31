@@ -503,3 +503,18 @@ fn a_criterion_never_checked_does_not_pass() {
     ]);
     assert!(!herdr_intents::check::passes(&r, BODY_THREE));
 }
+
+#[test]
+fn a_check_with_no_proof_or_no_answer_does_not_pass() {
+    for fallback in [
+        "no answer",
+        "no proof kept",
+        "the fold may describe this wrongly: it reads b",
+    ] {
+        let r = rec(&[
+            (1, "one", Verdict::Confirmed("yes".into())),
+            (2, "two", Verdict::CantCheck(fallback.into())),
+        ]);
+        assert!(!herdr_intents::check::passes(&r, BODY_TWO), "{fallback}");
+    }
+}

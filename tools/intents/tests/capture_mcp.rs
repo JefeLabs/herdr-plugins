@@ -413,10 +413,18 @@ fn captions_are_recorded_in_order() {
     assert_eq!(read_captions(&s), vec![3, 1]);
     let log = s.log().join("\n");
     assert!(
-        log.contains("[record][start]") && log.contains("video.mp4"),
+        log.contains("[record][start]") && log.contains("take.mp4]"),
         "{log}"
     );
+    assert!(
+        log.contains("[--cursor]"),
+        "the pointer is on the video: {log}"
+    );
     assert!(log.contains("[record][stop]"), "{log}");
+    assert!(
+        s.evidence.join("take.stopped").is_file(),
+        "a clean stop is marked"
+    );
     let (err, t) = s.call("caption", json!({"criterion": 1}));
     assert!(err, "no caption after the take: {t}");
 }
@@ -466,4 +474,16 @@ fn only_the_take_is_in_the_steps() {
     s.call("take_stop", json!({}));
     let steps = fs::read_to_string(s.evidence.join("steps.txt")).unwrap();
     assert_eq!(steps.lines().collect::<Vec<_>>(), vec!["click @e1"]);
+}
+
+#[test]
+fn a_tool_error_in_a_take_goes_to_the_run_log() {
+    let mut s = take_server();
+    let (err, _) = s.call("caption", json!({"criterion": 1}));
+    assert!(err);
+    let log = fs::read_to_string(s.evidence.join("run.log")).unwrap_or_default();
+    assert!(
+        log.contains("caption") && log.contains("take_start"),
+        "{log}"
+    );
 }

@@ -1617,7 +1617,7 @@ fn a_cancelled_take_keeps_no_video() {
     fx.set("FAKE_CLAUDE_HANG_TAKE", "1");
     let mut job = CaptureJob::spawn(fx.story_request(vec![1]), fx.env.clone(), false);
     let start = Instant::now();
-    while !fx.story(1).join("video.mp4").exists() {
+    while !fx.story(1).join("take.mp4").exists() {
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "the take never started"
@@ -1628,6 +1628,10 @@ fn a_cancelled_take_keeps_no_video() {
     fx.wait_done(&job);
     assert!(read_story(&fx.story(1)).is_none_or(|r| r.outcome != StoryOutcome::Kept));
     assert!(!fx.story(1).join("video.mp4").exists());
+    assert!(
+        !fx.story(1).join("take.mp4").exists(),
+        "the partial take is gone"
+    );
 }
 
 #[test]
@@ -1670,4 +1674,65 @@ fn the_story_prompt_orders_setup_rehearsal_and_take() {
         "the criteria to caption"
     );
     assert!(p.contains("never people"), "the guide's rules");
+}
+
+#[test]
+fn a_take_that_never_stopped_is_not_kept() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let mut fx = Fx::stories(ALL_CONFIRMED);
+    fx.set("FAKE_CLAUDE_NO_STOP", "1");
+    fx.run_check(fx.check_request(None));
+    assert!(
+        matches!(read_story(&fx.story(1)).unwrap().outcome, StoryOutcome::Failed(w) if w.contains("take_stop")),
+        "{:?}",
+        read_story(&fx.story(1))
+    );
+    assert!(!fx.story(1).join("video.mp4").exists());
+    assert!(!fx.story(1).join("take.mp4").exists());
+}
+
+#[test]
+fn a_re_take_that_fails_keeps_the_earlier_video() {
+    use herdr_intents::capture::{StoryOutcome, read_story};
+    let mut fx = Fx::stories(ALL_CONFIRMED);
+    fx.run_check(fx.check_request(None));
+    assert!(fx.story(1).join("video.mp4").is_file());
+    fx.set("FAKE_CLAUDE_CAPTIONS", "1");
+    let job = CaptureJob::spawn(fx.story_request(vec![1]), fx.env.clone(), false);
+    fx.wait_done(&job);
+    assert_eq!(
+        read_story(&fx.story(1)).unwrap().outcome,
+        StoryOutcome::NotShown(vec![3])
+    );
+    assert_eq!(
+        fs::read_to_string(fx.story(1).join("video.mp4")).unwrap(),
+        "video",
+        "the earlier video stays"
+    );
+}
+
+#[test]
+fn the_card_names_the_persona_only() {
+    let fx = Fx::stories(ALL_CONFIRMED);
+    fs::write(
+        fx.tmp.path().join("root/skoolscout/org/notify.md"),
+        STORY_INTENT.replace(
+            "- persona: Mark\n",
+            "- persona: Mark: tenant admin, signs in as mark@example.test with code 123456\n",
+        ),
+    )
+    .unwrap();
+    fx.run_check(fx.check_request(None));
+    let cfg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fx.story(1).join(".capture-mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(cfg["take"]["persona"], "Mark", "{cfg}");
+}
+
+#[test]
+fn a_take_keeps_its_run_log() {
+    let fx = Fx::stories(ALL_CONFIRMED);
+    fx.run_check(fx.check_request(None));
+    let log = fs::read_to_string(fx.story(1).join("run.log")).unwrap_or_default();
+    assert!(log.contains("1: confirmed: a"), "the agent's reply: {log}");
 }

@@ -1329,12 +1329,15 @@ fn run(
         ..
     } = &req.job
     {
+        let Ok(it) = crate::store::Store::load(intent_path) else {
+            return failed(format!("cannot read {}", intent_path.display()));
+        };
         record_stories(
             r,
             state,
             &guide,
             &base_url,
-            intent_path,
+            &it,
             stories_dir,
             Which::Numbers(numbers),
             managed_mcp,
@@ -1453,7 +1456,8 @@ fn run(
                             (
                                 n,
                                 crate::check::Verdict::CantCheck(format!(
-                                    "the fold may describe this wrongly: {t}"
+                                    "{}: {t}",
+                                    crate::check::FOLD_DOUBT
                                 )),
                             )
                         }
@@ -1479,10 +1483,15 @@ fn run(
             };
             let latest = crate::check::merge_check(crate::check::read_check(dir), checked.clone());
             let _ = crate::check::write_check(dir, &latest);
+            // read before the results are handed over: the runner writes them
+            // into the intent while the takes would be reading it
+            let story_intent = match &req.job {
+                Job::Check { intent_path, .. } => crate::store::Store::load(intent_path).ok(),
+                _ => None,
+            };
             let _ = tx.send(CaptureUpdate::Checked(checked));
             // every criterion holds: the stories' videos, on this same app
-            if let Job::Check { intent_path, .. } = &req.job
-                && let Ok(it) = crate::store::Store::load(intent_path)
+            if let Some(it) = story_intent
                 && crate::check::passes(&latest, &it.body)
             {
                 let looked_at: Vec<usize> = items.iter().map(|i| i.number).collect();
@@ -1491,7 +1500,7 @@ fn run(
                     state,
                     &guide,
                     &base_url,
-                    intent_path,
+                    &it,
                     &stories_dir(&it),
                     Which::AfterCheck(&looked_at),
                     managed_mcp,
@@ -1711,15 +1720,12 @@ fn record_stories(
     state: &std::sync::Mutex<JobState>,
     guide: &CaptureGuide,
     base_url: &str,
-    intent_path: &Path,
+    it: &crate::store::Intent,
     stories_dir: &Path,
     which: Which,
     managed_mcp: bool,
     progress: &dyn Fn(String),
 ) {
-    let Ok(it) = crate::store::Store::load(intent_path) else {
-        return;
-    };
     let all = crate::store::stories(&it.body);
     let chosen: Vec<&crate::store::IntentStory> = all
         .iter()
@@ -1760,12 +1766,13 @@ fn record_stories(
             continue;
         };
         let persona = story.persona.clone().unwrap_or_else(|| "unknown".into());
-        if guide_persona(&persona, &guide_stories.personas).is_none() {
+        // the card shows the guide's name for the persona, never more of the line
+        let Some(persona_name) = guide_persona(&persona, &guide_stories.personas).cloned() else {
             save(StoryOutcome::Failed(format!(
                 "persona {persona} isn't in the run guide's Stories section"
             )));
             continue;
-        }
+        };
         if story.waits || story.steps.is_empty() {
             save(StoryOutcome::Failed("the story is not drafted yet".into()));
             continue;
@@ -1776,14 +1783,17 @@ fn record_stories(
             ));
             continue;
         }
-        // an earlier video stays until this take is kept
+        // the take records into take.mp4; an earlier video.mp4 stays until
+        // this take is kept
         let video = dir.join("video.mp4");
-        let previous = dir.join("previous.mp4");
-        if video.is_file() {
-            let _ = std::fs::rename(&video, &previous);
+        let take = dir.join("take.mp4");
+        let stopped = dir.join("take.stopped");
+        for f in [&take, &stopped] {
+            let _ = std::fs::remove_file(f);
         }
-        let _ = std::fs::remove_file(dir.join("captions.json"));
-        let _ = std::fs::remove_file(dir.join("steps.txt"));
+        for f in ["captions.json", "steps.txt", "run.log"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
         let mcp_config = crate::capture_mcp::McpConfig {
             base_url: base_url.to_string(),
             session: format!("{}-s{}", r.browser, story.number),
@@ -1795,7 +1805,7 @@ fn record_stories(
             logs: Vec::new(),
             take: Some(crate::capture_mcp::TakeConfig {
                 title: story.name.clone(),
-                persona: persona.clone(),
+                persona: persona_name,
                 shows: shows.clone(),
                 dir: dir.clone(),
                 hold_ms: None,
@@ -1821,9 +1831,26 @@ fn record_stories(
             managed_mcp,
         );
         let captioned = read_captions(&dir);
+        // the agent's last word, beside the tools' own errors
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("run.log"))
+            {
+                let _ = match &ran {
+                    Ok(reply) => writeln!(f, "the agent: {}", reply.trim()),
+                    Err(why) => writeln!(f, "the run: {why}"),
+                };
+            }
+        }
         let outcome = match ran {
             Err(why) => StoryOutcome::Failed(why),
-            Ok(_) if !video.is_file() => StoryOutcome::Failed("no video was recorded".into()),
+            Ok(_) if !take.is_file() => StoryOutcome::Failed("no video was recorded".into()),
+            Ok(_) if !stopped.is_file() => {
+                StoryOutcome::Failed("the take did not end with take_stop".into())
+            }
             Ok(_) => {
                 let missing: Vec<usize> = shows
                     .iter()
@@ -1838,13 +1865,11 @@ fn record_stories(
             }
         };
         if outcome == StoryOutcome::Kept {
-            let _ = std::fs::remove_file(&previous);
+            let _ = std::fs::rename(&take, &video);
         } else {
-            let _ = std::fs::remove_file(&video);
-            if previous.is_file() {
-                let _ = std::fs::rename(&previous, &video);
-            }
+            let _ = std::fs::remove_file(&take);
         }
+        let _ = std::fs::remove_file(&stopped);
         save(outcome);
     }
 }

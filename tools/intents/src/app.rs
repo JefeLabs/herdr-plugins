@@ -3440,8 +3440,7 @@ impl App {
                 let _ = Store::update_meta(&it.path, |fm| fm.fold_check.clear());
                 continue;
             }
-            if crate::capture::is_running(&crate::check::checks_dir(&it))
-                || crate::capture::is_running(&self.evidence_home(&it))
+            if self.run_of(&it).is_some()
                 || !self
                     .fold_check_tried
                     .insert((it.path.clone(), keys.clone()))
@@ -3468,8 +3467,7 @@ impl App {
                 || self.reconcile_jobs.contains_key(&original.path)
                 || self.reconcile_failed.contains_key(&original.path)
                 || !self.searches_answered(&original)
-                || crate::capture::is_running(&crate::check::checks_dir(&original))
-                || crate::capture::is_running(&self.evidence_home(&original))
+                || self.run_of(&original).is_some()
                 || self.check_pending(&original)
             {
                 continue;
@@ -3563,6 +3561,9 @@ impl App {
         let home = self.evidence_home(it);
         if crate::capture::is_running(&home) {
             return Err("a capture of it is running: check when it ends".into());
+        }
+        if crate::capture::is_running(&crate::capture::stories_dir(it)) {
+            return Err("recording its stories: check when it ends".into());
         }
         let group_rel = it
             .path
@@ -3709,9 +3710,10 @@ impl App {
                 continue;
             }
             let busy = all.iter().any(|o| {
-                crate::capture::is_running(&crate::check::checks_dir(o))
+                (crate::capture::is_running(&crate::check::checks_dir(o))
+                    || crate::capture::is_running(&crate::capture::stories_dir(o)))
                     && (o.fm.repo == it.fm.repo || self.share_a_fixed_app(o, it))
-            });
+            }) || crate::capture::is_running(&crate::capture::stories_dir(it));
             if busy {
                 continue;
             }
@@ -3828,12 +3830,17 @@ impl App {
             self.message = Some("evidence is for bugs".into());
             return;
         }
-        if crate::capture::is_running(&self.evidence_home(&it))
-            || crate::capture::is_running(&crate::check::checks_dir(&it))
-        {
-            self.message =
-                Some("capturing already: the Evidence section shows how far it got".into());
-            return;
+        match self.run_of(&it) {
+            Some("recording its stories") => {
+                self.message = Some("recording its stories: capture when it ends".into());
+                return;
+            }
+            Some(_) => {
+                self.message =
+                    Some("capturing already: the Evidence section shows how far it got".into());
+                return;
+            }
+            None => {}
         }
         let repo = match self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo())) {
             Ok(repo) => repo,
@@ -4058,6 +4065,20 @@ impl App {
         });
     }
 
+    /// Why a run of `it` cannot start now: a check, a capture or a story
+    /// recording of it is running.
+    fn run_of(&self, it: &Intent) -> Option<&'static str> {
+        if crate::capture::is_running(&crate::capture::stories_dir(it)) {
+            Some("recording its stories")
+        } else if crate::capture::is_running(&crate::check::checks_dir(it)) {
+            Some("checking it")
+        } else if crate::capture::is_running(&self.evidence_home(it)) {
+            Some("capturing it")
+        } else {
+            None
+        }
+    }
+
     /// The intent's stories as the detail view lists them, with each one's
     /// last take and its video when one is kept.
     fn story_rows(&self, it: &Intent) -> Vec<StoryRow> {
@@ -4132,11 +4153,8 @@ impl App {
         use crate::capture::{Phase, Shot};
         let repo = self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo()))?;
         let stories_dir = crate::capture::stories_dir(it);
-        if crate::capture::is_running(&stories_dir) {
-            return Err("recording already".into());
-        }
-        if crate::capture::is_running(&crate::check::checks_dir(it)) {
-            return Err("a check of it is running: record when it ends".into());
+        if let Some(what) = self.run_of(it) {
+            return Err(format!("{what}: record when it ends"));
         }
         std::fs::create_dir_all(&stories_dir).map_err(|e| e.to_string())?;
         let group_rel = it
@@ -11639,6 +11657,61 @@ mod tests {
     fn stop_check(path: &Path) {
         crate::capture::cancel_running(&checks_of(path));
         wait_check_end(path);
+    }
+
+    /// Holds `it`'s stories lock as a live runner would (this process).
+    fn story_job_running(path: &Path) -> PathBuf {
+        let dir = crate::capture::stories_dir(&Store::load(path).unwrap());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".capture.lock"), std::process::id().to_string()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn x_waits_while_a_story_of_it_records() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        let dir = story_job_running(&path);
+        key(&mut fx.app, KeyCode::Char('X'));
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("recording"), "{m}");
+        assert!(
+            !checks_of(&path).join(".capture.lock").exists(),
+            "no check started"
+        );
+        let _ = fs::remove_file(dir.join(".capture.lock"));
+    }
+
+    #[test]
+    fn e_waits_while_a_story_of_it_records() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        select(&mut fx.app, "In the inbox");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let dir = story_job_running(&path);
+        key(&mut fx.app, KeyCode::Char('E'));
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("recording"), "{m}");
+        let _ = fs::remove_file(dir.join(".capture.lock"));
+    }
+
+    #[test]
+    fn an_automatic_check_waits_while_a_story_of_it_records() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        let dir = story_job_running(&path);
+        Store::update_meta(&path, |fm| fm.reconciled_for = vec![7]).unwrap();
+        fx.app.rescan();
+        fx.app.check_due();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!work_log(&fx).contains("start --area"), "{}", work_log(&fx));
+        // once the recording ends, the check is still due: it was not spent
+        fs::remove_file(dir.join(".capture.lock")).unwrap();
+        fx.app.check_due();
+        wait_for_work(&fx, "start --area");
+        wait_check_end(&path);
     }
 
     #[test]
