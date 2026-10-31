@@ -304,6 +304,7 @@ pub fn apply(path: &Path, body: &str, merged: &[u64], root: &Path) -> anyhow::Re
     std::fs::copy(path, backup_path(path))?;
     let kept = keep_left_out(&it.body, body);
     let kept = remap_demos(&it.body, &kept);
+    let kept = remap_shows(&it.body, &kept);
     it.body = owner_ticks(&it.body, &kept);
     let own = path
         .parent()
@@ -526,6 +527,49 @@ pub fn remap_demos(before: &str, after: &str) -> String {
                         moved.join(", ")
                     ));
                 }
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    let mut text = out.join("\n");
+    if after.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// `after` with each story's `- shows:` line that is unchanged from `before`
+/// renumbered to the same acceptance criteria (matched by wording) in
+/// `after`; a criterion that is gone drops out. Lines the agent wrote or
+/// changed stand, as with demo lines.
+pub fn remap_shows(before: &str, after: &str) -> String {
+    use crate::store::{criteria, criterion_key};
+    let old: Vec<String> = criteria(before)
+        .iter()
+        .map(|c| criterion_key(&c.text))
+        .collect();
+    let new: Vec<String> = criteria(after)
+        .iter()
+        .map(|c| criterion_key(&c.text))
+        .collect();
+    let old_lines: Vec<&str> = before.lines().map(str::trim).collect();
+    let mut out: Vec<String> = Vec::new();
+    for line in after.lines() {
+        match line.trim().strip_prefix("- shows:") {
+            Some(list) if old_lines.contains(&line.trim()) => {
+                let moved: Vec<String> = list
+                    .split(',')
+                    .filter_map(|n| n.trim().parse::<usize>().ok())
+                    .filter_map(|n| old.get(n.checked_sub(1)?))
+                    .filter_map(|key| new.iter().position(|k| k == key))
+                    .map(|i| (i + 1).to_string())
+                    .collect();
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push(
+                    format!("{indent}- shows: {}", moved.join(", "))
+                        .trim_end()
+                        .to_string(),
+                );
             }
             _ => out.push(line.to_string()),
         }
