@@ -128,7 +128,12 @@ pub struct PendingChat {
     pub intent: Intent,
     pub selection: Option<String>,
     pub from_editor: bool,
+    /// A first message the chat sends on its own (with the seed).
+    pub ask: Option<String>,
 }
+
+/// What the chat asks once the last open question of a feature or bug is answered.
+const DRAFT_STORIES: &str = "Every open question has its answer now: draft the stories.";
 
 pub enum Pending {
     OverwriteSave,
@@ -2313,6 +2318,7 @@ impl App {
                         intent: it,
                         selection: None,
                         from_editor: false,
+                        ask: None,
                     });
                 }
             }
@@ -2857,6 +2863,15 @@ impl App {
                                         Ok(()) => {
                                             self.message = Some("answer recorded".into());
                                             self.rescan();
+                                            // the last answer: the stories can be drafted now
+                                            if stories_due(&it) {
+                                                self.polish(PendingChat {
+                                                    intent: it.clone(),
+                                                    selection: None,
+                                                    from_editor: false,
+                                                    ask: Some(DRAFT_STORIES.into()),
+                                                });
+                                            }
                                         }
                                         Err(e) => self.message = Some(format!("save failed: {e}")),
                                     }
@@ -2889,6 +2904,7 @@ impl App {
                         intent: it,
                         selection: sel,
                         from_editor: true,
+                        ask: None,
                     });
                 }
             }
@@ -3091,6 +3107,7 @@ impl App {
             .filter(|r| !r.is_empty());
         let guide = crate::config::interview_guide(&self.dirs, kind).unwrap_or_default();
         let mut iv = crate::interview::Interview::new(kind, home_rel, self.group_paths(), guide);
+        iv.personas = self.story_personas(self.current_repo());
         // a follow-up: the agent sees the original, as data
         iv.context = follow_up
             .as_ref()
@@ -3193,6 +3210,14 @@ impl App {
     /// repo the tool runs in (as a save records it).
     fn current_repo(&self) -> Option<PathBuf> {
         self.capture_repo.clone().or_else(crate::send::capture_repo)
+    }
+
+    /// The run guide's Stories section for `repo`'s runs, when it has one:
+    /// the personas stories may use.
+    fn story_personas(&self, repo: Option<PathBuf>) -> Option<String> {
+        let run_repo = self.run_repo_for(repo).ok()?;
+        let guide = crate::capture::read_guide(&run_repo).ok()?;
+        crate::capture::guide_stories(&guide).map(|s| s.text)
     }
 
     /// Why capture cannot run here, if it cannot.
@@ -4770,12 +4795,20 @@ impl App {
             intent,
             selection,
             from_editor,
+            ask,
         } = pending;
         self.remember_agent(provider, model.clone());
         let conv_id = intent.fm.conversations.get(provider).cloned();
         let tpl = template(&self.dirs, &intent.fm.kind, true)
             .unwrap_or_else(|_| "Refine this intent.".to_string());
-        let seed = seed_prompt(&tpl, &intent.body, selection.as_deref(), &intent.fm.kind);
+        let personas = self.story_personas(intent.fm.repo.clone());
+        let seed = seed_prompt(
+            &tpl,
+            &intent.body,
+            selection.as_deref(),
+            &intent.fm.kind,
+            personas.as_deref(),
+        );
         let mut st = ChatState {
             turn: None,
             transcript: Vec::new(),
@@ -4805,7 +4838,12 @@ impl App {
             ),
             None => "polish".to_string(),
         };
-        self.start_turn(&mut st, &intent, &seed, &shown, Some(seed.clone()));
+        // a chat opened to ask something sends it with the seed
+        let (first, shown) = match ask {
+            Some(a) => (format!("{seed}\n{a}\n"), a),
+            None => (seed.clone(), shown),
+        };
+        self.start_turn(&mut st, &intent, &first, &shown, Some(first.clone()));
         self.screen = Screen::Chat(st);
     }
 
@@ -6562,6 +6600,15 @@ fn title_hint(kind: &str) -> &'static str {
 /// `add` mode: popup asks for a title; otherwise title from args or stdin's first line, body = rest.
 /// `piped` is what arrived on stdin when it is not a terminal; the caller
 /// reads it, so this never blocks on an open stdin.
+/// A feature or bug whose questions are all answered and whose stories are
+/// missing or still wait for those answers.
+fn stories_due(it: &Intent) -> bool {
+    matches!(it.fm.kind.as_str(), "enhancement" | "issue") && it.open_questions() == 0 && {
+        let stories = crate::store::stories(&it.body);
+        stories.is_empty() || stories.iter().any(|s| s.waits)
+    }
+}
+
 /// The tree this run shows, and which top-level groups were left out.
 /// - A space whose storage is a placeholder (meta, remote) or broken shows
 ///   nothing: its intents are not in this folder.
@@ -9823,6 +9870,55 @@ mod tests {
             fx.app.view().rows[fx.app.view().selected].label,
             "In the inbox"
         );
+    }
+
+    /// Beta (a feature) with `questions` open and a story waiting for them.
+    fn beta_waiting_for(fx: &mut Fx, questions: &[&str]) {
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        let open: String = questions.iter().map(|q| format!("- {q}\n")).collect();
+        it.body = format!(
+            "beta body\n\n## Acceptance criteria\n- [ ] a\n\n## Stories\n### A\n- persona: unknown\n- shows: 1\ndrafts wait for the open questions\n\n## Open questions\n{open}"
+        );
+        Store::save(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+    }
+
+    fn answer_first_question(fx: &mut Fx, text: &str) {
+        key(&mut fx.app, KeyCode::Char('Q'));
+        key(&mut fx.app, KeyCode::Enter);
+        type_str(&mut fx.app, text);
+        key(&mut fx.app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn answering_the_last_question_drafts_the_stories() {
+        let mut fx = setup("agy.jsonl");
+        beta_waiting_for(&mut fx, &["who?"]);
+        answer_first_question(&mut fx, "admins");
+        assert_eq!(
+            fx.app.view().screen,
+            "chat",
+            "the chat opens to review the drafts"
+        );
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(
+            log.contains("Every open question has its answer now: draft the stories."),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn answering_a_question_while_others_stay_open_drafts_nothing() {
+        let mut fx = setup("agy.jsonl");
+        beta_waiting_for(&mut fx, &["who?", "when?"]);
+        answer_first_question(&mut fx, "admins");
+        assert_eq!(fx.app.view().screen, "browse");
+        let log = fs::read_to_string(&fx.log).unwrap_or_default();
+        assert!(!log.contains("draft the stories"), "{log}");
     }
 
     #[test]

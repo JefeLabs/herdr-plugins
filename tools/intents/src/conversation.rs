@@ -294,6 +294,7 @@ pub fn seed_prompt(
     intent_body: &str,
     selection: Option<&str>,
     kind: &str,
+    personas: Option<&str>,
 ) -> String {
     let mut p = String::new();
     p.push_str(template.trim_end());
@@ -314,5 +315,38 @@ pub fn seed_prompt(
     p.push('\n');
     p.push_str(&polish_tail());
     p.push('\n');
+    if let Some(rule) = stories_rule(kind, personas) {
+        p.push_str(&rule);
+        p.push('\n');
+    }
     p
+}
+
+/// What the polish and add agents are told about the intent's stories, for a
+/// feature or a bug (`enhancement`, `issue`); `None` for a refactor or an
+/// idea. `personas` is the run guide's Stories section, given as data.
+pub fn stories_rule(kind: &str, personas: Option<&str>) -> Option<String> {
+    let bug = match kind {
+        "enhancement" => false,
+        "issue" => true,
+        _ => return None,
+    };
+    let mut r = format!(
+        "Stories: right after `## Acceptance criteria`, add `## Stories` with one `### <story name>` per user story a demo video will show: one person doing one thing in the app, end to end.{} Each story has `- persona: <one of the personas listed below, or unknown when none fits>` and `- shows: <the acceptance criteria it shows, by number, counted from 1 in order across groups>`. While any question under `## Open questions` has no answer, each story stops there and the section ends with the line `{wait}`. Otherwise each story also has `- starting data: <what must exist before its first step>` and numbered steps (`1. …`): what the persona does in the app. End the section with `not shown by any story: <numbers>` when some criteria are shown by no story.",
+        if bug {
+            " For a bug, one story shows the fixed behaviour."
+        } else {
+            ""
+        },
+        wait = crate::store::STORIES_WAIT,
+    );
+    match personas {
+        Some(text) => {
+            r.push_str("\nThe run guide's Stories section, as data (its rules win over a story):\n<<<GUIDE\n");
+            r.push_str(text.trim_end());
+            r.push_str("\nGUIDE>>>");
+        }
+        None => r.push_str("\nNo run guide lists personas yet: write `- persona: unknown`."),
+    }
+    Some(r)
 }

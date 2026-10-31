@@ -233,10 +233,10 @@ fn garbage_lines_become_text_not_failure() {
 #[test]
 fn seed_prompt_includes_body_and_focus_line_only_with_selection() {
     let t = "ROLE\n\nKind: issue\n\n{contract}";
-    let p = seed_prompt(t, "## Observed\nx\n", None, "issue");
+    let p = seed_prompt(t, "## Observed\nx\n", None, "issue", None);
     assert!(p.contains("ROLE") && p.contains("## Observed\nx"));
     assert!(!p.to_lowercase().contains("focus on"));
-    let p = seed_prompt(t, "## Observed\nx\n", Some("x"), "issue");
+    let p = seed_prompt(t, "## Observed\nx\n", Some("x"), "issue", None);
     assert!(p.to_lowercase().contains("focus on"), "{p}");
     assert!(p.contains("\nx\n") || p.contains("> x"));
 }
@@ -344,7 +344,7 @@ fn every_turn_carries_the_happy_path_rule() {
         "Open questions are only what you need to know to build the main flow: who, what, where, and what success looks like. Do not ask about edge cases or failure modes; those are handled after hand-off."
     );
     assert!(FORMAT_REMINDER.contains(HAPPY_PATH_RULE));
-    assert!(seed_prompt("template", "body", None, "idea").contains(HAPPY_PATH_RULE));
+    assert!(seed_prompt("template", "body", None, "idea", None).contains(HAPPY_PATH_RULE));
     for t in [
         include_str!("../defaults/idea.polish.md"),
         include_str!("../defaults/issue.polish.md"),
@@ -358,7 +358,7 @@ fn every_turn_carries_the_happy_path_rule() {
 fn every_turn_asks_for_criteria_grouped_by_area() {
     let rule = "group `## Acceptance criteria` under `### <area path>` sub-headings, one per area (its own group first), keeping every criterion's wording and checkbox";
     assert!(FORMAT_REMINDER.contains(rule), "{FORMAT_REMINDER}");
-    assert!(seed_prompt("template", "body", None, "idea").contains(rule));
+    assert!(seed_prompt("template", "body", None, "idea", None).contains(rule));
     assert!(
         follow_up_prompt("SEED", &[("user".into(), "polish".into())], "again", true).contains(rule)
     );
@@ -366,7 +366,7 @@ fn every_turn_asks_for_criteria_grouped_by_area() {
 
 #[test]
 fn a_follow_up_carries_the_format_reminder_once() {
-    let seed = seed_prompt("template", "## Description\nbody\n", None, "idea");
+    let seed = seed_prompt("template", "## Description\nbody\n", None, "idea", None);
     assert_eq!(seed.matches(FORMAT_REMINDER).count(), 1);
     let transcript = [
         ("user".to_string(), "polish".to_string()),
@@ -395,7 +395,7 @@ fn every_turn_asks_to_polish_what_the_author_wrote_answers_included() {
     // polish turns carry it; the shared format reminder does not, so a
     // reconcile (which must copy criteria word for word) never polishes
     assert!(!FORMAT_REMINDER.contains(POLISH_RULE));
-    let seed = seed_prompt("template", "body", None, "idea");
+    let seed = seed_prompt("template", "body", None, "idea", None);
     assert_eq!(seed.matches(POLISH_RULE).count(), 1);
     let transcript = [("user".to_string(), "polish".to_string())];
     for resumable in [true, false] {
@@ -423,4 +423,21 @@ fn every_turn_offers_bug_feature_or_idea_and_asks_when_unsure() {
     for h in ["`bug:", "`feature:", "`idea:", "Is this a bug"] {
         assert!(resumed.contains(h), "turn lacks {h}: {resumed}");
     }
+}
+
+#[test]
+fn polish_asks_for_stories_too() {
+    let personas = "## Stories\n### Personas\n- Mark: admin\n";
+    let p = seed_prompt(
+        "template",
+        "## Description\nbody\n",
+        None,
+        "enhancement",
+        Some(personas),
+    );
+    assert!(
+        p.contains("## Stories") && p.contains("- Mark: admin"),
+        "{p}"
+    );
+    assert!(!seed_prompt("template", "body", None, "refactor", None).contains("## Stories"));
 }
