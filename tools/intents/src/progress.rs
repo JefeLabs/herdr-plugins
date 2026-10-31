@@ -123,6 +123,18 @@ pub struct PlanBlock {
     pub in_review: bool,
 }
 
+/// What a running check or story recording of the intent is doing, for the
+/// card and the detail view: `checking 2/9 · seeding: kathia-signup`, or
+/// `recording · recording story 2: …`.
+pub fn activity(ev: &Evidence) -> Option<String> {
+    match (ev.checking, &ev.check_stage, &ev.story_stage) {
+        (Some((done, total)), Some(stage), _) => Some(format!("checking {done}/{total} · {stage}")),
+        (Some((done, total)), None, _) => Some(format!("checking {done}/{total}")),
+        (None, _, Some(stage)) => Some(format!("recording · {stage}")),
+        (None, _, None) => None,
+    }
+}
+
 /// What was gathered outside the intent file.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Evidence {
@@ -136,6 +148,10 @@ pub struct Evidence {
     pub unacknowledged: usize,
     /// A completion check running: (criteria with proof so far, criteria).
     pub checking: Option<(usize, usize)>,
+    /// What that check is doing now ("seeding: …", "recording story 2: …").
+    pub check_stage: Option<String>,
+    /// A story recording by hand running: what it is doing now.
+    pub story_stage: Option<String>,
     /// Follow-ups filed for it that are not yet complete.
     pub open_follow_ups: usize,
     /// Its automatic check waits until the merged code is pulled.
@@ -439,8 +455,8 @@ pub fn progress(it: &Intent, ev: &Evidence) -> Option<Progress> {
         fill: (base + verified).min(10.0),
         label: follow_up_note(
             pull_note(
-                match ev.checking {
-                    Some((done, total)) => format!("checking {done}/{total}"),
+                match activity(ev) {
+                    Some(running) => running,
                     None if complete => "✓ complete".to_string(),
                     None => {
                         let label = if all_ticked && shipped && ev.open_missing == 0 {

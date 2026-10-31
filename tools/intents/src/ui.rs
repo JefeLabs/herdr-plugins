@@ -907,6 +907,7 @@ mod tests {
             missing_selected: 0,
             stories: &[],
             stories_selected: 0,
+            activity: None,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -998,6 +999,7 @@ mod tests {
             missing_selected: 0,
             stories: &[],
             stories_selected: 0,
+            activity: None,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -1216,6 +1218,7 @@ mod tests {
             missing_selected: 0,
             stories: &[],
             stories_selected: 0,
+            activity: None,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -1420,6 +1423,8 @@ pub struct DetailView<'a> {
     /// Its stories, as `(mark, "<n>. <name> · <state>")`.
     pub stories: &'a [(String, String)],
     pub stories_selected: usize,
+    /// What a running check or story recording is doing, in the header.
+    pub activity: Option<String>,
 }
 
 /// A pull request in the detail view: linked by a `pr:` line or found by the
@@ -1495,29 +1500,39 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             format!("# {}", sanitize(&it.fm.title)),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(
-            format!(
-                "kind: {}   state: {}{}{}{}",
-                sanitize(crate::config::kind_label(&it.fm.kind)),
-                it.fm.state.label(),
-                if open > 0 {
-                    format!("   ?{open}")
-                } else {
-                    String::new()
-                },
-                it.fm
-                    .sent_to
-                    .as_ref()
-                    .map(|s| format!("   sent → {} ({})", s.handoff, s.workspace_id))
-                    .unwrap_or_default(),
-                if v.attachments.is_empty() {
-                    String::new()
-                } else {
-                    format!("   {} attachment(s)", v.attachments.len())
-                }
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "kind: {}   state: {}{}{}{}",
+                    sanitize(crate::config::kind_label(&it.fm.kind)),
+                    it.fm.state.label(),
+                    if open > 0 {
+                        format!("   ?{open}")
+                    } else {
+                        String::new()
+                    },
+                    it.fm
+                        .sent_to
+                        .as_ref()
+                        .map(|s| format!("   sent → {} ({})", s.handoff, s.workspace_id))
+                        .unwrap_or_default(),
+                    if v.attachments.is_empty() {
+                        String::new()
+                    } else {
+                        format!("   {} attachment(s)", v.attachments.len())
+                    }
+                ),
+                Style::default().add_modifier(Modifier::DIM),
             ),
-            Style::default().add_modifier(Modifier::DIM),
-        )),
+            // a running check or story recording, and what it is doing now
+            Span::styled(
+                v.activity
+                    .as_deref()
+                    .map(|a| format!("   {}", sanitize(a)))
+                    .unwrap_or_default(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
     ];
     Paragraph::new(header).render(layout[0], buf);
 
