@@ -907,6 +907,7 @@ mod tests {
             missing_selected: 0,
             stories: &[],
             stories_selected: 0,
+            video_criteria: &[],
             activity: None,
             follow_ups: &[],
             follow_ups_selected: 0,
@@ -999,6 +1000,7 @@ mod tests {
             missing_selected: 0,
             stories: &[],
             stories_selected: 0,
+            video_criteria: &[],
             activity: None,
             follow_ups: &[],
             follow_ups_selected: 0,
@@ -1028,7 +1030,7 @@ mod tests {
             "▸ Decisions (none)",
             "▸ Preconditions (1/1)",
             "▾ Acceptance criteria (1/2)",
-            "▸ Stories (0)",
+            "▸ Stories & Videos (0)",
             "▸ Demo Videos (1 linked, 1 found)",
             "▸ Artifacts (3 linked, 1 found)",
             "▸ Pull requests (1/2 merged, 1 found)",
@@ -1219,6 +1221,7 @@ mod tests {
             missing_selected: 0,
             stories: &[],
             stories_selected: 0,
+            video_criteria: &[],
             activity: None,
             follow_ups: &[],
             follow_ups_selected: 0,
@@ -1424,6 +1427,9 @@ pub struct DetailView<'a> {
     /// Its stories, as `(mark, "<n>. <name> · <state>")`.
     pub stories: &'a [(String, String)],
     pub stories_selected: usize,
+    /// The criteria (by number) a kept story video shows: `▶` in Acceptance
+    /// criteria, as an app-demo's criteria get.
+    pub video_criteria: &'a [usize],
     /// What a running check or story recording is doing, in the header.
     pub activity: Option<String>,
 }
@@ -1653,7 +1659,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             Pane::Stories => format!(
                 "{} {}",
                 marker(Pane::Stories),
-                count_title("Stories", &story_rows)
+                count_title("Stories & Videos", &story_rows)
             ),
             Pane::Demos => format!(
                 "{} {}",
@@ -1749,11 +1755,12 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 buf,
             ),
             Pane::Criteria => {
-                // ▶ on the criteria an app-demo shows
+                // ▶ on the criteria an app-demo or a kept story video shows
                 let demoed: Vec<usize> = arts
                     .iter()
                     .filter(|a| a.kind.eq_ignore_ascii_case("demo"))
                     .flat_map(|a| crate::demos::demo_target(&a.target).1)
+                    .chain(v.video_criteria.iter().copied())
                     .filter_map(|n| n.checked_sub(1))
                     .collect();
                 render_checklist(
