@@ -4418,10 +4418,9 @@ impl App {
 
     /// `r` on a story: records it again, once the completion check has passed.
     fn record_story(&mut self, it: &Intent, number: usize) {
-        let passed = crate::check::read_check(&crate::check::checks_dir(it))
-            .is_some_and(|l| crate::check::passes(&l, &it.body));
-        if !passed {
-            self.message = Some("the completion check hasn't passed yet".into());
+        let latest = crate::check::read_check(&crate::check::checks_dir(it));
+        if let Some(why) = crate::check::why_not_passing(latest.as_ref(), &it.body) {
+            self.message = Some(why);
             return;
         }
         self.message = Some(match self.start_story(it, number) {
@@ -14657,10 +14656,44 @@ mod tests {
         beta_with_stories(&mut fx);
         focus_stories(&mut fx.app);
         key(&mut fx.app, KeyCode::Char('r'));
-        assert_eq!(
-            fx.app.view().message.as_deref(),
-            Some("the completion check hasn't passed yet")
-        );
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("no completion check has run yet"), "{m}");
+        assert!(m.contains("X runs one"), "{m}");
+    }
+
+    #[test]
+    fn recording_by_hand_names_what_holds_the_check_back() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        let it = fx.app.selected_intent().unwrap().clone();
+        let dir = crate::check::checks_dir(&it);
+        fs::create_dir_all(&dir).unwrap();
+        let result =
+            |n: usize, t: &str, verdict: crate::check::Verdict| crate::check::CriterionResult {
+                number: n,
+                key: crate::store::criterion_key(t),
+                text: t.to_string(),
+                verdict,
+                proof: None,
+            };
+        crate::check::write_check(
+            &dir,
+            &crate::check::CheckRecord {
+                at: chrono::Local::now(),
+                merged: Vec::new(),
+                results: vec![
+                    result(1, "one", crate::check::Verdict::Confirmed("yes".into())),
+                    result(2, "two", crate::check::Verdict::Fails("no button".into())),
+                    result(3, "three", crate::check::Verdict::Confirmed("yes".into())),
+                ],
+                warning: None,
+            },
+        )
+        .unwrap();
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('r'));
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("criterion 2 fails"), "{m}");
     }
 
     #[test]
