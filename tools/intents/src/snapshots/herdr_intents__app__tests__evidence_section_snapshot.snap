@@ -1,5 +1,6 @@
 ---
 source: tools/intents/src/app.rs
+assertion_line: 14213
 expression: "render(&fx.app, 80, 24)"
 ---
 ▾ Inbox (1)            │# In the inbox
@@ -9,6 +10,7 @@ expression: "render(&fx.app, 80, 24)"
   ○ Beta               │
                        │ ▸ Preconditions (0/0) ─────────────────────────────────
                        │ ▸ Acceptance criteria (0/0) ───────────────────────────
+                       │ ▸ Stories (0) ─────────────────────────────────────────
                        │ ▸ Demo Videos (0) ─────────────────────────────────────
                        │ ▸ Open questions (2 open) ─────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────
@@ -18,7 +20,6 @@ expression: "render(&fx.app, 80, 24)"
                        │ ▾ Evidence (2) ────────────────────────────────────────
                        │✓ before · video · the email goes to every admin
                        │✗ after · video · admins still get it
-                       │
                        │
                        │
                        │

@@ -132,6 +132,15 @@ pub struct PendingChat {
     pub ask: Option<String>,
 }
 
+/// A story in the detail view: its mark, `<n>. <name> · <state>`, and its
+/// kept video.
+struct StoryRow {
+    number: usize,
+    mark: &'static str,
+    label: String,
+    video: Option<PathBuf>,
+}
+
 /// What the chat asks once the last open question of a feature or bug is answered.
 const DRAFT_STORIES: &str = "Every open question has its answer now: draft the stories.";
 
@@ -446,6 +455,7 @@ pub struct App {
     artifacts_selected: usize,
     evidence_selected: usize,
     missing_selected: usize,
+    stories_selected: usize,
     follow_ups_selected: usize,
     prs_selected: usize,
     demos_selected: usize,
@@ -529,6 +539,7 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Description => "description",
         Pane::Preconditions => "preconditions",
         Pane::Criteria => "criteria",
+        Pane::Stories => "stories",
         Pane::Questions => "questions",
         Pane::Artifacts => "artifacts",
         Pane::Evidence => "evidence",
@@ -577,6 +588,7 @@ impl App {
             artifacts_selected: 0,
             evidence_selected: 0,
             missing_selected: 0,
+            stories_selected: 0,
             follow_ups_selected: 0,
             prs_selected: 0,
             demos_selected: 0,
@@ -2031,6 +2043,7 @@ impl App {
             self.focus,
             Pane::Preconditions
                 | Pane::Criteria
+                | Pane::Stories
                 | Pane::Demos
                 | Pane::Questions
                 | Pane::PullRequests
@@ -2116,7 +2129,8 @@ impl App {
                     Pane::Tree => Pane::Description,
                     Pane::Description => Pane::Preconditions,
                     Pane::Preconditions => Pane::Criteria,
-                    Pane::Criteria => Pane::Demos,
+                    Pane::Criteria => Pane::Stories,
+                    Pane::Stories => Pane::Demos,
                     Pane::Demos => Pane::Questions,
                     Pane::Questions => Pane::PullRequests,
                     Pane::PullRequests => Pane::Missing,
@@ -2136,7 +2150,8 @@ impl App {
                     Pane::Missing => Pane::PullRequests,
                     Pane::PullRequests => Pane::Questions,
                     Pane::Questions => Pane::Demos,
-                    Pane::Demos => Pane::Criteria,
+                    Pane::Demos => Pane::Stories,
+                    Pane::Stories => Pane::Criteria,
                     Pane::Criteria => Pane::Preconditions,
                     Pane::Preconditions => Pane::Description,
                     Pane::Description => Pane::Tree,
@@ -2532,6 +2547,41 @@ impl App {
                             let path = path.clone();
                             self.select_path(&path);
                             self.focus = Pane::Tree;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Pane::Stories => {
+                let rows = self.story_rows(&it);
+                let last = rows.len().saturating_sub(1);
+                let selected = self.stories_selected.min(last);
+                let video = rows.get(selected).and_then(|r| r.video.clone());
+                let number = rows.get(selected).map(|r| r.number);
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.stories_selected = (selected + 1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.stories_selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter
+                    | KeyCode::Char('o')
+                    | KeyCode::Char('c')
+                    | KeyCode::Char('Y')
+                    | KeyCode::Char('O') => match video {
+                        Some(f) => match k.code {
+                            KeyCode::Char('c') => self.copy_file(&f),
+                            KeyCode::Char('Y') => self.copy_path(&f),
+                            KeyCode::Char('O') => self.reveal_file(&f),
+                            _ => self.open_in_chrome(&f),
+                        },
+                        None => self.message = Some("no video for this story yet".into()),
+                    },
+                    KeyCode::Char('r') => {
+                        if let Some(n) = number {
+                            self.record_story(&it, n);
                         }
                     }
                     _ => {}
@@ -3986,6 +4036,134 @@ impl App {
                 "could not copy the file".to_string()
             },
         );
+    }
+
+    /// `O`: shows the file in Finder (its folder in the file manager elsewhere).
+    fn reveal_file(&mut self, file: &Path) {
+        let ok = if cfg!(target_os = "macos") {
+            self.launch(
+                "OPEN_BIN_PATH",
+                "open",
+                &["-R".as_ref(), file.as_os_str()],
+                None,
+            )
+        } else {
+            let dir = file.parent().unwrap_or(file);
+            self.launch("OPEN_BIN_PATH", "xdg-open", &[dir.as_os_str()], None)
+        };
+        self.message = Some(if ok {
+            format!("showing {}", file.display())
+        } else {
+            format!("could not show {}", file.display())
+        });
+    }
+
+    /// The intent's stories as the detail view lists them, with each one's
+    /// last take and its video when one is kept.
+    fn story_rows(&self, it: &Intent) -> Vec<StoryRow> {
+        use crate::capture::StoryOutcome;
+        let dir = crate::capture::stories_dir(it);
+        let checks = crate::check::checks_dir(it);
+        // a story job, or a check whose takes follow it on the same run
+        let recording = crate::capture::is_running(&dir)
+            || (crate::capture::is_running(&checks)
+                && crate::check::read_check(&checks)
+                    .is_some_and(|l| crate::check::passes(&l, &it.body)));
+        crate::store::stories(&it.body)
+            .iter()
+            .map(|s| {
+                let folder = dir.join(crate::store::story_folder(s));
+                let video = Some(folder.join("video.mp4")).filter(|v| v.is_file());
+                let earlier = if video.is_some() {
+                    " · earlier video kept"
+                } else {
+                    ""
+                };
+                let (mark, state) = if s.waits {
+                    ("…", crate::store::STORIES_WAIT.to_string())
+                } else if recording {
+                    ("●", "recording…".to_string())
+                } else {
+                    match crate::capture::read_story(&folder).map(|r| r.outcome) {
+                        Some(StoryOutcome::Kept) if video.is_some() => ("▶", "video".to_string()),
+                        Some(StoryOutcome::NotShown(ns)) => {
+                            let list: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
+                            let which = if ns.len() == 1 {
+                                "criterion"
+                            } else {
+                                "criteria"
+                            };
+                            (
+                                "✗",
+                                format!("{which} {} didn't show{earlier}", list.join(", ")),
+                            )
+                        }
+                        Some(StoryOutcome::Failed(why)) => {
+                            ("!", format!("couldn't record: {why}{earlier}"))
+                        }
+                        _ => ("○", "not recorded yet".to_string()),
+                    }
+                };
+                StoryRow {
+                    number: s.number,
+                    mark,
+                    label: format!("{}. {} · {state}", s.number, s.name),
+                    video,
+                }
+            })
+            .collect()
+    }
+
+    /// `r` on a story: records it again, once the completion check has passed.
+    fn record_story(&mut self, it: &Intent, number: usize) {
+        let passed = crate::check::read_check(&crate::check::checks_dir(it))
+            .is_some_and(|l| crate::check::passes(&l, &it.body));
+        if !passed {
+            self.message = Some("the completion check hasn't passed yet".into());
+            return;
+        }
+        self.message = Some(match self.start_story(it, number) {
+            Ok(()) => format!("recording story {number}: its row shows how it went"),
+            Err(e) => format!("record: {e}"),
+        });
+    }
+
+    fn start_story(&mut self, it: &Intent, number: usize) -> Result<(), String> {
+        use crate::capture::{Phase, Shot};
+        let repo = self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo()))?;
+        let stories_dir = crate::capture::stories_dir(it);
+        if crate::capture::is_running(&stories_dir) {
+            return Err("recording already".into());
+        }
+        if crate::capture::is_running(&crate::check::checks_dir(it)) {
+            return Err("a check of it is running: record when it ends".into());
+        }
+        std::fs::create_dir_all(&stories_dir).map_err(|e| e.to_string())?;
+        let group_rel = it
+            .path
+            .parent()
+            .and_then(|p| p.strip_prefix(self.store.root()).ok())
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty());
+        let req = crate::capture::CaptureRequest {
+            repo,
+            group_rel,
+            stem: it.polish_name(),
+            phase: Phase::Before,
+            shot: Shot::Video,
+            intent: format!("{}\n\n{}", it.fm.title, it.body),
+            evidence: stories_dir.clone(),
+            before: None,
+            n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
+            merged: Vec::new(),
+            job: crate::capture::Job::Story {
+                numbers: vec![number],
+                intent_path: it.path.clone(),
+                root: self.store.root().to_path_buf(),
+                stories_dir,
+            },
+        };
+        self.launch_capture(req)
     }
 
     /// `Y`: copies the path (pbcopy on macOS; the terminal's clipboard over SSH).
@@ -6171,6 +6349,11 @@ impl App {
                         .into_iter()
                         .map(|(m, t, _)| (m, t))
                         .collect();
+                    let stories: Vec<(String, String)> = self
+                        .story_rows(intent)
+                        .into_iter()
+                        .map(|r| (r.mark.to_string(), r.label))
+                        .collect();
                     let missing: Vec<(String, String)> = self
                         .missing_rows(intent)
                         .into_iter()
@@ -6199,6 +6382,8 @@ impl App {
                             missing_selected: self.missing_selected,
                             follow_ups: &follow_ups,
                             follow_ups_selected: self.follow_ups_selected,
+                            stories: &stories,
+                            stories_selected: self.stories_selected,
                         },
                         right,
                         buf,
@@ -6258,6 +6443,7 @@ impl App {
                 (None, Pane::Missing) => "Missing items: j/k choose · Enter go to it · Esc tree".to_string(),
                 (None, Pane::FollowUps) => "Follow-ups: j/k choose · Enter go to it · F file another · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Stories) => "Stories: j/k choose · o play the video · c copy the file · Y copy its path · O show it in Finder · r record it again · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
@@ -9694,6 +9880,7 @@ mod tests {
         for pane in [
             "preconditions",
             "criteria",
+            "stories",
             "demos",
             "questions",
             "pull requests",
@@ -9837,6 +10024,8 @@ mod tests {
         assert_eq!(fx.app.view().focus, "preconditions");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "criteria");
+        key(&mut fx.app, KeyCode::Tab);
+        assert_eq!(fx.app.view().focus, "stories");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "demos");
         key(&mut fx.app, KeyCode::Tab);
@@ -9996,14 +10185,15 @@ mod tests {
             "Description",
             "Preconditions",
             "Acceptance criteria",
+            "Stories",
             "Open questions",
             "Artifacts",
         ] {
             assert!(text.contains(title), "pane {title} missing: {text}");
         }
         assert!(!text.contains("? a?"), "questions start collapsed: {text}");
-        // tree → description → preconditions → criteria → demos → questions
-        for _ in 0..5 {
+        // tree → description → preconditions → criteria → stories → demos → questions
+        for _ in 0..6 {
             key(&mut fx.app, KeyCode::Tab);
         }
         let text = render(&fx.app, 100, 24);
@@ -13710,6 +13900,199 @@ mod tests {
                 video.display()
             )),
             "{prompt}"
+        );
+    }
+
+    const STORY_BODY: &str = "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\n## Stories\n### Mark reinstates Maya\n- persona: Mark\n- shows: 1, 3\n1. Open it\n### Pat sees it back\n- persona: Pat\n- shows: 2\n1. Open applications\n### Kim waits\n- persona: Kim\n- shows: 1\ndrafts wait for the open questions\n";
+
+    /// Beta, sent, with three stories: the first kept a video, the second's
+    /// criterion did not show, the third waits. Returns the first's video.
+    fn beta_with_stories(fx: &mut Fx) -> PathBuf {
+        use crate::capture::{StoryOutcome, StoryRecord};
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = STORY_BODY.into();
+        it.fm.state = State::Sent;
+        it.fm.repo = fx.app.capture_repo.clone();
+        Store::save_force(&mut it).unwrap();
+        let dir = crate::capture::stories_dir(&it);
+        let record = |folder: &str, outcome: StoryOutcome, shows: Vec<usize>| {
+            let d = dir.join(folder);
+            fs::create_dir_all(&d).unwrap();
+            let rec = StoryRecord {
+                at: chrono::Local::now(),
+                outcome,
+                shows,
+                dropped: Vec::new(),
+            };
+            fs::write(d.join("story.json"), serde_json::to_string(&rec).unwrap()).unwrap();
+            d
+        };
+        let first = record("1-mark-reinstates-maya", StoryOutcome::Kept, vec![1, 3]);
+        fs::write(first.join("video.mp4"), "video").unwrap();
+        record(
+            "2-pat-sees-it-back",
+            StoryOutcome::NotShown(vec![2]),
+            vec![2],
+        );
+        fx.app.rescan();
+        select(&mut fx.app, "Beta");
+        first.join("video.mp4")
+    }
+
+    fn focus_stories(app: &mut App) {
+        for _ in 0..12 {
+            if app.view().focus == "stories" {
+                return;
+            }
+            key(app, KeyCode::Tab);
+        }
+        panic!(
+            "Tab never reached the Stories section: {:?}",
+            app.view().focus
+        );
+    }
+
+    /// A passing check for Beta's three criteria.
+    fn beta_check_passes(fx: &Fx) {
+        let it = fx.app.selected_intent().unwrap().clone();
+        let dir = crate::check::checks_dir(&it);
+        fs::create_dir_all(&dir).unwrap();
+        let results = ["one", "two", "three"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| crate::check::CriterionResult {
+                number: i + 1,
+                key: crate::store::criterion_key(t),
+                text: t.to_string(),
+                verdict: crate::check::Verdict::Confirmed("yes".into()),
+                proof: None,
+            })
+            .collect();
+        crate::check::write_check(
+            &dir,
+            &crate::check::CheckRecord {
+                at: chrono::Local::now(),
+                merged: Vec::new(),
+                results,
+                warning: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_stories_section_shows_each_story_and_its_state() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        let text = render(&fx.app, 120, 40);
+        for row in [
+            "1. Mark reinstates Maya · video",
+            "2. Pat sees it back · criterion 2 didn't show",
+            "3. Kim waits · drafts wait for the open questions",
+        ] {
+            assert!(text.contains(row), "{row:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn o_plays_a_storys_video() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('o'));
+        wait_for_log(&log, &video.display().to_string());
+    }
+
+    #[test]
+    fn c_copies_a_storys_video() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('c'));
+        if cfg!(target_os = "macos") {
+            let text = wait_for_log(&log, &video.display().to_string());
+            assert!(text.contains("set the clipboard to"), "{text}");
+        } else {
+            assert!(
+                fx.app
+                    .view()
+                    .message
+                    .unwrap_or_default()
+                    .contains("copied the path")
+            );
+        }
+    }
+
+    #[test]
+    fn capital_o_shows_the_video_in_finder() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('O'));
+        if cfg!(target_os = "macos") {
+            let text = wait_for_log(&log, &video.display().to_string());
+            assert!(text.contains("-R\n"), "{text}");
+        } else {
+            wait_for_log(&log, &video.parent().unwrap().display().to_string());
+        }
+    }
+
+    #[test]
+    fn a_story_without_a_video_says_so() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('o'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("no video for this story yet")
+        );
+    }
+
+    #[test]
+    fn recording_by_hand_waits_for_a_passing_check() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('r'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("the completion check hasn't passed yet")
+        );
+    }
+
+    #[test]
+    fn r_records_the_story_again_after_a_passing_check() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        beta_with_stories(&mut fx);
+        beta_check_passes(&fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        let it = fx.app.selected_intent().unwrap().clone();
+        let second = crate::capture::stories_dir(&it).join("2-pat-sees-it-back");
+        let before = crate::capture::read_story(&second).unwrap().at;
+        key(&mut fx.app, KeyCode::Char('r'));
+        let start = Instant::now();
+        while crate::capture::read_story(&second).is_none_or(|r| r.at == before) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "story 2 never ran"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let first = crate::capture::stories_dir(&it).join("1-mark-reinstates-maya");
+        assert!(first.join("video.mp4").is_file(), "story 1 left alone");
+        assert_eq!(
+            crate::capture::read_story(&first).unwrap().outcome,
+            crate::capture::StoryOutcome::Kept
         );
     }
 

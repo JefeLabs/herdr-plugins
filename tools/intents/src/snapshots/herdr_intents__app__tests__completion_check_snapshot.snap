@@ -1,5 +1,6 @@
 ---
 source: tools/intents/src/app.rs
+assertion_line: 13359
 expression: "render(&fx.app, 80, 24)"
 ---
 ▾ Inbox (1)            │# Alpha
@@ -17,7 +18,7 @@ expression: "render(&fx.app, 80, 24)"
                        │
                        │
                        │
-                       │
+                       │ ▸ Stories (0) ─────────────────────────────────────────
                        │ ▸ Demo Videos (0) ─────────────────────────────────────
                        │ ▸ Open questions (0 open) ─────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────

@@ -895,6 +895,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            stories: &[],
+            stories_selected: 0,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -983,6 +985,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            stories: &[],
+            stories_selected: 0,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -1194,6 +1198,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            stories: &[],
+            stories_selected: 0,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -1246,6 +1252,8 @@ pub enum Pane {
     Description,
     Preconditions,
     Criteria,
+    /// The intent's stories and their demo videos.
+    Stories,
     Demos,
     Questions,
     PullRequests,
@@ -1390,6 +1398,9 @@ pub struct DetailView<'a> {
     /// Its follow-ups, as `(mark, title)`.
     pub follow_ups: &'a [(String, String)],
     pub follow_ups_selected: usize,
+    /// Its stories, as `(mark, "<n>. <name> · <state>")`.
+    pub stories: &'a [(String, String)],
+    pub stories_selected: usize,
 }
 
 /// A pull request in the detail view: linked by a `pr:` line or found by the
@@ -1432,6 +1443,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
     let sections = [
         Pane::Preconditions,
         Pane::Criteria,
+        Pane::Stories,
         Pane::Demos,
         Pane::Questions,
         Pane::PullRequests,
@@ -1574,9 +1586,23 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             (n, f) => format!("Pull requests ({merged}/{n} merged, {f} found)"),
         }
     };
+    let story_rows: Vec<ItemRow> = v
+        .stories
+        .iter()
+        .map(|(mark, label)| ItemRow {
+            tag: mark.clone(),
+            text: label.clone(),
+            found: false,
+        })
+        .collect();
     let titles = [
         checklist_title(&names[0], &ps, &[]),
         checklist_title(&names[1], &cs, &fresh),
+        format!(
+            "{} {}",
+            marker(Pane::Stories),
+            count_title("Stories", &story_rows)
+        ),
         format!(
             "{} {}",
             marker(Pane::Demos),
@@ -1692,6 +1718,16 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 &pr_rows,
                 8,
                 "none yet — agents add a `pr:` line for each pull request they open (a adds one by hand)",
+                rect,
+                buf,
+            ),
+            Pane::Stories => render_items(
+                &titles[i],
+                v.focus == Pane::Stories,
+                v.stories_selected,
+                &story_rows,
+                2,
+                "none yet — polish drafts the stories once every open question has its answer",
                 rect,
                 buf,
             ),

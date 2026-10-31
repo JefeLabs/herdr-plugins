@@ -1,5 +1,6 @@
 ---
 source: tools/intents/src/app.rs
+assertion_line: 12526
 expression: "render(&fx.app, 80, 24)"
 ---
 ▾ Inbox (1)            │# Alpha
@@ -8,13 +9,13 @@ expression: "render(&fx.app, 80, 24)"
   → Alpha              │x
   ○ Beta               │ ▸ Preconditions (0/0) ─────────────────────────────────
   → Name the meeting to│ ▸ Acceptance criteria (0/2) ───────────────────────────
+                       │ ▸ Stories (0) ─────────────────────────────────────────
                        │ ▸ Demo Videos (0) ─────────────────────────────────────
                        │ ▸ Open questions (0 open) ─────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────
                        │ ▸ Missing items / Bugs (0) ────────────────────────────
                        │ ▾ Follow-ups (1) ──────────────────────────────────────
                        │→ Name the meeting too
-                       │
                        │
                        │
                        │
