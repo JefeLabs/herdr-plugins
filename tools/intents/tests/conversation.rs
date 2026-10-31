@@ -462,7 +462,7 @@ fn the_stories_prompt_asks_for_the_stories_section_only() {
         &[],
     );
     assert!(p.contains("- [ ] one"), "the intent: {p}");
-    assert!(p.contains("only the `## Stories` section"), "{p}");
+    assert!(p.contains("only the complete `## Stories` section"), "{p}");
     assert!(p.contains("- Mark: admin"), "the guide's personas: {p}");
 }
 
@@ -486,6 +486,10 @@ fn the_stories_prompt_carries_every_detail_and_says_to_read_it() {
         &details,
     );
     assert!(p.contains("Read everything below before you write"), "{p}");
+    assert!(
+        p.contains("re-evaluate each"),
+        "existing stories are re-evaluated: {p}"
+    );
     assert!(
         p.contains("D1 (owner): paid goes to Accepted"),
         "the decisions: {p}"

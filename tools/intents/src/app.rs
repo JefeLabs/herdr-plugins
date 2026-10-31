@@ -82,8 +82,6 @@ pub struct ChatState {
     /// While a resumed turn runs: the whole-context prompt to start again
     /// with if the conversation cannot be resumed.
     pub fresh: Option<String>,
-    /// A stories-only chat (`d` in the Stories section).
-    pub stories_only: bool,
 }
 
 /// What the agent picker is choosing right now.
@@ -132,9 +130,6 @@ pub struct PendingChat {
     pub from_editor: bool,
     /// A first message the chat sends on its own (with the seed).
     pub ask: Option<String>,
-    /// Drafts the Stories section alone: applying replaces only that section,
-    /// and the intent's polish conversation is left alone.
-    pub stories: bool,
 }
 
 /// A story in the detail view: its mark, `<n>. <name> · <state>`, and its
@@ -505,6 +500,8 @@ pub struct App {
     /// agent turn, and when it started.
     /// Running reconciles (and folds: the follow-up's stem), by intent.
     reconcile_jobs: HashMap<PathBuf, (Vec<u64>, Turn, std::time::Instant, Option<String>)>,
+    /// `d`: stories being drafted (or re-evaluated) in the background, by intent.
+    story_drafts: HashMap<PathBuf, (Turn, std::time::Instant)>,
     /// Folds started this session (original, follow-up stem): once each, until `r`.
     fold_tried: HashSet<(PathBuf, String)>,
     /// Fold checks started this session (original, keys): once each.
@@ -618,6 +615,7 @@ impl App {
             poll_ticks: 0,
             fixed_now: None,
             reconcile_jobs: HashMap::new(),
+            story_drafts: HashMap::new(),
             fold_tried: HashSet::new(),
             fold_check_tried: HashSet::new(),
             pr_merge_commits: HashMap::new(),
@@ -1023,7 +1021,9 @@ impl App {
 
     /// Background requests started and not yet reported, reconciles included.
     pub fn polls_in_flight(&self) -> usize {
-        self.poller.as_ref().map_or(0, |p| p.in_flight()) + self.reconcile_jobs.len()
+        self.poller.as_ref().map_or(0, |p| p.in_flight())
+            + self.reconcile_jobs.len()
+            + self.story_drafts.len()
     }
 
     /// Every intent in the tree, whatever the list's filter.
@@ -1142,6 +1142,126 @@ impl App {
                     .insert(path, (merged, turn, std::time::Instant::now(), fold));
             }
             Err(e) => self.message = Some(format!("reconcile could not start: {e:#}")),
+        }
+    }
+
+    /// `d`: drafts the intent's stories, or re-evaluates the ones it has, in the
+    /// background with the refinement agent (no conversation is resumed or kept).
+    fn start_story_draft(&mut self, it: &Intent) {
+        if self.story_drafts.contains_key(&it.path) {
+            self.message = Some("drafting its stories already".into());
+            return;
+        }
+        let last = crate::config::last_used(&self.dirs, &self.cfg);
+        let Some(mut spec) = self.cfg.providers.get(&last.provider).cloned() else {
+            self.message = Some(format!("stories: unknown provider `{}`", last.provider));
+            return;
+        };
+        if let Some(m) = &last.model {
+            spec.extra.extend([spec.model_flag.clone(), m.clone()]);
+        }
+        let cwd = polish_cwd(self.store.root(), &it.polish_name());
+        if let Err(e) = std::fs::create_dir_all(&cwd) {
+            self.message = Some(format!("cannot create {}: {e}", cwd.display()));
+            return;
+        }
+        let personas = self.story_personas(it.fm.repo.clone());
+        let prompt = crate::conversation::stories_prompt(
+            &it.fm.title,
+            &it.body,
+            &it.fm.kind,
+            personas.as_deref(),
+            &self.story_details(it),
+        );
+        match Turn::start(&spec, &prompt, None, &cwd, &self.provider_env) {
+            Ok(turn) => {
+                self.story_drafts
+                    .insert(it.path.clone(), (turn, std::time::Instant::now()));
+                self.message = Some(if crate::store::stories(&it.body).is_empty() {
+                    "drafting the stories…".into()
+                } else {
+                    "re-evaluating the stories…".into()
+                });
+            }
+            Err(e) => self.message = Some(format!("stories could not start: {e:#}")),
+        }
+    }
+
+    /// Writes finished drafts: only the Stories section changes, and the one
+    /// it replaces is kept in the stories folder as `before-draft.md`.
+    fn poll_story_drafts(&mut self) {
+        let mut done: Vec<(PathBuf, Result<Reply, String>)> = Vec::new();
+        let limit = self.reconcile_limit;
+        for (path, (turn, started)) in &mut self.story_drafts {
+            if started.elapsed() > limit {
+                turn.cancel();
+                done.push((
+                    path.clone(),
+                    Err(format!(
+                        "the agent did not finish within {} minutes",
+                        limit.as_secs().div_ceil(60)
+                    )),
+                ));
+                continue;
+            }
+            while let Some(msg) = turn.try_recv() {
+                match msg {
+                    TurnMsg::Finished(reply) => done.push((path.clone(), Ok(reply))),
+                    TurnMsg::Failed(e) => done.push((path.clone(), Err(e))),
+                    _ => {}
+                }
+            }
+        }
+        for (path, result) in done {
+            self.story_drafts.remove(&path);
+            let proposal = match result {
+                Ok(reply) => match reply.proposal {
+                    Some(p)
+                        if !crate::store::stories(&crate::store::replace_stories("", &p))
+                            .is_empty() =>
+                    {
+                        p
+                    }
+                    _ => {
+                        self.message = Some("stories: the agent returned no stories".into());
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    self.message = Some(format!("stories failed: {e}"));
+                    continue;
+                }
+            };
+            // the intent as it is now: only its Stories section changes
+            let mut it = match Store::load(&path) {
+                Ok(it) => it,
+                Err(e) => {
+                    self.message = Some(format!("stories not saved: {e:#}"));
+                    continue;
+                }
+            };
+            let mut kept = None;
+            if let Some(old) = crate::store::stories_section(&it.body) {
+                let dir = crate::capture::stories_dir(&it);
+                let file = dir.join("before-draft.md");
+                if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, &old).is_ok() {
+                    kept = Some(file);
+                }
+            }
+            it.body = crate::store::replace_stories(&it.body, &proposal);
+            let n = crate::store::stories(&it.body).len();
+            let title = it.fm.title.clone();
+            self.message = Some(match Store::save_force(&mut it) {
+                Ok(()) => match kept {
+                    Some(f) => format!(
+                        "drafted {n} stories for `{title}` (the earlier ones are in {})",
+                        f.display()
+                    ),
+                    None => format!("drafted {n} stories for `{title}`"),
+                },
+                Err(e) => format!("stories not saved: {e:#}"),
+            });
+            self.rescan();
         }
     }
 
@@ -2346,7 +2466,6 @@ impl App {
                         selection: None,
                         from_editor: false,
                         ask: None,
-                        stories: false,
                     });
                 }
             }
@@ -2613,13 +2732,7 @@ impl App {
                     }
                     KeyCode::Char('d') => {
                         if matches!(it.fm.kind.as_str(), "enhancement" | "issue") {
-                            self.polish(PendingChat {
-                                intent: it.clone(),
-                                selection: None,
-                                from_editor: false,
-                                ask: None,
-                                stories: true,
-                            });
+                            self.start_story_draft(&it);
                         } else {
                             self.message = Some(
                                 "stories are for features and bugs: K changes the kind".into(),
@@ -2962,7 +3075,6 @@ impl App {
                                                     selection: None,
                                                     from_editor: false,
                                                     ask: Some(DRAFT_STORIES.into()),
-                                                    stories: false,
                                                 });
                                             }
                                         }
@@ -2998,7 +3110,6 @@ impl App {
                         selection: sel,
                         from_editor: true,
                         ask: None,
-                        stories: false,
                     });
                 }
             }
@@ -5162,35 +5273,19 @@ impl App {
             selection,
             from_editor,
             ask,
-            stories,
         } = pending;
         self.remember_agent(provider, model.clone());
-        // a stories-only chat starts its own conversation and keeps it to itself
-        let conv_id = if stories {
-            None
-        } else {
-            intent.fm.conversations.get(provider).cloned()
-        };
+        let conv_id = intent.fm.conversations.get(provider).cloned();
         let tpl = template(&self.dirs, &intent.fm.kind, true)
             .unwrap_or_else(|_| "Refine this intent.".to_string());
         let personas = self.story_personas(intent.fm.repo.clone());
-        let seed = if stories {
-            crate::conversation::stories_prompt(
-                &intent.fm.title,
-                &intent.body,
-                &intent.fm.kind,
-                personas.as_deref(),
-                &self.story_details(&intent),
-            )
-        } else {
-            seed_prompt(
-                &tpl,
-                &intent.body,
-                selection.as_deref(),
-                &intent.fm.kind,
-                personas.as_deref(),
-            )
-        };
+        let seed = seed_prompt(
+            &tpl,
+            &intent.body,
+            selection.as_deref(),
+            &intent.fm.kind,
+            personas.as_deref(),
+        );
         let mut st = ChatState {
             turn: None,
             transcript: Vec::new(),
@@ -5206,11 +5301,9 @@ impl App {
             scroll: 0,
             model,
             fresh: None,
-            stories_only: stories,
         };
         self.select_path(&intent.path);
         let shown = match selection.as_deref() {
-            _ if stories => "draft the stories".to_string(),
             Some(s) => format!(
                 "polish (focus: {})",
                 s.lines()
@@ -5331,24 +5424,6 @@ impl App {
             // apply and dismiss live on Ctrl so a message starting with "a" or "d" is just typed (C1)
             (KeyCode::Char('a'), true) if st.turn.is_none() => {
                 match st.latest.as_ref().and_then(|r| r.proposal.clone()) {
-                    // stories only: the intent as it is now, with its Stories section replaced
-                    Some(proposal) if st.stories_only => match Store::load(&st.intent_path) {
-                        Ok(it) => {
-                            let proposal = crate::store::replace_stories(&it.body, &proposal);
-                            self.parked_chat = Some(st);
-                            self.screen = Screen::Diff {
-                                proposal,
-                                questions: Vec::new(),
-                                title: None,
-                                kind: None,
-                                scroll: 0,
-                            };
-                        }
-                        Err(e) => {
-                            st.hint = Some(format!("cannot read the intent: {e:#}"));
-                            self.screen = Screen::Chat(st);
-                        }
-                    },
                     Some(proposal) => {
                         let questions = st
                             .latest
@@ -5469,7 +5544,7 @@ impl App {
         let opened = st.opened_stamp;
         let provider = st.provider.clone();
         // a stories-only chat's conversation is not the intent's polish one
-        let conv_id = st.conv_id.clone().filter(|_| !st.stories_only);
+        let conv_id = st.conv_id.clone();
         let mut it = match Store::load(&path) {
             Ok(it) => it,
             Err(e) => {
@@ -5955,6 +6030,7 @@ impl App {
         // every ~60 s; all on background threads
         self.drain_polls();
         self.poll_reconciles();
+        self.poll_story_drafts();
         // pull requests, plans and searches are checked in either layout (a
         // merge must reconcile from the tree too); agent states only matter
         // to the cards, so they poll only while the list shows
@@ -5991,14 +6067,11 @@ impl App {
                 }
                 TurnMsg::ConversationId(id) => {
                     st.conv_id = Some(id.clone());
-                    // bookkeeping only: reload, record, no `updated` bump (C2);
-                    // a stories-only chat never replaces the polish conversation
-                    if !st.stories_only {
-                        let provider = st.provider.clone();
-                        let _ = Store::update_meta(&path, |fm| {
-                            fm.conversations.insert(provider, id);
-                        });
-                    }
+                    // bookkeeping only: reload, record, no `updated` bump (C2)
+                    let provider = st.provider.clone();
+                    let _ = Store::update_meta(&path, |fm| {
+                        fm.conversations.insert(provider, id);
+                    });
                 }
                 TurnMsg::Finished(reply) => {
                     if let Ok(it) = Store::load(&path)
@@ -14317,7 +14390,7 @@ mod tests {
     const DRAFTED: &str = "Here are the stories.\n```proposal\n## Description\nreworded by the agent\n\n## Stories\n### Mark reinstates Maya\n- persona: Mark\n- shows: 1\n- starting data: a withdrawn application\n1. Open it\n2. Reinstate it\n```\n";
 
     #[test]
-    fn d_drafts_only_the_stories_section() {
+    fn d_drafts_the_stories_in_place() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "Beta");
         let path = fx.app.selected_intent().unwrap().path.clone();
@@ -14333,15 +14406,25 @@ mod tests {
         focus_stories(&mut fx.app);
         agent_replies(&mut fx, &[DRAFTED]);
         key(&mut fx.app, KeyCode::Char('d'));
-        assert_eq!(fx.app.view().screen, "chat");
-        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        assert_eq!(
+            fx.app.view().screen,
+            "browse",
+            "no chat: d drafts on its own"
+        );
+        wait_until(&mut fx.app, "the draft", |a| a.story_drafts.is_empty());
         let log = fs::read_to_string(&fx.log).unwrap();
         assert!(
             !log.contains("--resume=polish-conv"),
             "not the polish conversation: {log}"
         );
-        ctrl(&mut fx.app, 'a');
-        key(&mut fx.app, KeyCode::Enter);
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("drafted")),
+            "{:?}",
+            fx.app.message
+        );
         let it = Store::load(&path).unwrap();
         assert!(it.body.contains("### Mark reinstates Maya"), "{}", it.body);
         assert!(
@@ -14400,7 +14483,7 @@ mod tests {
         focus_stories(&mut fx.app);
         agent_replies(&mut fx, &[DRAFTED]);
         key(&mut fx.app, KeyCode::Char('d'));
-        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        wait_until(&mut fx.app, "the draft", |a| a.story_drafts.is_empty());
         let log = fs::read_to_string(&fx.log).unwrap();
         assert!(
             log.contains("SPEC: a paid application lands on Accepted"),
@@ -14432,7 +14515,7 @@ mod tests {
         focus_stories(&mut fx.app);
         agent_replies(fx, &[DRAFTED]);
         key(&mut fx.app, KeyCode::Char('d'));
-        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        wait_until(&mut fx.app, "the draft", |a| a.story_drafts.is_empty());
         fs::read_to_string(&fx.log).unwrap()
     }
 
@@ -14466,6 +14549,34 @@ mod tests {
         fs::write(folder.join("docs/spec.md"), "LOOSE: never sent\n").unwrap();
         let log = drafting_prompt_with(&mut fx, &folder, "- spec: docs/spec.md\n");
         assert!(!log.contains("LOOSE"), "{log}");
+    }
+
+    #[test]
+    fn d_re_evaluates_the_stories_it_has_and_keeps_the_old_ones() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = "## Description\nbeta body\n\n## Acceptance criteria\n- [ ] one\n\n## Stories\n### Old story\n- persona: Mark\n- shows: 1\n1. Do it by hand\n".into();
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        focus_stories(&mut fx.app);
+        agent_replies(&mut fx, &[DRAFTED]);
+        key(&mut fx.app, KeyCode::Char('d'));
+        wait_until(&mut fx.app, "the draft", |a| a.story_drafts.is_empty());
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(log.contains("re-evaluate"), "{log}");
+        assert!(log.contains("### Old story"), "the agent sees them: {log}");
+        let it = Store::load(&path).unwrap();
+        assert!(it.body.contains("### Mark reinstates Maya"), "{}", it.body);
+        assert!(!it.body.contains("### Old story"), "{}", it.body);
+        let kept =
+            fs::read_to_string(crate::capture::stories_dir(&it).join("before-draft.md")).unwrap();
+        assert!(
+            kept.contains("### Old story") && kept.contains("Do it by hand"),
+            "{kept}"
+        );
     }
 
     #[test]
