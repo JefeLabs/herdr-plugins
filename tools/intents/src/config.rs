@@ -306,6 +306,9 @@ pub struct Config {
     /// Said once at start-up (the intents moved). Set by the caller from
     /// `storage::settle_root`.
     pub notice: Option<String>,
+    /// Why this space shows no intents: its `storage` is a placeholder (meta,
+    /// remote) or broken. Set by the caller from `space::storage_block`.
+    pub storage_block: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -575,6 +578,7 @@ pub fn load_or_init(dirs: &Dirs) -> anyhow::Result<Config> {
         root,
         scope: None,
         notice: None,
+        storage_block: None,
         editor: raw.editor.unwrap_or_else(|| "$EDITOR".to_string()),
         send_provider,
         polish_provider: raw.polish_provider.unwrap_or_else(|| "agy".to_string()),

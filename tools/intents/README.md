@@ -223,9 +223,12 @@ Every command runs with `sh -c` from the meta repo. `start` runs in its own proc
 ```toml
 [spaces.shop]
 meta = "~/code/shop-meta"
+storage = "profile"      # where the space's intents live; the default
 ```
 
-It is filled in for you the first time the tool starts in a workspace whose folder has `.helmsmith/space.toml`. The run guide is looked for in the space's meta repo, then in the intent's own repo; with neither, the tool says where to add one.
+It is filled in for you the first time the tool starts in a workspace whose folder has `.helmsmith/space.toml`.
+
+**Where a space's intents live.** `storage = "profile"` (the default, also with no line) keeps them in your own folder, `~/.helmsmith/intents/spaces/<space>/`. `meta` (the meta repo's `.helmsmith/intents/`, shared through git) and `remote` (a REST API, with `url = "…"`) are placeholders for now: the space then shows no intents, says `meta storage is not built yet` (or `remote …`), and refuses to add one, rather than writing them anywhere else. Outside a space, the whole tree leaves such a space's group out and names it. Any other word is an error that names `spaces.toml`. The run guide is looked for in the space's meta repo, then in the intent's own repo; with neither, the tool says where to add one.
 
 **Waiting for the pull.** In a project run this way, the automatic check after a merge waits until your checkout has the merged code: every merged pull request's merge commit (from `gh`) must be in the `HEAD` of the clone it merged into, which is the intent's repo for `#12`, or for `owner/repo#12` the space repo whose git URL in `space.toml` names that repo. A pull request in a repo the space does not list does not hold the check back. Until you pull, the card reads `· waiting for a pull` and the merge is not counted as checked. `X` checks whatever is checked out.
 

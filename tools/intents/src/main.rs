@@ -34,6 +34,11 @@ fn with_config(
         |k| std::env::var(k).ok(),
         |id| scope::herdr_label(std::path::Path::new(&herdr), id),
     );
+    // a space whose storage is not built yet shows no intents and takes none
+    cfg.storage_block = cfg
+        .scope
+        .as_deref()
+        .and_then(|s| herdr_intents::space::storage_block(&dirs, s));
     let dirs = herdr_intents::config::Dirs {
         config: dirs.config,
         root: cfg.root.clone(),

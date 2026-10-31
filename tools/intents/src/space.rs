@@ -125,16 +125,24 @@ pub fn missing(space: &Space) -> Vec<&SpaceRepo> {
     space.repos.iter().filter(|r| !r.path.is_dir()).collect()
 }
 
-/// Each person's pointers, `<config dir>/spaces.toml`: `[spaces.<name>] meta = "<path>"`.
+/// Each person's pointers, `<config dir>/spaces.toml`:
+/// `[spaces.<name>] meta = "<path>"`, `storage = "profile"`, `url = "…"`.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Pointers {
     #[serde(default)]
     spaces: std::collections::BTreeMap<String, Pointer>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Pointer {
-    meta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    meta: Option<String>,
+    /// `profile` (the default), or the placeholders `meta` and `remote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage: Option<String>,
+    /// A remote storage's address: kept, not used yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 /// Where this person's pointers are kept.
@@ -142,31 +150,89 @@ pub fn pointers_path(dirs: &Dirs) -> PathBuf {
     dirs.config.join("spaces.toml")
 }
 
-fn read_pointers(dirs: &Dirs) -> Pointers {
-    std::fs::read_to_string(pointers_path(dirs))
-        .ok()
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default()
+/// The pointers; no file reads as none, a file that does not parse is an error.
+fn read_pointers(dirs: &Dirs) -> Result<Pointers, String> {
+    let path = pointers_path(dirs);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Pointers::default()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// The entry for the space named `name`, matched in any case.
+fn pointer<'a>(pointers: &'a Pointers, name: &str) -> Option<&'a Pointer> {
+    pointers
+        .spaces
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, p)| p)
 }
 
 /// This person's meta repo for the space named `name` (`~` allowed).
 pub fn meta_for(dirs: &Dirs, name: &str) -> Option<PathBuf> {
-    read_pointers(dirs)
-        .spaces
-        .get(name)
-        .map(|p| PathBuf::from(shellexpand::tilde(&p.meta).into_owned()))
+    let pointers = read_pointers(dirs).ok()?;
+    let meta = pointer(&pointers, name)?.meta.as_ref()?;
+    Some(PathBuf::from(shellexpand::tilde(meta).into_owned()))
 }
 
-/// Records `meta` as the meta repo of the space named `name`.
+/// Records `meta` as the meta repo of the space named `name`, keeping the
+/// entry's other settings. A file that does not parse is left as it is.
 pub fn remember_meta(dirs: &Dirs, name: &str, meta: &Path) -> anyhow::Result<()> {
-    let mut pointers = read_pointers(dirs);
-    pointers.spaces.insert(
-        name.to_string(),
-        Pointer {
-            meta: meta.display().to_string(),
-        },
-    );
+    let mut pointers = read_pointers(dirs).map_err(|e| anyhow::anyhow!(e))?;
+    let key = pointers
+        .spaces
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(name))
+        .cloned()
+        .unwrap_or_else(|| name.to_string());
+    pointers.spaces.entry(key).or_default().meta = Some(meta.display().to_string());
     std::fs::create_dir_all(&dirs.config)?;
     std::fs::write(pointers_path(dirs), toml::to_string(&pointers)?)?;
     Ok(())
+}
+
+/// Where a space keeps its intents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Storage {
+    /// This person's own folder, `~/.helmsmith/intents/spaces/<space>/`.
+    Profile,
+    /// The meta repo's `.helmsmith/intents/`: not built yet.
+    Meta,
+    /// A REST API: not built yet.
+    Remote,
+}
+
+/// The storage the space named `name` uses: `profile` unless its entry says otherwise.
+pub fn storage_for(dirs: &Dirs, name: &str) -> Result<Storage, String> {
+    let pointers = read_pointers(dirs)?;
+    let Some(word) = pointer(&pointers, name).and_then(|p| p.storage.as_deref()) else {
+        return Ok(Storage::Profile);
+    };
+    match word.trim().to_ascii_lowercase().as_str() {
+        "profile" => Ok(Storage::Profile),
+        "meta" => Ok(Storage::Meta),
+        "remote" => Ok(Storage::Remote),
+        _ => Err(format!(
+            "{}: storage = \"{word}\" for space {name}: use profile, meta or remote",
+            pointers_path(dirs).display()
+        )),
+    }
+}
+
+/// Why the space named `name` shows no intents, when its storage is not one
+/// the tool can use yet (or its setting is broken).
+pub fn storage_block(dirs: &Dirs, name: &str) -> Option<String> {
+    let placeholder = |kind: &str| {
+        Some(format!(
+            "{kind} storage is not built yet (storage = \"{kind}\" for space {name} in {})",
+            pointers_path(dirs).display()
+        ))
+    };
+    match storage_for(dirs, name) {
+        Ok(Storage::Profile) => None,
+        Ok(Storage::Meta) => placeholder("meta"),
+        Ok(Storage::Remote) => placeholder("remote"),
+        Err(e) => Some(e),
+    }
 }

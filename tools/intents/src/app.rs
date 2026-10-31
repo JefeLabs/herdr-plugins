@@ -537,8 +537,12 @@ fn pane_name(p: Pane) -> &'static str {
 impl App {
     pub fn new(cfg: Config, dirs: Dirs) -> anyhow::Result<Self> {
         let store = Store::open(&cfg.root)?;
-        let notice = cfg.notice.clone();
-        let tree = store.scan()?.scoped(cfg.scope.as_deref());
+        let (tree, left_out) = visible_tree(&store, &cfg, &dirs)?;
+        let notice = cfg
+            .storage_block
+            .clone()
+            .or(left_out)
+            .or_else(|| cfg.notice.clone());
         let mut app = Self {
             exit_on_browse: false,
             store,
@@ -1665,7 +1669,7 @@ impl App {
             KeyCode::Char('+') => self.open_areas_input(),
             KeyCode::Char('u') => self.undo_reconcile(),
             // the card view says nothing about where an intent belongs
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !self.refuse_in_blocked_space() => {
                 self.screen = Screen::KindPick {
                     group: None,
                     follow_up: None,
@@ -1729,7 +1733,19 @@ impl App {
 
     /// The intent tree as this workspace sees it.
     fn scan(&self) -> anyhow::Result<Group> {
-        Ok(self.store.scan()?.scoped(self.cfg.scope.as_deref()))
+        Ok(visible_tree(&self.store, &self.cfg, &self.dirs)?.0)
+    }
+
+    /// True (and says why) when this space's storage is not one the tool can
+    /// write to yet: nothing is added or created anywhere else instead.
+    fn refuse_in_blocked_space(&mut self) -> bool {
+        match self.cfg.storage_block.clone() {
+            Some(why) => {
+                self.message = Some(why);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Where "the top level" is: the workspace's group, or the root.
@@ -2171,7 +2187,7 @@ impl App {
                 }
                 _ => {}
             },
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !self.refuse_in_blocked_space() => {
                 let group = (!self.rows.is_empty()).then(|| self.selected_group_dir());
                 self.screen = Screen::KindPick {
                     group,
@@ -2182,7 +2198,7 @@ impl App {
             KeyCode::Char('E') => self.capture_again(),
             KeyCode::Char('X') => self.check_now(),
             KeyCode::Char('F') => self.new_follow_up(),
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') if !self.refuse_in_blocked_space() => {
                 let parent = self.selected_group_dir();
                 self.screen = Screen::Input {
                     label: "new group".into(),
@@ -5881,7 +5897,9 @@ impl App {
                 self.list_total
             ),
         };
-        let empty = if self.list_total == 0 {
+        let empty = if let Some(why) = &self.cfg.storage_block {
+            why.as_str()
+        } else if self.list_total == 0 {
             "no intents yet: v back to the tree, then a adds one"
         } else {
             "nothing matches this filter: f changes it"
@@ -6523,6 +6541,42 @@ fn title_hint(kind: &str) -> &'static str {
 /// `add` mode: popup asks for a title; otherwise title from args or stdin's first line, body = rest.
 /// `piped` is what arrived on stdin when it is not a terminal; the caller
 /// reads it, so this never blocks on an open stdin.
+/// The tree this run shows, and which top-level groups were left out.
+/// - A space whose storage is a placeholder (meta, remote) or broken shows
+///   nothing: its intents are not in this folder.
+/// - The whole tree (no space) leaves out each group whose space is set that way.
+fn visible_tree(
+    store: &Store,
+    cfg: &Config,
+    dirs: &Dirs,
+) -> anyhow::Result<(Group, Option<String>)> {
+    if cfg.storage_block.is_some() {
+        let empty = Group {
+            path: store.root().to_path_buf(),
+            name: String::new(),
+            groups: Vec::new(),
+            intents: Vec::new(),
+            broken: Vec::new(),
+        };
+        return Ok((empty.scoped(cfg.scope.as_deref()), None));
+    }
+    let mut tree = store.scan()?.scoped(cfg.scope.as_deref());
+    if cfg.scope.is_some() {
+        return Ok((tree, None));
+    }
+    let mut left_out = Vec::new();
+    tree.groups.retain(|g| {
+        let blocked = crate::space::storage_block(dirs, &g.name).is_some();
+        if blocked {
+            left_out.push(g.name.clone());
+        }
+        !blocked
+    });
+    let note = (!left_out.is_empty())
+        .then(|| format!("left out: {}: storage not built yet", left_out.join(", ")));
+    Ok((tree, note))
+}
+
 pub fn add(
     cfg: Config,
     dirs: Dirs,
@@ -6530,6 +6584,9 @@ pub fn add(
     popup: bool,
     piped: Option<String>,
 ) -> anyhow::Result<()> {
+    if let Some(why) = &cfg.storage_block {
+        anyhow::bail!("{why}");
+    }
     let store = Store::open(&cfg.root)?;
     // the top of the workspace's group, or of the tree; there is no default group
     let group = cfg
@@ -6717,6 +6774,122 @@ mod tests {
                 .is_some_and(|m| m.contains("moved your intents")),
             "{:?}",
             fx.app.message
+        );
+    }
+
+    const META_BLOCK: &str =
+        "meta storage is not built yet (storage = \"meta\" for space skoolscout in /c/spaces.toml)";
+
+    /// The fixture seen from the skoolscout space, whose storage is a placeholder.
+    fn blocked_space() -> Fx {
+        setup_with("agy.jsonl", |c| {
+            c.scope = Some("skoolscout".into());
+            c.storage_block = Some(META_BLOCK.into());
+        })
+    }
+
+    /// Everything on screen at `w`×`h`, row by row.
+    fn screen_text(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_blocked_space_shows_why_and_no_intents() {
+        let mut fx = blocked_space();
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("meta storage is not built yet")),
+            "{:?}",
+            fx.app.message
+        );
+        let labels: Vec<String> = fx.app.view().rows.iter().map(|r| r.label.clone()).collect();
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("Alpha") || l.contains("Beta")),
+            "{labels:?}"
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        fx.app.message = None;
+        let text = screen_text(&fx.app, 120, 20);
+        assert!(text.contains("meta storage is not built yet"), "{text}");
+    }
+
+    #[test]
+    fn a_blocked_space_creates_nothing() {
+        let mut fx = blocked_space();
+        let root = fx.app.store.root().to_path_buf();
+        let before = md_files(&root);
+        let groups = fs::read_dir(root.join("skoolscout")).unwrap().count();
+        key(&mut fx.app, KeyCode::Char('a'));
+        assert_eq!(fx.app.view().screen, "browse", "no add view");
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("not built yet"))
+        );
+        key(&mut fx.app, KeyCode::Char('n'));
+        assert_eq!(fx.app.view().screen, "browse", "no new group prompt");
+        assert_eq!(md_files(&root), before);
+        assert_eq!(
+            fs::read_dir(root.join("skoolscout")).unwrap().count(),
+            groups
+        );
+    }
+
+    #[test]
+    fn the_whole_tree_leaves_out_a_blocked_space() {
+        let fx = setup_with("agy.jsonl", |c| {
+            let cfg_dir = c.root.parent().unwrap().join("cfg");
+            fs::write(
+                cfg_dir.join("spaces.toml"),
+                "[spaces.skoolscout]\nstorage = \"remote\"\n",
+            )
+            .unwrap();
+        });
+        let labels: Vec<String> = fx.app.view().rows.iter().map(|r| r.label.clone()).collect();
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("skoolscout") || l.contains("Alpha")),
+            "{labels:?}"
+        );
+        assert!(labels.iter().any(|l| l.contains("Inbox")), "{labels:?}");
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("skoolscout")),
+            "{:?}",
+            fx.app.message
+        );
+    }
+
+    #[test]
+    fn a_capture_is_refused_in_a_blocked_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let mut cfg = load_or_init(&dirs).unwrap();
+        cfg.scope = Some("skoolscout".into());
+        cfg.storage_block = Some(META_BLOCK.into());
+        let e = super::add(cfg, dirs.clone(), Some("x".into()), false, None).unwrap_err();
+        assert!(format!("{e:#}").contains("not built yet"), "{e:#}");
+        assert!(
+            !dirs.root.exists() || md_files(&dirs.root) == 0,
+            "nothing written"
         );
     }
 
