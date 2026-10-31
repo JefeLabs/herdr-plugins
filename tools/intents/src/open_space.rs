@@ -5,6 +5,11 @@
 //! `.helmsmith/intents/` names a space), the workspace takes the space's name
 //! and its intents load: the toolbar opens (Intents is its first tool), or,
 //! without one, the Intents pane does.
+//!
+//! Herdr creates the first workspace of a session before any hook can see
+//! it, so `open-space --first` runs at Herdr's startup for the lowest-numbered
+//! workspace. Startup also follows a restored session: a workspace that
+//! already shows a toolbar or Intents is only named, never toggled.
 
 use std::path::{Path, PathBuf};
 
@@ -26,8 +31,29 @@ pub enum Load {
     Toolbar,
     /// Intents opened in its own pane.
     Pane,
+    /// The workspace already had a toolbar or Intents pane, left as it was.
+    Already,
     /// Neither could open; the reason Herdr gave.
     Failed(String),
+}
+
+/// Labels of the panes that already show a space's intents.
+const INTENTS_PANES: [&str; 2] = ["Toolbar", "Intents"];
+
+/// The session's first workspace in `herdr workspace list`'s reply: the
+/// lowest-numbered, else the first listed.
+pub fn first_workspace(list: &Value) -> Option<String> {
+    let all = list.pointer("/result/workspaces")?.as_array()?;
+    let number = |w: &Value| w.get("number").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let first = all
+        .iter()
+        .enumerate()
+        .min_by_key(|(i, w)| (number(w), *i))?
+        .1;
+    first
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// The toolbar plugin, whose first tool is Intents.
@@ -132,7 +158,17 @@ pub fn open(id: &str, herdr: impl Fn(&[&str]) -> Result<Value, String>) -> Outco
     if let Err(e) = herdr(&["workspace", "rename", id, &space]) {
         return skip(format!("could not name it {space}: {e}"));
     }
-    let intents = load(pane, &top, focused, &herdr);
+    // a restored toolbar is already there: its toggle would close it
+    let all_panes = panes.pointer("/result/panes").and_then(Value::as_array);
+    let showing = all_panes.into_iter().flatten().any(|p| {
+        let label = p.get("label").and_then(Value::as_str);
+        label.is_some_and(|l| INTENTS_PANES.contains(&l))
+    });
+    let intents = if showing {
+        Load::Already
+    } else {
+        load(pane, &top, focused, &herdr)
+    };
     Outcome::Opened { space, intents }
 }
 
@@ -232,6 +268,7 @@ pub fn describe(id: &str, outcome: &Outcome) -> String {
             let how = match intents {
                 Load::Toolbar => "its intents opened in the toolbar".to_string(),
                 Load::Pane => "its intents opened in the Intents pane".to_string(),
+                Load::Already => "its intents were already open".to_string(),
                 Load::Failed(why) => format!("could not open its intents: {why}"),
             };
             format!("workspace {id} is now {space}; {how}")
@@ -282,6 +319,8 @@ mod tests {
         cwd: PathBuf,
         others: Vec<&'static str>,
         toolbar: bool,
+        /// Labels of panes beside the workspace's own (a restored toolbar).
+        open_panes: Vec<&'static str>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -293,6 +332,7 @@ mod tests {
                 cwd: cwd.to_path_buf(),
                 others: vec!["~"],
                 toolbar: true,
+                open_panes: Vec::new(),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -311,14 +351,24 @@ mod tests {
                         .others
                         .iter()
                         .enumerate()
-                        .map(|(i, l)| json!({"workspace_id": format!("w{}", i + 1), "label": l}))
+                        .map(|(i, l)| {
+                            json!({"workspace_id": format!("w{}", i + 1), "label": l, "number": i + 1})
+                        })
                         .collect();
                     all.push(ws);
                     Ok(json!({"result": {"workspaces": all}}))
                 }
-                ["pane", "list", "--workspace", "w3"] => Ok(json!({"result": {"panes": [
-                    {"pane_id": "w3:p1", "cwd": self.cwd, "workspace_id": "w3"}
-                ]}})),
+                ["pane", "list", "--workspace", "w3"] => {
+                    let mut panes =
+                        vec![json!({"pane_id": "w3:p1", "cwd": self.cwd, "workspace_id": "w3"})];
+                    for (i, label) in self.open_panes.iter().enumerate() {
+                        panes.push(json!({
+                            "pane_id": format!("w3:p{}", i + 2), "cwd": self.cwd,
+                            "workspace_id": "w3", "label": label
+                        }));
+                    }
+                    Ok(json!({"result": {"panes": panes}}))
+                }
                 // as Herdr 0.9.5: `plugin list` answers in text unless asked for JSON
                 ["plugin", "list"] => Ok(Value::String("2 plugins installed:\n…".into())),
                 ["plugin", "list", "--json"] => {
@@ -550,6 +600,60 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_that_already_shows_its_intents_is_named_but_not_toggled() {
+        // a restored session brings its toolbar back: toggling would close it
+        for open in ["Toolbar", "Intents"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let meta = meta_repo(tmp.path());
+            let mut herdr = FakeHerdr::new("skoolscout-com", &meta);
+            herdr.open_panes = vec![open];
+            assert_eq!(
+                open_with(&herdr),
+                Outcome::Opened {
+                    space: "skoolscout".into(),
+                    intents: Load::Already
+                },
+                "{open}"
+            );
+            let calls = herdr.calls();
+            assert!(calls.contains(&"workspace rename w3 skoolscout".to_string()));
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("plugin action") || c.starts_with("plugin pane")),
+                "{open}: {calls:?}"
+            );
+        }
+    }
+
+    fn open_with(herdr: &FakeHerdr) -> Outcome {
+        open("w3", |a| herdr.call(a))
+    }
+
+    #[test]
+    fn the_first_workspace_is_the_lowest_numbered() {
+        let list = json!({"result": {"workspaces": [
+            {"workspace_id": "w7", "label": "b", "number": 3},
+            {"workspace_id": "wD", "label": "~", "number": 1},
+            {"workspace_id": "w2", "label": "a", "number": 2}
+        ]}});
+        assert_eq!(first_workspace(&list).as_deref(), Some("wD"));
+        let unnumbered = json!({"result": {"workspaces": [
+            {"workspace_id": "w4"}, {"workspace_id": "w5"}
+        ]}});
+        assert_eq!(
+            first_workspace(&unnumbered).as_deref(),
+            Some("w4"),
+            "list order"
+        );
+        assert_eq!(
+            first_workspace(&json!({"result": {"workspaces": []}})),
+            None
+        );
+        assert_eq!(first_workspace(&Value::String("text".into())), None);
+    }
+
+    #[test]
     fn herdrs_error_reply_is_a_failure_even_when_it_exits_0() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -605,6 +709,14 @@ mod tests {
             intents: Load::Failed("boom".into()),
         };
         assert!(describe("w3", &failed).contains("could not open its intents: boom"));
+        let already = Outcome::Opened {
+            space: "skoolscout".into(),
+            intents: Load::Already,
+        };
+        assert_eq!(
+            describe("w3", &already),
+            "workspace w3 is now skoolscout; its intents were already open"
+        );
         assert_eq!(
             describe("w3", &Outcome::Skipped("not a meta repo".into())),
             "workspace w3 left as it is: not a meta repo"

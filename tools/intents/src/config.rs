@@ -44,8 +44,11 @@ pub enum Mode {
     /// One capture, detached from the tool that started it.
     CaptureRun(PathBuf),
     /// Herdr's `workspace.created` hook: a workspace opened in a meta repo
-    /// becomes its space and loads its intents.
-    OpenSpace,
+    /// becomes its space and loads its intents. `first` (`--first`, the
+    /// startup hook): the session's first workspace, which no event names.
+    OpenSpace {
+        first: bool,
+    },
     Usage(String),
 }
 
@@ -78,7 +81,10 @@ pub fn parse_mode(args: &[String]) -> Mode {
         }
         Some("capture-mcp") if args.len() == 2 => Mode::CaptureMcp(PathBuf::from(&args[1])),
         Some("capture-run") if args.len() == 2 => Mode::CaptureRun(PathBuf::from(&args[1])),
-        Some("open-space") if args.len() == 1 => Mode::OpenSpace,
+        Some("open-space") if args.len() == 1 => Mode::OpenSpace { first: false },
+        Some("open-space") if args.len() == 2 && args[1] == "--first" => {
+            Mode::OpenSpace { first: true }
+        }
         Some(_) => Mode::Usage(USAGE.to_string()),
     }
 }
@@ -1152,7 +1158,14 @@ mod tests {
         assert!(
             matches!(parse_mode(&["--version".into()]), Mode::Usage(t) if t.starts_with("herdr-intents "))
         );
-        assert_eq!(parse_mode(&["open-space".into()]), Mode::OpenSpace);
+        assert_eq!(
+            parse_mode(&["open-space".into()]),
+            Mode::OpenSpace { first: false }
+        );
+        assert_eq!(
+            parse_mode(&["open-space".into(), "--first".into()]),
+            Mode::OpenSpace { first: true }
+        );
         assert!(matches!(
             parse_mode(&["open-space".into(), "w3".into()]),
             Mode::Usage(_)
