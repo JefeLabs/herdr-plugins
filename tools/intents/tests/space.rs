@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use herdr_intents::config::Dirs;
 use herdr_intents::space::{
-    Storage, meta_for, missing, pointers_path, read_space, remember_meta, storage_block,
-    storage_for,
+    Storage, is_meta, meta_for, missing, pointers_path, read_intents_config, read_space,
+    remember_meta, storage_block, storage_for,
 };
 
 #[test]
@@ -148,4 +148,58 @@ fn a_spaces_file_that_does_not_parse_blocks_and_is_kept() {
 fn storage_matches_the_space_name_in_any_case() {
     let (_t, dirs) = spaces(Some("[spaces.SkoolScout]\nstorage = \"meta\"\n"));
     assert_eq!(storage_for(&dirs, "skoolscout"), Ok(Storage::Meta));
+}
+
+// ---- the meta repo's intents folder: the space's name ---------------------------------
+
+#[test]
+fn an_intents_folder_or_a_space_file_makes_a_meta_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("skoolscout-com");
+    fs::create_dir_all(repo.join(".helmsmith/hooks")).unwrap();
+    assert!(!is_meta(&repo), "hooks alone are not intents config");
+    fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
+    assert!(is_meta(&repo));
+    let other = tmp.path().join("meta");
+    fs::create_dir_all(other.join(".helmsmith")).unwrap();
+    fs::write(other.join(".helmsmith/space.toml"), "repos = []\n").unwrap();
+    assert!(is_meta(&other));
+}
+
+#[test]
+fn the_intents_config_names_the_space() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("skoolscout-com");
+    fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
+    fs::write(
+        repo.join(".helmsmith/intents/config.toml"),
+        "space = \"skoolscout\"\n",
+    )
+    .unwrap();
+    assert_eq!(read_intents_config(&repo).unwrap().space, "skoolscout");
+}
+
+#[test]
+fn without_a_config_file_the_space_is_named_after_the_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("tourneyseason");
+    fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
+    assert_eq!(read_intents_config(&repo).unwrap().space, "tourneyseason");
+}
+
+#[test]
+fn a_broken_intents_config_says_where() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("meta");
+    fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
+    fs::write(repo.join(".helmsmith/intents/config.toml"), "space = [\n").unwrap();
+    let why = read_intents_config(&repo).unwrap_err();
+    assert!(why.contains(".helmsmith/intents/config.toml"), "{why}");
+    fs::write(
+        repo.join(".helmsmith/intents/config.toml"),
+        "space = \"a/b\"\n",
+    )
+    .unwrap();
+    let why = read_intents_config(&repo).unwrap_err();
+    assert!(why.contains("space = \"a/b\""), "{why}");
 }
