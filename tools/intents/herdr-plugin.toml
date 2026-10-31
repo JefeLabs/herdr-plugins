@@ -31,6 +31,11 @@ command = ["../../target/release/herdr-intents"]
 on = "workspace.created"
 command = ["../../target/release/herdr-intents", "open-space"]
 
+# The session's first workspace is created before any hook sees it: at
+# startup, open its space the same way.
+[[startup]]
+command = ["../../target/release/herdr-intents", "open-space", "--first"]
+
 [[actions]]
 id = "add"
 title = "Intents: capture"

@@ -75,20 +75,24 @@ fn main() -> ExitCode {
             with_config(|cfg, dirs| app::add(cfg, dirs, title, popup, piped))
         }
         Mode::CaptureMcp(config) => herdr_intents::capture_mcp::serve(&config),
-        Mode::OpenSpace => {
-            // Herdr's workspace.created hook; the line lands in its plugin log
+        Mode::OpenSpace { first } => {
+            // Herdr's workspace.created hook, or (--first) its startup hook;
+            // the line lands in Herdr's plugin log
             use herdr_intents::open_space;
             let get = |k: &str| std::env::var(k).ok();
-            let event = get("HERDR_PLUGIN_EVENT_JSON");
-            let line = match open_space::event_workspace(
-                event.as_deref(),
-                get("HERDR_WORKSPACE_ID").as_deref(),
-            ) {
-                Some(id) => {
-                    let bin = get("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-                    let outcome = open_space::open(&id, open_space::cli(bin.into()));
-                    open_space::describe(&id, &outcome)
-                }
+            let bin = get("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+            let herdr = open_space::cli(bin.into());
+            let id = if first {
+                herdr(&["workspace", "list"])
+                    .ok()
+                    .and_then(|list| open_space::first_workspace(&list))
+            } else {
+                let event = get("HERDR_PLUGIN_EVENT_JSON");
+                open_space::event_workspace(event.as_deref(), get("HERDR_WORKSPACE_ID").as_deref())
+            };
+            let line = match id {
+                Some(id) => open_space::describe(&id, &open_space::open(&id, herdr)),
+                None if first => "open-space: the session has no workspace".to_string(),
                 None => "open-space: the event names no workspace".to_string(),
             };
             let _ = writeln!(std::io::stdout(), "{line}");
