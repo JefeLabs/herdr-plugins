@@ -134,6 +134,14 @@ pub struct PendingChat {
 
 /// A story in the detail view: its mark, `<n>. <name> · <state>`, and its
 /// kept video.
+/// What run of an intent is going.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Busy {
+    Recording,
+    Checking,
+    Capturing,
+}
+
 struct StoryRow {
     number: usize,
     mark: &'static str,
@@ -504,6 +512,8 @@ pub struct App {
     story_drafts: HashMap<PathBuf, (Turn, std::time::Instant)>,
     /// Checks started with `X`, until their end is reported in the status line.
     checks_by_hand: HashSet<PathBuf>,
+    /// When `queued_stories_due` last looked at the intents' queues.
+    queue_scanned: Option<std::time::Instant>,
     /// Folds started this session (original, follow-up stem): once each, until `r`.
     fold_tried: HashSet<(PathBuf, String)>,
     /// Fold checks started this session (original, keys): once each.
@@ -619,6 +629,7 @@ impl App {
             reconcile_jobs: HashMap::new(),
             story_drafts: HashMap::new(),
             checks_by_hand: HashSet::new(),
+            queue_scanned: None,
             fold_tried: HashSet::new(),
             fold_check_tried: HashSet::new(),
             pr_merge_commits: HashMap::new(),
@@ -4405,14 +4416,55 @@ impl App {
     /// Why a run of `it` cannot start now: a check, a capture or a story
     /// recording of it is running.
     fn run_of(&self, it: &Intent) -> Option<&'static str> {
+        self.busy_with(it).map(|b| match b {
+            Busy::Recording => "recording its stories",
+            Busy::Checking => "checking it",
+            Busy::Capturing => "capturing it",
+        })
+    }
+
+    /// Which run of `it` is going, if any (an intent has one at a time).
+    fn busy_with(&self, it: &Intent) -> Option<Busy> {
         if crate::capture::is_running(&crate::capture::stories_dir(it)) {
-            Some("recording its stories")
+            Some(Busy::Recording)
         } else if crate::capture::is_running(&crate::check::checks_dir(it)) {
-            Some("checking it")
+            Some(Busy::Checking)
         } else if crate::capture::is_running(&self.evidence_home(it)) {
-            Some("capturing it")
+            Some(Busy::Capturing)
         } else {
             None
+        }
+    }
+
+    /// The story a run of `it` is recording this moment.
+    fn recording_now(&self, it: &Intent) -> Option<usize> {
+        crate::capture::recording_story(&crate::capture::stories_dir(it))
+            .or_else(|| crate::capture::recording_story(&crate::check::checks_dir(it)))
+    }
+
+    /// Starts a run for stories queued with `r` that no run will record: the
+    /// run they waited on was a capture, or it ended (or crashed) before
+    /// taking them. One that cannot start says why on each queued row.
+    fn queued_stories_due(&mut self) {
+        if self
+            .queue_scanned
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+        {
+            return;
+        }
+        self.queue_scanned = Some(std::time::Instant::now());
+        for it in self.all_intents() {
+            let dir = crate::capture::stories_dir(&it);
+            if crate::capture::queued_stories(&dir).is_empty() || self.busy_with(&it).is_some() {
+                continue;
+            }
+            if let Err(e) = self.start_story_run(&it, Vec::new()) {
+                crate::capture::fail_stories(&it.path, &dir, &[], &e, chrono::Local::now());
+                self.message = Some(format!(
+                    "the stories queued for `{}` couldn't record: {e}",
+                    it.fm.title
+                ));
+            }
         }
     }
 
@@ -4421,12 +4473,14 @@ impl App {
     fn story_rows(&self, it: &Intent) -> Vec<StoryRow> {
         use crate::capture::StoryOutcome;
         let dir = crate::capture::stories_dir(it);
-        let checks = crate::check::checks_dir(it);
-        // a story job, or a check whose takes follow it on the same run
-        let recording = crate::capture::is_running(&dir)
-            || (crate::capture::is_running(&checks)
-                && crate::check::read_check(&checks)
-                    .is_some_and(|l| crate::check::passes(&l, &it.body)));
+        let now = self.recording_now(it);
+        // a story run still getting its app ready: the stories it was started for
+        let preparing = if now.is_none() && crate::capture::is_running(&dir) {
+            crate::capture::run_stories(&dir)
+        } else {
+            Vec::new()
+        };
+        let queued = crate::capture::queued_stories(&dir);
         crate::store::stories(&it.body)
             .iter()
             .map(|s| {
@@ -4439,8 +4493,10 @@ impl App {
                 };
                 let (mark, state) = if s.waits {
                     ("…", crate::store::STORIES_WAIT.to_string())
-                } else if recording {
+                } else if now == Some(s.number) || preparing.contains(&s.number) {
                     ("●", "recording…".to_string())
+                } else if queued.contains(&s.number) {
+                    ("◌", "queued".to_string())
                 } else {
                     match crate::capture::read_story(&folder).map(|r| r.outcome) {
                         Some(StoryOutcome::Kept) if video.is_some() => ("▶", "video".to_string()),
@@ -4472,10 +4528,32 @@ impl App {
             .collect()
     }
 
-    /// `r` on a story: records it again, once the completion check has passed.
-    /// `r`: records the story now. A completion check that hasn't passed is
-    /// named, not waited for (`X` records every story after one passes).
+    /// `r`: records the story now. While a run of the intent is going, it
+    /// queues the story for that run instead, and `r` on a queued story takes
+    /// it off. A completion check that hasn't passed is named, not waited for
+    /// (`X` records every story after one passes).
     fn record_story(&mut self, it: &Intent, number: usize) {
+        let dir = crate::capture::stories_dir(it);
+        if let Some(busy) = self.busy_with(it) {
+            self.message = Some(if crate::capture::unqueue_story(&dir, number) {
+                format!("story {number} taken off the queue")
+            } else if self.recording_now(it) == Some(number) {
+                format!("story {number} is recording now")
+            } else {
+                match crate::capture::queue_story(&dir, number) {
+                    Ok(()) => format!(
+                        "story {number} queued: it records {}",
+                        match busy {
+                            Busy::Recording => "next, on the same app",
+                            Busy::Checking => "after the check, on the same app",
+                            Busy::Capturing => "once the capture ends",
+                        }
+                    ),
+                    Err(e) => format!("record: {e}"),
+                }
+            });
+            return;
+        }
         let latest = crate::check::read_check(&crate::check::checks_dir(it));
         // the reason's head ("the last check (08:57) hasn't passed"), which
         // never holds ": " itself; the detail is the list after it
@@ -4485,13 +4563,14 @@ impl App {
                 format!(" ({head})")
             })
             .unwrap_or_default();
-        self.message = Some(match self.start_story(it, number) {
+        self.message = Some(match self.start_story_run(it, vec![number]) {
             Ok(()) => format!("recording story {number}{note}: its row shows how it went"),
             Err(e) => format!("record: {e}"),
         });
     }
 
-    fn start_story(&mut self, it: &Intent, number: usize) -> Result<(), String> {
+    /// Starts a story run of `it` for `numbers` (none: only the queued ones).
+    fn start_story_run(&mut self, it: &Intent, numbers: Vec<usize>) -> Result<(), String> {
         use crate::capture::{Phase, Shot};
         let repo = self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo()))?;
         let stories_dir = crate::capture::stories_dir(it);
@@ -4517,7 +4596,7 @@ impl App {
             n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
             merged: Vec::new(),
             job: crate::capture::Job::Story {
-                numbers: vec![number],
+                numbers,
                 intent_path: it.path.clone(),
                 root: self.store.root().to_path_buf(),
                 stories_dir,
@@ -6093,6 +6172,7 @@ impl App {
         self.poll_reconciles();
         self.poll_story_drafts();
         self.report_checks_by_hand();
+        self.queued_stories_due();
         // pull requests, plans and searches are checked in either layout (a
         // merge must reconcile from the tree too); agent states only matter
         // to the cards, so they poll only while the list shows
@@ -14381,8 +14461,13 @@ mod tests {
     /// Beta, sent, with three stories: the first kept a video, the second's
     /// criterion did not show, the third waits. Returns the first's video.
     fn beta_with_stories(fx: &mut Fx) -> PathBuf {
+        with_stories(fx, "Beta")
+    }
+
+    /// `title`, sent, with Beta's three stories (see `beta_with_stories`).
+    fn with_stories(fx: &mut Fx, title: &str) -> PathBuf {
         use crate::capture::{StoryOutcome, StoryRecord};
-        select(&mut fx.app, "Beta");
+        select(&mut fx.app, title);
         let path = fx.app.selected_intent().unwrap().path.clone();
         let mut it = Store::load(&path).unwrap();
         it.body = STORY_BODY.into();
@@ -14410,7 +14495,7 @@ mod tests {
             vec![2],
         );
         fx.app.rescan();
-        select(&mut fx.app, "Beta");
+        select(&mut fx.app, title);
         first.join("video.mp4")
     }
 
@@ -14829,6 +14914,197 @@ mod tests {
             m.ends_with(" hasn't passed): its row shows how it went"),
             "{m}"
         );
+    }
+
+    /// Makes a run of the intent look busy: a live lock (this test's own
+    /// pid) in `dir`, and `stage` as what it is doing.
+    fn pretend_running(dir: &Path, stage: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(".capture.lock"), std::process::id().to_string()).unwrap();
+        fs::write(dir.join(".stage"), stage).unwrap();
+    }
+
+    /// Story `n`'s row as the Stories section lists it.
+    fn story_row(fx: &Fx, n: usize) -> String {
+        let it = fx.app.selected_intent().unwrap().clone();
+        fx.app
+            .story_rows(&it)
+            .into_iter()
+            .find(|r| r.number == n)
+            .unwrap()
+            .label
+    }
+
+    #[test]
+    fn r_during_a_recording_queues_the_story_and_r_again_unqueues_it() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        let it = fx.app.selected_intent().unwrap().clone();
+        let dir = crate::capture::stories_dir(&it);
+        pretend_running(&dir, "recording story 1: Mark reinstates Maya");
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('r'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("story 2 queued: it records next, on the same app")
+        );
+        assert_eq!(crate::capture::queued_stories(&dir), vec![2]);
+        assert!(
+            story_row(&fx, 2).ends_with(" · queued"),
+            "{}",
+            story_row(&fx, 2)
+        );
+        assert!(
+            story_row(&fx, 1).ends_with(" · recording…"),
+            "{}",
+            story_row(&fx, 1)
+        );
+        key(&mut fx.app, KeyCode::Char('r'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("story 2 taken off the queue")
+        );
+        assert!(crate::capture::queued_stories(&dir).is_empty());
+        key(&mut fx.app, KeyCode::Char('k'));
+        key(&mut fx.app, KeyCode::Char('r'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("story 1 is recording now")
+        );
+        assert!(crate::capture::queued_stories(&dir).is_empty());
+    }
+
+    #[test]
+    fn r_during_a_check_queues_the_story_for_after_it() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        let it = fx.app.selected_intent().unwrap().clone();
+        pretend_running(
+            &crate::check::checks_dir(&it),
+            "the agent is checking the criteria",
+        );
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('r'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("story 2 queued: it records after the check, on the same app")
+        );
+        assert!(
+            story_row(&fx, 2).ends_with(" · queued"),
+            "{}",
+            story_row(&fx, 2)
+        );
+        // the check is not recording story 1
+        assert!(
+            story_row(&fx, 1).ends_with(" · video"),
+            "{}",
+            story_row(&fx, 1)
+        );
+    }
+
+    #[test]
+    fn r_during_a_capture_queues_the_story_for_once_it_ends() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        let it = fx.app.selected_intent().unwrap().clone();
+        pretend_running(&fx.app.evidence_home(&it), "the agent is reproducing it");
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('r'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("story 2 queued: it records once the capture ends")
+        );
+    }
+
+    #[test]
+    fn queued_stories_start_a_run_once_nothing_runs() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        beta_with_stories(&mut fx);
+        let it = fx.app.selected_intent().unwrap().clone();
+        let dir = crate::capture::stories_dir(&it);
+        let second = dir.join("2-pat-sees-it-back");
+        let before = crate::capture::read_story(&second).unwrap().at;
+        crate::capture::queue_story(&dir, 2).unwrap();
+        fx.app.tick();
+        let start = Instant::now();
+        while crate::capture::read_story(&second).is_none_or(|r| r.at == before) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "the queued story never ran"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(crate::capture::queued_stories(&dir).is_empty());
+    }
+
+    #[test]
+    fn r_on_two_intents_runs_both_at_once() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        // each run's `work start` takes 2s, so the first is still going
+        fx.app
+            .capture_env
+            .push(("FAKE_WORK_SLOW".into(), "1".into()));
+        with_stories(&mut fx, "Alpha");
+        let alpha = fx.app.selected_intent().unwrap().clone();
+        beta_with_stories(&mut fx);
+        let beta = fx.app.selected_intent().unwrap().clone();
+        let first = record_second_story_start(&mut fx);
+        assert!(first.starts_with("recording story 2"), "{first}");
+        // back to the tree, and up to Alpha
+        for _ in 0..12 {
+            if fx.app.view().focus == "tree" {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Tab);
+        }
+        for _ in 0..5 {
+            if fx
+                .app
+                .selected_intent()
+                .is_some_and(|i| i.fm.title == alpha.fm.title)
+            {
+                break;
+            }
+            key(&mut fx.app, KeyCode::Char('k'));
+        }
+        let second = record_second_story_start(&mut fx);
+        assert!(
+            crate::capture::is_running(&crate::capture::stories_dir(&beta)),
+            "Beta's run is still going"
+        );
+        assert!(
+            second.starts_with("recording story 2"),
+            "not queued: {second}"
+        );
+        for it in [&alpha, &beta] {
+            let start = Instant::now();
+            while crate::capture::is_running(&crate::capture::stories_dir(it)) {
+                assert!(start.elapsed() < Duration::from_secs(20), "{}", it.fm.title);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        assert!(
+            crate::capture::read_story(
+                &crate::capture::stories_dir(&alpha).join("2-pat-sees-it-back")
+            )
+            .is_some_and(|r| r.outcome != crate::capture::StoryOutcome::NotShown(vec![2]))
+        );
+    }
+
+    /// Presses `r` on the selected intent's second story; the status line.
+    fn record_second_story_start(fx: &mut Fx) -> String {
+        focus_stories(&mut fx.app);
+        for _ in 0..3 {
+            key(&mut fx.app, KeyCode::Char('k'));
+        }
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('r'));
+        fx.app.view().message.unwrap_or_default()
     }
 
     #[test]

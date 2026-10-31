@@ -1084,7 +1084,13 @@ impl CaptureJob {
         {
             let (r, st) = (runner.clone(), std::sync::Arc::clone(&state));
             std::thread::spawn(move || {
+                let started = chrono::Local::now();
                 let mut rec = run(&req, &r, &st, managed_mcp, &tx);
+                if let Outcome::Failed(why) = &rec.outcome
+                    && why != "cancelled"
+                {
+                    fail_waiting_stories(&req.job, why, started);
+                }
                 let app_warning = stop_app_once(&r, &st);
                 rec.warning = finish_once(&r, &st).or(app_warning);
                 let _ = tx.send(CaptureUpdate::Done(rec));
@@ -1512,11 +1518,15 @@ fn run(
                 _ => None,
             };
             let _ = tx.send(CaptureUpdate::Checked(checked));
-            // every criterion holds: the stories' videos, on this same app
-            if let Some(it) = story_intent
-                && crate::check::passes(&latest, &it.body)
-            {
+            // every criterion holds: the stories' videos, on this same app;
+            // either way, the stories queued by hand with `r`
+            if let Some(it) = story_intent {
                 let looked_at: Vec<usize> = items.iter().map(|i| i.number).collect();
+                let which = if crate::check::passes(&latest, &it.body) {
+                    Which::AfterCheck(&looked_at)
+                } else {
+                    Which::Numbers(&[])
+                };
                 record_stories(
                     r,
                     state,
@@ -1524,7 +1534,7 @@ fn run(
                     &base_url,
                     &it,
                     &stories_dir(&it),
-                    Which::AfterCheck(&looked_at),
+                    which,
                     managed_mcp,
                     &progress,
                 );
@@ -1766,10 +1776,18 @@ fn record_stories(
         })
         .collect();
     let personas = guide_stories(guide);
-    for story in chosen {
+    // the chosen stories, then each one queued with `r` meanwhile, on this app
+    let mut pending: std::collections::VecDeque<usize> = chosen.iter().map(|s| s.number).collect();
+    loop {
         if cancelled(state) {
             return;
         }
+        let Some(number) = pending.pop_front().or_else(|| take_queued(stories_dir)) else {
+            break;
+        };
+        let Some(story) = all.iter().find(|s| s.number == number) else {
+            continue;
+        };
         let dir = stories_dir.join(crate::store::story_folder(story));
         if std::fs::create_dir_all(&dir).is_err() {
             continue;
@@ -2131,6 +2149,157 @@ pub fn read_stage(dir: &Path) -> Option<String> {
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
+}
+
+/// A story run that ended before its takes (its app never started, say):
+/// each story it was to record, and each one queued, says why, so a request
+/// never waits on a run that is gone.
+fn fail_waiting_stories(job: &Job, why: &str, since: chrono::DateTime<chrono::Local>) {
+    if let Job::Story {
+        numbers,
+        intent_path,
+        stories_dir,
+        ..
+    } = job
+    {
+        fail_stories(intent_path, stories_dir, numbers, why, since);
+    }
+}
+
+/// Says `why` on each of `numbers` and each story queued, unless a take since
+/// `since` already said how it went; the queue is emptied.
+pub fn fail_stories(
+    intent_path: &Path,
+    stories_dir: &Path,
+    numbers: &[usize],
+    why: &str,
+    since: chrono::DateTime<chrono::Local>,
+) {
+    let Ok(it) = crate::store::Store::load(intent_path) else {
+        return;
+    };
+    let all = crate::store::stories(&it.body);
+    let mut waiting = numbers.to_vec();
+    while let Some(n) = take_queued(stories_dir) {
+        if !waiting.contains(&n) {
+            waiting.push(n);
+        }
+    }
+    for n in waiting {
+        let Some(story) = all.iter().find(|s| s.number == n) else {
+            continue;
+        };
+        let dir = stories_dir.join(crate::store::story_folder(story));
+        // a take this run did record keeps its own outcome
+        if read_story(&dir).is_some_and(|r| r.at >= since) || std::fs::create_dir_all(&dir).is_err()
+        {
+            continue;
+        }
+        let (_, dropped) = crate::store::shown_criteria(&it.body, story);
+        write_story(
+            &dir,
+            &StoryRecord {
+                at: chrono::Local::now(),
+                outcome: StoryOutcome::Failed(why.to_string()),
+                shows: story.shows.clone(),
+                dropped,
+            },
+        );
+    }
+}
+
+/// The stories asked for with `r` while a run of the intent was going, one
+/// empty file per request (`<when>-<story number>`) in the stories folder's
+/// `.queue/`: adding, taking and removing are each one file operation, so
+/// the app and the runner never need a lock.
+const QUEUE: &str = ".queue";
+
+/// Queues story `number` to record after what the intent's run is doing.
+pub fn queue_story(stories_dir: &Path, number: usize) -> std::io::Result<()> {
+    let dir = stories_dir.join(QUEUE);
+    std::fs::create_dir_all(&dir)?;
+    let when = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(format!("{when:020}-{number}")))
+        .map(|_| ())
+}
+
+/// The queue's entries, oldest first: (file, story number).
+fn queue_entries(stories_dir: &Path) -> Vec<(PathBuf, usize)> {
+    let Ok(read) = std::fs::read_dir(stories_dir.join(QUEUE)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, usize)> = read
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let n = name.rsplit_once('-')?.1.parse().ok()?;
+            Some((e.path(), n))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The queued story numbers, oldest request first, each once.
+pub fn queued_stories(stories_dir: &Path) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (_, n) in queue_entries(stories_dir) {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// Takes story `number` off the queue; false when it was not queued.
+pub fn unqueue_story(stories_dir: &Path, number: usize) -> bool {
+    let mut removed = false;
+    for (file, n) in queue_entries(stories_dir) {
+        if n == number && std::fs::remove_file(file).is_ok() {
+            removed = true;
+        }
+    }
+    removed
+}
+
+/// Takes the oldest request off the queue, for a run to record.
+pub fn take_queued(stories_dir: &Path) -> Option<usize> {
+    // a request someone else took first is skipped
+    queue_entries(stories_dir)
+        .into_iter()
+        .find_map(|(file, n)| std::fs::remove_file(file).ok().map(|()| n))
+}
+
+/// The story a run in `dir` is recording this moment, from its stage
+/// ("recording story 2: …").
+pub fn recording_story(dir: &Path) -> Option<usize> {
+    if !is_running(dir) {
+        return None;
+    }
+    read_stage(dir)?
+        .strip_prefix("recording story ")?
+        .split_once(':')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// The stories a story run in `dir` was started for (none for any other run).
+pub fn run_stories(dir: &Path) -> Vec<usize> {
+    std::fs::read_to_string(dir.join(ORDER))
+        .ok()
+        .and_then(|t| serde_json::from_str::<CaptureOrder>(&t).ok())
+        .and_then(|o| match o.req.job {
+            Job::Story { numbers, .. } => Some(numbers),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Whether a capture is running for this evidence folder: its runner is
