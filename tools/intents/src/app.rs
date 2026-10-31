@@ -79,6 +79,11 @@ pub struct ChatState {
     pub scroll: u16,
     /// Model chosen in the picker, if the provider offers any.
     pub model: Option<String>,
+    /// While a resumed turn runs: the whole-context prompt to start again
+    /// with if the conversation cannot be resumed.
+    pub fresh: Option<String>,
+    /// A stories-only chat (`d` in the Stories section).
+    pub stories_only: bool,
 }
 
 /// What the agent picker is choosing right now.
@@ -125,7 +130,24 @@ pub struct PendingChat {
     pub intent: Intent,
     pub selection: Option<String>,
     pub from_editor: bool,
+    /// A first message the chat sends on its own (with the seed).
+    pub ask: Option<String>,
+    /// Drafts the Stories section alone: applying replaces only that section,
+    /// and the intent's polish conversation is left alone.
+    pub stories: bool,
 }
+
+/// A story in the detail view: its mark, `<n>. <name> · <state>`, and its
+/// kept video.
+struct StoryRow {
+    number: usize,
+    mark: &'static str,
+    label: String,
+    video: Option<PathBuf>,
+}
+
+/// What the chat asks once the last open question of a feature or bug is answered.
+const DRAFT_STORIES: &str = "Every open question has its answer now: draft the stories.";
 
 pub enum Pending {
     OverwriteSave,
@@ -427,6 +449,7 @@ pub struct App {
     /// section and stays when focus leaves for the tree or the description.
     open: Pane,
     description_scroll: u16,
+    decisions_scroll: u16,
     /// mtime of our own binary at startup; a newer one on disk means a rebuild
     /// is waiting for a restart of the slot.
     pub binary_stamp: Option<std::time::SystemTime>,
@@ -438,6 +461,7 @@ pub struct App {
     artifacts_selected: usize,
     evidence_selected: usize,
     missing_selected: usize,
+    stories_selected: usize,
     follow_ups_selected: usize,
     prs_selected: usize,
     demos_selected: usize,
@@ -521,7 +545,9 @@ fn pane_name(p: Pane) -> &'static str {
         Pane::Description => "description",
         Pane::Preconditions => "preconditions",
         Pane::Criteria => "criteria",
+        Pane::Stories => "stories",
         Pane::Questions => "questions",
+        Pane::Decisions => "decisions",
         Pane::Artifacts => "artifacts",
         Pane::Evidence => "evidence",
         Pane::Missing => "missing",
@@ -534,7 +560,12 @@ fn pane_name(p: Pane) -> &'static str {
 impl App {
     pub fn new(cfg: Config, dirs: Dirs) -> anyhow::Result<Self> {
         let store = Store::open(&cfg.root)?;
-        let tree = store.scan()?.scoped(cfg.scope.as_deref());
+        let (tree, left_out) = visible_tree(&store, &cfg, &dirs)?;
+        let notice = cfg
+            .storage_block
+            .clone()
+            .or(left_out)
+            .or_else(|| cfg.notice.clone());
         let mut app = Self {
             exit_on_browse: false,
             store,
@@ -548,13 +579,14 @@ impl App {
             screen: Screen::Browse,
             editor: TextArea::default(),
             editing: None,
-            message: None,
+            message: notice,
             provider_env: Vec::new(),
             herdr_env: Vec::new(),
             parked_chat: None,
             focus: Pane::Tree,
             open: Pane::Criteria,
             description_scroll: 0,
+            decisions_scroll: 0,
             binary_stamp: binary_mtime(),
             newer_build: false,
             ticks: 0,
@@ -564,6 +596,7 @@ impl App {
             artifacts_selected: 0,
             evidence_selected: 0,
             missing_selected: 0,
+            stories_selected: 0,
             follow_ups_selected: 0,
             prs_selected: 0,
             demos_selected: 0,
@@ -1661,7 +1694,7 @@ impl App {
             KeyCode::Char('+') => self.open_areas_input(),
             KeyCode::Char('u') => self.undo_reconcile(),
             // the card view says nothing about where an intent belongs
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !self.refuse_in_blocked_space() => {
                 self.screen = Screen::KindPick {
                     group: None,
                     follow_up: None,
@@ -1725,7 +1758,38 @@ impl App {
 
     /// The intent tree as this workspace sees it.
     fn scan(&self) -> anyhow::Result<Group> {
-        Ok(self.store.scan()?.scoped(self.cfg.scope.as_deref()))
+        Ok(visible_tree(&self.store, &self.cfg, &self.dirs)?.0)
+    }
+
+    /// True (and says why) when a move's destination, typed from the root,
+    /// lies in a space whose storage the tool cannot write to yet.
+    fn refuse_blocked_target(&mut self, value: &str) -> bool {
+        let Some(first) = Path::new(value.trim())
+            .components()
+            .find(|c| matches!(c, std::path::Component::Normal(_)))
+        else {
+            return false;
+        };
+        let space = first.as_os_str().to_string_lossy();
+        match crate::space::storage_block(&self.dirs, &space) {
+            Some(why) => {
+                self.message = Some(why);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True (and says why) when this space's storage is not one the tool can
+    /// write to yet: nothing is added or created anywhere else instead.
+    fn refuse_in_blocked_space(&mut self) -> bool {
+        match self.cfg.storage_block.clone() {
+            Some(why) => {
+                self.message = Some(why);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Where "the top level" is: the workspace's group, or the root.
@@ -1769,6 +1833,7 @@ impl App {
 
     fn reset_pane_cursors(&mut self) {
         self.description_scroll = 0;
+        self.decisions_scroll = 0;
         self.preconditions_selected = 0;
         self.criteria_selected = 0;
         self.question_selected = 0;
@@ -1986,7 +2051,9 @@ impl App {
         if matches!(
             self.focus,
             Pane::Preconditions
+                | Pane::Decisions
                 | Pane::Criteria
+                | Pane::Stories
                 | Pane::Demos
                 | Pane::Questions
                 | Pane::PullRequests
@@ -2070,31 +2137,35 @@ impl App {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Description,
-                    Pane::Description => Pane::Preconditions,
-                    Pane::Preconditions => Pane::Criteria,
+                    Pane::Description => Pane::Questions,
+                    Pane::Questions => Pane::Decisions,
+                    Pane::Decisions => Pane::Preconditions,
+                    Pane::Preconditions => Pane::Stories,
+                    Pane::Stories => Pane::Criteria,
                     Pane::Criteria => Pane::Demos,
-                    Pane::Demos => Pane::Questions,
-                    Pane::Questions => Pane::PullRequests,
-                    Pane::PullRequests => Pane::Missing,
+                    Pane::Demos => Pane::Artifacts,
+                    Pane::Artifacts => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Evidence,
+                    Pane::Evidence => Pane::Missing,
                     Pane::Missing => Pane::FollowUps,
-                    Pane::FollowUps => Pane::Artifacts,
-                    Pane::Artifacts => Pane::Evidence,
-                    Pane::Evidence => Pane::Tree,
+                    Pane::FollowUps => Pane::Tree,
                 };
                 return Flow::Continue;
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Pane::Tree => Pane::Evidence,
-                    Pane::Evidence => Pane::Artifacts,
-                    Pane::Artifacts => Pane::FollowUps,
+                    Pane::Tree => Pane::FollowUps,
                     Pane::FollowUps => Pane::Missing,
-                    Pane::Missing => Pane::PullRequests,
-                    Pane::PullRequests => Pane::Questions,
-                    Pane::Questions => Pane::Demos,
+                    Pane::Missing => Pane::Evidence,
+                    Pane::Evidence => Pane::PullRequests,
+                    Pane::PullRequests => Pane::Artifacts,
+                    Pane::Artifacts => Pane::Demos,
                     Pane::Demos => Pane::Criteria,
-                    Pane::Criteria => Pane::Preconditions,
-                    Pane::Preconditions => Pane::Description,
+                    Pane::Criteria => Pane::Stories,
+                    Pane::Stories => Pane::Preconditions,
+                    Pane::Preconditions => Pane::Decisions,
+                    Pane::Decisions => Pane::Questions,
+                    Pane::Questions => Pane::Description,
                     Pane::Description => Pane::Tree,
                 };
                 return Flow::Continue;
@@ -2167,7 +2238,7 @@ impl App {
                 }
                 _ => {}
             },
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if !self.refuse_in_blocked_space() => {
                 let group = (!self.rows.is_empty()).then(|| self.selected_group_dir());
                 self.screen = Screen::KindPick {
                     group,
@@ -2178,7 +2249,7 @@ impl App {
             KeyCode::Char('E') => self.capture_again(),
             KeyCode::Char('X') => self.check_now(),
             KeyCode::Char('F') => self.new_follow_up(),
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') if !self.refuse_in_blocked_space() => {
                 let parent = self.selected_group_dir();
                 self.screen = Screen::Input {
                     label: "new group".into(),
@@ -2274,6 +2345,8 @@ impl App {
                         intent: it,
                         selection: None,
                         from_editor: false,
+                        ask: None,
+                        stories: false,
                     });
                 }
             }
@@ -2347,6 +2420,20 @@ impl App {
             return Flow::Continue;
         }
         match self.focus {
+            Pane::Decisions => match k.code {
+                KeyCode::Esc => self.focus = Pane::Tree,
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
+                    self.decisions_scroll = self
+                        .decisions_scroll
+                        .saturating_add(if k.code == KeyCode::PageDown { 5 } else { 1 })
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
+                    self.decisions_scroll = self
+                        .decisions_scroll
+                        .saturating_sub(if k.code == KeyCode::PageUp { 5 } else { 1 })
+                }
+                _ => {}
+            },
             Pane::Description => match k.code {
                 KeyCode::Esc => self.focus = Pane::Tree,
                 KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
@@ -2487,6 +2574,56 @@ impl App {
                             let path = path.clone();
                             self.select_path(&path);
                             self.focus = Pane::Tree;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Pane::Stories => {
+                let rows = self.story_rows(&it);
+                let last = rows.len().saturating_sub(1);
+                let selected = self.stories_selected.min(last);
+                let video = rows.get(selected).and_then(|r| r.video.clone());
+                let number = rows.get(selected).map(|r| r.number);
+                match k.code {
+                    KeyCode::Esc => self.focus = Pane::Tree,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.stories_selected = (selected + 1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.stories_selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Enter
+                    | KeyCode::Char('o')
+                    | KeyCode::Char('c')
+                    | KeyCode::Char('Y')
+                    | KeyCode::Char('O') => match video {
+                        Some(f) => match k.code {
+                            KeyCode::Char('c') => self.copy_file(&f),
+                            KeyCode::Char('Y') => self.copy_path(&f),
+                            KeyCode::Char('O') => self.reveal_file(&f),
+                            _ => self.open_in_chrome(&f),
+                        },
+                        None => self.message = Some("no video for this story yet".into()),
+                    },
+                    KeyCode::Char('r') => {
+                        if let Some(n) = number {
+                            self.record_story(&it, n);
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if matches!(it.fm.kind.as_str(), "enhancement" | "issue") {
+                            self.polish(PendingChat {
+                                intent: it.clone(),
+                                selection: None,
+                                from_editor: false,
+                                ask: None,
+                                stories: true,
+                            });
+                        } else {
+                            self.message = Some(
+                                "stories are for features and bugs: K changes the kind".into(),
+                            );
                         }
                     }
                     _ => {}
@@ -2818,6 +2955,16 @@ impl App {
                                         Ok(()) => {
                                             self.message = Some("answer recorded".into());
                                             self.rescan();
+                                            // the last answer: the stories can be drafted now
+                                            if stories_due(&it) {
+                                                self.polish(PendingChat {
+                                                    intent: it.clone(),
+                                                    selection: None,
+                                                    from_editor: false,
+                                                    ask: Some(DRAFT_STORIES.into()),
+                                                    stories: false,
+                                                });
+                                            }
                                         }
                                         Err(e) => self.message = Some(format!("save failed: {e}")),
                                     }
@@ -2850,6 +2997,8 @@ impl App {
                         intent: it,
                         selection: sel,
                         from_editor: true,
+                        ask: None,
+                        stories: false,
                     });
                 }
             }
@@ -3052,6 +3201,7 @@ impl App {
             .filter(|r| !r.is_empty());
         let guide = crate::config::interview_guide(&self.dirs, kind).unwrap_or_default();
         let mut iv = crate::interview::Interview::new(kind, home_rel, self.group_paths(), guide);
+        iv.personas = self.story_personas(self.current_repo());
         // a follow-up: the agent sees the original, as data
         iv.context = follow_up
             .as_ref()
@@ -3069,6 +3219,7 @@ impl App {
             input: String::new(),
             provider: last.provider,
             model: last.model,
+            resumed: false,
             conv_id: None,
             folder,
             fallback,
@@ -3106,6 +3257,7 @@ impl App {
             return;
         }
         let resumable = st.conv_id.is_some() && !spec.resume.is_empty();
+        st.resumed = resumable;
         let prompt = st.iv.prompt(step, resumable, &message);
         match Turn::start(
             &spec,
@@ -3152,6 +3304,14 @@ impl App {
     /// repo the tool runs in (as a save records it).
     fn current_repo(&self) -> Option<PathBuf> {
         self.capture_repo.clone().or_else(crate::send::capture_repo)
+    }
+
+    /// The run guide's Stories section for `repo`'s runs, when it has one:
+    /// the personas stories may use.
+    fn story_personas(&self, repo: Option<PathBuf>) -> Option<String> {
+        let run_repo = self.run_repo_for(repo).ok()?;
+        let guide = crate::capture::read_guide(&run_repo).ok()?;
+        crate::capture::guide_stories(&guide).map(|s| s.text)
     }
 
     /// Why capture cannot run here, if it cannot.
@@ -3324,8 +3484,7 @@ impl App {
                 let _ = Store::update_meta(&it.path, |fm| fm.fold_check.clear());
                 continue;
             }
-            if crate::capture::is_running(&crate::check::checks_dir(&it))
-                || crate::capture::is_running(&self.evidence_home(&it))
+            if self.run_of(&it).is_some()
                 || !self
                     .fold_check_tried
                     .insert((it.path.clone(), keys.clone()))
@@ -3352,8 +3511,7 @@ impl App {
                 || self.reconcile_jobs.contains_key(&original.path)
                 || self.reconcile_failed.contains_key(&original.path)
                 || !self.searches_answered(&original)
-                || crate::capture::is_running(&crate::check::checks_dir(&original))
-                || crate::capture::is_running(&self.evidence_home(&original))
+                || self.run_of(&original).is_some()
                 || self.check_pending(&original)
             {
                 continue;
@@ -3447,6 +3605,9 @@ impl App {
         let home = self.evidence_home(it);
         if crate::capture::is_running(&home) {
             return Err("a capture of it is running: check when it ends".into());
+        }
+        if crate::capture::is_running(&crate::capture::stories_dir(it)) {
+            return Err("recording its stories: check when it ends".into());
         }
         let group_rel = it
             .path
@@ -3593,9 +3754,10 @@ impl App {
                 continue;
             }
             let busy = all.iter().any(|o| {
-                crate::capture::is_running(&crate::check::checks_dir(o))
+                (crate::capture::is_running(&crate::check::checks_dir(o))
+                    || crate::capture::is_running(&crate::capture::stories_dir(o)))
                     && (o.fm.repo == it.fm.repo || self.share_a_fixed_app(o, it))
-            });
+            }) || crate::capture::is_running(&crate::capture::stories_dir(it));
             if busy {
                 continue;
             }
@@ -3712,12 +3874,17 @@ impl App {
             self.message = Some("evidence is for bugs".into());
             return;
         }
-        if crate::capture::is_running(&self.evidence_home(&it))
-            || crate::capture::is_running(&crate::check::checks_dir(&it))
-        {
-            self.message =
-                Some("capturing already: the Evidence section shows how far it got".into());
-            return;
+        match self.run_of(&it) {
+            Some("recording its stories") => {
+                self.message = Some("recording its stories: capture when it ends".into());
+                return;
+            }
+            Some(_) => {
+                self.message =
+                    Some("capturing already: the Evidence section shows how far it got".into());
+                return;
+            }
+            None => {}
         }
         let repo = match self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo())) {
             Ok(repo) => repo,
@@ -3920,6 +4087,271 @@ impl App {
                 "could not copy the file".to_string()
             },
         );
+    }
+
+    /// `O`: shows the file in Finder (its folder in the file manager elsewhere).
+    fn reveal_file(&mut self, file: &Path) {
+        let ok = if cfg!(target_os = "macos") {
+            self.launch(
+                "OPEN_BIN_PATH",
+                "open",
+                &["-R".as_ref(), file.as_os_str()],
+                None,
+            )
+        } else {
+            let dir = file.parent().unwrap_or(file);
+            self.launch("OPEN_BIN_PATH", "xdg-open", &[dir.as_os_str()], None)
+        };
+        self.message = Some(if ok {
+            format!("showing {}", file.display())
+        } else {
+            format!("could not show {}", file.display())
+        });
+    }
+
+    /// Everything known about `it` beyond its own text, for drafting its
+    /// stories: where it is filed, the specs, plans and ADRs it links (only
+    /// files inside its repo, each capped), its pull requests, the latest
+    /// check, a bug's captured evidence, and the end of its conversation.
+    fn story_details(&self, it: &Intent) -> Vec<(String, String)> {
+        const DOC: usize = 24_000;
+        const DOCS: usize = 72_000;
+        const CHAT: usize = 12_000;
+        let cut_end = |text: &str, cap: usize| -> String {
+            if text.len() <= cap {
+                return text.to_string();
+            }
+            let mut at = cap;
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            format!("{}\n[… cut]", &text[..at])
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        let group = self.rel(it.path.parent().unwrap_or(self.store.root()));
+        if !group.as_os_str().is_empty() {
+            out.push(("Where it is filed".into(), group.display().to_string()));
+        }
+        // linked documents go to the agent's provider: `repo:` is part of the
+        // intent (any agent can rewrite it), so it must be a real git repository,
+        // never the home folder or `/`, and a link must be a relative path to a
+        // Markdown or text file, with no `..` and no hidden part
+        let home = dirs_home().and_then(|h| std::fs::canonicalize(h).ok());
+        let repo = it
+            .fm
+            .repo
+            .as_deref()
+            .filter(|r| r.join(".git").exists())
+            .and_then(|r| std::fs::canonicalize(r).ok())
+            .filter(|r| r.parent().is_some() && Some(r) != home.as_ref());
+        let safe_link = |target: &str| {
+            let rel = Path::new(target.trim());
+            !target.trim().starts_with('~')
+                && rel.is_relative()
+                && rel.components().all(|c| match c {
+                    std::path::Component::Normal(part) => !part.to_string_lossy().starts_with('.'),
+                    std::path::Component::CurDir => true,
+                    _ => false,
+                })
+                && matches!(
+                    rel.extension().and_then(|e| e.to_str()),
+                    Some("md" | "markdown" | "txt")
+                )
+        };
+        let mut budget = DOCS;
+        for a in crate::store::artifacts(&it.body) {
+            if budget == 0
+                || !matches!(a.kind.to_lowercase().as_str(), "spec" | "plan" | "adr")
+                || !safe_link(&a.target)
+            {
+                continue;
+            }
+            let Ok(file) = std::fs::canonicalize(self.resolve_artifact_path(it, &a.target)) else {
+                continue;
+            };
+            if !repo.as_ref().is_some_and(|r| file.starts_with(r)) || !file.is_file() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let text = cut_end(&text, DOC.min(budget));
+            budget = budget.saturating_sub(text.len());
+            out.push((format!("The linked {} {}", a.kind, a.target), text));
+        }
+        let prs: Vec<String> = self
+            .pr_rows(it)
+            .iter()
+            .map(|r| {
+                format!(
+                    "- {} {}: {}",
+                    r.target,
+                    format!("{:?}", r.state).to_lowercase(),
+                    r.title.as_deref().unwrap_or("")
+                )
+            })
+            .collect();
+        if !prs.is_empty() {
+            out.push(("Pull requests".into(), prs.join("\n")));
+        }
+        if let Some(rec) = crate::check::read_check(&crate::check::checks_dir(it)) {
+            use crate::check::Verdict;
+            let lines: Vec<String> = rec
+                .results
+                .iter()
+                .map(|r| {
+                    let (word, why) = match &r.verdict {
+                        Verdict::Confirmed(t) => ("confirmed", t),
+                        Verdict::Fails(t) => ("fails", t),
+                        Verdict::Missing(t) => ("missing", t),
+                        Verdict::CantCheck(t) => ("can't check", t),
+                    };
+                    format!("- criterion {} ({}): {word}: {why}", r.number, r.text)
+                })
+                .collect();
+            out.push(("The latest completion check".into(), lines.join("\n")));
+        }
+        let evidence: Vec<String> = self
+            .evidence_rows(it)
+            .into_iter()
+            .map(|r| format!("- {}", r.label))
+            .collect();
+        if !evidence.is_empty() {
+            out.push(("Captured evidence".into(), evidence.join("\n")));
+        }
+        if let Ok(chat) = std::fs::read_to_string(it.transcript_path())
+            && !chat.trim().is_empty()
+        {
+            let start = chat.len().saturating_sub(CHAT);
+            let mut at = start;
+            while !chat.is_char_boundary(at) {
+                at += 1;
+            }
+            out.push((
+                "The polish conversation (its end)".into(),
+                chat[at..].to_string(),
+            ));
+        }
+        out
+    }
+
+    /// Why a run of `it` cannot start now: a check, a capture or a story
+    /// recording of it is running.
+    fn run_of(&self, it: &Intent) -> Option<&'static str> {
+        if crate::capture::is_running(&crate::capture::stories_dir(it)) {
+            Some("recording its stories")
+        } else if crate::capture::is_running(&crate::check::checks_dir(it)) {
+            Some("checking it")
+        } else if crate::capture::is_running(&self.evidence_home(it)) {
+            Some("capturing it")
+        } else {
+            None
+        }
+    }
+
+    /// The intent's stories as the detail view lists them, with each one's
+    /// last take and its video when one is kept.
+    fn story_rows(&self, it: &Intent) -> Vec<StoryRow> {
+        use crate::capture::StoryOutcome;
+        let dir = crate::capture::stories_dir(it);
+        let checks = crate::check::checks_dir(it);
+        // a story job, or a check whose takes follow it on the same run
+        let recording = crate::capture::is_running(&dir)
+            || (crate::capture::is_running(&checks)
+                && crate::check::read_check(&checks)
+                    .is_some_and(|l| crate::check::passes(&l, &it.body)));
+        crate::store::stories(&it.body)
+            .iter()
+            .map(|s| {
+                let folder = dir.join(crate::store::story_folder(s));
+                let video = Some(folder.join("video.mp4")).filter(|v| v.is_file());
+                let earlier = if video.is_some() {
+                    " · earlier video kept"
+                } else {
+                    ""
+                };
+                let (mark, state) = if s.waits {
+                    ("…", crate::store::STORIES_WAIT.to_string())
+                } else if recording {
+                    ("●", "recording…".to_string())
+                } else {
+                    match crate::capture::read_story(&folder).map(|r| r.outcome) {
+                        Some(StoryOutcome::Kept) if video.is_some() => ("▶", "video".to_string()),
+                        Some(StoryOutcome::NotShown(ns)) => {
+                            let list: Vec<String> = ns.iter().map(|n| n.to_string()).collect();
+                            let which = if ns.len() == 1 {
+                                "criterion"
+                            } else {
+                                "criteria"
+                            };
+                            (
+                                "✗",
+                                format!("{which} {} didn't show{earlier}", list.join(", ")),
+                            )
+                        }
+                        Some(StoryOutcome::Failed(why)) => {
+                            ("!", format!("couldn't record: {why}{earlier}"))
+                        }
+                        _ => ("○", "not recorded yet".to_string()),
+                    }
+                };
+                StoryRow {
+                    number: s.number,
+                    mark,
+                    label: format!("{}. {} · {state}", s.number, s.name),
+                    video,
+                }
+            })
+            .collect()
+    }
+
+    /// `r` on a story: records it again, once the completion check has passed.
+    fn record_story(&mut self, it: &Intent, number: usize) {
+        let passed = crate::check::read_check(&crate::check::checks_dir(it))
+            .is_some_and(|l| crate::check::passes(&l, &it.body));
+        if !passed {
+            self.message = Some("the completion check hasn't passed yet".into());
+            return;
+        }
+        self.message = Some(match self.start_story(it, number) {
+            Ok(()) => format!("recording story {number}: its row shows how it went"),
+            Err(e) => format!("record: {e}"),
+        });
+    }
+
+    fn start_story(&mut self, it: &Intent, number: usize) -> Result<(), String> {
+        use crate::capture::{Phase, Shot};
+        let repo = self.run_repo_for(it.fm.repo.clone().or_else(|| self.current_repo()))?;
+        let stories_dir = crate::capture::stories_dir(it);
+        if let Some(what) = self.run_of(it) {
+            return Err(format!("{what}: record when it ends"));
+        }
+        std::fs::create_dir_all(&stories_dir).map_err(|e| e.to_string())?;
+        let group_rel = it
+            .path
+            .parent()
+            .and_then(|p| p.strip_prefix(self.store.root()).ok())
+            .map(|p| p.display().to_string())
+            .filter(|s| !s.is_empty());
+        let req = crate::capture::CaptureRequest {
+            repo,
+            group_rel,
+            stem: it.polish_name(),
+            phase: Phase::Before,
+            shot: Shot::Video,
+            intent: format!("{}\n\n{}", it.fm.title, it.body),
+            evidence: stories_dir.clone(),
+            before: None,
+            n: (chrono::Local::now().timestamp() % 1_000_000) as u32,
+            merged: Vec::new(),
+            job: crate::capture::Job::Story {
+                numbers: vec![number],
+                intent_path: it.path.clone(),
+                root: self.store.root().to_path_buf(),
+                stories_dir,
+            },
+        };
+        self.launch_capture(req)
     }
 
     /// `Y`: copies the path (pbcopy on macOS; the terminal's clipboard over SSH).
@@ -4389,6 +4821,17 @@ impl App {
         if let Some(result) = done {
             st.turn = None;
             match result {
+                // a conversation that cannot resume (it ran in a folder that
+                // moved, or the provider forgot it) starts once more, fresh
+                Err(_) if st.resumed => {
+                    st.conv_id = None;
+                    // the failed turn's reply, whatever it streamed
+                    if st.transcript.last().is_some_and(|(who, _)| who == "agent") {
+                        st.transcript.pop();
+                    }
+                    let (step, message) = (st.step, st.message.clone());
+                    self.start_interview_turn(&mut st, step, message, false);
+                }
                 Err(e) => st.awaiting = Awaiting::Retry(e),
                 Ok(reply) => self.interview_reply(&mut st, reply),
             }
@@ -4718,12 +5161,36 @@ impl App {
             intent,
             selection,
             from_editor,
+            ask,
+            stories,
         } = pending;
         self.remember_agent(provider, model.clone());
-        let conv_id = intent.fm.conversations.get(provider).cloned();
+        // a stories-only chat starts its own conversation and keeps it to itself
+        let conv_id = if stories {
+            None
+        } else {
+            intent.fm.conversations.get(provider).cloned()
+        };
         let tpl = template(&self.dirs, &intent.fm.kind, true)
             .unwrap_or_else(|_| "Refine this intent.".to_string());
-        let seed = seed_prompt(&tpl, &intent.body, selection.as_deref(), &intent.fm.kind);
+        let personas = self.story_personas(intent.fm.repo.clone());
+        let seed = if stories {
+            crate::conversation::stories_prompt(
+                &intent.fm.title,
+                &intent.body,
+                &intent.fm.kind,
+                personas.as_deref(),
+                &self.story_details(&intent),
+            )
+        } else {
+            seed_prompt(
+                &tpl,
+                &intent.body,
+                selection.as_deref(),
+                &intent.fm.kind,
+                personas.as_deref(),
+            )
+        };
         let mut st = ChatState {
             turn: None,
             transcript: Vec::new(),
@@ -4738,9 +5205,12 @@ impl App {
             from_editor,
             scroll: 0,
             model,
+            fresh: None,
+            stories_only: stories,
         };
         self.select_path(&intent.path);
         let shown = match selection.as_deref() {
+            _ if stories => "draft the stories".to_string(),
             Some(s) => format!(
                 "polish (focus: {})",
                 s.lines()
@@ -4752,14 +5222,39 @@ impl App {
             ),
             None => "polish".to_string(),
         };
-        self.start_turn(&mut st, &intent, &seed, &shown);
+        // a chat opened to ask something sends it with the seed
+        let (first, shown) = match ask {
+            Some(a) => (format!("{seed}\n{a}\n"), a),
+            None => (seed.clone(), shown),
+        };
+        self.start_turn(&mut st, &intent, &first, &shown, Some(first.clone()));
         self.screen = Screen::Chat(st);
     }
 
-    fn start_turn(&mut self, st: &mut ChatState, intent: &Intent, prompt: &str, shown: &str) {
+    /// Starts the chat's turn on `prompt`; `fresh` is what to send instead
+    /// if a resumed conversation turns out not to resume.
+    fn start_turn(
+        &mut self,
+        st: &mut ChatState,
+        intent: &Intent,
+        prompt: &str,
+        shown: &str,
+        fresh: Option<String>,
+    ) {
+        st.fresh = st.conv_id.as_ref().and(fresh);
+        if self.launch_turn(st, intent, prompt) {
+            st.transcript.push(("user".into(), shown.to_string()));
+            st.transcript.push(("agent".into(), String::new()));
+            let _ = Store::append_transcript(intent, "user", shown);
+        }
+    }
+
+    /// Runs the provider on `prompt` in the intent's polish folder; false,
+    /// with the reason as the hint, when it cannot start.
+    fn launch_turn(&mut self, st: &mut ChatState, intent: &Intent, prompt: &str) -> bool {
         let Some(mut spec) = self.cfg.providers.get(&st.provider).cloned() else {
             st.hint = Some(format!("unknown provider `{}`", st.provider));
-            return;
+            return false;
         };
         if let Some(m) = &st.model {
             spec.extra.extend([spec.model_flag.clone(), m.clone()]);
@@ -4768,7 +5263,7 @@ impl App {
         let cwd = polish_cwd(self.store.root(), &intent.polish_name());
         if let Err(e) = std::fs::create_dir_all(&cwd) {
             st.hint = Some(format!("cannot create {}: {e}", cwd.display()));
-            return;
+            return false;
         }
         match Turn::start(
             &spec,
@@ -4778,15 +5273,16 @@ impl App {
             &self.provider_env,
         ) {
             Ok(turn) => {
-                st.transcript.push(("user".into(), shown.to_string()));
-                st.transcript.push(("agent".into(), String::new()));
                 st.latest = None;
                 st.hint = None;
                 st.scroll = 0;
                 st.turn = Some(turn);
-                let _ = Store::append_transcript(intent, "user", shown);
+                true
             }
-            Err(e) => st.hint = Some(format!("{e:#}")),
+            Err(e) => {
+                st.hint = Some(format!("{e:#}"));
+                false
+            }
         }
     }
 
@@ -4827,13 +5323,32 @@ impl App {
                             .map(|p| !p.resume.is_empty())
                             .unwrap_or(false);
                     let prompt = follow_up_prompt(&st.seed, &st.transcript, &text, resumable);
-                    self.start_turn(&mut st, &it, &prompt, &text);
+                    let fresh = follow_up_prompt(&st.seed, &st.transcript, &text, false);
+                    self.start_turn(&mut st, &it, &prompt, &text, Some(fresh));
                 }
                 self.screen = Screen::Chat(st);
             }
             // apply and dismiss live on Ctrl so a message starting with "a" or "d" is just typed (C1)
             (KeyCode::Char('a'), true) if st.turn.is_none() => {
                 match st.latest.as_ref().and_then(|r| r.proposal.clone()) {
+                    // stories only: the intent as it is now, with its Stories section replaced
+                    Some(proposal) if st.stories_only => match Store::load(&st.intent_path) {
+                        Ok(it) => {
+                            let proposal = crate::store::replace_stories(&it.body, &proposal);
+                            self.parked_chat = Some(st);
+                            self.screen = Screen::Diff {
+                                proposal,
+                                questions: Vec::new(),
+                                title: None,
+                                kind: None,
+                                scroll: 0,
+                            };
+                        }
+                        Err(e) => {
+                            st.hint = Some(format!("cannot read the intent: {e:#}"));
+                            self.screen = Screen::Chat(st);
+                        }
+                    },
                     Some(proposal) => {
                         let questions = st
                             .latest
@@ -4953,7 +5468,8 @@ impl App {
         let path = st.intent_path.clone();
         let opened = st.opened_stamp;
         let provider = st.provider.clone();
-        let conv_id = st.conv_id.clone();
+        // a stories-only chat's conversation is not the intent's polish one
+        let conv_id = st.conv_id.clone().filter(|_| !st.stories_only);
         let mut it = match Store::load(&path) {
             Ok(it) => it,
             Err(e) => {
@@ -5292,6 +5808,7 @@ impl App {
                     }
                 }
             }
+            InputAction::MoveTo if self.refuse_blocked_target(value) => {}
             InputAction::MoveTo => {
                 if let Some(it) = self.selected_intent().cloned() {
                     match self.store.move_intent(&it, Path::new(value)) {
@@ -5375,6 +5892,7 @@ impl App {
                     .unwrap_or(1);
                 *self.list_selected(pane) = linked.saturating_sub(1);
             }
+            InputAction::MoveGroup { .. } if self.refuse_blocked_target(value) => {}
             InputAction::MoveGroup { group } => {
                 let rel = self.rel(&group);
                 match self.store.move_group(&rel, Path::new(value)) {
@@ -5463,6 +5981,7 @@ impl App {
         let Some(turn) = st.turn.as_ref() else { return };
         let path = st.intent_path.clone();
         let mut finished = false;
+        let mut retry: Option<String> = None;
         while let Some(msg) = turn.try_recv() {
             match msg {
                 TurnMsg::Delta(d) => {
@@ -5472,11 +5991,14 @@ impl App {
                 }
                 TurnMsg::ConversationId(id) => {
                     st.conv_id = Some(id.clone());
-                    // bookkeeping only: reload, record, no `updated` bump (C2)
-                    let provider = st.provider.clone();
-                    let _ = Store::update_meta(&path, |fm| {
-                        fm.conversations.insert(provider, id);
-                    });
+                    // bookkeeping only: reload, record, no `updated` bump (C2);
+                    // a stories-only chat never replaces the polish conversation
+                    if !st.stories_only {
+                        let provider = st.provider.clone();
+                        let _ = Store::update_meta(&path, |fm| {
+                            fm.conversations.insert(provider, id);
+                        });
+                    }
                 }
                 TurnMsg::Finished(reply) => {
                     if let Ok(it) = Store::load(&path)
@@ -5493,13 +6015,39 @@ impl App {
                     finished = true;
                 }
                 TurnMsg::Failed(e) => {
-                    st.hint = Some(e);
+                    match st.fresh.take() {
+                        Some(prompt) => retry = Some(prompt),
+                        None => st.hint = Some(e),
+                    }
                     finished = true;
                 }
             }
         }
         if finished {
             st.turn = None;
+            st.fresh = None;
+            if let Some(prompt) = retry {
+                // the conversation cannot resume (it ran in a folder that
+                // moved, or the provider forgot it): forget it, start fresh
+                st.conv_id = None;
+                // the failed turn's reply, whatever it streamed
+                if st.transcript.last().is_some_and(|(who, _)| who == "agent") {
+                    st.transcript.pop();
+                }
+                let provider = st.provider.clone();
+                let _ = Store::update_meta(&path, |fm| {
+                    fm.conversations.remove(&provider);
+                });
+                if let Screen::Chat(mut st) = std::mem::replace(&mut self.screen, Screen::Browse) {
+                    if let Ok(it) = Store::load(&path)
+                        && self.launch_turn(&mut st, &it, &prompt)
+                    {
+                        st.transcript.push(("agent".into(), String::new()));
+                    }
+                    self.screen = Screen::Chat(st);
+                }
+                return;
+            }
             self.rescan_keep_screen();
         }
     }
@@ -5814,7 +6362,9 @@ impl App {
                 self.list_total
             ),
         };
-        let empty = if self.list_total == 0 {
+        let empty = if let Some(why) = &self.cfg.storage_block {
+            why.as_str()
+        } else if self.list_total == 0 {
             "no intents yet: v back to the tree, then a adds one"
         } else {
             "nothing matches this filter: f changes it"
@@ -6027,6 +6577,11 @@ impl App {
                         .into_iter()
                         .map(|(m, t, _)| (m, t))
                         .collect();
+                    let stories: Vec<(String, String)> = self
+                        .story_rows(intent)
+                        .into_iter()
+                        .map(|r| (r.mark.to_string(), r.label))
+                        .collect();
                     let missing: Vec<(String, String)> = self
                         .missing_rows(intent)
                         .into_iter()
@@ -6038,6 +6593,7 @@ impl App {
                             attachments: &attachments,
                             focus: self.focus,
                             description_scroll: self.description_scroll,
+                            decisions_scroll: self.decisions_scroll,
                             preconditions_selected: self.preconditions_selected,
                             criteria_selected: self.criteria_selected,
                             question_selected: self.question_selected,
@@ -6055,6 +6611,8 @@ impl App {
                             missing_selected: self.missing_selected,
                             follow_ups: &follow_ups,
                             follow_ups_selected: self.follow_ups_selected,
+                            stories: &stories,
+                            stories_selected: self.stories_selected,
                         },
                         right,
                         buf,
@@ -6114,6 +6672,8 @@ impl App {
                 (None, Pane::Missing) => "Missing items: j/k choose · Enter go to it · Esc tree".to_string(),
                 (None, Pane::FollowUps) => "Follow-ups: j/k choose · Enter go to it · F file another · Esc tree".to_string(),
                 (None, Pane::Questions) => "Questions: j/k choose · Enter answer · a add · Tab next pane · Esc tree".to_string(),
+                (None, Pane::Decisions) => "Decisions: j/k scroll · Esc tree".to_string(),
+                (None, Pane::Stories) => "Stories: j/k choose · d draft the stories · o play the video · c copy the file · Y copy its path · O show it in Finder · r record it again · Esc tree".to_string(),
                 (None, Pane::Evidence) => "Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again".to_string(),
                 (None, Pane::Artifacts) => "Artifacts: j/k choose · Enter read · o open outside · L link a found one · a add · Esc tree".to_string(),
                 (None, Pane::Demos) => "Demo Videos: j/k choose · Enter read the story · o play it · L link a found one · a add · Esc tree".to_string(),
@@ -6456,6 +7016,71 @@ fn title_hint(kind: &str) -> &'static str {
 /// `add` mode: popup asks for a title; otherwise title from args or stdin's first line, body = rest.
 /// `piped` is what arrived on stdin when it is not a terminal; the caller
 /// reads it, so this never blocks on an open stdin.
+/// A feature or bug whose questions are all answered and whose stories are
+/// missing or still wait for those answers.
+fn stories_due(it: &Intent) -> bool {
+    matches!(it.fm.kind.as_str(), "enhancement" | "issue") && it.open_questions() == 0 && {
+        let stories = crate::store::stories(&it.body);
+        stories.is_empty() || stories.iter().any(|s| s.waits)
+    }
+}
+
+/// The tree this run shows, and which top-level groups were left out.
+/// - A space whose storage is a placeholder (meta, remote) or broken shows
+///   nothing: its intents are not in this folder.
+/// - The whole tree (no space) leaves out each group whose space is set that way.
+fn visible_tree(
+    store: &Store,
+    cfg: &Config,
+    dirs: &Dirs,
+) -> anyhow::Result<(Group, Option<String>)> {
+    if cfg.storage_block.is_some() {
+        let empty = Group {
+            path: store.root().to_path_buf(),
+            name: String::new(),
+            groups: Vec::new(),
+            intents: Vec::new(),
+            broken: Vec::new(),
+        };
+        return Ok((empty.scoped(cfg.scope.as_deref()), None));
+    }
+    let mut tree = store.scan()?.scoped(cfg.scope.as_deref());
+    if cfg.scope.is_some() {
+        return Ok((tree, None));
+    }
+    // groups left out: those set to a placeholder storage, and those whose
+    // setting is broken, each named with its own reason
+    let mut placeholders: Vec<String> = Vec::new();
+    let mut broken: Vec<(String, Vec<String>)> = Vec::new();
+    tree.groups
+        .retain(|g| match crate::space::storage_for(dirs, &g.name) {
+            Ok(crate::space::Storage::Profile) => true,
+            Ok(_) => {
+                placeholders.push(g.name.clone());
+                false
+            }
+            Err(why) => {
+                match broken.iter_mut().find(|(w, _)| *w == why) {
+                    Some((_, names)) => names.push(g.name.clone()),
+                    None => broken.push((why, vec![g.name.clone()])),
+                }
+                false
+            }
+        });
+    let mut parts: Vec<String> = broken
+        .into_iter()
+        .map(|(why, names)| format!("{why} (left out: {})", names.join(", ")))
+        .collect();
+    if !placeholders.is_empty() {
+        parts.push(format!(
+            "left out: {}: storage not built yet",
+            placeholders.join(", ")
+        ));
+    }
+    let note = (!parts.is_empty()).then(|| parts.join(" · "));
+    Ok((tree, note))
+}
+
 pub fn add(
     cfg: Config,
     dirs: Dirs,
@@ -6463,6 +7088,9 @@ pub fn add(
     popup: bool,
     piped: Option<String>,
 ) -> anyhow::Result<()> {
+    if let Some(why) = &cfg.storage_block {
+        anyhow::bail!("{why}");
+    }
     let store = Store::open(&cfg.root)?;
     // the top of the workspace's group, or of the tree; there is no default group
     let group = cfg
@@ -6578,6 +7206,11 @@ mod tests {
     /// Two groups, three intents: Inbox/"In the inbox" (issue, 2 open questions),
     /// skoolscout/"Alpha" (idea), skoolscout/"Beta" (enhancement).
     fn setup(events: &str) -> Fx {
+        setup_with(events, |_| {})
+    }
+
+    /// `setup`, with the config adjusted before the app starts.
+    fn setup_with(events: &str, tune: impl FnOnce(&mut Config)) -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs {
             config: tmp.path().join("cfg"),
@@ -6586,6 +7219,7 @@ mod tests {
         let mut cfg = load_or_init(&dirs).unwrap();
         cfg.providers.insert("fake".into(), fake_spec());
         cfg.polish_provider = "fake".into();
+        tune(&mut cfg);
         let store = Store::open(&dirs.root).unwrap();
         store
             .create(
@@ -6629,6 +7263,193 @@ mod tests {
             app,
             log,
         }
+    }
+
+    #[test]
+    fn the_start_up_notice_is_shown() {
+        let fx = setup_with("agy.jsonl", |c| {
+            c.notice =
+                Some("moved your intents from /h/intents to /h/.helmsmith/intents/spaces".into())
+        });
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("moved your intents")),
+            "{:?}",
+            fx.app.message
+        );
+    }
+
+    const META_BLOCK: &str =
+        "meta storage is not built yet (storage = \"meta\" for space skoolscout in /c/spaces.toml)";
+
+    /// The fixture seen from the skoolscout space, whose storage is a placeholder.
+    fn blocked_space() -> Fx {
+        setup_with("agy.jsonl", |c| {
+            c.scope = Some("skoolscout".into());
+            c.storage_block = Some(META_BLOCK.into());
+        })
+    }
+
+    /// Everything on screen at `w`×`h`, row by row.
+    fn screen_text(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(Rect::new(0, 0, w, h), f.buffer_mut()))
+            .unwrap();
+        let buf = t.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_blocked_space_shows_why_and_no_intents() {
+        let mut fx = blocked_space();
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("meta storage is not built yet")),
+            "{:?}",
+            fx.app.message
+        );
+        let labels: Vec<String> = fx.app.view().rows.iter().map(|r| r.label.clone()).collect();
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("Alpha") || l.contains("Beta")),
+            "{labels:?}"
+        );
+        key(&mut fx.app, KeyCode::Char('v'));
+        fx.app.message = None;
+        let text = screen_text(&fx.app, 120, 20);
+        assert!(text.contains("meta storage is not built yet"), "{text}");
+    }
+
+    #[test]
+    fn a_blocked_space_creates_nothing() {
+        let mut fx = blocked_space();
+        let root = fx.app.store.root().to_path_buf();
+        let before = md_files(&root);
+        let groups = fs::read_dir(root.join("skoolscout")).unwrap().count();
+        key(&mut fx.app, KeyCode::Char('a'));
+        assert_eq!(fx.app.view().screen, "browse", "no add view");
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("not built yet"))
+        );
+        key(&mut fx.app, KeyCode::Char('n'));
+        assert_eq!(fx.app.view().screen, "browse", "no new group prompt");
+        assert_eq!(md_files(&root), before);
+        assert_eq!(
+            fs::read_dir(root.join("skoolscout")).unwrap().count(),
+            groups
+        );
+    }
+
+    #[test]
+    fn the_whole_tree_leaves_out_a_blocked_space() {
+        let fx = setup_with("agy.jsonl", |c| {
+            let cfg_dir = c.root.parent().unwrap().join("cfg");
+            fs::write(
+                cfg_dir.join("spaces.toml"),
+                "[spaces.skoolscout]\nstorage = \"remote\"\n",
+            )
+            .unwrap();
+        });
+        let labels: Vec<String> = fx.app.view().rows.iter().map(|r| r.label.clone()).collect();
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("skoolscout") || l.contains("Alpha")),
+            "{labels:?}"
+        );
+        assert!(labels.iter().any(|l| l.contains("Inbox")), "{labels:?}");
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("skoolscout")),
+            "{:?}",
+            fx.app.message
+        );
+    }
+
+    /// The fixture's whole tree, with `spaces.toml` holding `text`.
+    fn whole_tree_with_spaces(text: &'static str) -> Fx {
+        setup_with("agy.jsonl", move |c| {
+            let cfg_dir = c.root.parent().unwrap().join("cfg");
+            fs::write(cfg_dir.join("spaces.toml"), text).unwrap();
+        })
+    }
+
+    #[test]
+    fn a_broken_spaces_file_is_named_in_the_whole_tree() {
+        let fx = whole_tree_with_spaces("[spaces.x\nstorage = ");
+        let m = fx.app.message.clone().unwrap_or_default();
+        assert!(m.contains("spaces.toml"), "{m}");
+        assert!(!m.contains("not built yet"), "{m}");
+    }
+
+    #[test]
+    fn an_unknown_storage_word_is_named_in_the_whole_tree() {
+        let fx = whole_tree_with_spaces("[spaces.skoolscout]\nstorage = \"cloud\"\n");
+        let m = fx.app.message.clone().unwrap_or_default();
+        assert!(m.contains("cloud"), "{m}");
+        assert!(!m.contains("not built yet"), "{m}");
+    }
+
+    #[test]
+    fn moving_into_a_space_whose_storage_is_not_built_is_refused() {
+        let mut fx = whole_tree_with_spaces("[spaces.alpha]\nstorage = \"meta\"\n");
+        let root = fx.app.store.root().to_path_buf();
+        select(&mut fx.app, "In the inbox");
+        let before = fx.app.selected_intent().unwrap().path.clone();
+        key(&mut fx.app, KeyCode::Char('M'));
+        type_str(&mut fx.app, "alpha");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(before.is_file(), "the intent stayed");
+        assert!(!root.join("alpha").exists());
+        assert!(
+            fx.app
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("not built yet")),
+            "{:?}",
+            fx.app.message
+        );
+        // and a whole group (the row above)
+        key(&mut fx.app, KeyCode::Char('k'));
+        assert_eq!(fx.app.view().rows[fx.app.view().selected].label, "Inbox");
+        // the placeholder space may still have a profile folder from before
+        fs::create_dir_all(root.join("alpha")).unwrap();
+        key(&mut fx.app, KeyCode::Char('M'));
+        type_str(&mut fx.app, "alpha");
+        key(&mut fx.app, KeyCode::Enter);
+        assert!(root.join("Inbox").is_dir(), "the group stayed");
+        assert!(!root.join("alpha/Inbox").exists());
+    }
+
+    #[test]
+    fn a_capture_is_refused_in_a_blocked_space() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            config: tmp.path().join("cfg"),
+            root: tmp.path().join("root"),
+        };
+        let mut cfg = load_or_init(&dirs).unwrap();
+        cfg.scope = Some("skoolscout".into());
+        cfg.storage_block = Some(META_BLOCK.into());
+        let e = super::add(cfg, dirs.clone(), Some("x".into()), false, None).unwrap_err();
+        assert!(format!("{e:#}").contains("not built yet"), "{e:#}");
+        assert!(
+            !dirs.root.exists() || md_files(&dirs.root) == 0,
+            "nothing written"
+        );
     }
 
     /// Move the selected intent out of `raw` so the send gate lets it through.
@@ -8699,6 +9520,82 @@ mod tests {
         );
     }
 
+    /// The invocation after the first `--resume=<id>` one, as the fake logged it.
+    fn after_first_resume(log: &str, id: &str) -> String {
+        let at = log
+            .find(&format!("--resume={id}"))
+            .unwrap_or_else(|| panic!("no resume: {log}"));
+        let next = log[at..]
+            .find("\n--prompt=")
+            .unwrap_or_else(|| panic!("nothing after the resume: {log}"));
+        let rest = &log[at + next + 1..];
+        // the next invocation's line starts with --prompt= or --resume=
+        let end = ["\n--prompt=", "\n--resume="]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn a_chat_that_cannot_resume_starts_fresh_with_its_context() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_meta(&path, |fm| {
+            fm.conversations.insert("fake".into(), "gone".into());
+        })
+        .unwrap();
+        fx.app.rescan();
+        fx.app
+            .provider_env
+            .push(("FAKE_RESUME_FAILS".into(), "1".into()));
+        polish(&mut fx.app);
+        wait_until(&mut fx.app, "the fresh turn", |a| {
+            !a.view().turn_running && a.view().transcript_len >= 2
+        });
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert_eq!(log.matches("--resume=gone").count(), 1, "tried once: {log}");
+        let fresh = after_first_resume(&log, "gone");
+        assert!(!fresh.contains("--resume="), "then fresh: {log}");
+        assert!(fresh.contains("alpha body"), "with the intent: {fresh}");
+        assert_eq!(fx.app.view().transcript_len, 2, "one exchange, not two");
+        let it = Store::load(&path).unwrap();
+        assert_ne!(
+            it.fm.conversations.get("fake").map(String::as_str),
+            Some("gone"),
+            "the dead conversation is forgotten"
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_cannot_resume_starts_fresh_with_its_context() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "skoolscout");
+        key(&mut fx.app, KeyCode::Char('a'));
+        key(&mut fx.app, KeyCode::Char('f'));
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        // the restatement gave conv-int; every resume of it now fails
+        fx.app
+            .provider_env
+            .push(("FAKE_RESUME_FAILS".into(), "1".into()));
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
+        assert_eq!(awaiting(&fx.app), "review", "{:?}", fx.app.view().hint);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        let fresh = after_first_resume(&log, "conv-int");
+        assert!(!fresh.contains("--resume="), "then fresh: {log}");
+        assert!(
+            fresh.contains("The author's words:"),
+            "with the whole context: {fresh}"
+        );
+    }
+
     #[test]
     fn esc_cancels_running_turn() {
         let mut fx = setup("agy.jsonl");
@@ -9211,15 +10108,17 @@ mod tests {
             "the description leaves it open"
         );
         for pane in [
+            "questions",
+            "decisions",
             "preconditions",
+            "stories",
             "criteria",
             "demos",
-            "questions",
+            "artifacts",
             "pull requests",
+            "evidence",
             "missing",
             "follow-ups",
-            "artifacts",
-            "evidence",
         ] {
             key(&mut fx.app, KeyCode::Tab);
             assert_eq!(fx.app.view().focus, pane);
@@ -9227,17 +10126,17 @@ mod tests {
         }
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "tree");
-        assert_eq!(fx.app.view().open, "evidence", "the last one stays open");
+        assert_eq!(fx.app.view().open, "follow-ups", "the last one stays open");
         select(&mut fx.app, "Alpha");
         assert_eq!(
             fx.app.view().open,
-            "evidence",
+            "follow-ups",
             "and stays open on the next intent"
         );
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "evidence");
+        assert_eq!(fx.app.view().open, "follow-ups");
         key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().open, "artifacts");
+        assert_eq!(fx.app.view().open, "missing");
     }
 
     /// Tab from the tree to the named section.
@@ -9350,45 +10249,87 @@ mod tests {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
         assert_eq!(fx.app.view().focus, "tree");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "description");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "preconditions");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "criteria");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "demos");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "questions");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "pull requests");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "missing");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "follow-ups");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "artifacts");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "evidence");
-        key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "tree");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "evidence");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "artifacts");
+        let order = [
+            "description",
+            "questions",
+            "decisions",
+            "preconditions",
+            "stories",
+            "criteria",
+            "demos",
+            "artifacts",
+            "pull requests",
+            "evidence",
+            "missing",
+            "follow-ups",
+            "tree",
+        ];
+        for pane in order {
+            key(&mut fx.app, KeyCode::Tab);
+            assert_eq!(fx.app.view().focus, pane);
+        }
+        // and back, from the tree
+        for pane in order.iter().rev().skip(1).chain(["tree"].iter()) {
+            key(&mut fx.app, KeyCode::BackTab);
+            assert_eq!(fx.app.view().focus, *pane);
+        }
         key(&mut fx.app, KeyCode::BackTab);
         assert_eq!(fx.app.view().focus, "follow-ups");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "missing");
-        key(&mut fx.app, KeyCode::BackTab);
-        assert_eq!(fx.app.view().focus, "pull requests");
-        key(&mut fx.app, KeyCode::Tab);
-        // j/k in the tree still move the selection only while the tree has focus
+        // j/k in a section never move the tree's selection
         key(&mut fx.app, KeyCode::Char('j'));
         assert_eq!(
             fx.app.view().rows[fx.app.view().selected].label,
             "In the inbox"
         );
+    }
+
+    /// Beta (a feature) with `questions` open and a story waiting for them.
+    fn beta_waiting_for(fx: &mut Fx, questions: &[&str]) {
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        let open: String = questions.iter().map(|q| format!("- {q}\n")).collect();
+        it.body = format!(
+            "beta body\n\n## Acceptance criteria\n- [ ] a\n\n## Stories\n### A\n- persona: unknown\n- shows: 1\ndrafts wait for the open questions\n\n## Open questions\n{open}"
+        );
+        Store::save(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+    }
+
+    fn answer_first_question(fx: &mut Fx, text: &str) {
+        key(&mut fx.app, KeyCode::Char('Q'));
+        key(&mut fx.app, KeyCode::Enter);
+        type_str(&mut fx.app, text);
+        key(&mut fx.app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn answering_the_last_question_drafts_the_stories() {
+        let mut fx = setup("agy.jsonl");
+        beta_waiting_for(&mut fx, &["who?"]);
+        answer_first_question(&mut fx, "admins");
+        assert_eq!(
+            fx.app.view().screen,
+            "chat",
+            "the chat opens to review the drafts"
+        );
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(
+            log.contains("Every open question has its answer now: draft the stories."),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn answering_a_question_while_others_stay_open_drafts_nothing() {
+        let mut fx = setup("agy.jsonl");
+        beta_waiting_for(&mut fx, &["who?", "when?"]);
+        answer_first_question(&mut fx, "admins");
+        assert_eq!(fx.app.view().screen, "browse");
+        let log = fs::read_to_string(&fx.log).unwrap_or_default();
+        assert!(!log.contains("draft the stories"), "{log}");
     }
 
     #[test]
@@ -9458,6 +10399,36 @@ mod tests {
     }
 
     #[test]
+    fn decisions_have_their_own_section_and_leave_the_description() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body =
+            "## Description\nalpha body\n\n## Decisions\n\n- D1 (owner): paid goes to Accepted.\n"
+                .into();
+        Store::save(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        let text = render(&fx.app, 100, 30);
+        assert!(
+            !text.contains("D1 (owner)"),
+            "not in the description: {text}"
+        );
+        // tree → description → questions → decisions
+        for _ in 0..3 {
+            key(&mut fx.app, KeyCode::Tab);
+        }
+        assert_eq!(fx.app.view().focus, "decisions");
+        let text = render(&fx.app, 100, 30);
+        assert!(text.contains("Decisions"), "{text}");
+        assert!(
+            text.contains("D1 (owner): paid goes to Accepted."),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn detail_shows_every_section_title_and_opens_one() {
         let mut fx = setup("agy.jsonl");
         select(&mut fx.app, "In the inbox");
@@ -9466,14 +10437,15 @@ mod tests {
             "Description",
             "Preconditions",
             "Acceptance criteria",
+            "Stories",
             "Open questions",
             "Artifacts",
         ] {
             assert!(text.contains(title), "pane {title} missing: {text}");
         }
         assert!(!text.contains("? a?"), "questions start collapsed: {text}");
-        // tree → description → preconditions → criteria → demos → questions
-        for _ in 0..5 {
+        // tree → description → questions
+        for _ in 0..2 {
             key(&mut fx.app, KeyCode::Tab);
         }
         let text = render(&fx.app, 100, 24);
@@ -10244,10 +11216,11 @@ mod tests {
         let mut other = fake_spec();
         other.name = "fake2".into();
         fx.app.cfg.providers.insert("fake2".into(), other);
-        agent_replies(&mut fx, &[RESTATE, "", RESTATE]);
+        agent_replies(&mut fx, &[RESTATE, "", "", RESTATE]);
         reply_fails(&fx, 2);
+        reply_fails(&fx, 3); // and its fresh retry
         start_bug_in_skoolscout(&mut fx); // conv-int from the first agent
-        key(&mut fx.app, KeyCode::Enter); // that's right → the ask fails
+        key(&mut fx.app, KeyCode::Enter); // that's right → the ask fails, twice
         wait_turn(&mut fx.app);
         assert_eq!(awaiting(&fx.app), "retry");
         key(&mut fx.app, KeyCode::Char('m'));
@@ -10918,6 +11891,61 @@ mod tests {
     fn stop_check(path: &Path) {
         crate::capture::cancel_running(&checks_of(path));
         wait_check_end(path);
+    }
+
+    /// Holds `it`'s stories lock as a live runner would (this process).
+    fn story_job_running(path: &Path) -> PathBuf {
+        let dir = crate::capture::stories_dir(&Store::load(path).unwrap());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".capture.lock"), std::process::id().to_string()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn x_waits_while_a_story_of_it_records() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        let dir = story_job_running(&path);
+        key(&mut fx.app, KeyCode::Char('X'));
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("recording"), "{m}");
+        assert!(
+            !checks_of(&path).join(".capture.lock").exists(),
+            "no check started"
+        );
+        let _ = fs::remove_file(dir.join(".capture.lock"));
+    }
+
+    #[test]
+    fn e_waits_while_a_story_of_it_records() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        select(&mut fx.app, "In the inbox");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let dir = story_job_running(&path);
+        key(&mut fx.app, KeyCode::Char('E'));
+        let m = fx.app.view().message.unwrap_or_default();
+        assert!(m.contains("recording"), "{m}");
+        let _ = fs::remove_file(dir.join(".capture.lock"));
+    }
+
+    #[test]
+    fn an_automatic_check_waits_while_a_story_of_it_records() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        let path = sent_with_criteria(&mut fx, "Alpha");
+        let dir = story_job_running(&path);
+        Store::update_meta(&path, |fm| fm.reconciled_for = vec![7]).unwrap();
+        fx.app.rescan();
+        fx.app.check_due();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!work_log(&fx).contains("start --area"), "{}", work_log(&fx));
+        // once the recording ends, the check is still due: it was not spent
+        fs::remove_file(dir.join(".capture.lock")).unwrap();
+        fx.app.check_due();
+        wait_for_work(&fx, "start --area");
+        wait_check_end(&path);
     }
 
     #[test]
@@ -11737,7 +12765,11 @@ mod tests {
         assert!(shown.contains("Follow-ups (1)"), "{shown}");
         assert!(shown.contains("→ Name the meeting too"), "{shown}");
         key(&mut fx.app, KeyCode::Tab);
-        assert_eq!(fx.app.view().focus, "artifacts");
+        assert_eq!(
+            fx.app.view().focus,
+            "tree",
+            "follow-ups is the last section"
+        );
     }
 
     #[test]
@@ -12594,13 +13626,13 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_section_follows_pull_requests() {
+    fn the_missing_section_follows_evidence() {
         let mut fx = setup("agy.jsonl");
         let alpha = sent_with_criteria(&mut fx, "Alpha");
         let key2 = crate::store::criterion_key("the email names the meeting");
         missing_item(&mut fx, &alpha, &key2, false);
         select(&mut fx.app, "Alpha");
-        tab_to(&mut fx.app, "pull requests");
+        tab_to(&mut fx.app, "evidence");
         key(&mut fx.app, KeyCode::Tab);
         assert_eq!(fx.app.view().focus, "missing");
         let shown = render(&fx.app, 100, 30);
@@ -12635,6 +13667,12 @@ mod tests {
     fn completion_check_snapshot() {
         let mut fx = setup("agy.jsonl");
         let alpha = checked_alpha(&mut fx);
+        // a fixed day, so the snapshot's "checked 10-30" does not change with the date
+        let dir = crate::check::checks_dir(&Store::load(&alpha).unwrap());
+        let mut rec = crate::check::read_check(&dir).unwrap();
+        rec.at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Local, 2026, 10, 30, 12, 0, 0).unwrap();
+        crate::check::write_check(&dir, &rec).unwrap();
         let key2 = crate::store::criterion_key("the email names the meeting");
         missing_item(&mut fx, &alpha, &key2, false);
         select(&mut fx.app, "Alpha");
@@ -13179,6 +14217,366 @@ mod tests {
                 video.display()
             )),
             "{prompt}"
+        );
+    }
+
+    const STORY_BODY: &str = "## Description\nx\n\n## Acceptance criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\n## Stories\n### Mark reinstates Maya\n- persona: Mark\n- shows: 1, 3\n1. Open it\n### Pat sees it back\n- persona: Pat\n- shows: 2\n1. Open applications\n### Kim waits\n- persona: Kim\n- shows: 1\ndrafts wait for the open questions\n";
+
+    /// Beta, sent, with three stories: the first kept a video, the second's
+    /// criterion did not show, the third waits. Returns the first's video.
+    fn beta_with_stories(fx: &mut Fx) -> PathBuf {
+        use crate::capture::{StoryOutcome, StoryRecord};
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = STORY_BODY.into();
+        it.fm.state = State::Sent;
+        it.fm.repo = fx.app.capture_repo.clone();
+        Store::save_force(&mut it).unwrap();
+        let dir = crate::capture::stories_dir(&it);
+        let record = |folder: &str, outcome: StoryOutcome, shows: Vec<usize>| {
+            let d = dir.join(folder);
+            fs::create_dir_all(&d).unwrap();
+            let rec = StoryRecord {
+                at: chrono::Local::now(),
+                outcome,
+                shows,
+                dropped: Vec::new(),
+            };
+            fs::write(d.join("story.json"), serde_json::to_string(&rec).unwrap()).unwrap();
+            d
+        };
+        let first = record("1-mark-reinstates-maya", StoryOutcome::Kept, vec![1, 3]);
+        fs::write(first.join("video.mp4"), "video").unwrap();
+        record(
+            "2-pat-sees-it-back",
+            StoryOutcome::NotShown(vec![2]),
+            vec![2],
+        );
+        fx.app.rescan();
+        select(&mut fx.app, "Beta");
+        first.join("video.mp4")
+    }
+
+    fn focus_stories(app: &mut App) {
+        for _ in 0..12 {
+            if app.view().focus == "stories" {
+                return;
+            }
+            key(app, KeyCode::Tab);
+        }
+        panic!(
+            "Tab never reached the Stories section: {:?}",
+            app.view().focus
+        );
+    }
+
+    /// A passing check for Beta's three criteria.
+    fn beta_check_passes(fx: &Fx) {
+        let it = fx.app.selected_intent().unwrap().clone();
+        let dir = crate::check::checks_dir(&it);
+        fs::create_dir_all(&dir).unwrap();
+        let results = ["one", "two", "three"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| crate::check::CriterionResult {
+                number: i + 1,
+                key: crate::store::criterion_key(t),
+                text: t.to_string(),
+                verdict: crate::check::Verdict::Confirmed("yes".into()),
+                proof: None,
+            })
+            .collect();
+        crate::check::write_check(
+            &dir,
+            &crate::check::CheckRecord {
+                at: chrono::Local::now(),
+                merged: Vec::new(),
+                results,
+                warning: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_stories_section_shows_each_story_and_its_state() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        let text = render(&fx.app, 120, 40);
+        for row in [
+            "1. Mark reinstates Maya · video",
+            "2. Pat sees it back · criterion 2 didn't show",
+            "3. Kim waits · drafts wait for the open questions",
+        ] {
+            assert!(text.contains(row), "{row:?} in\n{text}");
+        }
+    }
+
+    const DRAFTED: &str = "Here are the stories.\n```proposal\n## Description\nreworded by the agent\n\n## Stories\n### Mark reinstates Maya\n- persona: Mark\n- shows: 1\n- starting data: a withdrawn application\n1. Open it\n2. Reinstate it\n```\n";
+
+    #[test]
+    fn d_drafts_only_the_stories_section() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = "## Description\nbeta body\n\n## Acceptance criteria\n- [x] one\n\n## Decisions\n- D1 (owner): yes\n\n## Artifacts\n- pr: #5\n".into();
+        it.fm.state = State::Sent;
+        it.fm
+            .conversations
+            .insert("fake".into(), "polish-conv".into());
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        focus_stories(&mut fx.app);
+        agent_replies(&mut fx, &[DRAFTED]);
+        key(&mut fx.app, KeyCode::Char('d'));
+        assert_eq!(fx.app.view().screen, "chat");
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(
+            !log.contains("--resume=polish-conv"),
+            "not the polish conversation: {log}"
+        );
+        ctrl(&mut fx.app, 'a');
+        key(&mut fx.app, KeyCode::Enter);
+        let it = Store::load(&path).unwrap();
+        assert!(it.body.contains("### Mark reinstates Maya"), "{}", it.body);
+        assert!(
+            it.body.contains("beta body") && !it.body.contains("reworded"),
+            "{}",
+            it.body
+        );
+        assert!(
+            it.body.contains("- [x] one"),
+            "criteria untouched: {}",
+            it.body
+        );
+        assert!(
+            it.body.contains("## Decisions\n- D1 (owner): yes"),
+            "{}",
+            it.body
+        );
+        assert!(it.body.contains("- pr: #5"), "{}", it.body);
+        assert_eq!(it.fm.state, State::Sent);
+        assert_eq!(
+            it.fm.conversations.get("fake").map(String::as_str),
+            Some("polish-conv"),
+            "the polish conversation is kept"
+        );
+    }
+
+    #[test]
+    fn d_reads_the_linked_documents_and_the_conversation() {
+        let mut fx = setup("agy.jsonl");
+        let repo = fx._tmp.path().join("intent-repo");
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("docs/reinstate.md"),
+            "SPEC: a paid application lands on Accepted\n",
+        )
+        .unwrap();
+        let outside = fx._tmp.path().join("secret.md");
+        fs::write(&outside, "SECRET: never sent\n").unwrap();
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = format!(
+            "## Description\nbeta body\n\n## Acceptance criteria\n- [ ] one\n\n## Artifacts\n- spec: docs/reinstate.md\n- spec: {}\n",
+            outside.display()
+        );
+        it.fm.repo = Some(repo.clone());
+        Store::save_force(&mut it).unwrap();
+        fs::write(
+            it.transcript_path(),
+            "**user:** the owner says paid goes straight to Accepted\n",
+        )
+        .unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        focus_stories(&mut fx.app);
+        agent_replies(&mut fx, &[DRAFTED]);
+        key(&mut fx.app, KeyCode::Char('d'));
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        let log = fs::read_to_string(&fx.log).unwrap();
+        assert!(
+            log.contains("SPEC: a paid application lands on Accepted"),
+            "{log}"
+        );
+        assert!(
+            log.contains("paid goes straight to Accepted"),
+            "the conversation: {log}"
+        );
+        assert!(
+            !log.contains("SECRET"),
+            "nothing from outside the repo: {log}"
+        );
+    }
+
+    /// Beta linking `links` (artifact lines) in `repo`; d pressed; the
+    /// drafting prompt as the fake provider logged it.
+    fn drafting_prompt_with(fx: &mut Fx, repo: &Path, links: &str) -> String {
+        select(&mut fx.app, "Beta");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        let mut it = Store::load(&path).unwrap();
+        it.body = format!(
+            "## Description\nbeta body\n\n## Acceptance criteria\n- [ ] one\n\n## Artifacts\n{links}"
+        );
+        it.fm.repo = Some(repo.to_path_buf());
+        Store::save_force(&mut it).unwrap();
+        fx.app.rescan();
+        fx.app.select_path(&path);
+        focus_stories(&mut fx.app);
+        agent_replies(fx, &[DRAFTED]);
+        key(&mut fx.app, KeyCode::Char('d'));
+        wait_until(&mut fx.app, "the drafting turn", |a| !a.view().turn_running);
+        fs::read_to_string(&fx.log).unwrap()
+    }
+
+    #[test]
+    fn d_never_reads_an_absolute_hidden_or_non_text_link() {
+        let mut fx = setup("agy.jsonl");
+        let repo = fx._tmp.path().join("intent-repo");
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("docs/spec.md"), "SPEC: kept\n").unwrap();
+        fs::write(repo.join("docs/abs.md"), "ABSOLUTE: never sent\n").unwrap();
+        fs::write(repo.join(".env.md"), "HIDDEN: never sent\n").unwrap();
+        fs::write(repo.join("docs/key.pem"), "KEY: never sent\n").unwrap();
+        let links = format!(
+            "- spec: docs/spec.md\n- spec: {}\n- spec: .env.md\n- plan: docs/key.pem\n- adr: docs/../docs/spec.md\n",
+            repo.join("docs/abs.md").display()
+        );
+        let log = drafting_prompt_with(&mut fx, &repo, &links);
+        assert!(log.contains("SPEC: kept"), "{log}");
+        for never in ["ABSOLUTE", "HIDDEN", "KEY:"] {
+            assert!(!log.contains(never), "{never} was sent: {log}");
+        }
+        assert_eq!(log.matches("SPEC: kept").count(), 1, "no `..` path: {log}");
+    }
+
+    #[test]
+    fn d_reads_nothing_from_a_repo_that_is_not_a_git_repository() {
+        let mut fx = setup("agy.jsonl");
+        let folder = fx._tmp.path().join("just-a-folder");
+        fs::create_dir_all(folder.join("docs")).unwrap();
+        fs::write(folder.join("docs/spec.md"), "LOOSE: never sent\n").unwrap();
+        let log = drafting_prompt_with(&mut fx, &folder, "- spec: docs/spec.md\n");
+        assert!(!log.contains("LOOSE"), "{log}");
+    }
+
+    #[test]
+    fn d_on_an_idea_says_how_to_change_the_kind() {
+        let mut fx = setup("agy.jsonl");
+        select(&mut fx.app, "Alpha");
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('d'));
+        assert_eq!(fx.app.view().screen, "browse");
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("stories are for features and bugs: K changes the kind")
+        );
+    }
+
+    #[test]
+    fn o_plays_a_storys_video() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('o'));
+        wait_for_log(&log, &video.display().to_string());
+    }
+
+    #[test]
+    fn c_copies_a_storys_video() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('c'));
+        if cfg!(target_os = "macos") {
+            let text = wait_for_log(&log, &video.display().to_string());
+            assert!(text.contains("set the clipboard to"), "{text}");
+        } else {
+            assert!(
+                fx.app
+                    .view()
+                    .message
+                    .unwrap_or_default()
+                    .contains("copied the path")
+            );
+        }
+    }
+
+    #[test]
+    fn capital_o_shows_the_video_in_finder() {
+        let mut fx = setup("agy.jsonl");
+        let log = log_launchers(&mut fx);
+        let video = beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('O'));
+        if cfg!(target_os = "macos") {
+            let text = wait_for_log(&log, &video.display().to_string());
+            assert!(text.contains("-R\n"), "{text}");
+        } else {
+            wait_for_log(&log, &video.parent().unwrap().display().to_string());
+        }
+    }
+
+    #[test]
+    fn a_story_without_a_video_says_so() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        key(&mut fx.app, KeyCode::Char('o'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("no video for this story yet")
+        );
+    }
+
+    #[test]
+    fn recording_by_hand_waits_for_a_passing_check() {
+        let mut fx = setup("agy.jsonl");
+        beta_with_stories(&mut fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('r'));
+        assert_eq!(
+            fx.app.view().message.as_deref(),
+            Some("the completion check hasn't passed yet")
+        );
+    }
+
+    #[test]
+    fn r_records_the_story_again_after_a_passing_check() {
+        let mut fx = setup("agy.jsonl");
+        with_capture(&mut fx, true, true);
+        beta_with_stories(&mut fx);
+        beta_check_passes(&fx);
+        focus_stories(&mut fx.app);
+        key(&mut fx.app, KeyCode::Char('j'));
+        let it = fx.app.selected_intent().unwrap().clone();
+        let second = crate::capture::stories_dir(&it).join("2-pat-sees-it-back");
+        let before = crate::capture::read_story(&second).unwrap().at;
+        key(&mut fx.app, KeyCode::Char('r'));
+        let start = Instant::now();
+        while crate::capture::read_story(&second).is_none_or(|r| r.at == before) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "story 2 never ran"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let first = crate::capture::stories_dir(&it).join("1-mark-reinstates-maya");
+        assert!(first.join("video.mp4").is_file(), "story 1 left alone");
+        assert_eq!(
+            crate::capture::read_story(&first).unwrap().outcome,
+            crate::capture::StoryOutcome::Kept
         );
     }
 

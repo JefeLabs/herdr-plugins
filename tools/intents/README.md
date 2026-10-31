@@ -19,7 +19,9 @@ On first run the tool seeds `intents.toml` and the kind templates in its config 
 herdr plugin config-dir jefelabs.intents      # ~/.config/herdr/plugins/config/jefelabs.intents
 ```
 
-Standalone runs use the same directory, so the toolbar and a plain terminal always see one config and one root (`~/intents` by default). `INTENTS_CONFIG_DIR` overrides the config dir and `INTENTS_ROOT` the root, so a workspace can point at its own `intents/` folder through the toolbar's per-worktree config (`env = { INTENTS_ROOT = "..." }`).
+Standalone runs use the same directory, so the toolbar and a plain terminal always see one config and one root (`~/.helmsmith/intents/spaces` by default). `INTENTS_CONFIG_DIR` overrides the config dir and `INTENTS_ROOT` the root, so a workspace can point at its own `intents/` folder through the toolbar's per-worktree config (`env = { INTENTS_ROOT = "..." }`).
+
+**Moved from `~/intents`.** The first start after the update moves the folder once and leaves `~/intents` as a link to it, so running checks and agents sent before the move keep working; delete the link when nothing uses it. A custom `root =` or `INTENTS_ROOT` is never moved. If both folders already hold intents, the tool uses the new one and names both, so you can move what is left by hand.
 
 ## One workspace per project
 
@@ -216,18 +218,57 @@ Sign in as demo@acme.test (password in the seed). Leave the billing pages alone.
 
 Every command runs with `sh -c` from the meta repo. `start` runs in its own process group for the whole run: it may stay in the foreground, or exit 0 leaving the app running (`docker compose up -d`); one that fails first ends the run at once with its last lines. The tool waits until the app answers, runs each `seed` (each must succeed within `ready_timeout`), and at the end runs `stop` (cut off after `stop_timeout`) and ends `start`'s whole group, also when the run is cancelled or fails. An app a crashed run left behind is ended by that intent's next run, and only if it is still the very process that run started. Without `{port}` in `url`, runs in a space take turns (a second is refused with the address in use), and a fixed address that already answers before `start` is refused too: the tool never seeds, drives or stops an app it did not start. A check that could not run (its app never answered, a seed failed) says why in the Evidence section. Log paths must stay inside the space's folder: no `..` out of it, no symlinks. The app runs from whatever your repos have checked out; the tool never switches branches.
 
-**Which space.** The space is the Herdr workspace (and its `~/intents` group). Your own config keeps where each space's meta repo is, in `spaces.toml` beside `intents.toml`:
+**Which space.** The space is the Herdr workspace (and its group under `~/.helmsmith/intents/spaces/`). Your own config keeps where each space's meta repo is, in `spaces.toml` beside `intents.toml`:
 
 ```toml
 [spaces.shop]
 meta = "~/code/shop-meta"
+storage = "profile"      # where the space's intents live; the default
 ```
 
-It is filled in for you the first time the tool starts in a workspace whose folder has `.helmsmith/space.toml`. The run guide is looked for in the space's meta repo, then in the intent's own repo; with neither, the tool says where to add one.
+It is filled in for you the first time the tool starts in a workspace whose folder has `.helmsmith/space.toml`.
+
+**Where a space's intents live.** `storage = "profile"` (the default, also with no line) keeps them in your own folder, `~/.helmsmith/intents/spaces/<space>/`. `meta` (the meta repo's `.helmsmith/intents/`, shared through git) and `remote` (a REST API, with `url = "…"`) are placeholders for now: the space then shows no intents, says `meta storage is not built yet` (or `remote …`), and refuses to add one, rather than writing them anywhere else. Outside a space, the whole tree leaves such a space's group out and names it. Any other word is an error that names `spaces.toml`. The run guide is looked for in the space's meta repo, then in the intent's own repo; with neither, the tool says where to add one.
 
 **Waiting for the pull.** In a project run this way, the automatic check after a merge waits until your checkout has the merged code: every merged pull request's merge commit (from `gh`) must be in the `HEAD` of the clone it merged into, which is the intent's repo for `#12`, or for `owner/repo#12` the space repo whose git URL in `space.toml` names that repo. A pull request in a repo the space does not list does not hold the check back. Until you pull, the card reads `· waiting for a pull` and the merge is not counted as checked. `X` checks whatever is checked out.
 
 **Skoolscout's way.** A guide with `default_area` in place of `start` keeps skoolscout's own steps: a `work` slot, e2e seed stories and logs in the slot's worktree, as the next sections describe.
+
+## Stories and demo videos
+
+A feature or a bug carries the user stories its demo videos will show, in a `## Stories` section after the acceptance criteria:
+
+```markdown
+## Stories
+### Mark reinstates Maya's withdrawn application
+- persona: Mark, a tenant admin
+- shows: 1, 3
+- starting data: Maya has a submitted application, then withdrawn
+1. Open Maya's application from Applications
+2. Choose Reinstate and confirm
+3. See the application back under Submitted
+```
+
+`shows:` names acceptance criteria by number, counted from 1 across groups (a reconcile or fold that renumbers criteria renumbers it too). Polish drafts the section: while open questions remain, each story has only its name, persona and `shows:`, with `drafts wait for the open questions`; once every question has its answer it adds the starting data and the steps. Answering the last open question with `Q` opens the chat on that drafting turn. The section goes to the coding agent with the rest of the intent, so it builds knowing what will be shown. Refactors and ideas have no stories.
+
+**The run guide names the personas.** Its instructions get a `## Stories` section; the guide's rules win over a story:
+
+```markdown
+## Stories
+### Personas
+- Mark: tenant admin, signs in as mark@example.test
+- Pat: a parent, signs in as pat@example.test
+### Setup may create
+- applications and notes, never people
+```
+
+Drafting picks personas from that list (`unknown` when none fits). With no such section stories are still drafted, but none is recorded: the row says `the run guide lists no personas for stories`.
+
+**When videos are recorded.** Once the completion check passes (no criterion failing or missing, counting every check so far; "can't check" does not hold it back), the same run records each story with no kept video, and records again any story showing a criterion that check looked at. Each story gets its own confined agent and browser session, which signs in, sets up the starting data through the app, rehearses the steps once unrecorded, sets up fresh data, then calls `take_start`: the video starts with a card naming the story and its persona, shows each criterion's own text as a caption when the agent says it is visible, and ends on a card listing what it showed. A video is kept only when every criterion the story shows got its caption; a re-take that fails keeps the earlier video. Nothing about signing in is ever on video.
+
+Each story's folder is `<stem>.assets/stories/<n>-<name>/`: `video.mp4`, `steps.txt` (the take's browser steps), `captions.json`, `story.json` (how the last take ended) and `run.log` (the agent's last word and any tool errors: read it when a take fails). A take records into `take.mp4` and becomes `video.mp4` only when it ends with `take_stop` and showed every criterion. Recording uses agent-browser's video, which needs ffmpeg with libx264 on `PATH` (`agent-browser doctor` checks); the pointer is drawn on the video.
+
+**Keys in the Stories section** (Tab to it): `d` drafts or redrafts the stories in a chat of their own. The agent is given everything known about the intent: every section of it (decisions included), the specs, plans and ADRs it links (only files inside its repo, each capped), its pull requests, the latest completion check, a bug's captured evidence and the end of its polish conversation, and writes stories that together show every criterion a person can see. It proposes only the `## Stories` section; Ctrl-a shows the change and Enter replaces that section alone, so criteria, decisions and artifacts stay as they are; for an idea or a refactor it says to change the kind with `K` first), `o` or Enter plays the video, `c` copies the file (it pastes into Slack or Messages on a Mac; elsewhere the path), `Y` copies its path, `O` shows it in Finder, `r` records it again once the check has passed. Each row reads `<n>. <name> · video`, `recording…`, `criterion 3 didn't show`, `couldn't record: <why>`, `drafts wait for the open questions` or `not recorded yet`.
 
 ## Evidence for bugs
 
@@ -376,7 +417,7 @@ Keys in the list: `j`/`k` move, `PgUp`/`PgDn` move a screen of cards (less one, 
 ## Files
 
 ```
-~/intents/
+~/.helmsmith/intents/spaces/
   2026-10-24-pending-label.md            ← a quick capture, at the top until you move it (M)
   2026-10-24-pending-label.assets/screen.png
   2026-10-24-pending-label.chat.md

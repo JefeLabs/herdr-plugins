@@ -1,16 +1,21 @@
 ---
 source: tools/intents/src/app.rs
+assertion_line: 12648
 expression: "render(&fx.app, 80, 24)"
 ---
 ▾ Inbox (1)            │# Alpha
   ○ In the inbox ?2    │kind: idea   state: sent
 ▾ skoolscout (3)       │ Description ───────────────────────────────────────────
   → Alpha              │x
-  ○ Beta               │ ▸ Preconditions (0/0) ─────────────────────────────────
-  → Name the meeting to│ ▸ Acceptance criteria (0/2) ───────────────────────────
+  ○ Beta               │ ▸ Open questions (0 open) ─────────────────────────────
+  → Name the meeting to│ ▸ Decisions (none) ────────────────────────────────────
+                       │ ▸ Preconditions (0/0) ─────────────────────────────────
+                       │ ▸ Stories (0) ─────────────────────────────────────────
+                       │ ▸ Acceptance criteria (0/2) ───────────────────────────
                        │ ▸ Demo Videos (0) ─────────────────────────────────────
-                       │ ▸ Open questions (0 open) ─────────────────────────────
+                       │ ▸ Artifacts (0) ───────────────────────────────────────
                        │ ▸ Pull requests (0) ───────────────────────────────────
+                       │ ▸ Evidence (0) ────────────────────────────────────────
                        │ ▸ Missing items / Bugs (0) ────────────────────────────
                        │ ▾ Follow-ups (1) ──────────────────────────────────────
                        │→ Name the meeting too
@@ -21,8 +26,4 @@ expression: "render(&fx.app, 80, 24)"
                        │
                        │
                        │
-                       │
-                       │
-                       │ ▸ Artifacts (0) ───────────────────────────────────────
-                       │ ▸ Evidence (0) ────────────────────────────────────────
 Follow-ups: j/k choose · Enter go to it · F file another · Esc tree

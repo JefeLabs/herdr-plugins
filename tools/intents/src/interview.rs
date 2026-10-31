@@ -51,6 +51,8 @@ pub struct Interview {
     /// For a follow-up: the intent it refines (title, description and
     /// criteria), given to the agent as data.
     pub context: Option<String>,
+    /// The run guide's Stories section (its personas), for drafting stories.
+    pub personas: Option<String>,
 }
 
 impl Interview {
@@ -65,6 +67,7 @@ impl Interview {
             qas: Vec::new(),
             refinements: Vec::new(),
             context: None,
+            personas: None,
         }
     }
 
@@ -97,9 +100,13 @@ impl Interview {
                     Some(h) => format!(" It is filed in `{h}`; keep that unless the author asked to move it."),
                     None => String::new(),
                 };
-                format!(
+                let rule_text = format!(
                     "{WRITE_UP_MARKER} Start with one line that says what this is, judged from the conversation: `bug: <what goes wrong> when <condition>`, `refactor: <what changes> in <where>`, `feature: <who> can <what>` or `idea: <the idea>`. Then one line `group: <path>` naming the group this intent belongs in, one of the existing groups.{keep} Then a fenced ```proposal block with the complete intent body: `## Description`, `## Preconditions` (`- [ ]` items), `## Acceptance criteria` (`- [ ]` checks: the criteria for its own group first, ungrouped, then one `### <group path>` sub-heading per other existing group the work touches, each with its own criteria), and `## Open questions` (each answered question with its `→ answer` on an indented line below it; each skipped question left open, without an answer). Then `questions:` with `- ` items for anything still unknown, or `questions: none`.\n{POLISH_RULE}"
-                )
+                );
+                match crate::conversation::stories_rule(&self.kind, self.personas.as_deref()) {
+                    Some(rule) => format!("{rule_text}\n{rule}"),
+                    None => rule_text,
+                }
             }
         }
     }
@@ -333,6 +340,9 @@ pub struct InterviewScreen {
     pub provider: String,
     pub model: Option<String>,
     pub conv_id: Option<String>,
+    /// The running or last turn resumed `conv_id`: when it fails, it is
+    /// started once more as a fresh turn carrying the whole context.
+    pub resumed: bool,
     /// `<root>/.polish/new-xxxxxxxx`, where the agent runs.
     pub folder: std::path::PathBuf,
     /// Where `a` would add today: the group a save falls back to.
@@ -380,6 +390,41 @@ mod tests {
         );
         iv.words = "tenant admins getting notifications when a user accepts a team invite".into();
         iv
+    }
+
+    const GUIDE_STORIES: &str =
+        "## Stories\n### Personas\n- Mark: tenant admin, signs in as mark@example.test\n";
+
+    fn kind_interview(kind: &str, personas: Option<&str>) -> Interview {
+        let mut iv = interview(Some("skoolscout"));
+        iv.kind = kind.into();
+        iv.personas = personas.map(str::to_string);
+        iv
+    }
+
+    #[test]
+    fn a_feature_write_up_asks_for_stories() {
+        let p = kind_interview("enhancement", Some(GUIDE_STORIES)).prompt(Step::WriteUp, false, "");
+        assert!(p.contains("## Stories"), "{p}");
+        assert!(p.contains("- shows:"), "{p}");
+        assert!(p.contains(crate::store::STORIES_WAIT), "{p}");
+        assert!(
+            p.contains("- Mark: tenant admin"),
+            "the guide's personas are given: {p}"
+        );
+        assert!(p.contains("not shown by any story"), "{p}");
+    }
+
+    #[test]
+    fn a_refactor_write_up_has_no_stories() {
+        let p = kind_interview("refactor", Some(GUIDE_STORIES)).prompt(Step::WriteUp, false, "");
+        assert!(!p.contains("## Stories"), "{p}");
+    }
+
+    #[test]
+    fn without_guide_personas_stories_say_unknown() {
+        let p = kind_interview("issue", None).prompt(Step::WriteUp, false, "");
+        assert!(p.contains("persona: unknown"), "{p}");
     }
 
     fn qa(q: &str, a: Option<&str>) -> Qa {

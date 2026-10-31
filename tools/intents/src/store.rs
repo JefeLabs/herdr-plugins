@@ -935,6 +935,7 @@ const SECTION_ORDER: &[&str] = &[
     "## Description",
     "## Preconditions",
     "## Acceptance criteria",
+    "## Stories",
     "## Open questions",
 ];
 
@@ -1282,6 +1283,175 @@ pub const PRECONDITIONS_HEADING: &str = "## Preconditions";
 /// Checks that prove the intent is done.
 pub fn criteria(body: &str) -> Vec<Criterion> {
     checklist(body, CRITERIA_HEADING)
+}
+
+pub const STORIES_HEADING: &str = "## Stories";
+/// The line a story carries until every open question has its answer.
+pub const STORIES_WAIT: &str = "drafts wait for the open questions";
+
+/// One story under `## Stories`: who acts, what must exist first, what they
+/// do, and which acceptance criteria its demo video shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentStory {
+    /// From 1, in the order the section lists them.
+    pub number: usize,
+    pub name: String,
+    pub persona: Option<String>,
+    /// Criteria numbers, counted from 1 across area groups.
+    pub shows: Vec<usize>,
+    pub starting_data: Option<String>,
+    pub steps: Vec<String>,
+    /// Drafted only once every open question has its answer.
+    pub waits: bool,
+}
+
+/// `1, 3` → `[1, 3]`; anything that is not a number is skipped.
+fn numbers(list: &str) -> Vec<usize> {
+    list.split(',')
+        .filter_map(|n| n.trim().parse::<usize>().ok())
+        .collect()
+}
+
+/// The stories under `## Stories`, each `### <name>` with its `- persona:`,
+/// `- shows:` and `- starting data:` lines and numbered steps.
+pub fn stories(body: &str) -> Vec<IntentStory> {
+    let mut out: Vec<IntentStory> = Vec::new();
+    for (_, line) in section_lines(body, STORIES_HEADING) {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("### ") {
+            out.push(IntentStory {
+                number: out.len() + 1,
+                name: name.trim().to_string(),
+                persona: None,
+                shows: Vec::new(),
+                starting_data: None,
+                steps: Vec::new(),
+                waits: false,
+            });
+            continue;
+        }
+        let Some(s) = out.last_mut() else { continue };
+        if let Some(v) = t.strip_prefix("- persona:") {
+            s.persona = Some(v.trim().to_string()).filter(|v| !v.is_empty());
+        } else if let Some(v) = t.strip_prefix("- shows:") {
+            s.shows = numbers(v);
+        } else if let Some(v) = t.strip_prefix("- starting data:") {
+            s.starting_data = Some(v.trim().to_string()).filter(|v| !v.is_empty());
+        } else if t.eq_ignore_ascii_case(STORIES_WAIT) {
+            s.waits = true;
+        } else if let Some((n, step)) = t.split_once(". ")
+            && !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_digit())
+        {
+            s.steps.push(step.trim().to_string());
+        }
+    }
+    out
+}
+
+/// The story's folder name, `<n>-<slug>`: its number keeps two stories of
+/// one name apart; the slug is its name's words, lower case, up to 48 letters.
+pub fn story_folder(s: &IntentStory) -> String {
+    let mut slug = String::new();
+    for word in s
+        .name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+    {
+        let word = word.to_lowercase();
+        if !slug.is_empty() && slug.len() + 1 + word.len() > 48 {
+            break;
+        }
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(&word);
+    }
+    format!("{}-{slug}", s.number)
+}
+
+/// The criteria a story shows that exist, with their text, and the numbers
+/// it names that match no criterion.
+pub fn shown_criteria(body: &str, s: &IntentStory) -> (Vec<(usize, String)>, Vec<usize>) {
+    let all = criteria(body);
+    let mut shown = Vec::new();
+    let mut dropped = Vec::new();
+    for &n in &s.shows {
+        match n.checked_sub(1).and_then(|i| all.get(i)) {
+            Some(c) => shown.push((n, c.text.clone())),
+            None => dropped.push(n),
+        }
+    }
+    (shown, dropped)
+}
+
+/// `body` with its Stories section replaced by the one in `proposal` (or the
+/// proposal itself, given without its heading), added after the acceptance
+/// criteria when there was none. Every other section stays as it is, and any
+/// other section the proposal holds is ignored.
+pub fn replace_stories(body: &str, proposal: &str) -> String {
+    let heading = |l: &str| l.starts_with("## ");
+    let is_stories = |l: &str| l.trim().eq_ignore_ascii_case(STORIES_HEADING);
+    // the new section's lines
+    let plines: Vec<&str> = proposal.lines().collect();
+    let from = plines
+        .iter()
+        .position(|l| is_stories(l))
+        .map_or(0, |i| i + 1);
+    let to = plines[from..]
+        .iter()
+        .position(|l| heading(l))
+        .map_or(plines.len(), |i| from + i);
+    let inner = plines[from..to].join("\n");
+    let section = format!("{STORIES_HEADING}\n{}", inner.trim());
+    // the body without its old section
+    let mut lines: Vec<&str> = body.lines().collect();
+    if let Some(start) = lines.iter().position(|l| is_stories(l)) {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| heading(l))
+            .map_or(lines.len(), |i| start + 1 + i);
+        lines.drain(start..end);
+    }
+    // where it goes: after the criteria, else before the open questions, else last
+    let after_criteria = lines
+        .iter()
+        .position(|l| l.trim().eq_ignore_ascii_case(CRITERIA_HEADING))
+        .map(|c| {
+            lines[c + 1..]
+                .iter()
+                .position(|l| heading(l))
+                .map_or(lines.len(), |i| c + 1 + i)
+        });
+    let at = after_criteria
+        .or_else(|| {
+            lines
+                .iter()
+                .position(|l| l.trim().eq_ignore_ascii_case(QUESTIONS_HEADING))
+        })
+        .unwrap_or(lines.len());
+    let before = lines[..at].join("\n");
+    let after = lines[at..].join("\n");
+    let mut out = before.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&section);
+    out.push('\n');
+    if !after.trim().is_empty() {
+        out.push('\n');
+        out.push_str(after.trim_start());
+        out.push('\n');
+    }
+    out
+}
+
+/// The criteria (from 1) no story shows.
+pub fn unshown_criteria(body: &str) -> Vec<usize> {
+    let shown: Vec<usize> = stories(body).iter().flat_map(|s| s.shows.clone()).collect();
+    (1..=criteria(body).len())
+        .filter(|n| !shown.contains(n))
+        .collect()
 }
 
 /// Set each acceptance criterion's checkbox from `ticked(text)`, keeping

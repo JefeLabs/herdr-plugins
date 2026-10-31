@@ -24,12 +24,21 @@ fn with_config(
         );
     }
     let mut cfg = load_or_init(&dirs)?;
+    // intents moved from ~/intents to ~/.helmsmith/intents/spaces: once
+    let settled = herdr_intents::storage::settle_root(&home, &cfg.root);
+    cfg.root = settled.root;
+    cfg.notice = settled.notice;
     // one Herdr workspace sees one top-level group: the one named like it
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
     cfg.scope = scope::resolve(
         |k| std::env::var(k).ok(),
         |id| scope::herdr_label(std::path::Path::new(&herdr), id),
     );
+    // a space whose storage is not built yet shows no intents and takes none
+    cfg.storage_block = cfg
+        .scope
+        .as_deref()
+        .and_then(|s| herdr_intents::space::storage_block(&dirs, s));
     let dirs = herdr_intents::config::Dirs {
         config: dirs.config,
         root: cfg.root.clone(),

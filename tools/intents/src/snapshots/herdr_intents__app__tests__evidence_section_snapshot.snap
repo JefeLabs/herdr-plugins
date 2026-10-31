@@ -1,5 +1,6 @@
 ---
 source: tools/intents/src/app.rs
+assertion_line: 14335
 expression: "render(&fx.app, 80, 24)"
 ---
 ▾ Inbox (1)            │# In the inbox
@@ -7,14 +8,14 @@ expression: "render(&fx.app, 80, 24)"
 ▾ skoolscout (2)       │ Description ───────────────────────────────────────────
   ○ Alpha              │Observed
   ○ Beta               │
+                       │ ▸ Open questions (2 open) ─────────────────────────────
+                       │ ▸ Decisions (none) ────────────────────────────────────
                        │ ▸ Preconditions (0/0) ─────────────────────────────────
+                       │ ▸ Stories (0) ─────────────────────────────────────────
                        │ ▸ Acceptance criteria (0/0) ───────────────────────────
                        │ ▸ Demo Videos (0) ─────────────────────────────────────
-                       │ ▸ Open questions (2 open) ─────────────────────────────
-                       │ ▸ Pull requests (0) ───────────────────────────────────
-                       │ ▸ Missing items / Bugs (0) ────────────────────────────
-                       │ ▸ Follow-ups (0) ──────────────────────────────────────
                        │ ▸ Artifacts (0) ───────────────────────────────────────
+                       │ ▸ Pull requests (0) ───────────────────────────────────
                        │ ▾ Evidence (2) ────────────────────────────────────────
                        │✓ before · video · the email goes to every admin
                        │✗ after · video · admins still get it
@@ -23,6 +24,6 @@ expression: "render(&fx.app, 80, 24)"
                        │
                        │
                        │
-                       │
-                       │
+                       │ ▸ Missing items / Bugs (0) ────────────────────────────
+                       │ ▸ Follow-ups (0) ──────────────────────────────────────
 Evidence: Enter open in Chrome · c copy file · Y copy path · E capture again

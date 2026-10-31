@@ -124,6 +124,50 @@ pub const READY_TIMEOUT_SECS: u64 = 600;
 /// How long the guide's `stop` may take, unless the guide says.
 pub const STOP_TIMEOUT_SECS: u64 = 60;
 
+/// The run guide's `## Stories` section: the personas stories may use, and
+/// the section itself (what setup may create, other rules) for the agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuideStories {
+    /// The names under `### Personas`, from `- <Name>: …` lines.
+    pub personas: Vec<String>,
+    /// The whole section, heading included.
+    pub text: String,
+}
+
+/// The guide's Stories section, when it has one that names a persona.
+pub fn guide_stories(guide: &CaptureGuide) -> Option<GuideStories> {
+    let mut text = String::new();
+    let mut inside = false;
+    for line in guide.body.lines() {
+        if line.starts_with("## ") {
+            inside = line.trim().eq_ignore_ascii_case("## Stories");
+        }
+        if inside {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    let mut personas = Vec::new();
+    let mut in_personas = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("### ") {
+            in_personas = t.eq_ignore_ascii_case("### Personas");
+            continue;
+        }
+        if in_personas
+            && let Some((name, _)) = t.strip_prefix("- ").and_then(|r| r.split_once(':'))
+            && !name.trim().is_empty()
+        {
+            personas.push(name.trim().to_string());
+        }
+    }
+    (!personas.is_empty()).then(|| GuideStories {
+        personas,
+        text: text.trim_end().to_string() + "\n",
+    })
+}
+
 /// Reads `<repo>/.helmsmith/run.md` (else the older `capture.md`): YAML front
 /// matter, then the body. `start` makes it any project's commands; else
 /// `default_area` makes it skoolscout's work slots.
@@ -356,6 +400,13 @@ pub enum Job {
         #[serde(default)]
         fold: bool,
     },
+    /// Records the chosen stories' demo videos (by their number).
+    Story {
+        numbers: Vec<usize>,
+        intent_path: PathBuf,
+        root: PathBuf,
+        stories_dir: PathBuf,
+    },
 }
 
 impl CaptureRequest {
@@ -364,6 +415,7 @@ impl CaptureRequest {
     pub fn run_dir(&self) -> &Path {
         match &self.job {
             Job::Check { check_dir, .. } => check_dir,
+            Job::Story { stories_dir, .. } => stories_dir,
             Job::Capture => &self.evidence,
         }
     }
@@ -417,9 +469,14 @@ impl Runner {
 
     /// Closes the capture's browser session (its own Chrome goes with it).
     fn close_browser(&self) {
+        self.close_session(&self.browser);
+    }
+
+    /// Closes one agent-browser session.
+    fn close_session(&self, session: &str) {
         let _ = self
             .cmd(&self.agent_browser)
-            .args(["--session", &self.browser, "close"])
+            .args(["--session", session, "close"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -1121,6 +1178,7 @@ fn run(
                 items,
             )
         }
+        Job::Story { .. } => (crate::capture_mcp::Mode::Story, None, Vec::new()),
     };
     // the app: the guide's own commands (any project), or skoolscout's work slot
     let (base_url, log_files) = match &guide.mode {
@@ -1263,6 +1321,38 @@ fn run(
         }
     };
 
+    // a story job: the chosen stories' takes, on this app
+    if let Job::Story {
+        numbers,
+        intent_path,
+        stories_dir,
+        ..
+    } = &req.job
+    {
+        let Ok(it) = crate::store::Store::load(intent_path) else {
+            return failed(format!("cannot read {}", intent_path.display()));
+        };
+        record_stories(
+            r,
+            state,
+            &guide,
+            &base_url,
+            &it,
+            stories_dir,
+            Which::Numbers(numbers),
+            managed_mcp,
+            &progress,
+        );
+        if cancelled(state) {
+            return failed("cancelled".into());
+        }
+        return record(
+            Outcome::Reproduced("the stories were recorded".into()),
+            None,
+            Vec::new(),
+        );
+    }
+
     // the agent: claude with no shell, only the browser tools, in the evidence folder
     if std::fs::create_dir_all(&req.evidence).is_err() {
         return failed(format!("cannot create {}", req.evidence.display()));
@@ -1287,30 +1377,9 @@ fn run(
                 from: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
             })
             .collect(),
+        take: None,
     };
     let config_file = req.evidence.join(".capture-mcp.json");
-    let written = serde_json::to_string(&mcp_config)
-        .map_err(|e| e.to_string())
-        .and_then(|t| std::fs::write(&config_file, t).map_err(|e| e.to_string()));
-    if let Err(e) = written {
-        return failed(format!("cannot write {}: {e}", config_file.display()));
-    }
-    let server = crate::capture_mcp::SERVER;
-    let mcp = serde_json::json!({
-        "mcpServers": {
-            server: {
-                "type": "stdio",
-                "command": r.intents,
-                "args": ["capture-mcp", config_file],
-            }
-        }
-    })
-    .to_string();
-    let allowed = crate::capture_mcp::tool_names(&mcp_config)
-        .iter()
-        .map(|t| format!("mcp__{server}__{t}"))
-        .collect::<Vec<_>>()
-        .join(",");
     let prompt = match &req.job {
         Job::Capture => capture_prompt(
             &guide,
@@ -1327,105 +1396,33 @@ fn run(
             &base_url,
             req.before.as_ref().filter(|_| req.phase == Phase::After),
         ),
+        // a story job returned before this
+        Job::Story { .. } => String::new(),
     };
-    let mut args: Vec<String> = [
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--restricted",
-        "--permission-mode",
-        "dontAsk",
-        "--tools",
-        "",
-        "--mcp-config",
-        &mcp,
-        "--allowedTools",
-        &allowed,
-        "--settings",
-        r#"{"disableAllHooks":true}"#,
-    ]
-    .iter()
-    .map(|a| a.to_string())
-    .collect();
-    if !managed_mcp {
-        args.push("--strict-mcp-config".into());
-    }
-    args.extend(["-p".to_string(), prompt]);
-    if cancelled(state) {
-        return failed("cancelled".into());
-    }
     progress(match req.job {
         Job::Capture => "the agent is reproducing it".into(),
         Job::Check { .. } => "the agent is checking the criteria".into(),
+        Job::Story { .. } => "recording the stories".into(),
     });
     let since = std::time::SystemTime::now();
-    let mut cmd = r.cmd(&r.claude);
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.args(&args)
-            .current_dir(&req.evidence)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .process_group(0);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return failed(format!("claude: {e}")),
-    };
-    let pgid = child.id() as i32;
-    // registered under the lock cancel() reads: either it sees the agent and
-    // stops it, or this sees the cancel and stops it here
-    let cancelled_meanwhile = {
-        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        s.agent_pgid = Some(pgid);
-        s.cancelled
-    };
-    if cancelled_meanwhile {
-        stop_group(pgid);
-    }
-    // a watchdog: an agent that never finishes is stopped
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let limit = match req.job {
         Job::Capture => AGENT_LIMIT,
         Job::Check { .. } => crate::check::check_limit(items.len(), req.phase == Phase::After),
+        Job::Story { .. } => STORY_LIMIT,
     };
-    {
-        let done = std::sync::Arc::clone(&done);
-        std::thread::spawn(move || {
-            let until = std::time::Instant::now() + limit;
-            while std::time::Instant::now() < until {
-                if done.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            stop_group(pgid);
-        });
-    }
-    let mut result = String::new();
-    if let Some(out) = child.stdout.take() {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
-                && v.get("type").and_then(|t| t.as_str()) == Some("result")
-            {
-                result = v
-                    .get("result")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-            }
-        }
-    }
-    let _ = child.wait();
-    done.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut s) = state.lock() {
-        s.agent_pgid = None;
-    }
-    r.close_browser();
-    if cancelled(state) {
-        return failed("cancelled".into());
-    }
+    let result = match run_agent(
+        r,
+        state,
+        &mcp_config,
+        &config_file,
+        prompt,
+        &req.evidence,
+        limit,
+        managed_mcp,
+    ) {
+        Ok(text) => text,
+        Err(why) => return failed(why),
+    };
     // the browser calls the tools ran, for the "after" to repeat
     let steps: Vec<String> = std::fs::read_to_string(&steps_file)
         .unwrap_or_default()
@@ -1459,7 +1456,8 @@ fn run(
                             (
                                 n,
                                 crate::check::Verdict::CantCheck(format!(
-                                    "the fold may describe this wrongly: {t}"
+                                    "{}: {t}",
+                                    crate::check::FOLD_DOUBT
                                 )),
                             )
                         }
@@ -1485,11 +1483,434 @@ fn run(
             };
             let latest = crate::check::merge_check(crate::check::read_check(dir), checked.clone());
             let _ = crate::check::write_check(dir, &latest);
+            // read before the results are handed over: the runner writes them
+            // into the intent while the takes would be reading it
+            let story_intent = match &req.job {
+                Job::Check { intent_path, .. } => crate::store::Store::load(intent_path).ok(),
+                _ => None,
+            };
             let _ = tx.send(CaptureUpdate::Checked(checked));
+            // every criterion holds: the stories' videos, on this same app
+            if let Some(it) = story_intent
+                && crate::check::passes(&latest, &it.body)
+            {
+                let looked_at: Vec<usize> = items.iter().map(|i| i.number).collect();
+                record_stories(
+                    r,
+                    state,
+                    &guide,
+                    &base_url,
+                    &it,
+                    &stories_dir(&it),
+                    Which::AfterCheck(&looked_at),
+                    managed_mcp,
+                    &progress,
+                );
+            }
         }
     }
     let file = out_file.exists().then_some(name);
     record(parse_outcome(req.phase, &result), file, steps)
+}
+
+/// Runs the confined agent on `prompt` with the tools `mcp_config` grants
+/// (written to `config_file`), in `cwd`, stopped after `limit`; its final
+/// reply, or why it did not run ("cancelled" when the run was).
+#[allow(clippy::too_many_arguments)]
+fn run_agent(
+    r: &Runner,
+    state: &std::sync::Mutex<JobState>,
+    mcp_config: &crate::capture_mcp::McpConfig,
+    config_file: &Path,
+    prompt: String,
+    cwd: &Path,
+    limit: std::time::Duration,
+    managed_mcp: bool,
+) -> Result<String, String> {
+    let written = serde_json::to_string(mcp_config)
+        .map_err(|e| e.to_string())
+        .and_then(|t| std::fs::write(config_file, t).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        return Err(format!("cannot write {}: {e}", config_file.display()));
+    }
+    let server = crate::capture_mcp::SERVER;
+    let mcp = serde_json::json!({
+        "mcpServers": {
+            server: {
+                "type": "stdio",
+                "command": r.intents,
+                "args": ["capture-mcp", config_file],
+            }
+        }
+    })
+    .to_string();
+    let allowed = crate::capture_mcp::tool_names(mcp_config)
+        .iter()
+        .map(|t| format!("mcp__{server}__{t}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut args: Vec<String> = [
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--restricted",
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        "",
+        "--mcp-config",
+        &mcp,
+        "--allowedTools",
+        &allowed,
+        "--settings",
+        r#"{"disableAllHooks":true}"#,
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    if !managed_mcp {
+        args.push("--strict-mcp-config".into());
+    }
+    args.extend(["-p".to_string(), prompt]);
+    if cancelled(state) {
+        return Err("cancelled".into());
+    }
+    let mut cmd = r.cmd(&r.claude);
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.args(&args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Err(format!("claude: {e}")),
+    };
+    let pgid = child.id() as i32;
+    // registered under the lock cancel() reads: either it sees the agent and
+    // stops it, or this sees the cancel and stops it here
+    let cancelled_meanwhile = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.agent_pgid = Some(pgid);
+        s.cancelled
+    };
+    if cancelled_meanwhile {
+        stop_group(pgid);
+    }
+    // a watchdog: an agent that never finishes is stopped
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + limit;
+            while std::time::Instant::now() < until {
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            stop_group(pgid);
+        });
+    }
+    let mut result = String::new();
+    if let Some(out) = child.stdout.take() {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                && v.get("type").and_then(|t| t.as_str()) == Some("result")
+            {
+                result = v
+                    .get("result")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+    }
+    let _ = child.wait();
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut s) = state.lock() {
+        s.agent_pgid = None;
+    }
+    r.close_session(&mcp_config.session);
+    if cancelled(state) {
+        return Err("cancelled".into());
+    }
+    Ok(result)
+}
+
+/// How long one story's agent may take: setup, a rehearsal, setup again, the take.
+pub const STORY_LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How a story's last take ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum StoryOutcome {
+    /// Every criterion it shows got its caption: `video.mp4` is kept.
+    Kept,
+    /// These criteria never showed; no new video was kept.
+    NotShown(Vec<usize>),
+    /// Why it could not be recorded.
+    Failed(String),
+}
+
+/// A story's last take, kept as `<story folder>/story.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryRecord {
+    pub at: chrono::DateTime<chrono::Local>,
+    pub outcome: StoryOutcome,
+    /// The criteria the story shows, as numbered when it ran.
+    pub shows: Vec<usize>,
+    /// Numbers it named that match no criterion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<usize>,
+}
+
+/// An intent's stories folder: `<stem>.assets/stories`.
+pub fn stories_dir(it: &crate::store::Intent) -> PathBuf {
+    it.assets_dir().join("stories")
+}
+
+/// A story folder's last take, if it has one.
+pub fn read_story(dir: &Path) -> Option<StoryRecord> {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("story.json")).ok()?).ok()
+}
+
+fn write_story(dir: &Path, rec: &StoryRecord) {
+    if let Ok(text) = serde_json::to_string_pretty(rec) {
+        let _ = std::fs::write(dir.join("story.json"), text);
+    }
+}
+
+/// Which stories a run records.
+enum Which<'a> {
+    /// These, by number (recorded by hand).
+    Numbers(&'a [usize]),
+    /// After a passing check: those with no kept video, and those showing a
+    /// criterion this check looked at.
+    AfterCheck(&'a [usize]),
+}
+
+/// The guide's persona a story's `persona:` names: `Mark` for `Mark, a
+/// tenant admin`, matched in any case.
+fn guide_persona<'a>(persona: &str, names: &'a [String]) -> Option<&'a String> {
+    let p = persona.trim().to_lowercase();
+    names.iter().find(|n| {
+        let n = n.to_lowercase();
+        p.strip_prefix(&n)
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()))
+    })
+}
+
+/// The criteria numbers in a take's `captions.json`.
+fn read_captions(dir: &Path) -> Vec<usize> {
+    std::fs::read_to_string(dir.join("captions.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Records the stories `which` picks, one confined agent and browser session
+/// each, on the app this run started. Each writes its own `story.json`.
+#[allow(clippy::too_many_arguments)]
+fn record_stories(
+    r: &Runner,
+    state: &std::sync::Mutex<JobState>,
+    guide: &CaptureGuide,
+    base_url: &str,
+    it: &crate::store::Intent,
+    stories_dir: &Path,
+    which: Which,
+    managed_mcp: bool,
+    progress: &dyn Fn(String),
+) {
+    let all = crate::store::stories(&it.body);
+    let chosen: Vec<&crate::store::IntentStory> = all
+        .iter()
+        .filter(|s| match &which {
+            Which::Numbers(ns) => ns.contains(&s.number),
+            Which::AfterCheck(looked_at) => {
+                let kept = read_story(&stories_dir.join(crate::store::story_folder(s)))
+                    .is_some_and(|r| r.outcome == StoryOutcome::Kept);
+                !s.waits && (!kept || s.shows.iter().any(|n| looked_at.contains(n)))
+            }
+        })
+        .collect();
+    let personas = guide_stories(guide);
+    for story in chosen {
+        if cancelled(state) {
+            return;
+        }
+        let dir = stories_dir.join(crate::store::story_folder(story));
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let (shows, dropped) = crate::store::shown_criteria(&it.body, story);
+        let save = |outcome: StoryOutcome| {
+            write_story(
+                &dir,
+                &StoryRecord {
+                    at: chrono::Local::now(),
+                    outcome,
+                    shows: story.shows.clone(),
+                    dropped: dropped.clone(),
+                },
+            )
+        };
+        let Some(guide_stories) = &personas else {
+            save(StoryOutcome::Failed(
+                "the run guide lists no personas for stories".into(),
+            ));
+            continue;
+        };
+        let persona = story.persona.clone().unwrap_or_else(|| "unknown".into());
+        // the card shows the guide's name for the persona, never more of the line
+        let Some(persona_name) = guide_persona(&persona, &guide_stories.personas).cloned() else {
+            save(StoryOutcome::Failed(format!(
+                "persona {persona} isn't in the run guide's Stories section"
+            )));
+            continue;
+        };
+        if story.waits || story.steps.is_empty() {
+            save(StoryOutcome::Failed("the story is not drafted yet".into()));
+            continue;
+        }
+        if shows.is_empty() {
+            save(StoryOutcome::Failed(
+                "the story shows no acceptance criterion".into(),
+            ));
+            continue;
+        }
+        // the take records into take.mp4; an earlier video.mp4 stays until
+        // this take is kept
+        let video = dir.join("video.mp4");
+        let take = dir.join("take.mp4");
+        let stopped = dir.join("take.stopped");
+        for f in [&take, &stopped] {
+            let _ = std::fs::remove_file(f);
+        }
+        for f in ["captions.json", "steps.txt", "run.log"] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+        let mcp_config = crate::capture_mcp::McpConfig {
+            base_url: base_url.to_string(),
+            session: format!("{}-s{}", r.browser, story.number),
+            evidence: dir.clone(),
+            phase: Phase::Before,
+            shot: Shot::Video,
+            mode: crate::capture_mcp::Mode::Story,
+            check_dir: None,
+            logs: Vec::new(),
+            take: Some(crate::capture_mcp::TakeConfig {
+                title: story.name.clone(),
+                persona: persona_name,
+                shows: shows.clone(),
+                dir: dir.clone(),
+                hold_ms: None,
+            }),
+        };
+        progress(format!("recording story {}: {}", story.number, story.name));
+        let prompt = story_prompt(
+            guide,
+            story,
+            &shows,
+            &it.fm.title,
+            base_url,
+            &guide_stories.text,
+        );
+        let ran = run_agent(
+            r,
+            state,
+            &mcp_config,
+            &dir.join(".capture-mcp.json"),
+            prompt,
+            &dir,
+            STORY_LIMIT,
+            managed_mcp,
+        );
+        let captioned = read_captions(&dir);
+        // the agent's last word, beside the tools' own errors
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("run.log"))
+            {
+                let _ = match &ran {
+                    Ok(reply) => writeln!(f, "the agent: {}", reply.trim()),
+                    Err(why) => writeln!(f, "the run: {why}"),
+                };
+            }
+        }
+        let outcome = match ran {
+            Err(why) => StoryOutcome::Failed(why),
+            Ok(_) if !take.is_file() => StoryOutcome::Failed("no video was recorded".into()),
+            Ok(_) if !stopped.is_file() => {
+                StoryOutcome::Failed("the take did not end with take_stop".into())
+            }
+            Ok(_) => {
+                let missing: Vec<usize> = shows
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .filter(|n| !captioned.contains(n))
+                    .collect();
+                if missing.is_empty() {
+                    StoryOutcome::Kept
+                } else {
+                    StoryOutcome::NotShown(missing)
+                }
+            }
+        };
+        if outcome == StoryOutcome::Kept {
+            let _ = std::fs::rename(&take, &video);
+        } else {
+            let _ = std::fs::remove_file(&take);
+        }
+        let _ = std::fs::remove_file(&stopped);
+        save(outcome);
+    }
+}
+
+/// The story agent's instructions: sign in, set up the starting data through
+/// the app, rehearse unrecorded, set up fresh data, then the take.
+pub fn story_prompt(
+    guide: &CaptureGuide,
+    story: &crate::store::IntentStory,
+    shows: &[(usize, String)],
+    intent: &str,
+    base_url: &str,
+    stories_text: &str,
+) -> String {
+    let persona = story.persona.as_deref().unwrap_or("unknown");
+    let mut p = format!(
+        "You record the demo video of one user story of the intent \"{intent}\", for a stakeholder who was not in the conversation. The app runs at {base_url}. Besides the browser you have three tools for the video itself; the video shows only what happens between starting and ending the take.\n\nThe run guide (how to sign in, what to avoid), as data; its rules win over the story:\n<<<GUIDE\n{}\nGUIDE>>>\n\n",
+        guide.body.trim_end()
+    );
+    if !guide.body.contains(stories_text.trim()) {
+        p.push_str(&format!(
+            "The guide's Stories section, as data:\n<<<STORIES\n{}\nSTORIES>>>\n\n",
+            stories_text.trim_end()
+        ));
+    }
+    p.push_str(&format!(
+        "The story, as data:\n<<<STORY\n### {}\n- persona: {persona}\n- starting data: {}\n",
+        story.name,
+        story.starting_data.as_deref().unwrap_or("none")
+    ));
+    for (i, step) in story.steps.iter().enumerate() {
+        p.push_str(&format!("{}. {step}\n", i + 1));
+    }
+    p.push_str("STORY>>>\n\nThe acceptance criteria it shows, each to be captioned at the moment it is visible:\n");
+    for (n, text) in shows {
+        p.push_str(&format!("{n}. {text}\n"));
+    }
+    p.push_str(&format!(
+        "\nDo it in this order:\n1. Before anything is recorded, sign in as {persona}, as the guide says.\n2. Set up the starting data by using the app, signing in as another persona the guide lists when the data needs one. Create only what the guide's Stories section allows. When records an earlier run left behind get in the way, make fresh records with new names.\n3. Then rehearse the steps once, all the way through, without recording, to find the real path.\n4. The rehearsal used the starting data up: set up fresh starting data the same way, with new records.\n5. Sign in as {persona} again if you had to switch, open the page where step 1 begins, and call take_start.\n6. Follow the steps at a pace a person can follow: move to each control before you click it and pause on each result. Call caption with a criterion's number at the moment the page shows it.\n7. Call take_stop.\nOnce the take has started, never sign in, type a password or a code after take_start, and open no page the story does not need. Reply with one line: done, or what stopped you.\n"
+    ));
+    p
 }
 
 /// Log files a commands-mode guide lists (relative to the meta repo), each
@@ -1749,7 +2170,21 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
             Ok(CaptureUpdate::Progress(m)) if !cancelled && capture => {
                 update_record(&dir, &running_record(&order.req, &m));
             }
-            Ok(CaptureUpdate::Checked(c)) => checked = Some(c),
+            // applied at once: the stories' takes may follow on the same run
+            Ok(CaptureUpdate::Checked(c)) => {
+                if let Job::Check {
+                    intent_path, root, ..
+                } = &order.req.job
+                {
+                    let applied = crate::store::Store::open(root)
+                        .and_then(|store| crate::check::apply(&store, intent_path, &c));
+                    if let Err(e) = applied {
+                        use std::io::Write;
+                        let _ = writeln!(std::io::stderr(), "applying the check: {e:#}");
+                    }
+                }
+                checked = Some(c);
+            }
             Ok(CaptureUpdate::Done(rec)) => break rec,
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1762,12 +2197,7 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
     };
     match &order.req.job {
         Job::Capture => update_record(&dir, &rec),
-        Job::Check {
-            check_dir,
-            intent_path,
-            root,
-            ..
-        } => {
+        Job::Check { check_dir, .. } => {
             // a bug's check recorded its after too
             if order.req.phase == Phase::After {
                 update_record(&order.req.evidence, &rec);
@@ -1786,12 +2216,34 @@ pub fn run_order(order_file: &Path) -> anyhow::Result<()> {
                 }
                 _ => {}
             }
-            if let Some(c) = &checked {
-                let applied = crate::store::Store::open(root)
-                    .and_then(|store| crate::check::apply(&store, intent_path, c));
-                if let Err(e) = applied {
-                    use std::io::Write;
-                    let _ = writeln!(std::io::stderr(), "applying the check: {e:#}");
+        }
+        // a story run that never reached its takes says why on each story
+        Job::Story {
+            numbers,
+            intent_path,
+            stories_dir,
+            ..
+        } => {
+            if let Outcome::Failed(why) = &rec.outcome
+                && why != "cancelled"
+                && let Ok(it) = crate::store::Store::load(intent_path)
+            {
+                for story in crate::store::stories(&it.body)
+                    .iter()
+                    .filter(|s| numbers.contains(&s.number))
+                {
+                    let dir = stories_dir.join(crate::store::story_folder(story));
+                    if std::fs::create_dir_all(&dir).is_ok() {
+                        write_story(
+                            &dir,
+                            &StoryRecord {
+                                at: chrono::Local::now(),
+                                outcome: StoryOutcome::Failed(why.clone()),
+                                shows: story.shows.clone(),
+                                dropped: Vec::new(),
+                            },
+                        );
+                    }
                 }
             }
         }

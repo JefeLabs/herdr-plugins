@@ -497,6 +497,15 @@ pub fn render_list(title: &str, items: &[String], selected: usize, area: Rect, b
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_description_leaves_out_stories_and_decisions() {
+        let body = "## Description\nwhat it is\n\n## Stories\n### Mark reinstates Maya\n- shows: 1\n\n## Decisions\n\n- D1 (owner): yes\n";
+        let d = description_text(body);
+        assert_eq!(d, "what it is");
+        assert_eq!(decisions_text(body), "- D1 (owner): yes");
+    }
+
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -880,6 +889,7 @@ mod tests {
             attachments: &[],
             focus,
             description_scroll: 0,
+            decisions_scroll: 0,
             preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
@@ -895,6 +905,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            stories: &[],
+            stories_selected: 0,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -968,6 +980,7 @@ mod tests {
             attachments: &[],
             focus,
             description_scroll: 0,
+            decisions_scroll: 0,
             preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
@@ -983,6 +996,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            stories: &[],
+            stories_selected: 0,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -1007,12 +1022,14 @@ mod tests {
         let (_t, rows) = lists_detail(Pane::Tree, Pane::Criteria, 0);
         let all = rows.join("\n");
         let titles = [
+            "▸ Open questions (1 open)",
+            "▸ Decisions (none)",
             "▸ Preconditions (1/1)",
+            "▸ Stories (0)",
             "▾ Acceptance criteria (1/2)",
             "▸ Demo Videos (1 linked, 1 found)",
-            "▸ Open questions (1 open)",
-            "▸ Pull requests (1/2 merged, 1 found)",
             "▸ Artifacts (3 linked, 1 found)",
+            "▸ Pull requests (1/2 merged, 1 found)",
         ];
         let at: Vec<usize> = titles.iter().map(|t| row_of(&rows, t)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "in this order:\n{all}");
@@ -1112,15 +1129,17 @@ mod tests {
         // stacked in order right under the description; the closed ones below
         // the open section sit at the bottom
         let desc = row_of(&rows, "The description.");
-        assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 1, "{all}");
-        assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 1);
-        assert_eq!(row_of(&rows, "▸ Demo Videos"), 17, "{all}");
-        assert_eq!(row_of(&rows, "▸ Open questions"), 18, "{all}");
-        assert_eq!(row_of(&rows, "▸ Pull requests"), 19, "{all}");
-        assert_eq!(row_of(&rows, "▸ Missing items / Bugs"), 20, "{all}");
-        assert_eq!(row_of(&rows, "▸ Follow-ups"), 21, "{all}");
-        assert_eq!(row_of(&rows, "▸ Artifacts"), 22, "{all}");
-        assert_eq!(row_of(&rows, "▸ Evidence"), 23, "{all}");
+        assert_eq!(row_of(&rows, "▸ Open questions"), desc + 1, "{all}");
+        assert_eq!(row_of(&rows, "▸ Decisions"), desc + 2, "{all}");
+        assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 3, "{all}");
+        assert_eq!(row_of(&rows, "▸ Stories"), desc + 4, "{all}");
+        assert!(row_of(&rows, "▾ Acceptance criteria") > desc + 4);
+        assert_eq!(row_of(&rows, "▸ Demo Videos"), 18, "{all}");
+        assert_eq!(row_of(&rows, "▸ Artifacts"), 19, "{all}");
+        assert_eq!(row_of(&rows, "▸ Pull requests"), 20, "{all}");
+        assert_eq!(row_of(&rows, "▸ Evidence"), 21, "{all}");
+        assert_eq!(row_of(&rows, "▸ Missing items / Bugs"), 22, "{all}");
+        assert_eq!(row_of(&rows, "▸ Follow-ups"), 23, "{all}");
 
         let (_t, rows) = detail(&it, Pane::Tree, Pane::Artifacts, 80, 24);
         let all = rows.join("\n");
@@ -1158,7 +1177,7 @@ mod tests {
         let (_t, rows) = detail(&it, Pane::Tree, Pane::Criteria, 80, 30);
         let all = rows.join("\n");
         // at most a third of the height for the description (it scrolls)
-        assert!(row_of(&rows, "▸ Preconditions") <= 2 + 10, "{all}");
+        assert!(row_of(&rows, "▸ Open questions") <= 2 + 10, "{all}");
         assert!(all.contains("crit three"), "{all}");
     }
 
@@ -1179,6 +1198,7 @@ mod tests {
             attachments: &[],
             focus: Pane::Questions,
             description_scroll: 0,
+            decisions_scroll: 0,
             preconditions_selected: 0,
             criteria_selected: 0,
             question_selected: 0,
@@ -1194,6 +1214,8 @@ mod tests {
             results: &[],
             missing: &[],
             missing_selected: 0,
+            stories: &[],
+            stories_selected: 0,
             follow_ups: &[],
             follow_ups_selected: 0,
         };
@@ -1246,8 +1268,12 @@ pub enum Pane {
     Description,
     Preconditions,
     Criteria,
+    /// The intent's stories and their demo videos.
+    Stories,
     Demos,
     Questions,
+    /// The decisions an agent recorded while settling the open questions.
+    Decisions,
     PullRequests,
     /// The missing items / bugs a completion check filed.
     Missing,
@@ -1364,6 +1390,7 @@ pub struct DetailView<'a> {
     pub attachments: &'a [(String, u64)],
     pub focus: Pane,
     pub description_scroll: u16,
+    pub decisions_scroll: u16,
     pub preconditions_selected: usize,
     pub criteria_selected: usize,
     pub question_selected: usize,
@@ -1390,6 +1417,9 @@ pub struct DetailView<'a> {
     /// Its follow-ups, as `(mark, title)`.
     pub follow_ups: &'a [(String, String)],
     pub follow_ups_selected: usize,
+    /// Its stories, as `(mark, "<n>. <name> · <state>")`.
+    pub stories: &'a [(String, String)],
+    pub stories_selected: usize,
 }
 
 /// A pull request in the detail view: linked by a `pr:` line or found by the
@@ -1424,21 +1454,26 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
     let arts = crate::store::artifacts(&it.body);
     let fresh = crate::store::new_criteria(it);
     let desc = description_text(&it.body);
+    let decisions = decisions_text(&it.body);
     // the description takes what it needs, up to a third of the height (it
     // scrolls); below it the four sections are an accordion: the open one
     // gets the rest, the others a title line each
     let desc_rows = wrap_text(&desc, area.width as usize).len() as u16;
     let desc_h = (desc_rows + 1).clamp(2, (area.height / 3).max(4));
+    // what has to be settled, what must hold, what it shows and checks, then
+    // what was built and what came of it
     let sections = [
+        Pane::Questions,
+        Pane::Decisions,
         Pane::Preconditions,
+        Pane::Stories,
         Pane::Criteria,
         Pane::Demos,
-        Pane::Questions,
+        Pane::Artifacts,
         Pane::PullRequests,
+        Pane::Evidence,
         Pane::Missing,
         Pane::FollowUps,
-        Pane::Artifacts,
-        Pane::Evidence,
     ];
     let mut constraints = vec![Constraint::Length(2), Constraint::Length(desc_h)];
     constraints.extend(sections.iter().map(|s| {
@@ -1574,37 +1609,63 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             (n, f) => format!("Pull requests ({merged}/{n} merged, {f} found)"),
         }
     };
-    let titles = [
-        checklist_title(&names[0], &ps, &[]),
-        checklist_title(&names[1], &cs, &fresh),
-        format!(
-            "{} {}",
-            marker(Pane::Demos),
-            count_title("Demo Videos", &demo_rows)
-        ),
-        format!(
-            "{} Open questions ({} open)",
-            marker(Pane::Questions),
-            it.open_questions()
-        ),
-        format!("{} {pr_title}", marker(Pane::PullRequests)),
-        format!(
-            "{} Missing items / Bugs ({})",
-            marker(Pane::Missing),
-            v.missing.len()
-        ),
-        format!(
-            "{} Follow-ups ({})",
-            marker(Pane::FollowUps),
-            v.follow_ups.len()
-        ),
-        format!(
-            "{} {}",
-            marker(Pane::Artifacts),
-            count_title("Artifacts", &artifact_rows)
-        ),
-        format!("{} Evidence ({})", marker(Pane::Evidence), v.evidence.len()),
-    ];
+    let story_rows: Vec<ItemRow> = v
+        .stories
+        .iter()
+        .map(|(mark, label)| ItemRow {
+            tag: mark.clone(),
+            text: label.clone(),
+            found: false,
+        })
+        .collect();
+    // each section's title line; the order is `sections`'
+    let title_of = |p: Pane| -> String {
+        match p {
+            Pane::Questions => format!(
+                "{} Open questions ({} open)",
+                marker(Pane::Questions),
+                it.open_questions()
+            ),
+            Pane::Decisions => format!(
+                "{} Decisions{}",
+                marker(Pane::Decisions),
+                if decisions.is_empty() { " (none)" } else { "" }
+            ),
+            Pane::Preconditions => checklist_title(&names[0], &ps, &[]),
+            Pane::Criteria => checklist_title(&names[1], &cs, &fresh),
+            Pane::Stories => format!(
+                "{} {}",
+                marker(Pane::Stories),
+                count_title("Stories", &story_rows)
+            ),
+            Pane::Demos => format!(
+                "{} {}",
+                marker(Pane::Demos),
+                count_title("Demo Videos", &demo_rows)
+            ),
+            Pane::Artifacts => format!(
+                "{} {}",
+                marker(Pane::Artifacts),
+                count_title("Artifacts", &artifact_rows)
+            ),
+            Pane::PullRequests => format!("{} {pr_title}", marker(Pane::PullRequests)),
+            Pane::Evidence => {
+                format!("{} Evidence ({})", marker(Pane::Evidence), v.evidence.len())
+            }
+            Pane::Missing => format!(
+                "{} Missing items / Bugs ({})",
+                marker(Pane::Missing),
+                v.missing.len()
+            ),
+            Pane::FollowUps => format!(
+                "{} Follow-ups ({})",
+                marker(Pane::FollowUps),
+                v.follow_ups.len()
+            ),
+            Pane::Tree | Pane::Description => String::new(),
+        }
+    };
+    let titles: Vec<String> = sections.iter().map(|p| title_of(*p)).collect();
     let follow_up_rows: Vec<ItemRow> = v
         .follow_ups
         .iter()
@@ -1639,6 +1700,24 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
             continue;
         }
         match section {
+            Pane::Decisions => {
+                let block = pane_block(&titles[i], v.focus == Pane::Decisions);
+                let inner = block.inner(rect);
+                block.render(rect, buf);
+                if decisions.is_empty() {
+                    Paragraph::new(Span::styled(
+                        "none — the decisions an agent records while settling the open questions",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                    .wrap(Wrap { trim: false })
+                    .render(inner, buf);
+                } else {
+                    Paragraph::new(crate::markdown::render_markdown(&decisions))
+                        .wrap(Wrap { trim: false })
+                        .scroll((v.decisions_scroll, 0))
+                        .render(inner, buf);
+                }
+            }
             Pane::Preconditions => render_checklist(
                 &ps,
                 &names[0],
@@ -1692,6 +1771,16 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
                 &pr_rows,
                 8,
                 "none yet — agents add a `pr:` line for each pull request they open (a adds one by hand)",
+                rect,
+                buf,
+            ),
+            Pane::Stories => render_items(
+                &titles[i],
+                v.focus == Pane::Stories,
+                v.stories_selected,
+                &story_rows,
+                2,
+                "none yet — polish drafts the stories once every open question has its answer",
                 rect,
                 buf,
             ),
@@ -2124,10 +2213,13 @@ pub fn description_text(body: &str) -> String {
     for line in body.lines() {
         if line.starts_with("## ") {
             let h = line.trim();
+            // sections with their own place in the detail view
             skipping = h.eq_ignore_ascii_case("## Acceptance criteria")
                 || h.eq_ignore_ascii_case("## Open questions")
                 || h.eq_ignore_ascii_case("## Preconditions")
-                || h.eq_ignore_ascii_case("## Artifacts");
+                || h.eq_ignore_ascii_case("## Artifacts")
+                || h.eq_ignore_ascii_case(crate::store::STORIES_HEADING)
+                || h.eq_ignore_ascii_case(DECISIONS_HEADING);
             if skipping {
                 continue;
             }
@@ -2136,6 +2228,26 @@ pub fn description_text(body: &str) -> String {
             }
         }
         if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
+}
+
+/// The decisions an agent records in an intent (`## Decisions`).
+pub const DECISIONS_HEADING: &str = "## Decisions";
+
+/// The `## Decisions` section's text, without its heading.
+pub fn decisions_text(body: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in body.lines() {
+        if line.starts_with("## ") {
+            inside = line.trim().eq_ignore_ascii_case(DECISIONS_HEADING);
+            continue;
+        }
+        if inside {
             out.push_str(line);
             out.push('\n');
         }

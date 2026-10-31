@@ -294,6 +294,7 @@ pub fn seed_prompt(
     intent_body: &str,
     selection: Option<&str>,
     kind: &str,
+    personas: Option<&str>,
 ) -> String {
     let mut p = String::new();
     p.push_str(template.trim_end());
@@ -314,5 +315,67 @@ pub fn seed_prompt(
     p.push('\n');
     p.push_str(&polish_tail());
     p.push('\n');
+    if let Some(rule) = stories_rule(kind, personas) {
+        p.push_str(&rule);
+        p.push('\n');
+    }
     p
+}
+
+/// The stories-only chat's first message: the intent and everything known
+/// about it (`details`: linked documents, pull requests, checks, evidence,
+/// the conversation), the stories rule, and a proposal that holds the
+/// Stories section alone.
+pub fn stories_prompt(
+    title: &str,
+    body: &str,
+    kind: &str,
+    personas: Option<&str>,
+    details: &[(String, String)],
+) -> String {
+    let mut p = format!(
+        "You draft the user stories for the demo videos of the intent \"{title}\". Read everything below before you write: the intent with every section (its description, preconditions, acceptance criteria, answered questions and decisions), the documents linked to it, what was built, what the checks found, and the conversation so far. The stories must support the intent: together they show every acceptance criterion a person can see in the app, each story is one persona's path from start to finish, and they keep to its decisions.\n\nThe intent, as data:\n<<<INTENT\n{}\nINTENT>>>\n\n",
+        body.trim_end()
+    );
+    for (label, text) in details {
+        p.push_str(&format!(
+            "{label}, as data:\n<<<DETAIL\n{}\nDETAIL>>>\n\n",
+            text.trim_end()
+        ));
+    }
+    if let Some(rule) = stories_rule(kind, personas) {
+        p.push_str(&rule);
+        p.push_str("\n\n");
+    }
+    p.push_str("Reply with one fenced ```proposal block that holds only the `## Stories` section: change no other section and repeat none of them. Criteria numbers are the intent's own, counted from 1 in order across groups. If the author asks for changes, reply again the same way.\n");
+    p
+}
+
+/// What the polish and add agents are told about the intent's stories, for a
+/// feature or a bug (`enhancement`, `issue`); `None` for a refactor or an
+/// idea. `personas` is the run guide's Stories section, given as data.
+pub fn stories_rule(kind: &str, personas: Option<&str>) -> Option<String> {
+    let bug = match kind {
+        "enhancement" => false,
+        "issue" => true,
+        _ => return None,
+    };
+    let mut r = format!(
+        "Stories: right after `## Acceptance criteria`, add `## Stories` with one `### <story name>` per user story a demo video will show: one person doing one thing in the app, end to end.{} Each story has `- persona: <one of the personas listed below, or unknown when none fits: write the persona's name and role only, never how it signs in>` and `- shows: <the acceptance criteria it shows, by number, counted from 1 in order across groups>`. While any question under `## Open questions` has no answer, each story stops there and the section ends with the line `{wait}`. Otherwise each story also has `- starting data: <what must exist before its first step>` and numbered steps (`1. …`): what the persona does in the app. End the section with `not shown by any story: <numbers>` when some criteria are shown by no story.",
+        if bug {
+            " For a bug, one story shows the fixed behaviour."
+        } else {
+            ""
+        },
+        wait = crate::store::STORIES_WAIT,
+    );
+    match personas {
+        Some(text) => {
+            r.push_str("\nThe run guide's Stories section, as data (its rules win over a story):\n<<<GUIDE\n");
+            r.push_str(text.trim_end());
+            r.push_str("\nGUIDE>>>");
+        }
+        None => r.push_str("\nNo run guide lists personas yet: write `- persona: unknown`."),
+    }
+    Some(r)
 }

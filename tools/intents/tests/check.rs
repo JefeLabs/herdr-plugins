@@ -449,3 +449,72 @@ fn a_log_outside_the_space_is_refused() {
     let e = herdr_intents::capture::space_log_paths(&meta, &["logs/link.log".into()]).unwrap_err();
     assert!(e.contains("outside the space"), "{e}");
 }
+
+// ---- when a check passes (for the stories' videos) ------------------------
+
+const BODY_TWO: &str = "## Acceptance criteria\n- [ ] one\n- [ ] two\n";
+const BODY_THREE: &str = "## Acceptance criteria\n- [ ] one\n- [ ] two\n- [ ] three\n";
+
+fn rec(verdicts: &[(usize, &str, Verdict)]) -> CheckRecord {
+    CheckRecord {
+        at: chrono::Local::now(),
+        merged: Vec::new(),
+        results: verdicts
+            .iter()
+            .map(|(n, text, v)| CriterionResult {
+                number: *n,
+                key: criterion_key(text),
+                text: text.to_string(),
+                verdict: v.clone(),
+                proof: None,
+            })
+            .collect(),
+        warning: None,
+    }
+}
+
+#[test]
+fn a_check_passes_when_nothing_fails_or_is_missing() {
+    let r = rec(&[
+        (1, "one", Verdict::Confirmed("yes".into())),
+        (2, "two", Verdict::CantCheck("log only".into())),
+    ]);
+    assert!(herdr_intents::check::passes(&r, BODY_TWO));
+}
+
+#[test]
+fn a_failing_or_missing_criterion_does_not_pass() {
+    let with = |v: Verdict| rec(&[(1, "one", Verdict::Confirmed("yes".into())), (2, "two", v)]);
+    assert!(!herdr_intents::check::passes(
+        &with(Verdict::Fails("no".into())),
+        BODY_TWO
+    ));
+    assert!(!herdr_intents::check::passes(
+        &with(Verdict::Missing("no".into())),
+        BODY_TWO
+    ));
+}
+
+#[test]
+fn a_criterion_never_checked_does_not_pass() {
+    let r = rec(&[
+        (1, "one", Verdict::Confirmed("yes".into())),
+        (2, "two", Verdict::Confirmed("yes".into())),
+    ]);
+    assert!(!herdr_intents::check::passes(&r, BODY_THREE));
+}
+
+#[test]
+fn a_check_with_no_proof_or_no_answer_does_not_pass() {
+    for fallback in [
+        "no answer",
+        "no proof kept",
+        "the fold may describe this wrongly: it reads b",
+    ] {
+        let r = rec(&[
+            (1, "one", Verdict::Confirmed("yes".into())),
+            (2, "two", Verdict::CantCheck(fallback.into())),
+        ]);
+        assert!(!herdr_intents::check::passes(&r, BODY_TWO), "{fallback}");
+    }
+}
