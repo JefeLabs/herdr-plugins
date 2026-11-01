@@ -4898,12 +4898,13 @@ impl App {
             Some((title, body)) => (title, body, areas, false),
             None => (st.iv.raw_title(), st.iv.raw_body(), Vec::new(), true),
         };
+        let original = st.follow_up_of.as_ref().and_then(|p| Store::load(p).ok());
         let created = self.store.create(
             Path::new(&group),
             &title,
             &st.save_kind,
             &body,
-            self.current_repo(),
+            new_intent_repo(original.as_ref(), self.current_repo()),
         );
         let it = match created {
             Ok(it) => it,
@@ -4918,7 +4919,6 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().to_string());
         let (provider, conv) = (st.provider.clone(), st.conv_id.clone());
-        let original = st.follow_up_of.as_ref().and_then(|p| Store::load(p).ok());
         let _ = Store::update_fields(&it.path, |fm| {
             fm.state = if raw { State::Raw } else { State::Refining };
             fm.areas = areas;
@@ -7163,6 +7163,19 @@ fn written_intent(st: &InterviewScreen, pending: Option<&str>) -> Option<(String
         qs.push(format!("Not applied yet: {p}"));
     }
     Some((title, merge_questions(&proposal, &qs)))
+}
+
+/// The `repo:` a new intent is filed with. `original` is set when the new
+/// intent is a follow-up (`F`): it refines that intent's shipped work, so it
+/// is meant for the same checkout. `workspace` is where Herdr's workspace (or
+/// the current directory) resolves: no checkout at all when the workspace sits
+/// above the repos, or a different checkout than the original's. The
+/// original's wins; once its checkout is gone, the workspace's.
+fn new_intent_repo(original: Option<&Intent>, workspace: Option<PathBuf>) -> Option<PathBuf> {
+    original
+        .and_then(|o| o.fm.repo.clone())
+        .filter(|r| r.is_dir())
+        .or(workspace)
 }
 
 /// The question that starts an add.
@@ -12786,6 +12799,90 @@ mod tests {
             original.parent(),
             "filed in the original's group, whatever group the agent names"
         );
+    }
+
+    // a refactor follow-up filed from a workspace above the repos was saved
+    // with `repo: null`, so `s` refused it: "intent has no repo"
+    #[test]
+    fn a_follow_up_takes_the_originals_repo_when_the_workspace_has_none() {
+        let mut fx = setup("agy.jsonl");
+        let app_repo = fx._tmp.path().join("app-repo");
+        fs::create_dir_all(&app_repo).unwrap();
+        select(&mut fx.app, "In the inbox");
+        let mut original = fx.app.selected_intent().unwrap().clone();
+        original.fm.repo = Some(app_repo.clone());
+        assert_eq!(new_intent_repo(Some(&original), None), Some(app_repo));
+    }
+
+    #[test]
+    fn a_follow_ups_repo_is_the_originals_over_the_workspaces_while_it_exists() {
+        let mut fx = setup("agy.jsonl");
+        let app_repo = fx._tmp.path().join("app-repo");
+        let workspace = fx._tmp.path().join("elsewhere");
+        fs::create_dir_all(&app_repo).unwrap();
+        select(&mut fx.app, "In the inbox");
+        let mut original = fx.app.selected_intent().unwrap().clone();
+        original.fm.repo = Some(app_repo.clone());
+        assert_eq!(
+            new_intent_repo(Some(&original), Some(workspace.clone())),
+            Some(app_repo.clone()),
+            "the original's checkout wins"
+        );
+        fs::remove_dir(&app_repo).unwrap();
+        assert_eq!(
+            new_intent_repo(Some(&original), Some(workspace.clone())),
+            Some(workspace),
+            "a gone checkout (a removed worktree) falls back to the workspace's"
+        );
+        original.fm.repo = None;
+        assert_eq!(new_intent_repo(Some(&original), None), None);
+    }
+
+    #[test]
+    fn f_files_the_follow_up_for_the_originals_repo() {
+        let mut fx = setup("agy.jsonl");
+        let app_repo = fx._tmp.path().join("app-repo");
+        fs::create_dir_all(&app_repo).unwrap();
+        // the workspace resolves to some other checkout
+        fx.app.capture_repo = Some(fx._tmp.path().join("elsewhere"));
+        select(&mut fx.app, "In the inbox");
+        let original = fx.app.selected_intent().unwrap().path.clone();
+        Store::update_fields(&original, |fm| {
+            fm.state = State::Sent;
+            fm.repo = Some(app_repo.clone());
+        })
+        .unwrap();
+        fx.app.rescan();
+        agent_replies(&mut fx, &[RESTATE, "enough", WRITE_UP]);
+        select(&mut fx.app, "In the inbox");
+        key(&mut fx.app, KeyCode::Char('F'));
+        key(&mut fx.app, KeyCode::Char('r')); // a refactor, as reported
+        type_str(&mut fx.app, WORDS);
+        key(&mut fx.app, KeyCode::Enter);
+        wait_turn(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // that's right → enough
+        wait_turn(&mut fx.app);
+        past_capture(&mut fx.app);
+        key(&mut fx.app, KeyCode::Enter); // save
+        let follow = fx.app.selected_intent().unwrap().clone();
+        assert_ne!(follow.path, original);
+        assert_eq!(follow.fm.kind, "refactor");
+        assert_eq!(
+            follow.fm.repo,
+            Some(app_repo),
+            "sent where the original was"
+        );
+    }
+
+    #[test]
+    fn an_intent_that_is_no_follow_up_takes_the_workspace_repo() {
+        let fx = setup("agy.jsonl");
+        let workspace = fx._tmp.path().to_path_buf();
+        assert_eq!(
+            new_intent_repo(None, Some(workspace.clone())),
+            Some(workspace)
+        );
+        assert_eq!(new_intent_repo(None, None), None);
     }
 
     #[test]
