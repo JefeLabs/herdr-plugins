@@ -2505,6 +2505,43 @@ pub fn is_running(evidence: &Path) -> bool {
     runner_pid(evidence).is_some()
 }
 
+/// Whether a check, capture or recording is running in the space whose
+/// intents are under `space` (in the intents root `root`) and whose meta
+/// repo is `meta`: a live lock in one of its intents' folders (checks and
+/// stories), in one of its intents' evidence folders under `.polish/`, or
+/// the meta repo's run lock.
+pub fn space_busy(root: &Path, space: &Path, meta: &Path) -> bool {
+    fn walk(dir: &Path, root: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(&path, root),
+                Ok(t) if t.is_file() && name == LOCK => is_running(dir),
+                Ok(t) if t.is_file() && name.ends_with(".md") && !name.ends_with(".chat.md") => {
+                    crate::store::Store::load(&path).is_ok_and(|it| {
+                        is_running(&evidence_dir(&crate::config::polish_cwd(
+                            root,
+                            &it.polish_name(),
+                        )))
+                    })
+                }
+                _ => false,
+            }
+        })
+    }
+    let held = std::fs::read_to_string(space_lock_path(meta))
+        .ok()
+        .and_then(|t| {
+            let pid: i32 = t.split_whitespace().next()?.parse().ok()?;
+            (pid > 0).then_some(pid)
+        });
+    held.is_some_and(pid_alive) || walk(space, root)
+}
+
 /// Asks the capture running for this evidence folder to stop (SIGTERM to
 /// its runner, which stops the agent and finishes the effort); false when
 /// none runs.

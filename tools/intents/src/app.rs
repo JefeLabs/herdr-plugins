@@ -1904,6 +1904,21 @@ impl App {
 
     /// True (and says why) when a move's destination, typed from the root,
     /// lies in a space whose storage the tool cannot write to yet.
+    /// A typed group path whose first folder is a name a space has left
+    /// (`skoolscout/…` once it is `skoolscout-com`), with the space's name now.
+    fn current_path(&self, value: &str) -> String {
+        let value = value.trim();
+        let (first, rest) = value.split_once('/').unwrap_or((value, ""));
+        if first.is_empty() {
+            return value.to_string();
+        }
+        let now = crate::space::current_name(&self.dirs, first);
+        match rest {
+            "" => now,
+            _ => format!("{now}/{rest}"),
+        }
+    }
+
     fn refuse_blocked_target(&mut self, value: &str) -> bool {
         let Some(first) = Path::new(value.trim())
             .components()
@@ -3433,8 +3448,8 @@ impl App {
         if !crate::space::is_meta(&here) {
             return;
         }
-        // an intents folder that names another space is not this one's
-        if let Some(Ok(space)) = crate::space::intents_space(&here)
+        // a meta repo that names another space is not this one's
+        if let Some(Ok(space)) = crate::space::repo_space(&self.dirs, &here)
             && !space.eq_ignore_ascii_case(&name)
         {
             return;
@@ -5965,7 +5980,8 @@ impl App {
             InputAction::MoveTo if self.refuse_blocked_target(value) => {}
             InputAction::MoveTo => {
                 if let Some(it) = self.selected_intent().cloned() {
-                    match self.store.move_intent(&it, Path::new(value)) {
+                    let to = self.current_path(value);
+                    match self.store.move_intent(&it, Path::new(&to)) {
                         Ok(moved) => {
                             self.rescan();
                             self.select_path(&moved.path);
@@ -5981,7 +5997,7 @@ impl App {
             InputAction::EditAreas => {
                 let areas: Vec<String> = value
                     .split(',')
-                    .map(|a| a.trim().trim_matches('/').to_string())
+                    .map(|a| self.current_path(a.trim().trim_matches('/')))
                     .filter(|a| !a.is_empty())
                     .collect();
                 if let Some(bad) = areas.iter().find(|a| !self.store.root().join(a).is_dir()) {
@@ -7895,6 +7911,37 @@ mod tests {
         for _ in 0..80 {
             key(app, KeyCode::Backspace);
         }
+    }
+
+    #[test]
+    fn a_typed_area_or_destination_naming_a_spaces_old_name_takes_its_new_one() {
+        let mut fx = setup("agy.jsonl");
+        // the fixture's skoolscout space was once called skool, and moved
+        fs::create_dir_all(&fx.app.dirs.config).unwrap();
+        fs::write(
+            crate::space::pointers_path(&fx.app.dirs),
+            "[spaces.skoolscout]\nold_names = [\"skool\"]\n",
+        )
+        .unwrap();
+        let root = fx.app.store.root().to_path_buf();
+        std::os::unix::fs::symlink("skoolscout", root.join("skool")).unwrap();
+        fx.app.rescan();
+        select(&mut fx.app, "Alpha");
+        let path = fx.app.selected_intent().unwrap().path.clone();
+        key(&mut fx.app, KeyCode::Char('+'));
+        type_text(&mut fx.app, "skool");
+        key(&mut fx.app, KeyCode::Enter);
+        assert_eq!(Store::load(&path).unwrap().fm.areas, vec!["skoolscout"]);
+        key(&mut fx.app, KeyCode::Char('M'));
+        type_text(&mut fx.app, "skool");
+        key(&mut fx.app, KeyCode::Enter);
+        let file = path.file_name().unwrap();
+        assert_eq!(
+            fx.app.selected_intent().map(|i| i.path.clone()),
+            Some(root.join("skoolscout").join(file)),
+            "{:?}",
+            fx.app.message
+        );
     }
 
     #[test]
@@ -12369,10 +12416,11 @@ mod tests {
         )
         .unwrap();
         fx.app.capture_repo = Some(meta.clone());
-        fx.app.cfg.scope = Some("tourneyseason".into());
+        // no origin: the space is the meta repo's folder name
+        fx.app.cfg.scope = Some("space-meta".into());
         fx.app.remember_space_meta();
         assert_eq!(
-            crate::space::meta_for(&fx.app.dirs, "tourneyseason"),
+            crate::space::meta_for(&fx.app.dirs, "space-meta"),
             Some(meta)
         );
         assert!(
@@ -12387,24 +12435,30 @@ mod tests {
     }
 
     #[test]
-    fn an_intents_folder_marks_the_meta_repo_of_the_space_it_names() {
+    fn a_meta_repo_is_the_meta_repo_of_the_space_its_origin_names() {
         let mut fx = setup("agy.jsonl");
-        let meta = fx._tmp.path().join("skoolscout-com");
+        // cloned into a folder named differently from the repo
+        let meta = fx._tmp.path().join("skoolscout");
         fs::create_dir_all(meta.join(".helmsmith/intents")).unwrap();
-        fs::write(
-            meta.join(".helmsmith/intents/config.toml"),
-            "space = \"skoolscout\"\n",
-        )
-        .unwrap();
+        git_in(&meta, &["init", "-q"]);
+        git_in(
+            &meta,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:skoolscout/skoolscout-com.git",
+            ],
+        );
         fx.app.capture_repo = Some(meta.clone());
         // a workspace for another space started here records nothing
         fx.app.cfg.scope = Some("tourneyseason".into());
         fx.app.remember_space_meta();
         assert_eq!(crate::space::meta_for(&fx.app.dirs, "tourneyseason"), None);
-        fx.app.cfg.scope = Some("skoolscout".into());
+        fx.app.cfg.scope = Some("skoolscout-com".into());
         fx.app.remember_space_meta();
         assert_eq!(
-            crate::space::meta_for(&fx.app.dirs, "skoolscout"),
+            crate::space::meta_for(&fx.app.dirs, "skoolscout-com"),
             Some(meta)
         );
     }

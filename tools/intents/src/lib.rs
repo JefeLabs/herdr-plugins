@@ -16,6 +16,7 @@ pub mod reconcile;
 pub mod scope;
 pub mod send;
 pub mod space;
+pub mod space_move;
 pub mod storage;
 pub mod store;
 pub mod ui;

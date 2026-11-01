@@ -1,6 +1,7 @@
 //! Spaces: a project's repos, anchored by a meta repo whose `.helmsmith/`
 //! holds the shared `space.toml` (the repos) and `run.md` (how to run the app),
-//! plus each person's pointer from a space's name to its meta repo.
+//! plus each person's pointer from a space's name to its meta repo. A space
+//! is named after its meta repo: the repo name in its `origin`.
 
 use std::path::{Path, PathBuf};
 
@@ -83,8 +84,20 @@ pub fn target_slug(target: &str) -> Option<String> {
     git_slug(slug)
 }
 
-/// `owner/repo` of a clone's `origin`, as `git` says.
-pub fn origin_slug(repo: &Path) -> Option<String> {
+/// The repo's name in a git URL, as the URL writes it: the last path
+/// segment without `.git` (`git@github.com:o/Shop-Meta.git` → `Shop-Meta`).
+/// Like `git_slug`, something must come before it, so a bare host is none.
+pub fn repo_name(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let mut parts = url.rsplit(['/', ':']);
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    parts.next().filter(|s| !s.is_empty())?;
+    Some(repo.to_string())
+}
+
+/// The URL of a clone's `origin`, as `git` says; none without one.
+fn origin_url(repo: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(repo)
@@ -94,8 +107,13 @@ pub fn origin_slug(repo: &Path) -> Option<String> {
         .ok()?;
     out.status
         .success()
-        .then(|| git_slug(&String::from_utf8_lossy(&out.stdout)))
-        .flatten()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|url| !url.is_empty())
+}
+
+/// `owner/repo` of a clone's `origin`, as `git` says.
+pub fn origin_slug(repo: &Path) -> Option<String> {
+    git_slug(&origin_url(repo)?)
 }
 
 /// Reads `<meta>/.helmsmith/space.toml`.
@@ -134,50 +152,26 @@ pub fn is_meta(repo: &Path) -> bool {
     repo.join(INTENTS_DIR).is_dir() || repo.join(".helmsmith").join("space.toml").is_file()
 }
 
-/// What a meta repo's `.helmsmith/intents/config.toml` says.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntentsConfig {
-    /// The space's name, its folder in the intents storage: `space = "…"`,
-    /// else the repo's folder name.
-    pub space: String,
+/// The space a meta repo names: the repo name in its `origin` URL, so every
+/// clone lands in the same space whatever its folder is called; without an
+/// `origin`, or when that name is not one folder name, the repo's folder
+/// name. `.helmsmith/intents/config.toml` is no longer read.
+pub fn space_name(meta: &Path) -> Result<String, String> {
+    if let Some(name) = origin_url(meta)
+        .and_then(|url| repo_name(&url))
+        .and_then(|n| crate::scope::group_name(&n))
+    {
+        return Ok(name);
+    }
+    meta.file_name()
+        .and_then(|n| crate::scope::group_name(&n.to_string_lossy()))
+        .ok_or_else(|| format!("{} has no name a space can take", meta.display()))
 }
 
-#[derive(Default, serde::Deserialize)]
-struct IntentsFile {
-    #[serde(default)]
-    space: Option<String>,
-}
-
-/// Reads `<meta>/.helmsmith/intents/config.toml`. No file reads as the space
-/// named after the repo's folder.
-pub fn read_intents_config(meta: &Path) -> Result<IntentsConfig, String> {
-    let file = meta.join(INTENTS_DIR).join("config.toml");
-    let parsed: IntentsFile = match std::fs::read_to_string(&file) {
-        Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => IntentsFile::default(),
-        Err(e) => return Err(format!("{}: {e}", file.display())),
-    };
-    let space = match parsed.space {
-        Some(name) => crate::scope::group_name(&name).ok_or_else(|| {
-            format!(
-                "{}: space = \"{name}\" is not one folder name",
-                file.display()
-            )
-        })?,
-        None => meta
-            .file_name()
-            .and_then(|n| crate::scope::group_name(&n.to_string_lossy()))
-            .ok_or_else(|| format!("{}: name the space with space = \"…\"", file.display()))?,
-    };
-    Ok(IntentsConfig { space })
-}
-
-/// The space a repo's intents folder names, when it has one; `Err` says why
-/// its config cannot be read.
+/// The space `repo` names when it is a meta repo (`.helmsmith/intents/` or
+/// `.helmsmith/space.toml`); `Err` says why it has no usable name.
 pub fn intents_space(repo: &Path) -> Option<Result<String, String>> {
-    repo.join(INTENTS_DIR)
-        .is_dir()
-        .then(|| read_intents_config(repo).map(|c| c.space))
+    is_meta(repo).then(|| space_name(repo))
 }
 
 /// Each person's pointers, `<config dir>/spaces.toml`:
@@ -198,6 +192,18 @@ struct Pointer {
     /// A remote storage's address: kept, not used yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    /// Names the space had before it took its meta repo's name, which still
+    /// find it (a Herdr workspace, `INTENTS_SCOPE`, an agent's old path).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    old_names: Vec<String>,
+}
+
+impl Pointer {
+    /// Whether `name` is this entry's, as its key `key` or an old name, in any case.
+    fn answers_to(&self, key: &str, name: &str) -> bool {
+        key.eq_ignore_ascii_case(name)
+            || self.old_names.iter().any(|o| o.eq_ignore_ascii_case(name))
+    }
 }
 
 /// Where this person's pointers are kept.
@@ -215,13 +221,39 @@ fn read_pointers(dirs: &Dirs) -> Result<Pointers, String> {
     }
 }
 
-/// The entry for the space named `name`, matched in any case.
-fn pointer<'a>(pointers: &'a Pointers, name: &str) -> Option<&'a Pointer> {
-    pointers
-        .spaces
+/// The key and entry of the space named `name`, matched in any case: its
+/// own key first, then a space that used to be called that.
+fn entry<'a>(pointers: &'a Pointers, name: &str) -> Option<(&'a String, &'a Pointer)> {
+    let spaces = &pointers.spaces;
+    spaces
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, p)| p)
+        .or_else(|| spaces.iter().find(|(k, p)| p.answers_to(k, name)))
+}
+
+/// The entry for the space named `name` (or once named that).
+fn pointer<'a>(pointers: &'a Pointers, name: &str) -> Option<&'a Pointer> {
+    entry(pointers, name).map(|(_, p)| p)
+}
+
+/// The space's name now: `name`, unless a space used to be called that.
+pub fn current_name(dirs: &Dirs, name: &str) -> String {
+    read_pointers(dirs)
+        .ok()
+        .and_then(|p| entry(&p, name).map(|(k, _)| k.clone()))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// The space whose pointer already points at `meta` (paths compared once
+/// resolved): before a move it still has the old name.
+pub fn pointed_at(dirs: &Dirs, meta: &Path) -> Option<String> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| plain(p));
+    let want = real(meta);
+    let pointers = read_pointers(dirs).ok()?;
+    pointers.spaces.into_iter().find_map(|(key, p)| {
+        let path = PathBuf::from(shellexpand::tilde(p.meta.as_deref()?).into_owned());
+        (real(&path) == want).then_some(key)
+    })
 }
 
 /// This person's meta repo for the space named `name` (`~` allowed).
@@ -235,11 +267,8 @@ pub fn meta_for(dirs: &Dirs, name: &str) -> Option<PathBuf> {
 /// entry's other settings. A file that does not parse is left as it is.
 pub fn remember_meta(dirs: &Dirs, name: &str, meta: &Path) -> anyhow::Result<()> {
     let mut pointers = read_pointers(dirs).map_err(|e| anyhow::anyhow!(e))?;
-    let key = pointers
-        .spaces
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case(name))
-        .cloned()
+    let key = entry(&pointers, name)
+        .map(|(k, _)| k.clone())
         .unwrap_or_else(|| name.to_string());
     pointers.spaces.entry(key).or_default().meta = Some(meta.display().to_string());
     std::fs::create_dir_all(&dirs.config)?;
@@ -290,4 +319,79 @@ pub fn storage_block(dirs: &Dirs, name: &str) -> Option<String> {
         Ok(Storage::Remote) => placeholder("remote"),
         Err(e) => Some(e),
     }
+}
+
+/// Every pointer: the space's key and its meta repo (`~` expanded).
+pub fn pointer_metas(dirs: &Dirs) -> Vec<(String, PathBuf)> {
+    let Ok(pointers) = read_pointers(dirs) else {
+        return Vec::new();
+    };
+    pointers
+        .spaces
+        .into_iter()
+        .filter_map(|(key, p)| {
+            let meta = PathBuf::from(shellexpand::tilde(p.meta.as_deref()?).into_owned());
+            Some((key, meta))
+        })
+        .collect()
+}
+
+/// Renames the pointer `from` to `to`, which keeps `from` as an old name.
+/// An entry already called `to` keeps its own settings and takes only
+/// what it lacks from `from`'s.
+pub fn rename_pointer(dirs: &Dirs, from: &str, to: &str) -> anyhow::Result<()> {
+    let mut pointers = read_pointers(dirs).map_err(|e| anyhow::anyhow!(e))?;
+    let Some(old) = pointers.spaces.remove(from) else {
+        anyhow::bail!("{}: no space {from}", pointers_path(dirs).display());
+    };
+    let key = pointers
+        .spaces
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(to))
+        .cloned()
+        .unwrap_or_else(|| to.to_string());
+    let new = pointers.spaces.entry(key).or_default();
+    new.meta = new.meta.take().or(old.meta);
+    new.storage = new.storage.take().or(old.storage);
+    new.url = new.url.take().or(old.url);
+    for name in old.old_names.into_iter().chain([from.to_string()]) {
+        if !new.old_names.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
+            new.old_names.push(name);
+        }
+    }
+    std::fs::write(pointers_path(dirs), toml::to_string(&pointers)?)?;
+    Ok(())
+}
+
+/// The other names the space of meta repo `meta`, now called `name`, goes
+/// by: the key of a pointer to it not yet moved to `name`, and the old
+/// names it keeps.
+pub fn other_names(dirs: &Dirs, meta: &Path, name: &str) -> Vec<String> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| plain(p));
+    let want = real(meta);
+    let Ok(pointers) = read_pointers(dirs) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (key, p) in pointers.spaces {
+        let Some(m) = p.meta.as_deref() else { continue };
+        if real(Path::new(&*shellexpand::tilde(m))) != want {
+            continue;
+        }
+        for n in std::iter::once(key).chain(p.old_names) {
+            if !n.eq_ignore_ascii_case(name) && !out.iter().any(|o| o.eq_ignore_ascii_case(&n)) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// The space a workspace in meta repo `repo` sees: the name of the pointer
+/// that already points at it, which keeps the old name until the space
+/// moves (so nothing shows empty or is captured apart meanwhile); else the
+/// name the repo gives it. None when `repo` is not a meta repo.
+pub fn repo_space(dirs: &Dirs, repo: &Path) -> Option<Result<String, String>> {
+    let found = intents_space(repo)?;
+    Some(found.map(|name| pointed_at(dirs, repo).unwrap_or(name)))
 }

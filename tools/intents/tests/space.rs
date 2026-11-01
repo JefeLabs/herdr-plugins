@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use herdr_intents::config::Dirs;
 use herdr_intents::space::{
-    Storage, is_meta, meta_for, missing, pointers_path, read_intents_config, read_space,
-    remember_meta, storage_block, storage_for,
+    Storage, current_name, intents_space, is_meta, meta_for, missing, other_names, pointed_at,
+    pointers_path, read_space, remember_meta, repo_name, repo_space, space_name, storage_block,
+    storage_for,
 };
 
 #[test]
@@ -166,40 +167,255 @@ fn an_intents_folder_or_a_space_file_makes_a_meta_repo() {
     assert!(is_meta(&other));
 }
 
-#[test]
-fn the_intents_config_names_the_space() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("skoolscout-com");
-    fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
-    fs::write(
-        repo.join(".helmsmith/intents/config.toml"),
-        "space = \"skoolscout\"\n",
-    )
-    .unwrap();
-    assert_eq!(read_intents_config(&repo).unwrap().space, "skoolscout");
+/// A git repo at `path` whose `origin` is `url` (none when `url` is empty).
+fn git_repo(path: &Path, url: &str) {
+    fs::create_dir_all(path).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    if !url.is_empty() {
+        git(&["remote", "add", "origin", url]);
+    }
 }
 
 #[test]
-fn without_a_config_file_the_space_is_named_after_the_repo() {
+fn the_space_is_named_after_the_meta_repos_origin_not_its_folder() {
+    // a teammate cloned skoolscout-com into a folder called skoolscout
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("skoolscout");
+    git_repo(&repo, "git@github.com:skoolscout/skoolscout-com.git");
+    fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
+    assert_eq!(space_name(&repo).as_deref(), Ok("skoolscout-com"));
+    assert_eq!(intents_space(&repo), Some(Ok("skoolscout-com".to_string())));
+}
+
+#[test]
+fn an_origin_url_in_any_form_gives_the_repo_name_with_its_case() {
+    for (url, want) in [
+        (
+            "git@github.com:skoolscout/skoolscout-com.git",
+            "skoolscout-com",
+        ),
+        (
+            "https://github.com/skoolscout/skoolscout-com",
+            "skoolscout-com",
+        ),
+        (
+            "ssh://git@github.com/skoolscout/skoolscout-com.git",
+            "skoolscout-com",
+        ),
+        ("https://github.com/Acme/Shop-Meta.git/", "Shop-Meta"),
+        (
+            "  git@gitlab.com:group/sub/tourneyseason.git\n",
+            "tourneyseason",
+        ),
+    ] {
+        assert_eq!(repo_name(url).as_deref(), Some(want), "{url}");
+    }
+    assert_eq!(repo_name(""), None);
+    assert_eq!(repo_name("https://github.com/"), None);
+}
+
+#[test]
+fn without_an_origin_the_space_is_the_folder_name() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("tourneyseason");
-    fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
-    assert_eq!(read_intents_config(&repo).unwrap().space, "tourneyseason");
+    git_repo(&repo, "");
+    assert_eq!(space_name(&repo).as_deref(), Ok("tourneyseason"));
+    let plain = tmp.path().join("not-a-repo");
+    fs::create_dir_all(&plain).unwrap();
+    assert_eq!(space_name(&plain).as_deref(), Ok("not-a-repo"));
 }
 
 #[test]
-fn a_broken_intents_config_says_where() {
+fn a_remote_name_that_is_not_a_folder_name_falls_back_to_the_folder() {
     let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("meta");
+    let repo = tmp.path().join("acme-meta");
+    git_repo(&repo, "git@github.com:acme/.github.git");
+    assert_eq!(space_name(&repo).as_deref(), Ok("acme-meta"));
+}
+
+#[test]
+fn the_old_space_line_in_config_toml_is_no_longer_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("skoolscout-com");
+    git_repo(&repo, "git@github.com:skoolscout/skoolscout-com.git");
     fs::create_dir_all(repo.join(".helmsmith/intents")).unwrap();
-    fs::write(repo.join(".helmsmith/intents/config.toml"), "space = [\n").unwrap();
-    let why = read_intents_config(&repo).unwrap_err();
-    assert!(why.contains(".helmsmith/intents/config.toml"), "{why}");
-    fs::write(
-        repo.join(".helmsmith/intents/config.toml"),
-        "space = \"a/b\"\n",
+    let config = repo.join(".helmsmith/intents/config.toml");
+    fs::write(&config, "space = \"skoolscout\"\n").unwrap();
+    assert_eq!(space_name(&repo).as_deref(), Ok("skoolscout-com"));
+    fs::write(&config, "space = [\n").unwrap();
+    assert_eq!(
+        intents_space(&repo),
+        Some(Ok("skoolscout-com".to_string())),
+        "a config.toml that does not parse no longer matters"
+    );
+}
+
+#[test]
+fn a_space_file_alone_names_the_space_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("shop-meta");
+    git_repo(&repo, "git@github.com:acme/shop-meta.git");
+    fs::create_dir_all(repo.join(".helmsmith")).unwrap();
+    fs::write(repo.join(".helmsmith/space.toml"), "repos = []\n").unwrap();
+    assert_eq!(intents_space(&repo), Some(Ok("shop-meta".to_string())));
+    let plain = tmp.path().join("plain");
+    git_repo(&plain, "git@github.com:acme/plain.git");
+    assert_eq!(intents_space(&plain), None, "not a meta repo");
+}
+
+fn dirs_in(tmp: &Path) -> Dirs {
+    Dirs {
+        config: tmp.join("cfg"),
+        root: tmp.join("root"),
+    }
+}
+
+fn pointers(dirs: &Dirs, text: &str) {
+    fs::create_dir_all(&dirs.config).unwrap();
+    fs::write(pointers_path(dirs), text).unwrap();
+}
+
+#[test]
+fn an_old_name_finds_the_space_it_became() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = dirs_in(tmp.path());
+    pointers(
+        &dirs,
+        "[spaces.skoolscout-com]\nmeta = \"/code/skoolscout-com\"\nstorage = \"meta\"\nold_names = [\"skoolscout\"]\n",
+    );
+    assert_eq!(current_name(&dirs, "skoolscout"), "skoolscout-com");
+    assert_eq!(current_name(&dirs, "SkoolScout"), "skoolscout-com");
+    assert_eq!(current_name(&dirs, "skoolscout-com"), "skoolscout-com");
+    assert_eq!(current_name(&dirs, "tourneyseason"), "tourneyseason");
+    assert_eq!(
+        meta_for(&dirs, "skoolscout").as_deref(),
+        Some(Path::new("/code/skoolscout-com"))
+    );
+    assert_eq!(storage_for(&dirs, "skoolscout"), Ok(Storage::Meta));
+}
+
+#[test]
+fn recording_a_meta_repo_keeps_the_spaces_old_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = dirs_in(tmp.path());
+    pointers(
+        &dirs,
+        "[spaces.skoolscout-com]\nmeta = \"/code/skoolscout-com\"\nold_names = [\"skoolscout\"]\n",
+    );
+    remember_meta(
+        &dirs,
+        "skoolscout-com",
+        Path::new("/elsewhere/skoolscout-com"),
     )
     .unwrap();
-    let why = read_intents_config(&repo).unwrap_err();
-    assert!(why.contains("space = \"a/b\""), "{why}");
+    assert_eq!(current_name(&dirs, "skoolscout"), "skoolscout-com");
+    assert_eq!(
+        meta_for(&dirs, "skoolscout").as_deref(),
+        Some(Path::new("/elsewhere/skoolscout-com"))
+    );
+}
+
+#[test]
+fn the_pointer_that_already_points_at_a_meta_repo_names_its_space() {
+    // before the move, skoolscout-com's own pointer is still keyed skoolscout
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = dirs_in(tmp.path());
+    let meta = tmp.path().join("work/skoolscout-com");
+    fs::create_dir_all(&meta).unwrap();
+    fs::create_dir_all(tmp.path().join("work/other")).unwrap();
+    pointers(
+        &dirs,
+        &format!(
+            "[spaces.tourneyseason]\nmeta = \"{t}\"\n\n[spaces.skoolscout]\nmeta = \"{m}\"\n",
+            t = tmp.path().join("work/other").display(),
+            // written through a `..`, as a person might
+            m = tmp.path().join("work/other/../skoolscout-com").display()
+        ),
+    );
+    assert_eq!(pointed_at(&dirs, &meta).as_deref(), Some("skoolscout"));
+    let unknown = tmp.path().join("work/new-meta");
+    fs::create_dir_all(&unknown).unwrap();
+    assert_eq!(pointed_at(&dirs, &unknown), None);
+}
+
+#[test]
+fn a_meta_repos_space_goes_by_its_old_names_before_and_after_the_move() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = dirs_in(tmp.path());
+    let meta = tmp.path().join("work/skoolscout-com");
+    let other = tmp.path().join("work/tourneyseason");
+    fs::create_dir_all(&meta).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    // before: the pointer still has the old name
+    pointers(
+        &dirs,
+        &format!(
+            "[spaces.skoolscout]\nmeta = \"{}\"\n\n[spaces.tourney]\nmeta = \"{}\"\n",
+            meta.display(),
+            other.display()
+        ),
+    );
+    assert_eq!(
+        other_names(&dirs, &meta, "skoolscout-com"),
+        vec!["skoolscout"]
+    );
+    // after: the old name is kept on the renamed pointer
+    pointers(
+        &dirs,
+        &format!(
+            "[spaces.skoolscout-com]\nmeta = \"{}\"\nold_names = [\"skoolscout\", \"skool\"]\n\n[spaces.tourney]\nmeta = \"{}\"\n",
+            meta.display(),
+            other.display()
+        ),
+    );
+    assert_eq!(
+        other_names(&dirs, &meta, "skoolscout-com"),
+        vec!["skoolscout", "skool"]
+    );
+    assert_eq!(other_names(&dirs, &other, "tourneyseason"), vec!["tourney"]);
+}
+
+#[test]
+fn until_its_move_a_meta_repos_space_keeps_its_pointers_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = dirs_in(tmp.path());
+    let meta = tmp.path().join("skoolscout-com");
+    git_repo(&meta, "git@github.com:skoolscout/skoolscout-com.git");
+    fs::create_dir_all(meta.join(".helmsmith/intents")).unwrap();
+    // a teammate with no pointer yet: the name its origin gives
+    assert_eq!(
+        repo_space(&dirs, &meta),
+        Some(Ok("skoolscout-com".to_string()))
+    );
+    // not moved yet (a run held it back): still the pointer's name
+    pointers(
+        &dirs,
+        &format!("[spaces.skoolscout]\nmeta = \"{}\"\n", meta.display()),
+    );
+    assert_eq!(repo_space(&dirs, &meta), Some(Ok("skoolscout".to_string())));
+    // moved
+    pointers(
+        &dirs,
+        &format!(
+            "[spaces.skoolscout-com]\nmeta = \"{}\"\nold_names = [\"skoolscout\"]\n",
+            meta.display()
+        ),
+    );
+    assert_eq!(
+        repo_space(&dirs, &meta),
+        Some(Ok("skoolscout-com".to_string()))
+    );
+    let plain = tmp.path().join("plain");
+    git_repo(&plain, "");
+    assert_eq!(repo_space(&dirs, &plain), None, "not a meta repo");
 }

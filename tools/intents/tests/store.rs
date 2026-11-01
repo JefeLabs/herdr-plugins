@@ -1094,3 +1094,51 @@ fn a_story_named_as_a_slug_reads_as_words() {
     );
     assert_eq!(story_title("Pat sees **it** back"), "Pat sees it back");
 }
+
+/// `<root>/skoolscout-com` with one intent, and the link the move leaves:
+/// `<root>/skoolscout → skoolscout-com`.
+fn moved_space() -> (tempfile::TempDir, Store) {
+    let (tmp, s) = store();
+    s.create(Path::new("skoolscout-com"), "Moved", "idea", "x\n", None)
+        .unwrap();
+    std::os::unix::fs::symlink("skoolscout-com", s.root().join("skoolscout")).unwrap();
+    (tmp, s)
+}
+
+fn top_names(s: &Store) -> Vec<String> {
+    s.scan()
+        .unwrap()
+        .groups
+        .into_iter()
+        .map(|g| g.name)
+        .collect()
+}
+
+#[test]
+fn the_link_a_moved_space_leaves_never_shows_as_a_second_group() {
+    let (_tmp, s) = moved_space();
+    assert_eq!(top_names(&s), vec!["skoolscout-com"]);
+}
+
+#[test]
+fn a_link_to_a_folder_outside_the_root_still_shows() {
+    let (tmp, s) = store();
+    let synced = tmp.path().join("synced/team");
+    fs::create_dir_all(&synced).unwrap();
+    std::os::unix::fs::symlink(&synced, s.root().join("team")).unwrap();
+    assert_eq!(top_names(&s), vec!["team"]);
+}
+
+#[test]
+fn a_scope_still_named_like_the_link_shows_the_moved_space() {
+    // an Intents started before the move keeps its old scope
+    let (_tmp, s) = moved_space();
+    let tree = s.scan().unwrap().scoped(Some("skoolscout"));
+    assert_eq!(tree.groups.len(), 1);
+    let titles: Vec<_> = tree.groups[0]
+        .intents
+        .iter()
+        .map(|i| i.fm.title.clone())
+        .collect();
+    assert_eq!(titles, vec!["Moved"]);
+}

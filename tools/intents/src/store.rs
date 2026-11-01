@@ -295,12 +295,17 @@ impl Group {
         let Some(name) = scope else {
             return self;
         };
-        let mut groups: Vec<Group> = self
-            .groups
-            .into_iter()
-            .filter(|g| g.name.eq_ignore_ascii_case(name))
-            .take(1)
-            .collect();
+        // a scope named like a moved space's old name shows where it went
+        let link = self.path.join(name);
+        let moved_to = is_alias_link(&self.path, &link)
+            .then(|| std::fs::canonicalize(&link).ok())
+            .flatten()
+            .and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()));
+        let wanted = |g: &Group| match &moved_to {
+            Some(to) => g.name == *to,
+            None => g.name.eq_ignore_ascii_case(name),
+        };
+        let mut groups: Vec<Group> = self.groups.into_iter().filter(wanted).take(1).collect();
         if groups.is_empty() {
             groups.push(Group {
                 path: self.path.join(name),
@@ -318,6 +323,15 @@ impl Group {
             broken: Vec::new(),
         }
     }
+}
+
+/// Whether `path`, an entry of the intents root, is a link to another group
+/// of the same root: what moving a space leaves at its old name.
+pub fn is_alias_link(root: &Path, path: &Path) -> bool {
+    let link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let target = std::fs::canonicalize(path).ok();
+    let root = std::fs::canonicalize(root).ok();
+    link && target.is_some_and(|t| t.is_dir() && t.parent() == root.as_deref())
 }
 
 #[derive(Debug)]
@@ -389,6 +403,10 @@ impl Store {
             let path = entry.path();
             let fname = entry.file_name().to_string_lossy().to_string();
             if fname.starts_with('.') {
+                continue;
+            }
+            // the link a moved space leaves at its old name is not a group
+            if dir == self.root && is_alias_link(&self.root, &path) {
                 continue;
             }
             if path.is_dir() {

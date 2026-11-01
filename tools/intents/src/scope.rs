@@ -172,15 +172,20 @@ mod tests {
 
     #[test]
     fn a_workspace_in_a_meta_repo_sees_that_repos_space() {
-        // Herdr names a workspace after its folder: `skoolscout-com`
+        // a clone in a folder called skoolscout: Herdr names the workspace
+        // after it, the meta repo's origin names the space skoolscout-com
         let s = resolve(
             env(&[("HERDR_WORKSPACE_ID", "w5")]),
-            |_| Some("skoolscout-com".to_string()),
-            || Some("skoolscout".to_string()),
+            |_| Some("skoolscout".to_string()),
+            || Some("skoolscout-com".to_string()),
         );
-        assert_eq!(s.as_deref(), Some("skoolscout"));
-        let outside = resolve(env(&[]), |_| None, || Some("skoolscout".to_string()));
-        assert_eq!(outside.as_deref(), Some("skoolscout"), "outside Herdr too");
+        assert_eq!(s.as_deref(), Some("skoolscout-com"));
+        let outside = resolve(env(&[]), |_| None, || Some("skoolscout-com".to_string()));
+        assert_eq!(
+            outside.as_deref(),
+            Some("skoolscout-com"),
+            "outside Herdr too"
+        );
     }
 
     #[test]
