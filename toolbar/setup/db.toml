@@ -1,6 +1,9 @@
+# LazySql on the active agent's database, when the space's run guide says how
+# to find it (Intents' context: `db:`); otherwise its own connection list. It
+# restarts on the new database when another agent becomes active.
 [[tool]]
 id      = "db"
 name    = "Database"
 icon    = "@ICON@"
-command = ["lazysql"]
+command = ["lazysql", "{db?}"]
 cwd     = "~"

@@ -10,6 +10,8 @@
 
 prefix = "ctrl-]"
 bar    = "large"   # bigger buttons: five columns by two rows (or "small")
+# Tells tools where they are: {meta}, {db}, {agent} (see the README).
+context = ["/absolute/path/to/herdr-plugins/target/release/herdr-intents", "context"]
 order  = ["intents", "issues", "db", "files", "editor", "browser", "usage", "terminal"]
 
 [[tool]]
@@ -28,7 +30,8 @@ command = ["gh", "dash"]
 id      = "db"
 name    = "Database"
 icon    = "▤"
-command = ["lazysql"]
+# the active agent's database, when the space's run guide says how to find it
+command = ["lazysql", "{db?}"]
 cwd     = "~"
 
 [[tool]]
@@ -36,6 +39,7 @@ id      = "files"
 name    = "Files"
 icon    = "▭"
 command = ["yazi"]
+cwd     = "{agent?}"   # the active agent's worktree
 
 # Jira: lists issues from the project `jira init` set up. Add "jira" to
 # `order` to use it.
@@ -87,11 +91,11 @@ panes = [
   ["dua", "i", "."],
 ]
 
-# A plain shell in a pane beside the work pane; `clear` only gives it a clean
-# screen.
+# A shell in the toolbar, never beside the agent's chat: at the space's meta
+# repo, else in the workspace's folder.
 [[tool]]
 id      = "terminal"
 name    = "Terminal"
 icon    = "▣"
-command = ["clear"]
-open    = "pane"
+command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
+cwd     = "{meta?}"

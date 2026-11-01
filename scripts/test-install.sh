@@ -378,6 +378,13 @@ if [ $status -eq 0 ] && grep -q '^bar *= *"large"' "$t17" 2>/dev/null && grep -q
 else
   flunk "no terminal: the default bar from the catalog" "exit $status: $(cat "$t17" 2>&1)"
 fi
+# Intents on the bar: the tools are told where they are by Intents' context
+if grep -qxF "context = [\"$h/.local/share/herdr-plugins/target/release/herdr-intents\", \"context\"]" "$t17" &&
+  grep -qF 'command = ["lazysql", "{db?}"]' "$t17" && grep -qF 'cwd     = "{meta?}"' "$t17"; then
+  pass "with Intents on the bar, the tools follow its context"
+else
+  flunk "with Intents on the bar, the tools follow its context" "$(cat "$t17" 2>&1)"
+fi
 case "$out" in
   *"left off: GitHub issues (needs gh, gh-dash)"*) pass "no terminal: says what it left off" ;;
   *) flunk "no terminal: says what it left off" "$out" ;;

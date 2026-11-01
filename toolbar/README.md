@@ -122,6 +122,33 @@ panes = [
 
 `graphics = true` (experimental) lets a slot tool draw Kitty images. The slot's screen model drops them, so the toolbar cuts each image command out of the tool's output, keeps the cursor where it was printed, and after each frame writes it to Herdr placed at that cell of the slot, with replies turned off (`q=2`) so nothing comes back into the toolbar's input. It also answers what a graphics tool asks before drawing: whether images work, the device attributes (`CSI c`), and, when the toolbar's terminal reports its pixel size, the cell and text-area size (`CSI 16 t`, `CSI 14 t`, and the pty's pixel size). Switching to another tool clears the images; switching back makes the tool redraw. Every frame passes through the toolbar, so a busy page is slower than in its own pane, and the slot is only as big as the toolbar: `open = "pane"` is the faster choice for real browsing. A tool that is not installed shows a one-line "cannot start" message in its slot and the other tools keep working.
 
+### Tools that know where they are
+
+A tool can name values about where it runs, in braces, in its `command`, `panes` or `cwd`: `{meta}`, `{db}`, `{agent}`. They come from the workspace's context command, set once at the top of `tools.toml`:
+
+```toml
+context = ["/absolute/path/to/herdr-plugins/target/release/herdr-intents", "context"]
+
+[[tool]]
+id      = "db"
+name    = "Database"
+icon    = "▤"
+command = ["lazysql", "{db?}"]   # the active agent's database, else LazySql's own list
+
+[[tool]]
+id      = "terminal"
+name    = "Terminal"
+icon    = "▣"
+command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
+cwd     = "{meta?}"              # the space's meta repo, else the workspace's folder
+```
+
+The command runs in the workspace's folder, with `TOOLBAR_AGENT_CWD` set to the active agent's folder, and prints a JSON object. Its text values are the names a tool can use, and a `<name>_error` value says why `<name>` is missing. `herdr-intents context` prints the space, its meta repo (`meta`), the active agent's worktree (`agent`) and its database (`db`), found by the space's run guide (see the Intents README). The toolbar adds `{agent}` itself, so it works without a context command too. `${…}` is the shell's, never a name.
+
+**The active agent** is the agent whose chat is in the main pane: the focused agent of this workspace, or, while you are in the toolbar, the one that was active before. The toolbar checks it every second (`herdr agent list`), and only when a tool names a value. When it changes, the context is asked again, and every tool you have opened whose values changed restarts right away on the new ones: LazySql moves to the new agent's database. Tools you have not opened wait for their first opening, and a pane tool takes the values it has when it opens.
+
+**A missing value.** `{name}` is required: a tool missing one does not start, and its slot says why (`Database needs {db}: no slot database here`). `{name?}` is optional: an argument that is only `{name?}` is left out, a `cwd` that is only `{name?}` is the workspace's folder, and inside a longer text it is empty.
+
 ### Per-worktree overrides
 
 A worktree may carry `.herdr-toolbar.toml` at its root with the same schema. Its entries replace global ones with the same `id`, new ids are appended, and its `order`, if present, wins. For example, a repo whose Postgres runs on a numbered slot:

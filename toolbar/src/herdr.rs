@@ -112,6 +112,15 @@ impl HerdrContext {
             .with_context(|| format!("running {} {}", self.bin.display(), args.join(" ")))
     }
 
+    /// `herdr agent list`: every agent of the session, as JSON.
+    pub fn agent_list(&self) -> Option<serde_json::Value> {
+        let out = self.herdr(&["agent", "list"]).ok()?;
+        out.status
+            .success()
+            .then(|| serde_json::from_slice(&out.stdout).ok())
+            .flatten()
+    }
+
     fn ws(&self) -> &str {
         self.workspace_id.as_deref().unwrap_or("default")
     }

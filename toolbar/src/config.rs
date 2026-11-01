@@ -73,6 +73,9 @@ pub struct RawConfig {
     pub prefix: Option<String>,
     pub bar: Option<BarSize>,
     pub order: Option<Vec<String>>,
+    /// A command that prints the workspace's context as a JSON object; its
+    /// text values fill tools' `{name}`s (see `context`).
+    pub context: Option<Vec<String>>,
     #[serde(default)]
     pub tool: Vec<ToolConfig>,
 }
@@ -83,6 +86,8 @@ pub struct Config {
     pub prefix: String,
     pub bar: BarSize,
     pub tools: Vec<ToolConfig>,
+    /// The context command; empty: none.
+    pub context: Vec<String>,
 }
 
 impl Default for Config {
@@ -91,6 +96,7 @@ impl Default for Config {
             prefix: DEFAULT_PREFIX.to_string(),
             bar: BarSize::Small,
             tools: Vec::new(),
+            context: Vec::new(),
         }
     }
 }
@@ -259,6 +265,7 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
     let mut prefix = global.prefix;
     let mut bar = global.bar;
     let mut order = global.order;
+    let mut context = global.context;
 
     if let Some(ws) = workspace {
         for t in ws.tool {
@@ -275,6 +282,9 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         }
         if ws.order.is_some() {
             order = ws.order;
+        }
+        if ws.context.is_some() {
+            context = ws.context;
         }
     }
 
@@ -303,6 +313,7 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         prefix: prefix.unwrap_or_else(|| DEFAULT_PREFIX.to_string()),
         bar: bar.unwrap_or_default(),
         tools,
+        context: context.unwrap_or_default(),
     })
 }
 
@@ -480,6 +491,29 @@ command = ["lazysql", "postgres://localhost:5433/x"]
     }
 
     #[test]
+    fn a_context_command_is_read_and_a_workspace_file_may_replace_it() {
+        let g = parse(&format!(
+            "context = [\"herdr-intents\", \"context\"]\n{}",
+            "[[tool]]\nid = \"a\"\nname = \"a\"\nicon = \"x\"\ncommand = [\"x\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            merge(g, None).unwrap().context,
+            vec!["herdr-intents", "context"]
+        );
+        let g = parse(&format!(
+            "context = [\"herdr-intents\", \"context\"]\n{}",
+            "[[tool]]\nid = \"a\"\nname = \"a\"\nicon = \"x\"\ncommand = [\"x\"]\n"
+        ))
+        .unwrap();
+        let w = parse("context = [\"./ctx.sh\"]\n").unwrap();
+        assert_eq!(merge(g, Some(w)).unwrap().context, vec!["./ctx.sh"]);
+        let none =
+            parse("[[tool]]\nid = \"a\"\nname = \"a\"\nicon = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(merge(none, None).unwrap().context.is_empty());
+    }
+
+    #[test]
     fn workspace_order_wins() {
         let ws = "order = [\"files\", \"db\"]\n";
         let (t, g, w) = dirs(GLOBAL, Some(ws));
@@ -488,7 +522,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         assert_eq!(
             ids,
             [
-                "files", "db", "intents", "issues", "editor", "browser", "usage", "terminal"
+                "files", "db", "intents", "issues", "terminal", "editor", "browser", "usage"
             ]
         );
     }
