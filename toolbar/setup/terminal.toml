@@ -1,8 +1,10 @@
-# A shell in the toolbar, never beside the agent's chat: at the space's meta
-# repo (Intents' context), else in the workspace's folder.
+# A shell in the toolbar, never beside the agent's chat, in the active agent's
+# worktree. Another agent becoming active keeps the shell; the next one starts
+# in the new worktree.
 [[tool]]
 id      = "terminal"
 name    = "Terminal"
 icon    = "@ICON@"
+group   = "agent"
 command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
-cwd     = "{meta?}"
+on_switch = "keep"

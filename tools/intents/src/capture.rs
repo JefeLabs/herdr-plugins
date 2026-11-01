@@ -75,6 +75,8 @@ pub struct CaptureGuide {
     /// A command, run in an agent's worktree, that prints the address of
     /// that agent's database (`db:`).
     pub db: Option<String>,
+    /// The space's default page for the toolbar's browser (`browse:`).
+    pub browse: Option<String>,
 }
 
 /// The guide's `splash:` block, as written: a logo (a path in the repo) and
@@ -254,6 +256,8 @@ struct GuideFront {
     splash: GuideSplash,
     #[serde(default)]
     db: Option<String>,
+    #[serde(default)]
+    browse: Option<String>,
 }
 
 /// How long the app gets to answer, unless the guide says.
@@ -353,6 +357,7 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
         logs: front.logs,
         splash: front.splash,
         db: front.db,
+        browse: front.browse,
     })
 }
 
@@ -2899,6 +2904,7 @@ mod tests {
             logs: Vec::new(),
             splash: Default::default(),
             db: None,
+            browse: None,
         }
     }
 

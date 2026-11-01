@@ -4,6 +4,7 @@
 id    = "usage"
 name  = "Usage"
 icon  = "@ICON@"
+group = "system"
 open  = "pane"
 panes = [
   ["procs", "--watch-interval", "2", "--sortd", "cpu", "--insert", "ReadBytes", "--insert", "WriteBytes",

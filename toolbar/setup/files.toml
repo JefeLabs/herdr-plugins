@@ -1,7 +1,8 @@
-# yazi in the active agent's folder (its worktree), else the workspace's.
+# yazi in the active agent's worktree (the agent group's folder); it restarts
+# there when another agent becomes active.
 [[tool]]
 id      = "files"
 name    = "Files"
 icon    = "@ICON@"
+group   = "agent"
 command = ["yazi"]
-cwd     = "{agent?}"

@@ -172,6 +172,7 @@ fn a_space_with_an_active_agent_gives_its_meta_repo_and_the_agents_database() {
             "meta": s.meta.display().to_string(),
             "agent": s.wt.display().to_string(),
             "db": "postgres://u@localhost:5434/db",
+            "browse_error": "the run guide has no browse: page for the space (its url needs a slot's port)",
         })
         .to_string()
     );
@@ -312,4 +313,41 @@ fn trusting_a_run_guide_without_a_db_command_says_so() {
     let s = space(None);
     let why = trust_db(&s.dirs, &s.meta).unwrap_err();
     assert!(why.contains("no db: command"), "{why}");
+}
+
+#[test]
+fn the_space_has_a_default_page_for_the_browser() {
+    let s = space(None);
+    let guide = |front: &str| format!("---\ndefault_area: org/social\n{front}---\nBody.\n");
+    let ctx = |s: &Space| {
+        gather(
+            &s.dirs,
+            Some("skoolscout-com"),
+            Some(&s.meta),
+            None,
+            Duration::from_secs(5),
+        )
+    };
+    put(
+        &s.meta.join(".helmsmith/capture.md"),
+        &guide("url: https://x.local:{port}\nbrowse: https://demo.x.local:3000\n"),
+    );
+    assert_eq!(ctx(&s)["browse"], "https://demo.x.local:3000");
+    // no browse: a fixed url stands in
+    put(
+        &s.meta.join(".helmsmith/capture.md"),
+        &guide("url: https://staging.x.dev\n"),
+    );
+    assert_eq!(ctx(&s)["browse"], "https://staging.x.dev");
+    // a url that needs a slot's port is no page for the whole space
+    put(
+        &s.meta.join(".helmsmith/capture.md"),
+        &guide("url: https://x.local:{port}\n"),
+    );
+    let got = ctx(&s);
+    assert!(!got.contains_key("browse"));
+    assert!(
+        got["browse_error"].as_str().unwrap().contains("browse:"),
+        "{got:?}"
+    );
 }

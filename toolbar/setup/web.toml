@@ -4,5 +4,6 @@
 id       = "web"
 name     = "Browser (in the toolbar)"
 icon     = "@ICON@"
-command  = ["terminal-browser", "open"]
+group   = "space"
+command  = ["terminal-browser", "open", "{browse?}"]
 graphics = true

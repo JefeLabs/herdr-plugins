@@ -3,4 +3,5 @@
 id      = "jira"
 name    = "Jira"
 icon    = "@ICON@"
+group   = "space"
 command = ["jira", "issue", "list"]
