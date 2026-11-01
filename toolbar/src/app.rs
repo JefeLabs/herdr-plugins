@@ -101,6 +101,8 @@ pub struct App {
     vars: crate::context::Vars,
     /// The command that prints it (`context = […]`); empty: none.
     context_cmd: Vec<String>,
+    /// The tools the bar's rules follow (`"---"` in `order`).
+    rules_after: Vec<String>,
 }
 
 impl App {
@@ -129,6 +131,7 @@ impl App {
             wake_rx,
             vars: crate::context::Vars::new(),
             context_cmd: Vec::new(),
+            rules_after: Vec::new(),
         };
         app.reload();
         if app.uses_context() {
@@ -149,6 +152,7 @@ impl App {
         } = loaded;
         self.bar = config.bar;
         self.context_cmd = config.context.clone();
+        self.rules_after = config.rules_after.clone();
         self.hover = None;
         let mut old: Vec<Slot> = std::mem::take(&mut self.slots);
         let selected_id = old.get(self.selected).map(|s| s.cfg.id.clone());
@@ -189,9 +193,25 @@ impl App {
         let _ = config.prefix; // prefix changes apply on next start; see reload()
     }
 
-    /// Where the bar's rule goes: before the first tool that opens a pane.
-    fn rule(&self) -> Option<usize> {
-        ui::rule_index(self.slots.iter().map(|s| s.cfg.open == Open::Pane))
+    /// Where the bar's rules go (before each of these tools): after each
+    /// tool a `"---"` in `order` follows, else one before the first tool
+    /// that opens a pane.
+    fn rules(&self) -> Vec<usize> {
+        let mut placed: Vec<usize> = self
+            .rules_after
+            .iter()
+            .filter_map(|id| self.slots.iter().position(|s| &s.cfg.id == id))
+            .map(|i| i + 1)
+            .filter(|&i| i < self.slots.len())
+            .collect();
+        placed.sort_unstable();
+        placed.dedup();
+        if placed.is_empty() {
+            return ui::rule_index(self.slots.iter().map(|s| s.cfg.open == Open::Pane))
+                .into_iter()
+                .collect();
+        }
+        placed
     }
 
     /// Inside Herdr, where the toolbar's pane can be resized.
@@ -204,7 +224,7 @@ impl App {
         ui::bar_layout(
             self.bar,
             self.slots.len(),
-            self.rule().is_some(),
+            self.rules().len(),
             self.size.rows,
         )
     }
@@ -519,7 +539,7 @@ impl App {
         let (content, bar) = ui::split(area, layout.width);
         if ev.column >= bar.x && bar.width > 0 {
             // not the rule, the marker row or the empty rows below
-            let at = ui::button_at(bar, layout.rows, self.slots.len(), self.rule(), ev.row);
+            let at = ui::button_at(bar, layout.rows, self.slots.len(), &self.rules(), ev.row);
             match (ev.kind, at) {
                 (MouseEventKind::Down(MouseButton::Left), Some(index)) => {
                     self.message = None;
@@ -656,6 +676,7 @@ impl App {
             prefix_armed: self.prefix.armed(),
             bar: self.bar,
             hover: self.hover,
+            rules: self.rules(),
         };
         ui::render(&frame, area, buf);
     }
@@ -1081,6 +1102,37 @@ mod tests {
         assert_eq!(app.hover, None, "the rule");
         app.apply_mouse(moved(SIZE.cols - 2, 3));
         assert_eq!(app.hover, Some(2));
+        app.shutdown();
+    }
+
+    #[test]
+    fn rules_in_order_are_drawn_where_order_puts_them() {
+        // order: a, rule, b, rule, c (all in the toolbar)
+        let cfg = format!(
+            "order = [\"a\", \"---\", \"b\", \"---\", \"c\"]\n{}",
+            three()
+        );
+        let fx = fixture(&cfg);
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let ids: Vec<&str> = app.slots.iter().map(|s| s.cfg.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"], "a rule is no tool");
+        // small buttons: a on row 0, a rule on row 1, b on 2, a rule on 3, c on 4
+        let mut t =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(SIZE.cols, SIZE.rows))
+                .unwrap();
+        t.draw(|f| app.draw(f.area(), f.buffer_mut())).unwrap();
+        let buf = t.backend().buffer();
+        let rail = |y: u16| {
+            (SIZE.cols - 3..SIZE.cols)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert_eq!((rail(1), rail(3)), ("───".to_string(), "───".to_string()));
+        assert_ne!(rail(2), "───");
+        for (y, want) in [(1, None), (2, Some(1)), (3, None), (4, Some(2))] {
+            app.apply_mouse(moved(SIZE.cols - 2, y));
+            assert_eq!(app.hover, want, "row {y}");
+        }
         app.shutdown();
     }
 

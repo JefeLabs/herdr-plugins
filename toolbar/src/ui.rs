@@ -36,6 +36,8 @@ pub struct Frame<'a> {
     pub bar: BarSize,
     /// The tool the mouse rests on: its name shows beside its button.
     pub hover: Option<usize>,
+    /// Where the bar's rules go: before each of these tools.
+    pub rules: Vec<usize>,
 }
 
 /// The width of the bar and the rows of each button.
@@ -49,9 +51,9 @@ pub struct BarLayout {
 /// buttons are five columns by two rows (one blank row between icons); they
 /// fall back to small ones (three columns, one row) when they would not all
 /// fit above the marker row.
-pub fn bar_layout(size: BarSize, count: usize, rule: bool, height: u16) -> BarLayout {
+pub fn bar_layout(size: BarSize, count: usize, rules: usize, height: u16) -> BarLayout {
     let small = BarLayout { width: 3, rows: 1 };
-    let needed = count * 2 + if rule { usize::from(rule_rows(2)) } else { 0 };
+    let needed = count * 2 + rules * usize::from(rule_rows(2));
     match size {
         BarSize::Small => small,
         BarSize::Large if needed <= usize::from(height.saturating_sub(1)) => {
@@ -80,10 +82,11 @@ pub fn rule_index(panes: impl IntoIterator<Item = bool>) -> Option<usize> {
     None
 }
 
-/// The tool button under row `y` of the bar, if any: not the rule, the
+/// The tool button under row `y` of the bar, if any: not a rule, the
 /// marker or the empty rows below the buttons.
-pub fn button_at(bar: Rect, rows: u16, count: usize, rule: Option<usize>, y: u16) -> Option<usize> {
-    (0..count).find(|&i| button(bar, rows, i, rule).is_some_and(|b| y >= b.y && y < b.y + b.height))
+pub fn button_at(bar: Rect, rows: u16, count: usize, rules: &[usize], y: u16) -> Option<usize> {
+    (0..count)
+        .find(|&i| button(bar, rows, i, rules).is_some_and(|b| y >= b.y && y < b.y + b.height))
 }
 
 /// `(content, bar)`: the bar is the rightmost `width` columns.
@@ -113,12 +116,12 @@ pub fn content_size(area: Rect, footer: bool, bar_width: u16) -> (u16, u16) {
 }
 
 pub fn render(frame: &Frame, area: Rect, buf: &mut Buffer) {
-    let rule = rule_index(frame.items.iter().map(|i| i.pane));
-    let layout = bar_layout(frame.bar, frame.items.len(), rule.is_some(), area.height);
+    let rules = &frame.rules;
+    let layout = bar_layout(frame.bar, frame.items.len(), rules.len(), area.height);
     let (content, bar) = split(area, layout.width);
     render_content(frame, content, buf);
-    render_bar(frame, bar, layout.rows, rule, buf);
-    render_hover(frame, content, bar, layout.rows, rule, buf);
+    render_bar(frame, bar, layout.rows, rules, buf);
+    render_hover(frame, content, bar, layout.rows, rules, buf);
 }
 
 fn render_content(frame: &Frame, area: Rect, buf: &mut Buffer) {
@@ -160,13 +163,10 @@ fn render_content(frame: &Frame, area: Rect, buf: &mut Buffer) {
 }
 
 /// Where tool button `i` sits in the bar, if it fits above the marker row.
-/// Buttons from the rule on sit below it.
-fn button(bar: Rect, rows: u16, i: usize, rule: Option<usize>) -> Option<Rect> {
-    let below_rule = if rule.is_some_and(|r| i >= r) {
-        rule_rows(rows)
-    } else {
-        0
-    };
+/// Each rule before it moves it down.
+fn button(bar: Rect, rows: u16, i: usize, rules: &[usize]) -> Option<Rect> {
+    let before = rules.iter().filter(|&&r| i >= r).count() as u16;
+    let below_rule = before * rule_rows(rows);
     let y = bar.y + (i as u16).checked_mul(rows)? + below_rule;
     // keep the last row for the reload/armed marker
     (y + rows <= bar.y + bar.height.saturating_sub(1)).then_some(Rect {
@@ -176,13 +176,13 @@ fn button(bar: Rect, rows: u16, i: usize, rule: Option<usize>) -> Option<Rect> {
     })
 }
 
-fn render_bar(frame: &Frame, area: Rect, rows: u16, rule: Option<usize>, buf: &mut Buffer) {
+fn render_bar(frame: &Frame, area: Rect, rows: u16, rules: &[usize], buf: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // a dim line between the tools that run here and those that open a pane
-    if let Some(r) = rule {
-        let y = area.y + r as u16 * rows + rule_rows(rows) - 1;
+    // a dim line between groups of tools
+    for (k, &r) in rules.iter().enumerate() {
+        let y = area.y + r as u16 * rows + (k as u16 + 1) * rule_rows(rows) - 1;
         if y < area.y + area.height.saturating_sub(1) {
             let line = Rect {
                 y,
@@ -195,7 +195,7 @@ fn render_bar(frame: &Frame, area: Rect, rows: u16, rule: Option<usize>, buf: &m
         }
     }
     for (i, item) in frame.items.iter().enumerate() {
-        let Some(button) = button(area, rows, i, rule) else {
+        let Some(button) = button(area, rows, i, rules) else {
             break;
         };
         let row = Rect {
@@ -246,13 +246,13 @@ fn render_hover(
     content: Rect,
     bar: Rect,
     rows: u16,
-    rule: Option<usize>,
+    rules: &[usize],
     buf: &mut Buffer,
 ) {
     let Some(i) = frame.hover else {
         return;
     };
-    let (Some(item), Some(button)) = (frame.items.get(i), button(bar, rows, i, rule)) else {
+    let (Some(item), Some(button)) = (frame.items.get(i), button(bar, rows, i, rules)) else {
         return;
     };
     let name = item.name;
@@ -347,6 +347,9 @@ mod tests {
     }
 
     fn bare<'a>(items: Vec<BarItem<'a>>, bar: BarSize, hover: Option<usize>) -> Frame<'a> {
+        let rules = rule_index(items.iter().map(|i| i.pane))
+            .into_iter()
+            .collect();
         Frame {
             items,
             screen: None,
@@ -355,6 +358,7 @@ mod tests {
             prefix_armed: false,
             bar,
             hover,
+            rules,
         }
     }
 
@@ -398,15 +402,15 @@ mod tests {
         assert_eq!(buf[(38, 1)].symbol(), "☑");
         assert_eq!(buf[(38, 2)].symbol(), "▤");
         assert_eq!(
-            bar_layout(BarSize::Large, 3, false, 6),
+            bar_layout(BarSize::Large, 3, 0, 6),
             BarLayout { width: 3, rows: 1 }
         );
         assert_eq!(
-            bar_layout(BarSize::Large, 3, false, 7),
+            bar_layout(BarSize::Large, 3, 0, 7),
             BarLayout { width: 5, rows: 2 }
         );
         assert_eq!(
-            bar_layout(BarSize::Small, 3, false, 40),
+            bar_layout(BarSize::Small, 3, 0, 40),
             BarLayout { width: 3, rows: 1 }
         );
     }
@@ -446,6 +450,25 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_goes_before_each_tool_the_frame_names() {
+        // groups: [0] | [1] | [2], small buttons
+        let mut frame = bare(items(&RUNNING, 0), BarSize::Small, None);
+        frame.rules = vec![1, 2];
+        let t = draw_at(&frame, 40, 8);
+        let buf = t.backend().buffer();
+        assert_eq!(buf[(38, 0)].symbol(), "◉");
+        assert_eq!(row(buf, 1, 40)[37..].to_string(), "───", "the first rule");
+        assert_eq!(buf[(38, 2)].symbol(), "☑");
+        assert_eq!(row(buf, 3, 40)[37..].to_string(), "───", "the second rule");
+        assert_eq!(buf[(38, 4)].symbol(), "▤");
+        let at = |y| button_at(Rect::new(37, 0, 3, 8), 1, 3, &[1, 2], y);
+        assert_eq!(
+            (at(0), at(1), at(2), at(3), at(4)),
+            (Some(0), None, Some(1), None, Some(2))
+        );
+    }
+
+    #[test]
     fn a_rule_between_large_buttons_has_one_blank_row_on_each_side() {
         let t = draw_at(&bare(grouped(&RUNNING, 2, 1), BarSize::Large, None), 40, 12);
         let buf = t.backend().buffer();
@@ -466,11 +489,11 @@ mod tests {
     fn the_rule_counts_when_large_buttons_must_fit() {
         // three tools and a rule with a blank row above it need eight rows above the marker
         assert_eq!(
-            bar_layout(BarSize::Large, 3, true, 9),
+            bar_layout(BarSize::Large, 3, 1, 9),
             BarLayout { width: 5, rows: 2 }
         );
         assert_eq!(
-            bar_layout(BarSize::Large, 3, true, 8),
+            bar_layout(BarSize::Large, 3, 1, 8),
             BarLayout { width: 3, rows: 1 }
         );
     }
@@ -478,7 +501,7 @@ mod tests {
     #[test]
     fn rows_map_to_buttons_skipping_the_rule() {
         let bar = Rect::new(35, 0, 5, 12);
-        let at = |y| button_at(bar, 2, 3, Some(1), y);
+        let at = |y| button_at(bar, 2, 3, &[1], y);
         assert_eq!((at(0), at(1)), (Some(0), Some(0)));
         assert_eq!(
             (at(2), at(3)),
@@ -491,11 +514,11 @@ mod tests {
         assert_eq!(at(11), None, "the marker row");
         let small = Rect::new(37, 0, 3, 8);
         assert_eq!(
-            button_at(small, 1, 3, Some(2), 2),
+            button_at(small, 1, 3, &[2], 2),
             None,
             "small: the rule only"
         );
-        assert_eq!(button_at(small, 1, 3, Some(2), 3), Some(2));
+        assert_eq!(button_at(small, 1, 3, &[2], 3), Some(2));
     }
 
     #[test]
@@ -528,6 +551,7 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
+            rules: Vec::new(),
         };
         let t = draw(&frame);
         insta::assert_snapshot!(t.backend());
@@ -554,6 +578,7 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
+            rules: Vec::new(),
         };
         let t = draw(&frame);
         insta::assert_snapshot!(t.backend());
@@ -573,6 +598,7 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
+            rules: Vec::new(),
         };
         let t = draw(&frame);
         let buf = t.backend().buffer();
@@ -596,6 +622,7 @@ mod tests {
             prefix_armed: true,
             bar: BarSize::Small,
             hover: None,
+            rules: Vec::new(),
         };
         let t = draw(&frame);
         let buf = t.backend().buffer();
@@ -622,6 +649,7 @@ mod tests {
             prefix_armed: false,
             bar: BarSize::Small,
             hover: None,
+            rules: Vec::new(),
         };
         let t = draw(&frame);
         let buf = t.backend().buffer();
