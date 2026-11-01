@@ -7,5 +7,7 @@ name    = "Editor"
 icon    = "@ICON@"
 group   = "agent"
 command = ["sh", "-c", "d=${XDG_CACHE_HOME:-$HOME/.cache}; mkdir -p \"$d\"; s=\"$d/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\"; rm -f \"$s\"; exec nvim --listen \"$s\""]
-# another agent becomes active: Neovim stays open and changes its folder
-on_switch = ["sh", "-c", "nvim --server \"${XDG_CACHE_HOME:-$HOME/.cache}/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\" --remote-send '<C-\\><C-n>:cd {agent}<CR>'"]
+# another agent becomes active: Neovim stays open and changes its folder. The
+# folder goes in as an argument ("$1"), never inside the script, and reaches
+# Neovim as a quoted string (chdir), never as a command line.
+on_switch = ["sh", "-c", "p=$(printf %s \"$1\" | sed \"s/'/''/g\"); exec nvim --server \"${XDG_CACHE_HOME:-$HOME/.cache}/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\" --remote-expr \"chdir('$p')\" >/dev/null", "sh", "{agent}"]

@@ -87,7 +87,7 @@ Editor's entry, with the socket its command already listens on:
 
 ```toml
 group     = "agent"
-on_switch = ["sh", "-c", "nvim --server \"${XDG_CACHE_HOME:-$HOME/.cache}/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\" --remote-send '<C-\\><C-n>:cd {agent}<CR>'"]
+on_switch = ["sh", "-c", "p=$(printf %s \"$1\" | sed \"s/'/''/g\"); exec nvim --server \"${XDG_CACHE_HOME:-$HOME/.cache}/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\" --remote-expr \"chdir('$p')\" >/dev/null", "sh", "{agent}"]
 ```
 
 - **The command runs in the background (my call).** It runs with the tool's `env`, in the new agent's folder. A failure shows on the toolbar's footer and doesn't stop the tool.
@@ -151,4 +151,4 @@ Intents stays the first tool, in the space group **(owner)**.
 
 - Field names in code, and how the rail's groups replace `rules_after`.
 - How the background `on_switch` command is run and timed out (a few seconds), and how its failure reads on the footer.
-- The exact Neovim keys for `:cd` (`<C-\><C-n>` first, so it works from insert mode).
+- Values reach a command only as their own arguments (`"$1"`), and Neovim gets a quoted `chdir()`, not keystrokes (fixed after a security review: a folder name must never become shell or Ex commands). A value with a control character is never used.
