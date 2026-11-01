@@ -247,11 +247,13 @@ It is filled in for you the first time the tool starts in a workspace whose fold
 
 **Skoolscout's way.** A guide with `default_area` in place of `start` keeps skoolscout's own steps: a `work` slot, e2e seed stories and logs in the slot's worktree, as the next sections describe.
 
-**The toolbar's context.** `herdr-intents context` prints, as one JSON object, what the toolbar's tools may know about the workspace it runs in: the space (`space`), its meta repo (`meta`), the active agent's worktree (`agent`, from `TOOLBAR_AGENT_CWD`) and that agent's database (`db`). A value that cannot be known is left out, and `meta_error` or `db_error` says why. The toolbar runs it as its `context` command (see the toolbar README): Terminal opens at the meta repo, and LazySql on the active agent's database. The run guide says how to find that database, so neither tool learns how the project runs:
+**The toolbar's context.** `herdr-intents context` prints, as one JSON object, what the toolbar's tools may know about the workspace it runs in: the space (`space`), its meta repo (`meta`), the space's default page for the browser (`browse`), the active agent's worktree (`agent`, from `TOOLBAR_AGENT_CWD`) and that agent's database (`db`). A value that cannot be known is left out, and `meta_error` or `db_error` says why. The toolbar runs it as its `context` command (see the toolbar README): Terminal opens at the meta repo, and LazySql on the active agent's database. The run guide says how to find that database, so neither tool learns how the project runs:
 
 ```yaml
 db: '. ./.env.slot 2>/dev/null; echo "postgres://app:secret@localhost:${PG_PORT:-5432}/app?sslmode=disable"'
 ```
+
+The space's page is the run guide's `browse:` (`browse: https://demo.example.local:3000`), else its `url` when that needs no slot's `{port}`; it is an address, not a command, so it needs no trust.
 
 `db:` is a command, run through `sh -c` at the top of the agent's worktree with `INTENTS_META` set to the meta repo, and the first line it prints is the address. Since the context runs it on its own, without a key from you, it runs only once you trust it: run `herdr-intents trust` in the meta repo, which shows the command and records it exactly (in `trusted-db.json` beside `intents.toml`). A changed `db:` must be trusted again, and until then the context says so and LazySql opens plain. A repo you only cloned never runs code just because you opened it. It may take 5 seconds. If it fails, the last line it wrote to stderr is the reason the toolbar shows, and if it prints nothing, there is no database.
 

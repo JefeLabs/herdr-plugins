@@ -644,6 +644,7 @@ mod tests {
             logs: vec![".logs/backend.log".into()],
             splash: Default::default(),
             db: None,
+            browse: None,
         }
     }
 

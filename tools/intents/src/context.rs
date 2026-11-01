@@ -135,11 +135,28 @@ pub fn gather(
                 })
         }
     };
+    let guide = meta
+        .as_ref()
+        .ok()
+        .map(|m| crate::capture::read_guide(m).map_err(|e| format!("{e:#}")));
+    // the space's default page: `browse:`, else a url that needs no slot
+    let browse = match &guide {
+        None => Err("no meta repo, so no run guide".to_string()),
+        Some(Err(e)) => Err(e.clone()),
+        Some(Ok(g)) => g
+            .browse
+            .clone()
+            .or_else(|| (!g.url.contains("{port}")).then(|| g.url.clone()))
+            .ok_or_else(|| {
+                "the run guide has no browse: page for the space (its url needs a slot's port)"
+                    .to_string()
+            }),
+    };
     let db = match (&meta, &agent) {
         (Err(_), _) => Err("no meta repo, so no run guide".to_string()),
         (Ok(_), None) => Err("no active agent".to_string()),
-        (Ok(meta), Some(agent)) => match crate::capture::read_guide(meta) {
-            Err(e) => Err(format!("{e:#}")),
+        (Ok(meta), Some(agent)) => match guide.clone().unwrap_or_else(|| Err(String::new())) {
+            Err(e) => Err(e),
             Ok(g) => match g.db {
                 None => Err(format!(
                     "the run guide in {} has no db: command",
@@ -161,6 +178,10 @@ pub fn gather(
     match db {
         Ok(d) => put("db", d),
         Err(e) => put("db_error", e),
+    }
+    match browse {
+        Ok(b) => put("browse", b),
+        Err(e) => put("browse_error", e),
     }
     out
 }
