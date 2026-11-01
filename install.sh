@@ -471,6 +471,11 @@ write_toolbar() { # <file> <nerd|text> <tool id>...
     printf '%s\n' "# herdr-toolbar tools, written by the herdr-plugins installer. Run it again" \
       "# with --setup to choose again, or edit this file (see the toolbar README)." "" \
       'prefix = "ctrl-]"' 'bar    = "large"' "order  = [$order]"
+    # Intents tells the tools where they are: the space, its meta repo, the
+    # active agent's database
+    case " $* " in *" intents "*)
+      printf '%s\n' "context = [\"$(toml_text "$dir/target/release/herdr-intents")\", \"context\"]" ;;
+    esac
     for id in "$@"; do
       icon=$(sed_text "$(awk -F'|' -v i="$id" -v f="$field" '$1 == i { print $f }' "$catalog/tools")")
       printf '\n'

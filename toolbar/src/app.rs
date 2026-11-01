@@ -30,6 +30,12 @@ pub struct Slot {
     pub proc: Option<ToolProcess>,
     /// Why the last spawn failed, shown instead of a screen.
     pub last_error: Option<String>,
+    /// Opened at least once: a tool never opened is not started for a
+    /// context change.
+    started: bool,
+    /// What it runs, its `{name}`s filled in: a new context that changes
+    /// this restarts it.
+    running_as: Option<ToolConfig>,
 }
 
 impl Slot {
@@ -91,6 +97,10 @@ pub struct App {
     /// The too-narrow width we last asked Herdr to widen, so a width Herdr
     /// will not widen is asked about once.
     widened_at: Option<u16>,
+    /// The workspace's context: what fills tools' `{name}`s.
+    vars: crate::context::Vars,
+    /// The command that prints it (`context = […]`); empty: none.
+    context_cmd: Vec<String>,
 }
 
 impl App {
@@ -117,8 +127,16 @@ impl App {
             paths,
             wake_tx,
             wake_rx,
+            vars: crate::context::Vars::new(),
+            context_cmd: Vec::new(),
         };
         app.reload();
+        if app.uses_context() {
+            app.vars.insert(
+                "_error".into(),
+                "finding the space and the active agent…".into(),
+            );
+        }
         Ok(app)
     }
 
@@ -130,6 +148,7 @@ impl App {
             ignored_untrusted,
         } = loaded;
         self.bar = config.bar;
+        self.context_cmd = config.context.clone();
         self.hover = None;
         let mut old: Vec<Slot> = std::mem::take(&mut self.slots);
         let selected_id = old.get(self.selected).map(|s| s.cfg.id.clone());
@@ -147,6 +166,8 @@ impl App {
                     cfg,
                     proc: None,
                     last_error: None,
+                    started: false,
+                    running_as: None,
                 },
             };
             self.slots.push(slot);
@@ -223,17 +244,30 @@ impl App {
     fn spawn(&mut self, idx: usize) {
         let size = self.content_size();
         let slot = &mut self.slots[idx];
+        slot.started = true;
+        // its `{name}`s from the context; one that is missing says why
+        let cfg = match crate::context::expand(&slot.cfg, &self.vars) {
+            Ok(cfg) => cfg,
+            Err(why) => {
+                slot.proc = None;
+                slot.running_as = None;
+                slot.last_error = Some(why);
+                return;
+            }
+        };
         let env = SpawnEnv {
             tool_id: slot.cfg.id.clone(),
             ..self.env.clone()
         };
-        match ToolProcess::spawn(&slot.cfg, &env, size, self.wake_tx.clone()) {
+        match ToolProcess::spawn(&cfg, &env, size, self.wake_tx.clone()) {
             Ok(p) => {
                 slot.proc = Some(p);
                 slot.last_error = None;
+                slot.running_as = Some(cfg);
             }
             Err(e) => {
                 slot.proc = None;
+                slot.running_as = None;
                 slot.last_error = Some(e);
             }
         }
@@ -290,7 +324,13 @@ impl App {
     /// Open a pane tool, or close the pane it opened, off the UI thread;
     /// Herdr answers in tens of milliseconds but the toolbar must never wait.
     fn toggle_pane(&mut self, idx: usize) {
-        let cfg = self.slots[idx].cfg.clone();
+        let cfg = match crate::context::expand(&self.slots[idx].cfg, &self.vars) {
+            Ok(cfg) => cfg,
+            Err(why) => {
+                self.message = Some(why);
+                return;
+            }
+        };
         let Some(ctx) = self.herdr.clone() else {
             self.message = Some(format!(
                 "{} opens in a Herdr pane: run the toolbar inside Herdr",
@@ -349,6 +389,48 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Whether any tool names a `{name}` from the workspace's context.
+    pub fn uses_context(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| !crate::context::placeholders(&s.cfg).is_empty())
+    }
+
+    /// The command that prints the workspace's context; empty: none.
+    pub fn context_cmd(&self) -> &[String] {
+        &self.context_cmd
+    }
+
+    /// A new context (the active agent changed, say): every opened tool it
+    /// changes restarts right away with the new values, or stops and says
+    /// why one is missing. Tools never opened, and pane tools, wait for
+    /// their next opening.
+    pub fn apply_context(&mut self, vars: crate::context::Vars) {
+        self.vars = vars;
+        for idx in 0..self.slots.len() {
+            let slot = &mut self.slots[idx];
+            let uses = !crate::context::placeholders(&slot.cfg).is_empty();
+            if !slot.started || !uses || slot.cfg.open == Open::Pane {
+                continue;
+            }
+            match crate::context::expand(&slot.cfg, &self.vars) {
+                Ok(now) if slot.running_as.as_ref() == Some(&now) => continue,
+                Err(why) if slot.running_as.is_none() => {
+                    slot.last_error = Some(why);
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(p) = slot.proc.as_mut() {
+                p.kill();
+            }
+            slot.proc = None;
+            slot.running_as = None;
+            slot.last_error = None;
+            self.spawn(idx);
         }
     }
 
@@ -627,6 +709,7 @@ pub fn run(
             .then(|| (w.width / w.columns, w.height / w.rows))
     });
     let env = SpawnEnv { cell, ..env };
+    let workspace_cwd = env.cwd.clone();
     let mut app = match App::new(
         paths,
         env,
@@ -641,6 +724,17 @@ pub fn run(
             return Err(e);
         }
     };
+    // tools that name `{values}` follow the workspace's context: the
+    // active agent, checked every second, and what the context command says
+    let follower = app.uses_context().then(|| {
+        let (tx, rx) = channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (h, cmd, s) = (herdr.clone(), app.context_cmd().to_vec(), stop.clone());
+        std::thread::spawn(move || {
+            crate::context::follow(h, cmd, workspace_cwd, Duration::from_secs(1), s, tx)
+        });
+        (rx, stop)
+    });
     if let Some(ctx) = herdr {
         app.set_herdr(ctx);
     }
@@ -694,7 +788,13 @@ pub fn run(
         // Drain pty wakes so one redraw covers a burst of output.
         while app.wake_rx.try_recv().is_ok() {}
         app.drain_notes();
+        if let Some(latest) = follower.as_ref().and_then(|(rx, _)| rx.try_iter().last()) {
+            app.apply_context(latest);
+        }
     })();
+    if let Some((_, stop)) = &follower {
+        stop.store(true, Ordering::Relaxed);
+    }
 
     app.shutdown();
     restore_terminal();
@@ -1146,6 +1246,65 @@ mod tests {
                 .unwrap_or_default()
                 .contains("pane run w1:p12 'terminal-browser' 'open'")
         });
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> crate::context::Vars {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn shows(app: &App, i: usize, text: &str) -> bool {
+        app.slots[i]
+            .proc
+            .as_ref()
+            .is_some_and(|p| p.screen().contents().contains(text))
+    }
+
+    #[test]
+    fn a_tool_follows_the_context_and_restarts_when_it_changes() {
+        let f = fixture(
+            &(tool("a", "echo A; sleep 30")
+                + &tool("db", "echo DB={db}; sleep 30")
+                + &tool("later", "echo L={db}; sleep 30")),
+        );
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        assert!(app.uses_context());
+        app.select(1);
+        // no context yet: the tool waits, saying why
+        assert!(app.slots[1].proc.is_none());
+        let why = app.slots[1].last_error.clone().unwrap_or_default();
+        assert!(why.contains("db needs {db}"), "{why}");
+        app.apply_context(vars(&[("db", "one")]));
+        let first = pid(&app, 1);
+        wait_until("DB=one", || shows(&app, 1, "DB=one"));
+        app.apply_context(vars(&[("db", "one"), ("meta", "/m")]));
+        assert_eq!(pid(&app, 1), first, "the same value: no restart");
+        app.apply_context(vars(&[("db", "two")]));
+        let second = pid(&app, 1);
+        assert_ne!(second, first, "a new value: restarted");
+        wait_until("DB=two", || shows(&app, 1, "DB=two"));
+        wait_until("the old one ended", || !alive(first));
+        app.apply_context(vars(&[("db_error", "no slot database")]));
+        assert!(app.slots[1].proc.is_none());
+        wait_until("the second one ended", || !alive(second));
+        let why = app.slots[1].last_error.clone().unwrap_or_default();
+        assert!(why.contains("no slot database"), "{why}");
+        assert_eq!(
+            app.slots[2].state(),
+            ToolState::NotStarted,
+            "never opened: not started"
+        );
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_toolbar_whose_tools_name_nothing_needs_no_context() {
+        let f = fixture(&three());
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        assert!(!app.uses_context());
+        app.shutdown();
     }
 
     #[test]

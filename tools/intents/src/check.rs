@@ -643,6 +643,7 @@ mod tests {
             body: "Sign in with Cmd+U.\n".into(),
             logs: vec![".logs/backend.log".into()],
             splash: Default::default(),
+            db: None,
         }
     }
 

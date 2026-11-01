@@ -1,9 +1,8 @@
-# A plain shell in a Herdr pane beside the work pane, in the workspace folder;
-# selecting it again closes that pane. The pane starts your shell; `clear`
-# only gives it a clean screen.
+# A shell in the toolbar, never beside the agent's chat: at the space's meta
+# repo (Intents' context), else in the workspace's folder.
 [[tool]]
 id      = "terminal"
 name    = "Terminal"
 icon    = "@ICON@"
-command = ["clear"]
-open    = "pane"
+command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
+cwd     = "{meta?}"

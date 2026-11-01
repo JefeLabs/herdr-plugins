@@ -31,6 +31,9 @@ case "$1 $2" in
     fi
     echo $((n + 1)) > "$FAKE_HERDR_LOG.next"
     printf '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p%s","tab_id":"w1:t1"}}}\n' "$n" ;;
+  "agent list")
+    # FAKE_AGENTS: a file holding the whole `agent list` reply
+    cat "${FAKE_AGENTS:-/dev/null}" ;;
   "plugin pane")
     # Real 0.9.5 shape: result.plugin_pane.pane.pane_id
     printf '{"id":"cli:plugin","result":{"plugin_pane":{"entrypoint":"toolbar","pane":{"pane_id":"w1:p9","tab_id":"w1:t1"},"plugin_id":"jefelabs.toolbar"},"type":"plugin_pane_opened"}}\n' ;;

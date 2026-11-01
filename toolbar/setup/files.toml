@@ -1,5 +1,7 @@
+# yazi in the active agent's folder (its worktree), else the workspace's.
 [[tool]]
 id      = "files"
 name    = "Files"
 icon    = "@ICON@"
 command = ["yazi"]
+cwd     = "{agent?}"
