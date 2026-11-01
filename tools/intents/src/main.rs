@@ -27,37 +27,43 @@ fn with_config(
     // intents moved from ~/intents to ~/.helmsmith/intents/spaces: once
     let settled = herdr_intents::storage::settle_root(&home, &cfg.root);
     cfg.root = settled.root;
-    cfg.notice = settled.notice;
+    let dirs = herdr_intents::config::Dirs {
+        config: dirs.config,
+        root: cfg.root.clone(),
+    };
+    // a space is named after its meta repo: one still under another name
+    // moves there once, unless a run is going in it
+    let moved = herdr_intents::space_move::settle_spaces(&dirs, |space, meta| {
+        herdr_intents::capture::space_busy(&dirs.root, space, meta)
+    });
+    let mut notices: Vec<String> = settled.notice.into_iter().chain(moved).collect();
     // one Herdr workspace sees one top-level group: its meta repo's space,
     // else the one named like it
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
-    let mut unreadable = None;
+    let mut unnamed = None;
     cfg.scope = scope::resolve(
         |k| std::env::var(k).ok(),
         |id| scope::herdr_label(std::path::Path::new(&herdr), id),
         || {
             let repo = herdr_intents::send::capture_repo()?;
-            match herdr_intents::space::intents_space(&repo)? {
+            match herdr_intents::space::repo_space(&dirs, &repo)? {
                 Ok(space) => Some(space),
                 Err(why) => {
-                    unreadable = Some(why);
+                    unnamed = Some(why);
                     None
                 }
             }
         },
-    );
-    if cfg.notice.is_none() {
-        cfg.notice = unreadable;
-    }
+    )
+    // a name the space has left (a workspace, INTENTS_SCOPE) still finds it
+    .map(|s| herdr_intents::space::current_name(&dirs, &s));
+    notices.extend(unnamed);
+    cfg.notice = (!notices.is_empty()).then(|| notices.join("; "));
     // a space whose storage is not built yet shows no intents and takes none
     cfg.storage_block = cfg
         .scope
         .as_deref()
         .and_then(|s| herdr_intents::space::storage_block(&dirs, s));
-    let dirs = herdr_intents::config::Dirs {
-        config: dirs.config,
-        root: cfg.root.clone(),
-    };
     f(cfg, dirs)
 }
 
@@ -90,8 +96,14 @@ fn main() -> ExitCode {
                 let event = get("HERDR_PLUGIN_EVENT_JSON");
                 open_space::event_workspace(event.as_deref(), get("HERDR_WORKSPACE_ID").as_deref())
             };
+            let home = get("HOME").map_or_else(|| "/".into(), std::path::PathBuf::from);
+            let dirs = resolve_dirs(get, &home, None);
+            // a workspace named with a name the space has left is the space's
+            let also_called = |meta: &std::path::Path, space: &str| {
+                herdr_intents::space::other_names(&dirs, meta, space)
+            };
             let line = match id {
-                Some(id) => open_space::describe(&id, &open_space::open(&id, herdr)),
+                Some(id) => open_space::describe(&id, &open_space::open(&id, also_called, herdr)),
                 None if first => "open-space: the session has no workspace".to_string(),
                 None => "open-space: the event names no workspace".to_string(),
             };

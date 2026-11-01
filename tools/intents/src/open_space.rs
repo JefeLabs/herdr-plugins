@@ -1,8 +1,8 @@
 //! Opening a meta repo's folder in a new Herdr workspace opens its space.
 //!
 //! Herdr runs `herdr-intents open-space` on `workspace.created`. When the new
-//! workspace's folder is in the main checkout of a meta repo (one whose
-//! `.helmsmith/intents/` names a space), the workspace takes the space's name
+//! workspace's folder is in the main checkout of a meta repo, the workspace
+//! takes the space's name (the meta repo's own, from its `origin`)
 //! and its intents load: the toolbar opens (Intents is its first tool), or,
 //! without one, the Intents pane does.
 //!
@@ -104,7 +104,14 @@ pub fn repo_of(folder: &Path) -> Option<(PathBuf, bool)> {
 
 /// Open the space of workspace `id`'s folder, asking Herdr through `herdr`
 /// (the CLI's arguments → its reply, or why it failed).
-pub fn open(id: &str, herdr: impl Fn(&[&str]) -> Result<Value, String>) -> Outcome {
+///
+/// `also_called(meta repo, space)` gives the other names the space goes by
+/// (its old names): a workspace named with one is the space's.
+pub fn open(
+    id: &str,
+    also_called: impl Fn(&Path, &str) -> Vec<String>,
+    herdr: impl Fn(&[&str]) -> Result<Value, String>,
+) -> Outcome {
     let skip = Outcome::Skipped;
     let ws = match herdr(&["workspace", "get", id]) {
         Ok(reply) => reply
@@ -131,12 +138,19 @@ pub fn open(id: &str, herdr: impl Fn(&[&str]) -> Result<Value, String>) -> Outco
         return skip(format!("{} is a linked worktree", top.display()));
     }
     // Herdr names a workspace after its repo and keeps it in step with the
-    // folder; any other name was chosen by someone, and stays
+    // folder, and this hook gave it its space's name, maybe a name the space
+    // has since left; any other name was chosen by someone, and stays
     let folder_name = top.file_name().map(|n| n.to_string_lossy().into_owned());
-    if folder_name.as_deref() != Some(label) {
+    let found = crate::space::intents_space(&top);
+    let old = match &found {
+        Some(Ok(space)) => also_called(&top, space),
+        _ => Vec::new(),
+    };
+    let is_old = |name: &str| old.iter().any(|o| o.eq_ignore_ascii_case(name.trim()));
+    if folder_name.as_deref() != Some(label) && !is_old(label) {
         return skip(format!("someone named it \"{label}\""));
     }
-    let space = match crate::space::intents_space(&top) {
+    let space = match found {
         None => return skip(format!("{} is not a meta repo", top.display())),
         Some(Err(why)) => return skip(why),
         Some(Ok(space)) => space,
@@ -147,7 +161,8 @@ pub fn open(id: &str, herdr: impl Fn(&[&str]) -> Result<Value, String>) -> Outco
             let taken = all.into_iter().flatten().find_map(|w| {
                 let other = w.get("workspace_id").and_then(Value::as_str) != Some(id);
                 let name = w.get("label").and_then(Value::as_str)?;
-                (other && name.trim().eq_ignore_ascii_case(&space)).then_some(name)
+                let same = name.trim().eq_ignore_ascii_case(&space) || is_old(name);
+                (other && same).then_some(name)
             });
             if let Some(name) = taken {
                 return skip(format!("{space} already has a workspace, \"{name}\""));
@@ -298,18 +313,35 @@ mod tests {
         );
     }
 
-    /// `<tmp>/skoolscout-com`: a git repo whose intents folder names `skoolscout`.
+    /// `<tmp>/skoolscout-com`: a meta repo cloned from `skoolscout/skoolscout-com`,
+    /// so its space is `skoolscout-com`.
     fn meta_repo(tmp: &Path) -> PathBuf {
         let meta = tmp.join("skoolscout-com");
         fs::create_dir_all(meta.join(".helmsmith/intents")).unwrap();
         fs::create_dir_all(meta.join("app-ui")).unwrap();
-        fs::write(
-            meta.join(".helmsmith/intents/config.toml"),
-            "space = \"skoolscout\"\n",
-        )
-        .unwrap();
         git(&meta, &["init", "-q"]);
+        git(
+            &meta,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:skoolscout/skoolscout-com.git",
+            ],
+        );
         fs::canonicalize(meta).unwrap()
+    }
+
+    /// No space here has been called anything else.
+    fn no_old(_: &Path, _: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// skoolscout-com's space used to be called skoolscout.
+    fn was_skoolscout(meta: &Path, space: &str) -> Vec<String> {
+        assert!(meta.ends_with("skoolscout-com"), "{}", meta.display());
+        assert_eq!(space, "skoolscout-com");
+        vec!["skoolscout".to_string()]
     }
 
     /// A Herdr that answers from these facts and records every call.
@@ -438,17 +470,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let meta = meta_repo(tmp.path());
         let herdr = FakeHerdr::new("skoolscout-com", &meta);
-        let got = open("w3", |a| herdr.call(a));
+        let got = open("w3", no_old, |a| herdr.call(a));
         assert_eq!(
             got,
             Outcome::Opened {
-                space: "skoolscout".into(),
+                space: "skoolscout-com".into(),
                 intents: Load::Toolbar
             }
         );
         let calls = herdr.calls();
         assert!(
-            calls.contains(&"workspace rename w3 skoolscout".to_string()),
+            calls.contains(&"workspace rename w3 skoolscout-com".to_string()),
             "{calls:?}"
         );
         assert!(
@@ -472,8 +504,8 @@ mod tests {
         let meta = meta_repo(tmp.path());
         let herdr = FakeHerdr::new("skoolscout-com", &meta.join("app-ui"));
         assert!(matches!(
-            open("w3", |a| herdr.call(a)),
-            Outcome::Opened { ref space, .. } if space == "skoolscout"
+            open("w3", no_old, |a| herdr.call(a)),
+            Outcome::Opened { ref space, .. } if space == "skoolscout-com"
         ));
     }
 
@@ -483,11 +515,11 @@ mod tests {
         let meta = meta_repo(tmp.path());
         let mut herdr = FakeHerdr::new("skoolscout-com", &meta);
         herdr.toolbar = false;
-        let got = open("w3", |a| herdr.call(a));
+        let got = open("w3", no_old, |a| herdr.call(a));
         assert_eq!(
             got,
             Outcome::Opened {
-                space: "skoolscout".into(),
+                space: "skoolscout-com".into(),
                 intents: Load::Pane
             }
         );
@@ -507,7 +539,7 @@ mod tests {
         let mut herdr = FakeHerdr::new("skoolscout-com", &meta);
         herdr.focused = false;
         assert!(matches!(
-            open("w3", |a| herdr.call(a)),
+            open("w3", no_old, |a| herdr.call(a)),
             Outcome::Opened {
                 intents: Load::Pane,
                 ..
@@ -522,8 +554,45 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let meta = meta_repo(tmp.path());
         let herdr = FakeHerdr::new("Fix the reminder bell", &meta);
-        assert!(matches!(open("w3", |a| herdr.call(a)), Outcome::Skipped(_)));
+        assert!(matches!(
+            open("w3", no_old, |a| herdr.call(a)),
+            Outcome::Skipped(_)
+        ));
         assert!(!herdr.changed_anything(), "{:?}", herdr.calls());
+    }
+
+    #[test]
+    fn a_workspace_still_named_with_an_old_name_takes_the_new_one() {
+        // named skoolscout by an earlier open-space, before the space took
+        // its meta repo's name
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = meta_repo(tmp.path());
+        let herdr = FakeHerdr::new("skoolscout", &meta);
+        assert_eq!(
+            open("w3", was_skoolscout, |a| herdr.call(a)),
+            Outcome::Opened {
+                space: "skoolscout-com".into(),
+                intents: Load::Toolbar
+            }
+        );
+        let calls = herdr.calls();
+        assert!(
+            calls.contains(&"workspace rename w3 skoolscout-com".to_string()),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_workspace_named_with_an_old_name_is_the_spaces_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = meta_repo(tmp.path());
+        let mut herdr = FakeHerdr::new("skoolscout-com", &meta);
+        herdr.others = vec!["~", "skoolscout"];
+        match open("w3", was_skoolscout, |a| herdr.call(a)) {
+            Outcome::Skipped(why) => assert!(why.contains("\"skoolscout\""), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!herdr.changed_anything());
     }
 
     #[test]
@@ -533,10 +602,16 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q"]);
         let herdr = FakeHerdr::new("tourneyseason", &fs::canonicalize(&repo).unwrap());
-        assert!(matches!(open("w3", |a| herdr.call(a)), Outcome::Skipped(_)));
+        assert!(matches!(
+            open("w3", no_old, |a| herdr.call(a)),
+            Outcome::Skipped(_)
+        ));
         assert!(!herdr.changed_anything());
         let home = FakeHerdr::new("~", tmp.path());
-        assert!(matches!(open("w3", |a| home.call(a)), Outcome::Skipped(_)));
+        assert!(matches!(
+            open("w3", no_old, |a| home.call(a)),
+            Outcome::Skipped(_)
+        ));
         assert!(!home.changed_anything());
     }
 
@@ -550,7 +625,10 @@ mod tests {
         git(&meta, &["worktree", "add", "-q", linked.to_str().unwrap()]);
         fs::create_dir_all(linked.join(".helmsmith/intents")).unwrap();
         let herdr = FakeHerdr::new("skoolscout-com-wt", &fs::canonicalize(&linked).unwrap());
-        assert!(matches!(open("w3", |a| herdr.call(a)), Outcome::Skipped(_)));
+        assert!(matches!(
+            open("w3", no_old, |a| herdr.call(a)),
+            Outcome::Skipped(_)
+        ));
         assert!(!herdr.changed_anything());
     }
 
@@ -559,22 +637,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let meta = meta_repo(tmp.path());
         let mut herdr = FakeHerdr::new("skoolscout-com", &meta);
-        herdr.others = vec!["~", "SkoolScout"];
-        match open("w3", |a| herdr.call(a)) {
-            Outcome::Skipped(why) => assert!(why.contains("SkoolScout"), "{why}"),
+        herdr.others = vec!["~", "SkoolScout-Com"];
+        match open("w3", no_old, |a| herdr.call(a)) {
+            Outcome::Skipped(why) => assert!(why.contains("SkoolScout-Com"), "{why}"),
             other => panic!("{other:?}"),
         }
         assert!(!herdr.changed_anything());
     }
 
     #[test]
-    fn an_unreadable_intents_config_is_named_and_nothing_changes() {
+    fn a_meta_repo_with_no_usable_name_is_named_and_nothing_changes() {
+        // no origin, and a folder name no space can take
         let tmp = tempfile::tempdir().unwrap();
-        let meta = meta_repo(tmp.path());
-        fs::write(meta.join(".helmsmith/intents/config.toml"), "space = [").unwrap();
-        let herdr = FakeHerdr::new("skoolscout-com", &meta);
-        match open("w3", |a| herdr.call(a)) {
-            Outcome::Skipped(why) => assert!(why.contains("config.toml"), "{why}"),
+        let meta = tmp.path().join(".meta");
+        fs::create_dir_all(meta.join(".helmsmith/intents")).unwrap();
+        git(&meta, &["init", "-q"]);
+        let meta = fs::canonicalize(meta).unwrap();
+        let herdr = FakeHerdr::new(".meta", &meta);
+        match open("w3", no_old, |a| herdr.call(a)) {
+            Outcome::Skipped(why) => assert!(why.contains("no name a space can take"), "{why}"),
             other => panic!("{other:?}"),
         }
         assert!(!herdr.changed_anything());
@@ -592,7 +673,7 @@ mod tests {
             }
             herdr.call(a)
         };
-        match open("w3", refusing) {
+        match open("w3", no_old, refusing) {
             Outcome::Skipped(why) => assert!(why.contains("workspace_not_found"), "{why}"),
             other => panic!("{other:?}"),
         }
@@ -610,13 +691,13 @@ mod tests {
             assert_eq!(
                 open_with(&herdr),
                 Outcome::Opened {
-                    space: "skoolscout".into(),
+                    space: "skoolscout-com".into(),
                     intents: Load::Already
                 },
                 "{open}"
             );
             let calls = herdr.calls();
-            assert!(calls.contains(&"workspace rename w3 skoolscout".to_string()));
+            assert!(calls.contains(&"workspace rename w3 skoolscout-com".to_string()));
             assert!(
                 !calls
                     .iter()
@@ -627,7 +708,7 @@ mod tests {
     }
 
     fn open_with(herdr: &FakeHerdr) -> Outcome {
-        open("w3", |a| herdr.call(a))
+        open("w3", no_old, |a| herdr.call(a))
     }
 
     #[test]
@@ -736,9 +817,9 @@ mod tests {
             herdr.call(a)
         };
         assert_eq!(
-            open("w3", failing),
+            open("w3", no_old, failing),
             Outcome::Opened {
-                space: "skoolscout".into(),
+                space: "skoolscout-com".into(),
                 intents: Load::Failed("plugin_pane_failed".into())
             }
         );
