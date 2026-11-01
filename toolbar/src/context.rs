@@ -88,17 +88,22 @@ fn whole_optional(text: &str) -> Option<&str> {
 /// is left out, a folder that is nothing else is the workspace's, and inside
 /// a longer text it is empty.
 pub fn expand(tool: &ToolConfig, vars: &Vars) -> Result<ToolConfig, String> {
+    // a value with a control character (a newline in a folder's name, say)
+    // is never put into a command: it could start a second one
+    let usable = |n: &str| vars.get(n).filter(|v| !v.chars().any(char::is_control));
     let mut missing: Option<String> = None;
+    let mut unusable = false;
     let mut sub = |text: &String| -> Option<String> {
-        if whole_optional(text).is_some_and(|n| !vars.contains_key(n)) {
+        if whole_optional(text).is_some_and(|n| usable(n).is_none()) {
             return None;
         }
         Some(fill(text, |n| match n.strip_suffix('?') {
-            Some(optional) => Some(vars.get(optional).cloned().unwrap_or_default()),
+            Some(optional) => Some(usable(optional).cloned().unwrap_or_default()),
             None => {
-                let v = vars.get(n).cloned();
+                let v = usable(n).cloned();
                 if v.is_none() && missing.is_none() {
                     missing = Some(n.to_string());
+                    unusable = vars.contains_key(n);
                 }
                 v
             }
@@ -114,6 +119,10 @@ pub fn expand(tool: &ToolConfig, vars: &Vars) -> Result<ToolConfig, String> {
     out.cwd = tool.cwd.as_ref().and_then(&mut sub);
     match missing {
         None => Ok(out),
+        Some(n) if unusable => Err(format!(
+            "{} needs {{{n}}}: its value has a control character, so it is not used",
+            tool.name
+        )),
         Some(n) => {
             let why = vars
                 .get(&format!("{n}_error"))
@@ -404,6 +413,28 @@ mod tests {
         // inside a longer text it is empty
         let inner = tool(&["sh", "-c", "echo [{db?}]"], None);
         assert_eq!(expand(&inner, &Vars::new()).unwrap().command[2], "echo []");
+    }
+
+    #[test]
+    fn a_value_with_a_control_character_is_refused() {
+        // a folder named with a newline must never become a second command
+        let t = tool(&["sh", "-c", "echo $1", "sh", "{agent}"], Some("{agent?}"));
+        let why = expand(&t, &vars(&[("agent", "/w/a\nrm -rf ~")])).unwrap_err();
+        assert!(
+            why.contains("{agent}") && why.contains("control character"),
+            "{why}"
+        );
+        // an optional one is left out rather than used
+        let opt = tool(&["lazysql", "{db?}"], None);
+        assert_eq!(
+            expand(&opt, &vars(&[("db", "postgres://h/d\r")]))
+                .unwrap()
+                .command,
+            vec!["lazysql"]
+        );
+        // quotes and spaces are ordinary characters in a path
+        let ok = expand(&t, &vars(&[("agent", "/w/it's a b")])).unwrap();
+        assert_eq!(ok.command[4], "/w/it's a b");
     }
 
     /// `herdr agent list`, as Herdr 0.9.5 answers it (all fields), for agents

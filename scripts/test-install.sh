@@ -259,7 +259,8 @@ fi
 t10=$(toml "$h")
 editor10=$(sed -n '/^id *= *"editor"/,/^\[\[tool\]\]/p' "$t10" 2>/dev/null)
 if grep -q 'exec nvim --listen' "$t10" 2>/dev/null && printf '%s\n' "$editor10" | grep -q '^group *= *"agent"' &&
-  printf '%s\n' "$editor10" | grep -qF ':cd {agent}<CR>' && ! printf '%s\n' "$editor10" | grep -q '^open *= *"pane"'; then
+  printf '%s\n' "$editor10" | grep -qF "chdir('\$p')" && printf '%s\n' "$editor10" | grep -qF '"sh", "{agent}"]' &&
+  ! printf '%s\n' "$editor10" | grep -q '^open *= *"pane"'; then
   pass "Editor tool added, Neovim in the toolbar following the agent"
 else
   flunk "Editor tool added, Neovim in the toolbar following the agent" "$(cat "$t10" 2>&1)"

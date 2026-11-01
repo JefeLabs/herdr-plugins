@@ -160,7 +160,9 @@ on_switch = "keep"
 **When another agent becomes active**, an agent tool's `on_switch` says what happens to it once you've opened it:
 - `"restart"` (the default) restarts it when its filled-in command or folder changed: LazySql moves to the new agent's database, yazi to its worktree.
 - `"keep"` leaves it running, as Terminal does with your shell. Its footer says `still in <the old worktree> · ctrl-] x starts it in the new one`, and the next start (it exited, or `Ctrl-]` `x`) is in the new worktree.
-- A command, such as Editor's `["sh", "-c", "nvim --server … --remote-send '<C-\\><C-n>:cd {agent}<CR>'"]`, leaves the tool running and runs the command, its values filled in, so the tool follows on its own: Neovim keeps your buffers and changes its folder. A command that fails says so on the footer.
+- A command leaves the tool running and runs the command, its values filled in, so the tool follows on its own. Editor's passes the folder as an argument and has Neovim `chdir()` to it, keeping your buffers: `["sh", "-c", "p=$(printf %s \"$1\" | sed \"s/'/''/g\"); exec nvim --server … --remote-expr \"chdir('$p')\"", "sh", "{agent}"]`. A command that fails says so on the footer.
+
+**Keep values out of shell strings.** A value is put into the text as it is, so a `{name}` inside a `sh -c` script would let a folder named `x'; rm -rf ~; '` become commands. Pass values as their own arguments (`["sh", "-c", "… \"$1\" …", "sh", "{agent}"]`), as above. A value with a control character, such as a newline, is never used.
 
 When the active agent first becomes known (just after the toolbar opens), a `"keep"` tool started a moment before moves into the agent's worktree too, and a command runs. Space and system tools keep running through a switch, since their values don't change. `on_switch` is only for agent tools, and only for tools that run in the toolbar: a pane tool takes its values when it opens.
 
