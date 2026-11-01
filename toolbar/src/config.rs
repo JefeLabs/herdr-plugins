@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 
 pub const WORKSPACE_FILE: &str = ".herdr-toolbar.toml";
 pub const DEFAULT_PREFIX: &str = "ctrl-]";
+/// In `order`, the bar's rule: `order = ["intents", "web", "---", "db"]`.
+pub const RULE: &str = "---";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ToolConfig {
@@ -88,6 +90,9 @@ pub struct Config {
     pub tools: Vec<ToolConfig>,
     /// The context command; empty: none.
     pub context: Vec<String>,
+    /// The tools the bar's rules follow, from each `"---"` in `order`; none:
+    /// one rule before the tools that open a pane.
+    pub rules_after: Vec<String>,
 }
 
 impl Default for Config {
@@ -97,6 +102,7 @@ impl Default for Config {
             bar: BarSize::Small,
             tools: Vec::new(),
             context: Vec::new(),
+            rules_after: Vec::new(),
         }
     }
 }
@@ -288,9 +294,19 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         }
     }
 
+    // each `"---"` in `order` is a rule: it follows the tool before it
+    let mut rules_after: Vec<String> = Vec::new();
     if let Some(order) = order {
-        let mut ordered = Vec::with_capacity(tools.len());
+        let mut ordered: Vec<ToolConfig> = Vec::with_capacity(tools.len());
         for id in &order {
+            if id == RULE {
+                if let Some(last) = ordered.last()
+                    && !rules_after.contains(&last.id)
+                {
+                    rules_after.push(last.id.clone());
+                }
+                continue;
+            }
             match tools.iter().position(|t| &t.id == id) {
                 Some(i) => ordered.push(tools.remove(i)),
                 None => bail!("`order` names unknown tool `{id}`"),
@@ -314,6 +330,7 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         bar: bar.unwrap_or_default(),
         tools,
         context: context.unwrap_or_default(),
+        rules_after,
     })
 }
 
@@ -511,6 +528,29 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let none =
             parse("[[tool]]\nid = \"a\"\nname = \"a\"\nicon = \"x\"\ncommand = [\"x\"]\n").unwrap();
         assert!(merge(none, None).unwrap().context.is_empty());
+    }
+
+    #[test]
+    fn each_rule_in_order_names_the_tool_it_follows() {
+        let ws = "order = [\"intents\", \"issues\", \"---\", \"db\"]\n";
+        let (t, g, w) = dirs(GLOBAL, Some(ws));
+        let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
+        assert_eq!(cfg.rules_after, vec!["issues"]);
+        assert!(
+            cfg.tools.iter().all(|t| t.id != "---"),
+            "the rule is no tool"
+        );
+        let (t, g, w) = dirs(GLOBAL, None);
+        let plain = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
+        assert!(plain.rules_after.is_empty(), "no rule in order");
+        let ws = "order = [\"---\", \"intents\", \"---\", \"---\", \"issues\", \"---\", \"db\"]\n";
+        let (t, g, w) = dirs(GLOBAL, Some(ws));
+        let many = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
+        assert_eq!(
+            many.rules_after,
+            vec!["intents", "issues"],
+            "one per gap, none before the first tool"
+        );
     }
 
     #[test]
