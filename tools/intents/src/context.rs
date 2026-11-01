@@ -145,6 +145,11 @@ pub fn gather(
                     "the run guide in {} has no db: command",
                     meta.join(".helmsmith").display()
                 )),
+                // a repo's own command runs only once its owner trusts it
+                Some(cmd) if !is_trusted(dirs, meta, &cmd) => Err(format!(
+                    "the run guide's db: command is not trusted yet: run `herdr-intents trust` in {}",
+                    meta.display()
+                )),
                 Some(cmd) => agent_db(&cmd, agent, meta, timeout),
             },
         },
@@ -158,4 +163,52 @@ pub fn gather(
         Err(e) => put("db_error", e),
     }
     out
+}
+
+/// Where this person keeps the `db:` commands they trust: the exact
+/// command, by meta repo.
+fn trust_file(dirs: &Dirs) -> PathBuf {
+    dirs.config.join("trusted-db.json")
+}
+
+fn trusted(dirs: &Dirs) -> std::collections::BTreeMap<String, String> {
+    std::fs::read(trust_file(dirs))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn trust_key(meta: &Path) -> String {
+    std::fs::canonicalize(meta)
+        .unwrap_or_else(|_| crate::space::plain(meta))
+        .display()
+        .to_string()
+}
+
+/// Whether `cmd` is the `db:` command trusted for meta repo `meta`.
+fn is_trusted(dirs: &Dirs, meta: &Path, cmd: &str) -> bool {
+    trusted(dirs).get(&trust_key(meta)).map(String::as_str) == Some(cmd)
+}
+
+/// Trusts the `db:` command of the run guide in meta repo `meta` as it is
+/// now (`herdr-intents trust`), and returns it. A repo's run guide is its
+/// author's: the toolbar's context runs a `db:` command on its own, so it
+/// runs one only once its owner has trusted that exact command; changing
+/// it needs trusting again.
+pub fn trust_db(dirs: &Dirs, meta: &Path) -> Result<String, String> {
+    let guide = crate::capture::read_guide(meta).map_err(|e| format!("{e:#}"))?;
+    let cmd = guide.db.ok_or_else(|| {
+        format!(
+            "the run guide in {} has no db: command",
+            meta.join(".helmsmith").display()
+        )
+    })?;
+    let mut all = trusted(dirs);
+    all.insert(trust_key(meta), cmd.clone());
+    let file = trust_file(dirs);
+    let text = serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dirs.config)
+        .and_then(|()| std::fs::write(&file, text + "\n"))
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(cmd)
 }

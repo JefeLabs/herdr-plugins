@@ -52,6 +52,9 @@ pub enum Mode {
     /// The toolbar's context for the workspace it runs in, as JSON: the
     /// space, its meta repo, the active agent's worktree and database.
     Context,
+    /// Trust the run guide's `db:` command in the meta repo the tool runs
+    /// in, as it is now: only then does the context run it.
+    Trust,
     Usage(String),
 }
 
@@ -86,6 +89,7 @@ pub fn parse_mode(args: &[String]) -> Mode {
         Some("capture-run") if args.len() == 2 => Mode::CaptureRun(PathBuf::from(&args[1])),
         Some("open-space") if args.len() == 1 => Mode::OpenSpace { first: false },
         Some("context") if args.len() == 1 => Mode::Context,
+        Some("trust") if args.len() == 1 => Mode::Trust,
         Some("open-space") if args.len() == 2 && args[1] == "--first" => {
             Mode::OpenSpace { first: true }
         }
@@ -1175,6 +1179,7 @@ mod tests {
             Mode::Usage(_)
         ));
         assert_eq!(parse_mode(&["context".into()]), Mode::Context);
+        assert_eq!(parse_mode(&["trust".into()]), Mode::Trust);
         assert!(matches!(
             parse_mode(&["context".into(), "x".into()]),
             Mode::Usage(_)

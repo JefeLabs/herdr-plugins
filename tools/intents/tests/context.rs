@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use herdr_intents::capture::read_guide;
 use herdr_intents::config::Dirs;
-use herdr_intents::context::{agent_db, gather};
+use herdr_intents::context::{agent_db, gather, trust_db};
 use herdr_intents::space::pointers_path;
 
 fn git(repo: &Path, args: &[&str]) {
@@ -157,6 +157,7 @@ fn json(map: &serde_json::Map<String, serde_json::Value>) -> String {
 #[test]
 fn a_space_with_an_active_agent_gives_its_meta_repo_and_the_agents_database() {
     let s = space(Some(SLOT_DB));
+    trust_db(&s.dirs, &s.meta).unwrap();
     let got = gather(
         &s.dirs,
         Some("skoolscout-com"),
@@ -235,4 +236,80 @@ fn what_cannot_be_known_says_why_instead_of_guessing() {
     let home = gather(&s.dirs, None, None, Some(&s.wt), Duration::from_secs(5));
     assert!(!home.contains_key("space") && !home.contains_key("meta"));
     assert_eq!(home["meta_error"], "this workspace is not a space");
+}
+
+#[test]
+fn a_run_guides_db_command_runs_only_once_trusted() {
+    // a repo's run guide is its author's: opening it must not run its code
+    let s = space(None);
+    let marker = s.meta.with_file_name("ran");
+    let cmd = format!("touch {}; echo postgres://h/d", marker.display());
+    put(&s.meta.join(".helmsmith/capture.md"), &guide(Some(&cmd)));
+    let untrusted = gather(
+        &s.dirs,
+        Some("skoolscout-com"),
+        Some(&s.meta),
+        Some(&s.wt),
+        Duration::from_secs(5),
+    );
+    assert!(!untrusted.contains_key("db"));
+    let why = untrusted["db_error"].as_str().unwrap();
+    assert!(
+        why.contains("not trusted") && why.contains("herdr-intents trust"),
+        "{why}"
+    );
+    assert!(why.contains(&s.meta.display().to_string()), "{why}");
+    assert!(!marker.exists(), "an untrusted db: command never runs");
+    assert_eq!(
+        trust_db(&s.dirs, &s.meta).as_deref(),
+        Ok(cmd.as_str()),
+        "says what it trusted"
+    );
+    let trusted = gather(
+        &s.dirs,
+        Some("skoolscout-com"),
+        Some(&s.meta),
+        Some(&s.wt),
+        Duration::from_secs(5),
+    );
+    assert_eq!(trusted["db"], "postgres://h/d");
+    assert!(marker.exists());
+}
+
+#[test]
+fn a_changed_db_command_must_be_trusted_again() {
+    let s = space(Some(SLOT_DB));
+    trust_db(&s.dirs, &s.meta).unwrap();
+    put(
+        &s.meta.join(".helmsmith/capture.md"),
+        &guide(Some("echo postgres://elsewhere/d")),
+    );
+    let got = gather(
+        &s.dirs,
+        Some("skoolscout-com"),
+        Some(&s.meta),
+        Some(&s.wt),
+        Duration::from_secs(5),
+    );
+    assert!(!got.contains_key("db"));
+    assert!(
+        got["db_error"].as_str().unwrap().contains("not trusted"),
+        "{got:?}"
+    );
+    trust_db(&s.dirs, &s.meta).unwrap();
+    let got = gather(
+        &s.dirs,
+        Some("skoolscout-com"),
+        Some(&s.meta),
+        Some(&s.wt),
+        Duration::from_secs(5),
+    );
+    assert_eq!(got["db"], "postgres://elsewhere/d");
+}
+
+#[test]
+fn trusting_a_run_guide_without_a_db_command_says_so() {
+    let s = space(None);
+    let why = trust_db(&s.dirs, &s.meta).unwrap_err();
+    assert!(why.contains("no db: command"), "{why}");
 }
