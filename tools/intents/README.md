@@ -376,7 +376,7 @@ Results live in `<name>.assets/checks/` (`latest.json` and the proof files).
 
 A refinement asked for after an intent shipped is a follow-up: its own intent, linked both ways to the one it refines (the original). It never reopens the original, and the original keeps its `✓` while the follow-up is worked on.
 
-**Filing one.** `F` on a sent intent (in the tree, on a card, or in the detail pane) opens the add conversation already linked to it. The agent gets the original's title, description and criteria as context. The follow-up is filed in the original's group, as refining, and you send it as usual. `F` on a follow-up links the new one to the first original, the intent that describes the feature, so every refinement lands in one place. On an intent that has not been sent, `F` is refused: edit that one instead.
+**Filing one.** `F` on a sent intent (in the tree, on a card, or in the detail pane) opens the add conversation already linked to it. The agent gets the original's title, description and criteria as context. The follow-up is filed in the original's group, as refining, and you send it as usual. It takes the original's `repo:`, wherever your workspace is, so it is sent to the same checkout; only if that checkout is gone (a removed worktree) does it take the workspace's. `F` on a follow-up links the new one to the first original, the intent that describes the feature, so every refinement lands in one place. On an intent that has not been sent, `F` is refused: edit that one instead.
 
 **On the original.**
 - A **Follow-ups** section in the detail pane, after Missing items / Bugs, lists each one: `✓` complete, `→` sent, `○` not yet. Enter goes to it.
