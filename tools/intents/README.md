@@ -247,6 +247,14 @@ It is filled in for you the first time the tool starts in a workspace whose fold
 
 **Skoolscout's way.** A guide with `default_area` in place of `start` keeps skoolscout's own steps: a `work` slot, e2e seed stories and logs in the slot's worktree, as the next sections describe.
 
+**The toolbar's context.** `herdr-intents context` prints, as one JSON object, what the toolbar's tools may know about the workspace it runs in: the space (`space`), its meta repo (`meta`), the active agent's worktree (`agent`, from `TOOLBAR_AGENT_CWD`) and that agent's database (`db`). A value that cannot be known is left out, and `meta_error` or `db_error` says why. The toolbar runs it as its `context` command (see the toolbar README): Terminal opens at the meta repo, and LazySql on the active agent's database. The run guide says how to find that database, so neither tool learns how the project runs:
+
+```yaml
+db: '. ./.env.slot 2>/dev/null; echo "postgres://app:secret@localhost:${PG_PORT:-5432}/app?sslmode=disable"'
+```
+
+`db:` is a command, run through `sh -c` at the top of the agent's worktree with `INTENTS_META` set to the meta repo, and the first line it prints is the address. It may take 5 seconds. If it fails, the last line it wrote to stderr is the reason the toolbar shows, and if it prints nothing, there is no database.
+
 ## Stories and demo videos
 
 A feature or a bug carries the user stories its demo videos will show, in a `## Stories` section after the acceptance criteria. The detail view lists them in the same order, Acceptance criteria then Stories, since a story names the criteria it shows by number:

@@ -49,6 +49,9 @@ pub enum Mode {
     OpenSpace {
         first: bool,
     },
+    /// The toolbar's context for the workspace it runs in, as JSON: the
+    /// space, its meta repo, the active agent's worktree and database.
+    Context,
     Usage(String),
 }
 
@@ -82,6 +85,7 @@ pub fn parse_mode(args: &[String]) -> Mode {
         Some("capture-mcp") if args.len() == 2 => Mode::CaptureMcp(PathBuf::from(&args[1])),
         Some("capture-run") if args.len() == 2 => Mode::CaptureRun(PathBuf::from(&args[1])),
         Some("open-space") if args.len() == 1 => Mode::OpenSpace { first: false },
+        Some("context") if args.len() == 1 => Mode::Context,
         Some("open-space") if args.len() == 2 && args[1] == "--first" => {
             Mode::OpenSpace { first: true }
         }
@@ -1168,6 +1172,11 @@ mod tests {
         );
         assert!(matches!(
             parse_mode(&["open-space".into(), "w3".into()]),
+            Mode::Usage(_)
+        ));
+        assert_eq!(parse_mode(&["context".into()]), Mode::Context);
+        assert!(matches!(
+            parse_mode(&["context".into(), "x".into()]),
             Mode::Usage(_)
         ));
     }

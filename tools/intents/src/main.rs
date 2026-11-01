@@ -110,6 +110,34 @@ fn main() -> ExitCode {
             let _ = writeln!(std::io::stdout(), "{line}");
             Ok(())
         }
+        Mode::Context => {
+            // the toolbar asks: which space, its meta repo, and the database
+            // of the agent whose chat is in the main pane (TOOLBAR_AGENT_CWD)
+            use herdr_intents::{context, space};
+            let get = |k: &str| std::env::var(k).ok();
+            let home = get("HOME").map_or_else(|| "/".into(), std::path::PathBuf::from);
+            let dirs = resolve_dirs(get, &home, None);
+            let herdr = get("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+            let here = herdr_intents::send::capture_repo();
+            let found = scope::resolve(
+                get,
+                |id| scope::herdr_label(std::path::Path::new(&herdr), id),
+                || space::repo_space(&dirs, here.as_deref()?)?.ok(),
+            )
+            .map(|s| space::current_name(&dirs, &s));
+            let agent = get("TOOLBAR_AGENT_CWD")
+                .filter(|a| !a.trim().is_empty())
+                .map(std::path::PathBuf::from);
+            let ctx = context::gather(
+                &dirs,
+                found.as_deref(),
+                here.as_deref(),
+                agent.as_deref(),
+                context::DB_TIMEOUT,
+            );
+            let _ = writeln!(std::io::stdout(), "{}", serde_json::Value::Object(ctx));
+            Ok(())
+        }
         Mode::CaptureRun(order) => herdr_intents::capture::run_order(&order),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-intents ");

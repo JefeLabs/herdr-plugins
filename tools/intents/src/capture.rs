@@ -72,6 +72,9 @@ pub struct CaptureGuide {
     pub logs: Vec<String>,
     /// How a story video's cards look (`splash:`); see `card_look`.
     pub splash: GuideSplash,
+    /// A command, run in an agent's worktree, that prints the address of
+    /// that agent's database (`db:`).
+    pub db: Option<String>,
 }
 
 /// The guide's `splash:` block, as written: a logo (a path in the repo) and
@@ -249,6 +252,8 @@ struct GuideFront {
     logs: Vec<String>,
     #[serde(default)]
     splash: GuideSplash,
+    #[serde(default)]
+    db: Option<String>,
 }
 
 /// How long the app gets to answer, unless the guide says.
@@ -347,6 +352,7 @@ pub fn read_guide(repo: &Path) -> anyhow::Result<CaptureGuide> {
         body: rest[end + "\n---\n".len()..].to_string(),
         logs: front.logs,
         splash: front.splash,
+        db: front.db,
     })
 }
 
@@ -2892,6 +2898,7 @@ mod tests {
             body: "Sign in with Cmd+U.\n".into(),
             logs: Vec::new(),
             splash: Default::default(),
+            db: None,
         }
     }
 
