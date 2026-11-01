@@ -253,7 +253,7 @@ It is filled in for you the first time the tool starts in a workspace whose fold
 db: '. ./.env.slot 2>/dev/null; echo "postgres://app:secret@localhost:${PG_PORT:-5432}/app?sslmode=disable"'
 ```
 
-`db:` is a command, run through `sh -c` at the top of the agent's worktree with `INTENTS_META` set to the meta repo, and the first line it prints is the address. It may take 5 seconds. If it fails, the last line it wrote to stderr is the reason the toolbar shows, and if it prints nothing, there is no database.
+`db:` is a command, run through `sh -c` at the top of the agent's worktree with `INTENTS_META` set to the meta repo, and the first line it prints is the address. Since the context runs it on its own, without a key from you, it runs only once you trust it: run `herdr-intents trust` in the meta repo, which shows the command and records it exactly (in `trusted-db.json` beside `intents.toml`). A changed `db:` must be trusted again, and until then the context says so and LazySql opens plain. A repo you only cloned never runs code just because you opened it. It may take 5 seconds. If it fails, the last line it wrote to stderr is the reason the toolbar shows, and if it prints nothing, there is no database.
 
 ## Stories and demo videos
 

@@ -138,6 +138,29 @@ fn main() -> ExitCode {
             let _ = writeln!(std::io::stdout(), "{}", serde_json::Value::Object(ctx));
             Ok(())
         }
+        Mode::Trust => {
+            // the owner says the meta repo's db: command may run on its own
+            let get = |k: &str| std::env::var(k).ok();
+            let home = get("HOME").map_or_else(|| "/".into(), std::path::PathBuf::from);
+            let dirs = resolve_dirs(get, &home, None);
+            match herdr_intents::send::capture_repo() {
+                Some(repo) if herdr_intents::space::is_meta(&repo) => {
+                    match herdr_intents::context::trust_db(&dirs, &repo) {
+                        Ok(cmd) => {
+                            let _ = writeln!(
+                                std::io::stdout(),
+                                "trusted the db: command of {}:\n  {cmd}",
+                                repo.display()
+                            );
+                            Ok(())
+                        }
+                        Err(why) => Err(anyhow::anyhow!(why)),
+                    }
+                }
+                Some(repo) => Err(anyhow::anyhow!("{} is not a meta repo", repo.display())),
+                None => Err(anyhow::anyhow!("run it inside the meta repo")),
+            }
+        }
         Mode::CaptureRun(order) => herdr_intents::capture::run_order(&order),
         Mode::Usage(text) => {
             let is_version = text.starts_with("herdr-intents ");
