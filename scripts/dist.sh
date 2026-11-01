@@ -38,20 +38,21 @@ build() { # <rust target> <asset name>
     *-linux-musl)
       var="CARGO_TARGET_$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')_LINKER"
       env "$var=rust-lld" RUSTFLAGS="-C linker-flavor=ld.lld" \
-        cargo build --release --target "$target" -p herdr-toolbar -p herdr-intents
+        cargo build --release --target "$target" -p herdr-toolbar -p herdr-intents -p herdr-doc
       ;;
     *)
-      cargo build --release --target "$target" -p herdr-toolbar -p herdr-intents
+      cargo build --release --target "$target" -p herdr-toolbar -p herdr-intents -p herdr-doc
       ;;
   esac
   stage=$(mktemp -d)
   root="$stage/herdr-plugins"
-  mkdir -p "$root/toolbar" "$root/tools/intents" "$root/target/release"
+  mkdir -p "$root/toolbar" "$root/tools/intents" "$root/tools/doc" "$root/target/release"
   cp toolbar/herdr-plugin.toml toolbar/README.md toolbar/tools.example.toml "$root/toolbar/"
   cp -R toolbar/setup "$root/toolbar/"
   cp tools/intents/herdr-plugin.toml tools/intents/README.md "$root/tools/intents/"
+  cp tools/doc/README.md "$root/tools/doc/"
   cp "target/$target/release/herdr-toolbar" "target/$target/release/herdr-intents" \
-    "$root/target/release/"
+    "target/$target/release/herdr-doc" "$root/target/release/"
   pack "dist/herdr-plugins-$name.tar.gz" "$stage" herdr-plugins
   rm -rf "$stage"
   check_clean "dist/herdr-plugins-$name.tar.gz"

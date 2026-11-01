@@ -47,6 +47,8 @@ echo 'id = "jefelabs.intents"' > "$stage/tools/intents/herdr-plugin.toml"
 [ -x target/release/herdr-toolbar ] || cargo build -q --release -p herdr-toolbar || exit 1
 cp target/release/herdr-toolbar "$stage/target/release/herdr-toolbar"
 printf '#!/bin/sh\n' > "$stage/target/release/herdr-intents"
+printf '#!/bin/sh\n' > "$stage/target/release/herdr-doc"
+chmod +x "$stage/target/release/herdr-doc"
 asset="herdr-plugins-$platform.tar.gz"
 tar -czf "$rel/$asset" -C "$work/stage" herdr-plugins
 echo "$(sha "$rel/$asset")  $asset" > "$rel/SHA256SUMS"
@@ -258,12 +260,13 @@ fi
 # 10. the Editor tool is added, listening so files can be opened in it
 t10=$(toml "$h")
 editor10=$(sed -n '/^id *= *"editor"/,/^\[\[tool\]\]/p' "$t10" 2>/dev/null)
-if grep -q 'exec nvim --listen' "$t10" 2>/dev/null && printf '%s\n' "$editor10" | grep -q '^group *= *"agent"' &&
+if printf '%s\n' "$editor10" | grep -qF 'target/release/herdr-doc"]' && [ -L "$h/.local/bin/herdr-doc" ] &&
+  printf '%s\n' "$editor10" | grep -q '^group *= *"agent"' &&
   printf '%s\n' "$editor10" | grep -qF "chdir('\$p')" && printf '%s\n' "$editor10" | grep -qF '"sh", "{agent}"]' &&
   ! printf '%s\n' "$editor10" | grep -q '^open *= *"pane"'; then
-  pass "Editor tool added, Neovim in the toolbar following the agent"
+  pass "Editor tool added: herdr-doc in the toolbar, following the agent, on PATH"
 else
-  flunk "Editor tool added, Neovim in the toolbar following the agent" "$(cat "$t10" 2>&1)"
+  flunk "Editor tool added: herdr-doc in the toolbar, following the agent, on PATH" "$(cat "$t10" 2>&1)"
 fi
 
 # 11. a second run keeps Neovim and adds the Editor once
