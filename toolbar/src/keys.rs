@@ -78,6 +78,8 @@ impl KeyChord {
 pub struct Prefix {
     armed: bool,
     chord: KeyChord,
+    /// The prefix as `tools.toml` writes it (`ctrl-]`), for hints.
+    text: String,
 }
 
 impl Prefix {
@@ -85,7 +87,13 @@ impl Prefix {
         Ok(Self {
             armed: false,
             chord: KeyChord::parse(prefix)?,
+            text: prefix.to_string(),
         })
+    }
+
+    /// The prefix as written, for hints such as "ctrl-] x".
+    pub fn label(&self) -> &str {
+        &self.text
     }
 
     pub fn armed(&self) -> bool {

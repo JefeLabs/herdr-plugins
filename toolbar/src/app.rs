@@ -36,6 +36,8 @@ pub struct Slot {
     /// What it runs, its `{name}`s filled in: a new context that changes
     /// this restarts it.
     running_as: Option<ToolConfig>,
+    /// A kept tool still on the previous agent: what its footer says.
+    stale: Option<String>,
 }
 
 impl Slot {
@@ -172,6 +174,7 @@ impl App {
                     last_error: None,
                     started: false,
                     running_as: None,
+                    stale: None,
                 },
             };
             self.slots.push(slot);
@@ -265,6 +268,7 @@ impl App {
         let size = self.content_size();
         let slot = &mut self.slots[idx];
         slot.started = true;
+        slot.stale = None;
         // its `{name}`s from the context; one that is missing says why
         let cfg = match crate::context::expand(&slot.cfg, &self.vars) {
             Ok(cfg) => cfg,
@@ -429,13 +433,50 @@ impl App {
     /// why one is missing. Tools never opened, and pane tools, wait for
     /// their next opening.
     pub fn apply_context(&mut self, vars: crate::context::Vars) {
+        let before = self.vars.get("agent").cloned();
+        let switched = before.as_ref() != vars.get("agent");
         self.vars = vars;
+        let mut restale = false;
         for idx in 0..self.slots.len() {
             let slot = &mut self.slots[idx];
             let uses = !crate::context::placeholders(&slot.cfg).is_empty();
             if !slot.started || !uses || slot.cfg.open == Open::Pane {
                 continue;
             }
+            // an agent tool that stays through a switch: Terminal keeps its
+            // shell, Editor follows through its own command
+            let running = slot
+                .proc
+                .as_ref()
+                .is_some_and(|p| p.state() == ToolState::Running);
+            if slot.cfg.group == Some(crate::config::Group::Agent) && running {
+                match slot.cfg.switch() {
+                    crate::config::Switch::Restart => {}
+                    // kept from a switch, not from the agent becoming known:
+                    // a tool started before then moves into its worktree
+                    crate::config::Switch::Keep if before.is_none() => {}
+                    crate::config::Switch::Keep => {
+                        // it stays; say so while it is on the previous agent
+                        let moved = crate::context::expand(&slot.cfg, &self.vars).ok();
+                        if switched && moved != slot.running_as {
+                            let was = before.clone().unwrap_or_default();
+                            slot.stale = Some(format!(
+                                "still in {was} · {} x starts it in the new one",
+                                self.prefix.label()
+                            ));
+                            restale = true;
+                        }
+                        continue;
+                    }
+                    crate::config::Switch::Run(cmd) => {
+                        if switched {
+                            self.run_on_switch(idx, cmd);
+                        }
+                        continue;
+                    }
+                }
+            }
+            let slot = &mut self.slots[idx];
             match crate::context::expand(&slot.cfg, &self.vars) {
                 Ok(now) if slot.running_as.as_ref() == Some(&now) => continue,
                 Err(why) if slot.running_as.is_none() => {
@@ -452,6 +493,46 @@ impl App {
             slot.last_error = None;
             self.spawn(idx);
         }
+        if restale {
+            // the footer takes a row: the tool gets one less, not covered
+            self.resize(self.size);
+        }
+    }
+
+    /// Runs tool `idx`'s `on_switch` command in the background, its
+    /// `{values}` filled in, in the new agent's folder; a failure shows on
+    /// the footer.
+    fn run_on_switch(&self, idx: usize, cmd: Vec<String>) {
+        let cfg = &self.slots[idx].cfg;
+        let name = cfg.name.clone();
+        let args = match crate::context::expand_command(cfg, &cmd, &self.vars) {
+            Ok(args) => args,
+            Err(why) => {
+                let _ = self.notes_tx.send(why);
+                return;
+            }
+        };
+        let cwd = self
+            .vars
+            .get("agent")
+            .map(std::path::PathBuf::from)
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| self.env.cwd.clone());
+        let env: Vec<(String, String)> = self
+            .env
+            .inherit
+            .iter()
+            .cloned()
+            .chain(cfg.env.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect();
+        let (tx, wake) = (self.notes_tx.clone(), self.wake_tx.clone());
+        std::thread::spawn(move || {
+            if let Err(why) = crate::context::run_briefly(&args, &cwd, &env, Duration::from_secs(5))
+            {
+                let _ = tx.send(format!("{name}: on_switch: {why}"));
+                let _ = wake.send(());
+            }
+        });
     }
 
     pub fn restart_selected(&mut self) {
@@ -620,7 +701,7 @@ impl App {
                 Some(format!("exited (code {c}), enter to restart"))
             }
             ToolState::Exited { code: None } => Some("exited, enter to restart".to_string()),
-            _ => None,
+            _ => slot.stale.clone(),
         }
     }
 
@@ -1348,6 +1429,79 @@ mod tests {
             ToolState::NotStarted,
             "never opened: not started"
         );
+        app.shutdown();
+    }
+
+    /// An agent tool `id` that prints the folder it started in, and stays.
+    fn agent_tool(id: &str, extra: &str) -> String {
+        format!(
+            "[[tool]]\nid = \"{id}\"\nname = \"{id}\"\nicon = \"x\"\ngroup = \"agent\"\ncommand = [\"sh\", \"-c\", \"echo AT=$(pwd); sleep 30\"]\n{extra}"
+        )
+    }
+
+    /// Two agents' worktrees, `<tmp>/wt-a` and `<tmp>/wt-b`.
+    fn worktrees(f: &Fixture) -> (String, String) {
+        let base = fs::canonicalize(f._tmp.path()).unwrap();
+        let (a, b) = (base.join("wt-a"), base.join("wt-b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        (a.display().to_string(), b.display().to_string())
+    }
+
+    #[test]
+    fn a_kept_tool_keeps_running_through_a_switch_and_restarts_in_the_new_folder() {
+        let f = fixture(&agent_tool("terminal", "on_switch = \"keep\"\n"));
+        let (a, b) = worktrees(&f);
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        app.apply_context(vars(&[("agent", &a)]));
+        app.select(0);
+        let first = pid(&app, 0);
+        wait_until("started in a", || shows(&app, 0, &format!("AT={a}")));
+        assert_eq!(app.view().footer, None);
+        app.apply_context(vars(&[("agent", &b)]));
+        assert_eq!(pid(&app, 0), first, "the shell is kept");
+        assert!(alive(first));
+        // it says it is still on the previous agent
+        let footer = app.view().footer.unwrap_or_default();
+        assert!(
+            footer.contains(&format!("still in {a}")) && footer.contains("x"),
+            "{footer}"
+        );
+        app.restart_selected();
+        wait_until("the next one starts in b", || {
+            shows(&app, 0, &format!("AT={b}"))
+        });
+        assert_eq!(app.view().footer, None, "moved: nothing to say");
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_switch_command_runs_once_per_switch_and_the_tool_keeps_running() {
+        let f = fixture("");
+        let (a, b) = worktrees(&f);
+        let log = f._tmp.path().join("switched.log");
+        let extra = format!(
+            "on_switch = [\"sh\", \"-c\", \"echo {{agent}} >> {}\"]\n",
+            log.display()
+        );
+        fs::write(&f.paths.global, agent_tool("editor", &extra)).unwrap();
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        app.select(0);
+        let first = pid(&app, 0);
+        // the agent becomes known, then another one becomes active
+        app.apply_context(vars(&[("agent", &a)]));
+        wait_until("it ran for a", || {
+            fs::read_to_string(&log).unwrap_or_default() == format!("{a}\n")
+        });
+        app.apply_context(vars(&[("agent", &b)]));
+        wait_until("it ran for b", || {
+            fs::read_to_string(&log).unwrap_or_default() == format!("{a}\n{b}\n")
+        });
+        assert_eq!(pid(&app, 0), first, "never restarted");
+        // a new context for the same agent runs nothing
+        app.apply_context(vars(&[("agent", &b), ("db", "x")]));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(fs::read_to_string(&log).unwrap(), format!("{a}\n{b}\n"));
         app.shutdown();
     }
 

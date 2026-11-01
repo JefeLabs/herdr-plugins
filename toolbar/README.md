@@ -143,7 +143,26 @@ command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
 cwd     = "{meta?}"              # the space's meta repo, else the workspace's folder
 ```
 
-The command runs in the workspace's folder, with `TOOLBAR_AGENT_CWD` set to the active agent's folder, and prints a JSON object. Its text values are the names a tool can use, and a `<name>_error` value says why `<name>` is missing. `herdr-intents context` prints the space, its meta repo (`meta`), the active agent's worktree (`agent`) and its database (`db`), found by the space's run guide (see the Intents README). The toolbar adds `{agent}` itself, so it works without a context command too. `${…}` is the shell's, never a name.
+The command runs in the workspace's folder, with `TOOLBAR_AGENT_CWD` set to the active agent's folder, and prints a JSON object. Its text values are the names a tool can use, and a `<name>_error` value says why `<name>` is missing. `herdr-intents context` prints the space, its meta repo (`meta`), the space's default page (`browse`, which the Browser opens), the active agent's worktree (`agent`) and its database (`db`), found by the space's run guide (see the Intents README). The toolbar adds `{agent}` itself, so it works without a context command too. `${…}` is the shell's, never a name.
+
+**Groups.** A tool can say what it follows with `group`, and the bar draws the groups top to bottom with a rule between each: `space` (the project; it starts at the meta repo, `{meta?}`), `agent` (the active agent; it starts in its worktree, `{agent?}`), and `system` (the machine; it starts as written). A `cwd` of a tool's own wins. `order` sorts the tools within a group, pane tools come last in theirs, and tools without a group come after the groups. Once any tool has a group, the groups draw the rules and `"---"` in `order` is ignored. A worktree's entry that replaces a grouped tool keeps its group unless it names one.
+
+```toml
+[[tool]]
+id        = "terminal"
+name      = "Terminal"
+icon      = "▣"
+group     = "agent"
+command   = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
+on_switch = "keep"
+```
+
+**When another agent becomes active**, an agent tool's `on_switch` says what happens to it once you've opened it:
+- `"restart"` (the default) restarts it when its filled-in command or folder changed: LazySql moves to the new agent's database, yazi to its worktree.
+- `"keep"` leaves it running, as Terminal does with your shell. Its footer says `still in <the old worktree> · ctrl-] x starts it in the new one`, and the next start (it exited, or `Ctrl-]` `x`) is in the new worktree.
+- A command, such as Editor's `["sh", "-c", "nvim --server … --remote-send '<C-\\><C-n>:cd {agent}<CR>'"]`, leaves the tool running and runs the command, its values filled in, so the tool follows on its own: Neovim keeps your buffers and changes its folder. A command that fails says so on the footer.
+
+When the active agent first becomes known (just after the toolbar opens), a `"keep"` tool started a moment before moves into the agent's worktree too, and a command runs. Space and system tools keep running through a switch, since their values don't change. `on_switch` is only for agent tools, and only for tools that run in the toolbar: a pane tool takes its values when it opens.
 
 **The active agent** is the agent whose chat is in the main pane: the focused agent of this workspace, or, while you are in the toolbar, the one that was active before. The toolbar checks it every second (`herdr agent list`), and only when a tool names a value. When it changes, the context is asked again, and every tool you have opened whose values changed restarts right away on the new ones: LazySql moves to the new agent's database. Tools you have not opened wait for their first opening, and a pane tool takes the values it has when it opens.
 

@@ -12,24 +12,29 @@ prefix = "ctrl-]"
 bar    = "large"   # bigger buttons: five columns by two rows (or "small")
 # Tells tools where they are: {meta}, {db}, {agent} (see the README).
 context = ["/absolute/path/to/herdr-plugins/target/release/herdr-intents", "context"]
-order  = ["intents", "issues", "db", "files", "editor", "browser", "usage", "terminal"]
+# The bar's groups go top to bottom: space, agent, system, with a rule between
+# them; `order` sorts within each group (see the README).
+order  = ["intents", "browser", "issues", "db", "files", "editor", "terminal", "usage"]
 
 [[tool]]
 id      = "intents"
 name    = "Intents"
 icon    = "✎"
+group   = "space"
 command = ["/absolute/path/to/herdr-plugins/target/release/herdr-intents"]
 
 [[tool]]
 id      = "issues"
 name    = "GitHub issues"
 icon    = "◉"
+group   = "space"
 command = ["gh", "dash"]
 
 [[tool]]
 id      = "db"
 name    = "Database"
 icon    = "▤"
+group   = "agent"
 # the active agent's database, when the space's run guide says how to find it
 command = ["lazysql", "{db?}"]
 cwd     = "~"
@@ -38,8 +43,8 @@ cwd     = "~"
 id      = "files"
 name    = "Files"
 icon    = "▭"
+group   = "agent"
 command = ["yazi"]
-cwd     = "{agent?}"   # the active agent's worktree
 
 # Jira: lists issues from the project `jira init` set up. Add "jira" to
 # `order` to use it.
@@ -56,8 +61,10 @@ cwd     = "{agent?}"   # the active agent's worktree
 id      = "editor"
 name    = "Editor"
 icon    = "◫"
+group   = "agent"
 command = ["sh", "-c", "d=${XDG_CACHE_HOME:-$HOME/.cache}; mkdir -p \"$d\"; s=\"$d/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\"; rm -f \"$s\"; exec nvim --listen \"$s\""]
-open    = "pane"
+# another agent becomes active: Neovim stays open and changes its folder
+on_switch = ["sh", "-c", "nvim --server \"${XDG_CACHE_HOME:-$HOME/.cache}/nvim-editor-${HERDR_WORKSPACE_ID:-local}.sock\" --remote-send '<C-\\><C-n>:cd {agent}<CR>'"]
 
 # Opens in a Herdr pane beside the work pane, at full size and speed;
 # selecting it again closes that pane.
@@ -65,7 +72,8 @@ open    = "pane"
 id      = "browser"
 name    = "Browser"
 icon    = "◎"
-command = ["terminal-browser", "open"]
+group   = "space"
+command = ["terminal-browser", "open", "{browse?}"]   # the space's page (run guide `browse:`)
 open    = "pane"
 
 # Experimental: the browser inside the toolbar's slot. Add "web" to `order`.
@@ -83,6 +91,7 @@ open    = "pane"
 id    = "usage"
 name  = "Usage"
 icon  = "▤"
+group   = "system"
 open  = "pane"
 panes = [
   ["procs", "--watch-interval", "2", "--sortd", "cpu", "--insert", "ReadBytes", "--insert", "WriteBytes",
@@ -91,11 +100,13 @@ panes = [
   ["dua", "i", "."],
 ]
 
-# A shell in the toolbar, never beside the agent's chat: at the space's meta
-# repo, else in the workspace's folder.
+# A shell in the toolbar, never beside the agent's chat, in the active agent's
+# worktree. Another agent becoming active keeps the shell; the next one starts
+# in the new worktree.
 [[tool]]
 id      = "terminal"
 name    = "Terminal"
 icon    = "▣"
+group   = "agent"
 command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\""]
-cwd     = "{meta?}"
+on_switch = "keep"   # another agent becoming active keeps the shell

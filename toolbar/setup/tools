@@ -11,4 +11,4 @@ browser|Browser|terminal-browser|1|terminal-browser|\uf488|◎
 web|Browser in toolbar|(experimental)|0|terminal-browser|\ueaae|◍
 editor|Editor|Neovim|1|neovim|\uf36f|◫
 usage|Usage|procs, oxker, dua|1|procs oxker dua|\uf463|▤
-terminal|Terminal|a shell at the meta repo|1||\uea85|▣
+terminal|Terminal|a shell in the agent's worktree|1||\uea85|▣

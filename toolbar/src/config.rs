@@ -38,9 +38,57 @@ pub struct ToolConfig {
     /// command each, in place of `command`.
     #[serde(default)]
     pub panes: Vec<Vec<String>>,
+    /// What the tool follows: the space, the active agent, or the machine.
+    #[serde(default)]
+    pub group: Option<Group>,
+    /// An agent tool's answer to another agent becoming active.
+    #[serde(default)]
+    pub on_switch: Option<OnSwitch>,
+}
+
+/// The bar's groups, top to bottom: what a tool's context is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Group {
+    /// The space: the project as a whole. Starts at the meta repo.
+    Space,
+    /// The active agent. Starts in its worktree; `on_switch` says what a
+    /// switch does.
+    Agent,
+    /// The machine.
+    System,
+}
+
+/// `on_switch`, as written: `"restart"`, `"keep"`, or a command.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum OnSwitch {
+    Word(String),
+    Command(Vec<String>),
+}
+
+/// What another agent becoming active does to an agent tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Switch {
+    /// Restart it when its filled-in command or folder changed.
+    Restart,
+    /// Leave it running; its next start uses the new values.
+    Keep,
+    /// Leave it running, and run this command so it follows by itself.
+    Run(Vec<String>),
 }
 
 impl ToolConfig {
+    /// What a switch of the active agent does to it: `on_switch`, else
+    /// a restart when its values changed.
+    pub fn switch(&self) -> Switch {
+        match &self.on_switch {
+            Some(OnSwitch::Word(w)) if w == "keep" => Switch::Keep,
+            Some(OnSwitch::Command(c)) if !c.is_empty() => Switch::Run(c.clone()),
+            _ => Switch::Restart,
+        }
+    }
+
     /// What a pane tool runs, one command per pane: `panes`, else `command`.
     pub fn pane_commands(&self) -> Vec<Vec<String>> {
         if self.panes.is_empty() {
@@ -126,6 +174,23 @@ pub fn parse(text: &str) -> anyhow::Result<RawConfig> {
         }
         if t.id.is_empty() {
             bail!("a tool has an empty id");
+        }
+        match &t.on_switch {
+            None => {}
+            Some(_) if t.group != Some(Group::Agent) => {
+                bail!(
+                    "tool `{}`: on_switch is for agent tools (group = \"agent\")",
+                    t.id
+                )
+            }
+            Some(OnSwitch::Word(w)) if w != "restart" && w != "keep" => bail!(
+                "tool `{}`: on_switch = \"{w}\": use \"restart\", \"keep\" or a command",
+                t.id
+            ),
+            Some(OnSwitch::Command(c)) if c.is_empty() => {
+                bail!("tool `{}` has an empty on_switch command", t.id)
+            }
+            Some(_) => {}
         }
     }
     Ok(raw)
@@ -274,9 +339,15 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
     let mut context = global.context;
 
     if let Some(ws) = workspace {
-        for t in ws.tool {
+        for mut t in ws.tool {
             match tools.iter_mut().find(|g| g.id == t.id) {
-                Some(slot) => *slot = t,
+                Some(slot) => {
+                    // it keeps its place in the bar: its group, unless it says
+                    if t.group.is_none() {
+                        t.group = slot.group;
+                    }
+                    *slot = t;
+                }
                 None => tools.push(t),
             }
         }
@@ -315,9 +386,31 @@ pub fn merge(global: RawConfig, workspace: Option<RawConfig>) -> anyhow::Result<
         ordered.append(&mut tools);
         tools = ordered;
     }
-    // tools that run in the toolbar first, then those that open a pane, so
-    // the bar can draw one rule between them; `order` holds within each group
-    tools.sort_by_key(|t| t.open == Open::Pane);
+    if tools.iter().any(|t| t.group.is_some()) {
+        // the groups, in their order (ungrouped last), pane tools last in
+        // each; a rule between groups, so `"---"` is not needed
+        let rank = |t: &ToolConfig| t.group.map_or(3, |g| g as u8);
+        tools.sort_by_key(|t| (rank(t), t.open == Open::Pane));
+        rules_after = tools
+            .windows(2)
+            .filter(|w| rank(&w[0]) != rank(&w[1]))
+            .map(|w| w[0].id.clone())
+            .collect();
+        // a group's folder, unless the tool sets its own
+        for t in &mut tools {
+            if t.cwd.is_none() {
+                t.cwd = match t.group {
+                    Some(Group::Space) => Some("{meta?}".into()),
+                    Some(Group::Agent) => Some("{agent?}".into()),
+                    _ => None,
+                };
+            }
+        }
+    } else {
+        // tools that run in the toolbar first, then those that open a pane,
+        // so the bar can draw one rule between them; `order` holds within
+        tools.sort_by_key(|t| t.open == Open::Pane);
+    }
 
     for t in &mut tools {
         if let Some(cwd) = &t.cwd {
@@ -474,20 +567,35 @@ mod tests {
     fn parses_the_spec_example() {
         let raw = parse(GLOBAL).unwrap();
         assert_eq!(raw.tool.len(), 8);
-        assert_eq!(raw.tool[2].id, "db");
         assert!(
             raw.tool.iter().all(|t| t.env.is_empty()),
             "nothing personal (such as a Jira project) in the example"
         );
         let want: Vec<String> = [
-            "intents", "issues", "db", "files", "editor", "browser", "usage", "terminal",
+            "intents", "browser", "issues", "db", "files", "editor", "terminal", "usage",
         ]
         .map(String::from)
         .to_vec();
         assert_eq!(raw.order.as_deref(), Some(&want[..]));
         assert_eq!(raw.prefix.as_deref(), Some("ctrl-]"));
-        assert_eq!(raw.tool[5].id, "browser");
-        assert_eq!(raw.tool[5].open, Open::Pane, "the browser opens in a pane");
+        let tool = |id: &str| raw.tool.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(
+            tool("browser").open,
+            Open::Pane,
+            "the browser opens in a pane"
+        );
+        let group = |id: &str| tool(id).group;
+        assert_eq!(
+            ["intents", "issues", "browser"].map(group),
+            [Some(Group::Space); 3]
+        );
+        assert_eq!(
+            ["db", "files", "editor", "terminal"].map(group),
+            [Some(Group::Agent); 4]
+        );
+        assert_eq!(group("usage"), Some(Group::System));
+        assert_eq!(tool("terminal").switch(), Switch::Keep);
+        assert!(matches!(tool("editor").switch(), Switch::Run(_)));
     }
 
     #[test]
@@ -501,10 +609,22 @@ command = ["lazysql", "postgres://localhost:5433/x"]
 "#;
         let (t, g, w) = dirs(GLOBAL, Some(ws));
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
-        assert_eq!(cfg.tools.len(), 8);
-        assert_eq!(cfg.tools[2].id, "db");
-        assert_eq!(cfg.tools[2].name, "Slot DB");
-        assert_eq!(cfg.tools[2].command[1], "postgres://localhost:5433/x");
+        let ids: Vec<&str> = cfg.tools.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "intents", "issues", "browser", "db", "files", "editor", "terminal", "usage"
+            ],
+            "the replacement keeps its place"
+        );
+        let db = cfg.tools.iter().find(|t| t.id == "db").unwrap();
+        assert_eq!(db.name, "Slot DB");
+        assert_eq!(db.command[1], "postgres://localhost:5433/x");
+        assert_eq!(
+            db.group,
+            Some(Group::Agent),
+            "and its group, since it names none"
+        );
     }
 
     #[test]
@@ -532,25 +652,134 @@ command = ["lazysql", "postgres://localhost:5433/x"]
 
     #[test]
     fn each_rule_in_order_names_the_tool_it_follows() {
+        // without groups (the example has them), `"---"` draws the rules
+        let plain_tools: String = ["intents", "issues", "db", "files"]
+            .map(|id| {
+                format!(
+                    "[[tool]]\nid = \"{id}\"\nname = \"{id}\"\nicon = \"x\"\ncommand = [\"x\"]\n"
+                )
+            })
+            .concat();
         let ws = "order = [\"intents\", \"issues\", \"---\", \"db\"]\n";
-        let (t, g, w) = dirs(GLOBAL, Some(ws));
+        let (t, g, w) = dirs(&plain_tools, Some(ws));
         let cfg = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
         assert_eq!(cfg.rules_after, vec!["issues"]);
         assert!(
             cfg.tools.iter().all(|t| t.id != "---"),
             "the rule is no tool"
         );
-        let (t, g, w) = dirs(GLOBAL, None);
+        let (t, g, w) = dirs(&plain_tools, None);
         let plain = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
         assert!(plain.rules_after.is_empty(), "no rule in order");
         let ws = "order = [\"---\", \"intents\", \"---\", \"---\", \"issues\", \"---\", \"db\"]\n";
-        let (t, g, w) = dirs(GLOBAL, Some(ws));
+        let (t, g, w) = dirs(&plain_tools, Some(ws));
         let many = load_merged(&g, &w, &trusting(&t, &w)).unwrap().config;
         assert_eq!(
             many.rules_after,
             vec!["intents", "issues"],
             "one per gap, none before the first tool"
         );
+    }
+
+    fn grouped_tool(id: &str, group: &str, extra: &str) -> String {
+        let group = if group.is_empty() {
+            String::new()
+        } else {
+            format!("group = \"{group}\"\n")
+        };
+        format!(
+            "[[tool]]\nid = \"{id}\"\nname = \"{id}\"\nicon = \"x\"\ncommand = [\"x\"]\n{group}{extra}"
+        )
+    }
+
+    #[test]
+    fn groups_order_the_bar_and_draw_its_rules() {
+        let text = String::from("order = [\"c\", \"---\", \"b\", \"a\", \"d\", \"p\"]\n")
+            + &grouped_tool("a", "space", "")
+            + &grouped_tool("b", "agent", "")
+            + &grouped_tool("c", "system", "")
+            + &grouped_tool("d", "", "")
+            + &grouped_tool("p", "agent", "open = \"pane\"\n");
+        let cfg = merge(parse(&text).unwrap(), None).unwrap();
+        let ids: Vec<&str> = cfg.tools.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a", "b", "p", "c", "d"],
+            "space, agent (pane last), system, then ungrouped"
+        );
+        assert_eq!(
+            cfg.rules_after,
+            vec!["a", "p", "c"],
+            "a rule between groups; `---` ignored"
+        );
+        // within a group, `order` holds
+        let text = String::from("order = [\"y\", \"x\"]\n")
+            + &grouped_tool("x", "agent", "")
+            + &grouped_tool("y", "agent", "");
+        let cfg = merge(parse(&text).unwrap(), None).unwrap();
+        let ids: Vec<&str> = cfg.tools.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["y", "x"]);
+        assert!(cfg.rules_after.is_empty(), "one group: no rule");
+    }
+
+    #[test]
+    fn a_group_gives_its_tools_a_folder_unless_they_set_one() {
+        let text = grouped_tool("s", "space", "")
+            + &grouped_tool("a", "agent", "")
+            + &grouped_tool("m", "system", "")
+            + &grouped_tool("own", "agent", "cwd = \"/var/tmp\"\n");
+        let cfg = merge(parse(&text).unwrap(), None).unwrap();
+        let cwd = |id: &str| cfg.tools.iter().find(|t| t.id == id).unwrap().cwd.clone();
+        assert_eq!(cwd("s").as_deref(), Some("{meta?}"));
+        assert_eq!(cwd("a").as_deref(), Some("{agent?}"));
+        assert_eq!(cwd("m"), None);
+        assert_eq!(cwd("own").as_deref(), Some("/var/tmp"));
+    }
+
+    #[test]
+    fn an_agent_tool_says_what_a_switch_does_to_it() {
+        let text = grouped_tool("r", "agent", "")
+            + &grouped_tool("k", "agent", "on_switch = \"keep\"\n")
+            + &grouped_tool(
+                "e",
+                "agent",
+                "on_switch = [\"nvim\", \"--remote-send\", \":cd {agent}<CR>\"]\n",
+            );
+        let cfg = merge(parse(&text).unwrap(), None).unwrap();
+        let switch = |id: &str| cfg.tools.iter().find(|t| t.id == id).unwrap().switch();
+        assert_eq!(switch("r"), Switch::Restart);
+        assert_eq!(switch("k"), Switch::Keep);
+        assert_eq!(
+            switch("e"),
+            Switch::Run(vec![
+                "nvim".into(),
+                "--remote-send".into(),
+                ":cd {agent}<CR>".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn a_wrong_group_or_switch_is_refused_naming_the_tool() {
+        let unknown = parse(&grouped_tool("db", "repo", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("repo"), "{unknown}");
+        let space = parse(&grouped_tool("jira", "space", "on_switch = \"keep\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            space.contains("jira") && space.contains("on_switch"),
+            "{space}"
+        );
+        let word = parse(&grouped_tool("db", "agent", "on_switch = \"sometimes\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(word.contains("db") && word.contains("sometimes"), "{word}");
+        let empty = parse(&grouped_tool("db", "agent", "on_switch = []\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("db"), "{empty}");
     }
 
     #[test]
@@ -562,8 +791,9 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         assert_eq!(
             ids,
             [
-                "files", "db", "intents", "issues", "terminal", "editor", "browser", "usage"
-            ]
+                "intents", "issues", "browser", "files", "db", "editor", "terminal", "usage"
+            ],
+            "the groups first; within the agent group, the workspace's order"
         );
     }
 
@@ -647,7 +877,7 @@ command = ["lazysql", "postgres://localhost:5433/x"]
         let trust = Trust::new(t.path().join("trusted.json"));
         trust.allow(&w.join(WORKSPACE_FILE)).unwrap();
         let cfg = load_merged(&g, &w, &trust).unwrap().config;
-        let env = &cfg.tools[2].env;
+        let env = &cfg.tools.iter().find(|t| t.id == "db").unwrap().env;
         assert_eq!(env.get("PGHOST").map(String::as_str), Some("localhost"));
         assert!(!env.contains_key("DYLD_INSERT_LIBRARIES"));
         assert!(!env.contains_key("LD_PRELOAD"));

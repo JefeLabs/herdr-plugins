@@ -76,6 +76,8 @@ fn browser() -> ToolConfig {
         open: Open::Pane,
         graphics: false,
         panes: vec![],
+        group: None,
+        on_switch: None,
     }
 }
 
@@ -95,6 +97,8 @@ fn usage() -> ToolConfig {
             vec!["oxker".into()],
             vec!["dua".into(), "i".into(), "/w s".into()],
         ],
+        group: None,
+        on_switch: None,
     }
 }
 

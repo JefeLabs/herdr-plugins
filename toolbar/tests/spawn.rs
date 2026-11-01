@@ -18,6 +18,8 @@ fn cfg(cmd: &[&str]) -> ToolConfig {
         open: Default::default(),
         graphics: false,
         panes: vec![],
+        group: None,
+        on_switch: None,
     }
 }
 

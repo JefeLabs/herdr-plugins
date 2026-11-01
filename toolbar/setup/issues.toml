@@ -2,4 +2,5 @@
 id      = "issues"
 name    = "GitHub issues"
 icon    = "@ICON@"
+group   = "space"
 command = ["gh", "dash"]

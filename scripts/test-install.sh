@@ -257,11 +257,12 @@ fi
 
 # 10. the Editor tool is added, listening so files can be opened in it
 t10=$(toml "$h")
-if grep -q '^id *= *"editor"' "$t10" 2>/dev/null && grep -q 'exec nvim --listen' "$t10" &&
-  sed -n '/^id *= *"editor"/,/^\[\[tool\]\]/p' "$t10" | grep -q '^open *= *"pane"'; then
-  pass "Editor tool added, Neovim listening in a pane"
+editor10=$(sed -n '/^id *= *"editor"/,/^\[\[tool\]\]/p' "$t10" 2>/dev/null)
+if grep -q 'exec nvim --listen' "$t10" 2>/dev/null && printf '%s\n' "$editor10" | grep -q '^group *= *"agent"' &&
+  printf '%s\n' "$editor10" | grep -qF ':cd {agent}<CR>' && ! printf '%s\n' "$editor10" | grep -q '^open *= *"pane"'; then
+  pass "Editor tool added, Neovim in the toolbar following the agent"
 else
-  flunk "Editor tool added, Neovim listening in a pane" "$(cat "$t10" 2>&1)"
+  flunk "Editor tool added, Neovim in the toolbar following the agent" "$(cat "$t10" 2>&1)"
 fi
 
 # 11. a second run keeps Neovim and adds the Editor once
@@ -371,7 +372,7 @@ mkdir -p "$h"
 run "$h" - "$work/good" --tools
 t17=$(toml "$h")
 if [ $status -eq 0 ] && grep -q '^bar *= *"large"' "$t17" 2>/dev/null && grep -q '^prefix *= *"ctrl-\]"' "$t17" &&
-  grep -q '^order *= *\["intents", "db", "files", "editor", "usage", "terminal"\]' "$t17" &&
+  grep -q '^order *= *\["intents", "db", "files", "editor", "terminal", "usage"\]' "$t17" &&
   ! grep -qE '^id *= *"(jira|web|issues|browser)"' "$t17" &&
   grep -qF "\"$h/.local/share/herdr-plugins/target/release/herdr-intents\"" "$t17"; then
   pass "no terminal: the default bar from the catalog"
@@ -380,10 +381,11 @@ else
 fi
 # Intents on the bar: the tools are told where they are by Intents' context
 if grep -qxF "context = [\"$h/.local/share/herdr-plugins/target/release/herdr-intents\", \"context\"]" "$t17" &&
-  grep -qF 'command = ["lazysql", "{db?}"]' "$t17" && grep -qF 'cwd     = "{meta?}"' "$t17"; then
-  pass "with Intents on the bar, the tools follow its context"
+  grep -qF 'command = ["lazysql", "{db?}"]' "$t17" && grep -qF 'on_switch = "keep"' "$t17" &&
+  grep -qF 'group   = "agent"' "$t17" && grep -qF 'group   = "space"' "$t17"; then
+  pass "with Intents on the bar, the tools follow its context in groups"
 else
-  flunk "with Intents on the bar, the tools follow its context" "$(cat "$t17" 2>&1)"
+  flunk "with Intents on the bar, the tools follow its context in groups" "$(cat "$t17" 2>&1)"
 fi
 case "$out" in
   *"left off: GitHub issues (needs gh, gh-dash)"*) pass "no terminal: says what it left off" ;;
@@ -430,7 +432,7 @@ answers() { # <file> <line>...: the answers, one per line
   : > "$f"
   for a in "$@"; do printf '%s\n' "$a" >> "$f"; done
 }
-default_order='^order *= *\["intents", "db", "files", "editor", "usage", "terminal"\]'
+default_order='^order *= *\["intents", "db", "files", "editor", "terminal", "usage"\]'
 
 # 20. Enter takes the defaults
 h="$work/h20"
@@ -455,7 +457,7 @@ answers "$work/a21" "4" "" "n" ""
 TTY="$work/a21"
 run "$h" - "$work/good" --tools
 unset TTY
-if grep -q '^order *= *\["intents", "db", "editor", "usage", "terminal"\]' "$(toml "$h")" 2>/dev/null; then
+if grep -q '^order *= *\["intents", "db", "editor", "terminal", "usage"\]' "$(toml "$h")" 2>/dev/null; then
   case "$out" in
     *"[ ] 4  Files"*) pass "walk-through: numbers switch tools" ;;
     *) flunk "walk-through: numbers switch tools" "list not shown again: $out" ;;
@@ -895,7 +897,7 @@ answers "$work/a41" "7" "" "n" ""
 TTY="$work/a41"
 run "$h" "$work/f41" "$work/good" --tools
 unset TTY
-if grep -q '^order *= *\["intents", "db", "files", "web", "editor", "browser", "usage", "terminal"\]' "$(toml "$h")" 2>/dev/null; then
+if grep -q '^order *= *\["intents", "web", "browser", "db", "files", "editor", "terminal", "usage"\]' "$(toml "$h")" 2>/dev/null; then
   case "$out" in
     *"[x] 6  Browser "*"[ ] 7  Browser in toolbar"*) pass "list in the mock-up's order, bar in the owner's" ;;
     *) flunk "list in the mock-up's order, bar in the owner's" "list: $out" ;;

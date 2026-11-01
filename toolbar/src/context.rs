@@ -124,6 +124,66 @@ pub fn expand(tool: &ToolConfig, vars: &Vars) -> Result<ToolConfig, String> {
     }
 }
 
+/// `cmd` with its `{name}`s filled in from `vars`, as `expand` fills a
+/// tool's command; `Err` names a missing one.
+pub fn expand_command(
+    tool: &ToolConfig,
+    cmd: &[String],
+    vars: &Vars,
+) -> Result<Vec<String>, String> {
+    let mut t = tool.clone();
+    t.command = cmd.to_vec();
+    t.panes = Vec::new();
+    t.cwd = None;
+    expand(&t, vars).map(|t| t.command)
+}
+
+/// Runs `args` in `cwd` with `env`, waiting at most `timeout`; `Err` is the
+/// last line it wrote to stderr, or why it did not run or finish.
+pub fn run_briefly(
+    args: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let Some((program, rest)) = args.split_first() else {
+        return Ok(());
+    };
+    let mut child = std::process::Command::new(program)
+        .args(rest)
+        .current_dir(cwd)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run `{program}`: {e}"))?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let mut err = String::new();
+                if let Some(mut e) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut e, &mut err);
+                }
+                let line = err.lines().rev().map(str::trim).find(|l| !l.is_empty());
+                return Err(
+                    line.map_or_else(|| format!("`{program}` failed ({status})"), str::to_string)
+                );
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("`{program}` took longer than {timeout:?}"));
+            }
+        }
+    }
+}
+
 /// The active agent of workspace `workspace`, from `herdr agent list`: the
 /// focused agent there; else (the toolbar has focus) the one active before,
 /// if it is still there; else the workspace's first agent.
@@ -265,6 +325,8 @@ mod tests {
             open: Default::default(),
             graphics: false,
             panes: Vec::new(),
+            group: None,
+            on_switch: None,
         }
     }
 
