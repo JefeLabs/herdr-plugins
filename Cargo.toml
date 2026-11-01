@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["toolbar", "tools/intents"]
+members = ["toolbar", "tools/intents", "tools/doc"]
 
 [workspace.package]
 edition = "2024"

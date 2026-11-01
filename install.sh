@@ -466,6 +466,7 @@ write_toolbar() { # <file> <nerd|text> <tool id>...
   for id in "$@"; do order="$order${order:+, }\"$id\""; done
   if [ "$mode" = nerd ]; then field=6; else field=7; fi
   intents=$(sed_text "$(toml_text "$dir/target/release/herdr-intents")")
+  doc=$(sed_text "$(toml_text "$dir/target/release/herdr-doc")")
   repos=$(sed_text "$(toml_text "${HERDR_PLUGINS_REPOS:-$HOME}")")
   {
     printf '%s\n' "# herdr-toolbar tools, written by the herdr-plugins installer. Run it again" \
@@ -479,10 +480,16 @@ write_toolbar() { # <file> <nerd|text> <tool id>...
     for id in "$@"; do
       icon=$(sed_text "$(awk -F'|' -v i="$id" -v f="$field" '$1 == i { print $f }' "$catalog/tools")")
       printf '\n'
-      sed -e "s|@ICON@|$icon|" -e "s|@INTENTS@|$intents|" -e "s|@REPOS@|$repos|" -e "s|@VM@|$vm|" \
+      sed -e "s|@ICON@|$icon|" -e "s|@INTENTS@|$intents|" -e "s|@DOC@|$doc|" -e "s|@REPOS@|$repos|" -e "s|@VM@|$vm|" \
         "$catalog/$id.toml"
     done
   } > "$file.tmp" && mv "$file.tmp" "$file"
+  # the Editor's `herdr-doc open <file>` is how agents show you a file: on PATH
+  case " $* " in *" editor "*)
+    if [ -x "$dir/target/release/herdr-doc" ] && mkdir -p "$bin" 2>/dev/null; then
+      ln -sf "$dir/target/release/herdr-doc" "$bin/herdr-doc"
+    fi ;;
+  esac
 }
 ask() { # <variable>: the next answer (empty once the answers run out)
   if [ -z "${asking:-}" ]; then
