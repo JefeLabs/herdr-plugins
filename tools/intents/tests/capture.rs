@@ -1031,6 +1031,29 @@ fn a_failed_seed_still_finishes_the_effort() {
     assert_eq!(fx.log("claude.log"), "", "no agent after a failed seed");
 }
 
+// a seed that exits 0 but creates nobody (the agent then finds only the
+// platform's people) left no trace of what it did: its output was dropped
+#[test]
+fn a_seeds_output_is_kept_in_the_captures_app_log() {
+    let fx = Fx::new();
+    fx.run(false);
+    let log = fs::read_to_string(fx.evidence().join(".app.log")).unwrap_or_default();
+    assert!(
+        log.contains("make said on stdout: -C") && log.contains("STORY=kathia-signup"),
+        "{log:?}"
+    );
+    assert!(log.contains("make said on stderr: -C"), "{log:?}");
+}
+
+#[test]
+fn a_failed_seeds_output_is_kept_in_the_captures_app_log() {
+    let mut fx = Fx::new();
+    fx.set("FAKE_MAKE_FAIL", "1");
+    fx.run(false);
+    let log = fs::read_to_string(fx.evidence().join(".app.log")).unwrap_or_default();
+    assert!(log.contains("make said on stderr:"), "{log:?}");
+}
+
 #[test]
 fn a_start_that_fails_otherwise_ends_the_capture() {
     let mut fx = Fx::new();
@@ -1307,6 +1330,15 @@ impl Fx {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+// the detail pane's "check · couldn't run" row opens the check's .app.log
+#[test]
+fn a_checks_seed_output_is_kept_in_its_app_log() {
+    let fx = Fx::checking("Done.\n1: confirmed: only the contact");
+    fx.run_check(fx.check_request(None));
+    let log = fs::read_to_string(fx.tmp.path().join("checks/.app.log")).unwrap_or_default();
+    assert!(log.contains("make said on stdout: -C"), "{log:?}");
 }
 
 #[test]
