@@ -7,6 +7,8 @@ expression: "render(&fx.app, 80, 24)"
 ▾ skoolscout (2)       │ Description ───────────────────────────────────────────
   ○ Alpha              │Observed
   ○ Beta               │
+                       │
+                       │
                        │ ▸ Open questions (2 open) ─────────────────────────────
                        │ ▸ Decisions (none) ────────────────────────────────────
                        │ ▸ Preconditions (0/0) ─────────────────────────────────
@@ -17,8 +19,6 @@ expression: "render(&fx.app, 80, 24)"
                        │ ▾ Evidence (2) ────────────────────────────────────────
                        │✓ before · video · the email goes to every admin
                        │✗ after · video · admins still get it
-                       │
-                       │
                        │
                        │
                        │

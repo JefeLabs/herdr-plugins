@@ -6,8 +6,10 @@ expression: "render(&fx.app, 80, 24)"
   ○ In the inbox ?2    │kind: idea   state: sent
 ▾ skoolscout (3)       │ Description ───────────────────────────────────────────
   → Alpha              │x
-  ○ Beta               │ ▸ Open questions (0 open) ─────────────────────────────
-  → Name the meeting to│ ▸ Decisions (none) ────────────────────────────────────
+  ○ Beta               │
+  → Name the meeting to│
+                       │ ▸ Open questions (0 open) ─────────────────────────────
+                       │ ▸ Decisions (none) ────────────────────────────────────
                        │ ▸ Preconditions (0/0) ─────────────────────────────────
                        │ ▸ Acceptance criteria (0/2) ───────────────────────────
                        │ ▸ Stories & Videos (0) ────────────────────────────────
@@ -17,8 +19,6 @@ expression: "render(&fx.app, 80, 24)"
                        │ ▸ Missing items / Bugs (0) ────────────────────────────
                        │ ▾ Follow-ups (1) ──────────────────────────────────────
                        │→ Name the meeting too
-                       │
-                       │
                        │
                        │
                        │

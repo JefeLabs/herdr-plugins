@@ -6,14 +6,14 @@ expression: "render(&fx.app, 80, 24)"
   ○ In the inbox ?2    │kind: idea   state: sent
 ▾ skoolscout (3)       │ Description ───────────────────────────────────────────
   → Alpha              │x
-  ○ Beta               │ ▸ Open questions (0 open) ─────────────────────────────
-  ◐ Missing meeting nam│ ▸ Decisions (none) ────────────────────────────────────
+  ○ Beta               │
+  ◐ Missing meeting nam│
+                       │ ▸ Open questions (0 open) ─────────────────────────────
+                       │ ▸ Decisions (none) ────────────────────────────────────
                        │ ▸ Preconditions (0/0) ─────────────────────────────────
                        │ ▾ Acceptance criteria (0/2) ───────────────────────────
                        │[ ] ✓ the primary contact gets an email
                        │[ ] ✗ the email names the meeting
-                       │
-                       │
                        │
                        │
                        │

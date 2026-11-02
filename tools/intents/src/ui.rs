@@ -1108,13 +1108,15 @@ mod tests {
         for hidden in ["pre one", "q one?", "docs/spec.md"] {
             assert!(!all.contains(hidden), "{hidden:?} is collapsed:\n{all}");
         }
-        // stacked in order right under the description; the closed ones below
-        // the open section sit at the bottom
+        // stacked in order under the description, after two blank lines that
+        // set it apart; the closed ones below the open section sit at the bottom
         let desc = row_of(&rows, "The description.");
-        assert_eq!(row_of(&rows, "▸ Open questions"), desc + 1, "{all}");
-        assert_eq!(row_of(&rows, "▸ Decisions"), desc + 2, "{all}");
-        assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 3, "{all}");
-        assert_eq!(row_of(&rows, "▾ Acceptance criteria"), desc + 4, "{all}");
+        assert_eq!(rows[desc + 1].trim(), "", "{all}");
+        assert_eq!(rows[desc + 2].trim(), "", "{all}");
+        assert_eq!(row_of(&rows, "▸ Open questions"), desc + 3, "{all}");
+        assert_eq!(row_of(&rows, "▸ Decisions"), desc + 4, "{all}");
+        assert_eq!(row_of(&rows, "▸ Preconditions"), desc + 5, "{all}");
+        assert_eq!(row_of(&rows, "▾ Acceptance criteria"), desc + 6, "{all}");
         // the stories, which name criteria by number, come right after them
         assert_eq!(row_of(&rows, "▸ Stories"), 18, "{all}");
         assert_eq!(row_of(&rows, "▸ Artifacts"), 19, "{all}");
@@ -1159,8 +1161,12 @@ mod tests {
         let it = intent_with(&body);
         let (_t, rows) = detail(&it, Pane::Tree, Pane::Criteria, 80, 30);
         let all = rows.join("\n");
-        // at most a third of the height for the description (it scrolls)
-        assert!(row_of(&rows, "▸ Open questions") <= 2 + 10, "{all}");
+        // at most a third of the height for the description (it scrolls),
+        // then its gap
+        assert!(
+            row_of(&rows, "▸ Open questions") <= 2 + 10 + DESCRIPTION_GAP as usize,
+            "{all}"
+        );
         assert!(all.contains("crit three"), "{all}");
     }
 
@@ -1430,6 +1436,10 @@ fn pane_block(title: &str, focused: bool) -> Block<'static> {
         .title(Span::styled(format!(" {title} "), style))
 }
 
+/// Blank lines between the Description and the first section title, so the
+/// description reads as its own block rather than running into the list.
+const DESCRIPTION_GAP: u16 = 2;
+
 /// Header, then Description / Acceptance criteria / Open questions as three
 /// separately scrollable, separately focusable panes.
 pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
@@ -1462,7 +1472,12 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         Pane::Missing,
         Pane::FollowUps,
     ];
-    let mut constraints = vec![Constraint::Length(2), Constraint::Length(desc_h)];
+    // header, description, two blank lines that set the description apart
+    let mut constraints = vec![
+        Constraint::Length(2),
+        Constraint::Length(desc_h),
+        Constraint::Length(DESCRIPTION_GAP),
+    ];
     constraints.extend(sections.iter().map(|s| {
         if *s == v.open {
             Constraint::Min(2)
@@ -1674,7 +1689,7 @@ pub fn render_intent(v: &DetailView, area: Rect, buf: &mut Buffer) {
         })
         .collect();
     for (i, section) in sections.into_iter().enumerate() {
-        let rect = layout[2 + i];
+        let rect = layout[3 + i];
         if section != v.open {
             pane_block(&titles[i], false).render(rect, buf);
             continue;
