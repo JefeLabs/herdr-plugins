@@ -1452,8 +1452,20 @@ fn run(
             };
             let base_url = guide.url.replace("{port}", &port);
 
-            // the people and the tenant the agent signs in as
+            // the people and the tenant the agent signs in as. What the seeds
+            // print goes to the run's .app.log, as in commands mode: a seed can
+            // exit 0 having created nobody, and only its output says why
             let e2e = Path::new(&worktree).join("app-test-e2e-runner");
+            let seed_log = req.run_dir().join(".app.log");
+            let _ = std::fs::create_dir_all(req.run_dir())
+                .and_then(|()| std::fs::File::create(&seed_log));
+            let seed_output = || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seed_log)
+                    .and_then(|f| Ok((f.try_clone()?.into(), f.into())))
+                    .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()))
+            };
             for story in &guide.seed {
                 if cancelled(state) {
                     return failed("cancelled".into());
@@ -1463,12 +1475,13 @@ fn run(
                 if let Some(slot) = field("SLOT") {
                     make.env("SLOT", slot);
                 }
+                let (out, err) = seed_output();
                 let status = make
                     .arg("-C")
                     .arg(&e2e)
                     .args(["e2e-story", &format!("STORY={story}"), "FAST=1"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stdout(out)
+                    .stderr(err)
                     .status();
                 match status {
                     Ok(s) if s.success() => {}
