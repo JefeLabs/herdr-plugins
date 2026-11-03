@@ -1,6 +1,6 @@
 [package]
 name = "herdr-doc"
-version = "0.11.1"
+version = "0.11.2"
 description = "Herdr toolbar tool: a document shown formatted, toggled to Neovim to edit it"
 edition.workspace = true
 license.workspace = true
