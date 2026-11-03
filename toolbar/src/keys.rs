@@ -17,6 +17,8 @@ pub enum Action {
     Reload,
     Restart,
     Quit,
+    /// Open the selected tool in a pane of its own, or close that pane.
+    PopOut,
     /// Swallow the key (it armed or cancelled the prefix).
     Ignore,
 }
@@ -121,6 +123,7 @@ impl Prefix {
             KeyCode::Char('r') => Action::Reload,
             KeyCode::Char('x') => Action::Restart,
             KeyCode::Char('q') => Action::Quit,
+            KeyCode::Char('p') => Action::PopOut,
             _ => Action::Ignore,
         }
     }
@@ -314,6 +317,7 @@ mod tests {
             ('r', Action::Reload),
             ('x', Action::Restart),
             ('q', Action::Quit),
+            ('p', Action::PopOut),
         ] {
             arm(&mut p);
             assert_eq!(p.handle(k(Char(ch), NONE)), want, "key {ch}");

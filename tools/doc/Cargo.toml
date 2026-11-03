@@ -8,7 +8,9 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1"
+nix = { version = "0.31", features = ["signal", "poll", "term"] }
 tempfile = "3"
 
 [dev-dependencies]
+portable-pty = "0.9"
 tempfile = "3"

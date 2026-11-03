@@ -20,6 +20,11 @@ enum Mode {
     Focus,
     /// `unzip <zip> <member> <folder>`, for the installer.
     Unzip(String, String, String),
+    /// `attach <relay> [<control> <tool> <prefix>]`: a pop-out's pane.
+    Attach(String, Option<herdr_toolbar::relay::DockTo>),
+    /// `wrap <control> <tool> <prefix> -- <command…>`: the pane of a
+    /// pop-out with a `popout` command of its own.
+    Wrap(herdr_toolbar::relay::DockTo, Vec<String>),
     Usage(String),
 }
 
@@ -33,6 +38,30 @@ fn parse_mode(args: &[String]) -> Mode {
         [a] if a == "trust" => Mode::Trust,
         [a] if a == "focus" => Mode::Focus,
         [a, tool] if a == "select" => Mode::Select(tool.clone()),
+        // a pop-out's pane; not in the usage line
+        [a, socket] if a == "attach" => Mode::Attach(socket.clone(), None),
+        // ...that leaves with `Ctrl-] c` or `Ctrl-] d` (the toolbar's prefix, then c or d)
+        [a, socket, control, tool, prefix] if a == "attach" => Mode::Attach(
+            socket.clone(),
+            Some(herdr_toolbar::relay::DockTo {
+                control: control.into(),
+                tool: tool.clone(),
+                prefix: prefix.clone(),
+            }),
+        ),
+        // a pop-out running its own command, behind the same leave keys
+        [a, control, tool, prefix, dashes, command @ ..]
+            if a == "wrap" && dashes == "--" && !command.is_empty() =>
+        {
+            Mode::Wrap(
+                herdr_toolbar::relay::DockTo {
+                    control: control.into(),
+                    tool: tool.clone(),
+                    prefix: prefix.clone(),
+                },
+                command.to_vec(),
+            )
+        }
         // the installer's fallback for .zip tools; not in the usage line
         [a, zip, member, folder] if a == "unzip" => {
             Mode::Unzip(zip.clone(), member.clone(), folder.clone())
@@ -50,6 +79,13 @@ fn main() -> ExitCode {
         Mode::Tui => run_tui(),
         Mode::Toggle => run_toggle(),
         Mode::Select(tool) => run_select(&tool),
+        Mode::Attach(socket, dock) => {
+            herdr_toolbar::relay::attach(std::path::Path::new(&socket), dock)
+        }
+        Mode::Wrap(dock, command) => match herdr_toolbar::wrap::wrap(&dock, &command) {
+            Ok(code) => return ExitCode::from(code),
+            Err(e) => Err(e),
+        },
         Mode::Trust => run_trust(),
         Mode::Focus => HerdrContext::from_env().and_then(|ctx| herdr::focus(&ctx)),
         Mode::Unzip(zip, member, folder) => herdr_toolbar::unzip::extract_member(
@@ -154,6 +190,56 @@ mod tests {
             Mode::Unzip("a.zip".into(), "dir/x".into(), "out".into())
         );
         assert_eq!(parse_mode(&["focus".into()]), Mode::Focus);
+        assert_eq!(
+            parse_mode(&["attach".into(), "r.sock".into()]),
+            Mode::Attach("r.sock".into(), None)
+        );
+        assert_eq!(
+            parse_mode(&[
+                "attach".into(),
+                "r.sock".into(),
+                "c.sock".into(),
+                "files".into(),
+                "ctrl-]".into()
+            ]),
+            Mode::Attach(
+                "r.sock".into(),
+                Some(herdr_toolbar::relay::DockTo {
+                    control: "c.sock".into(),
+                    tool: "files".into(),
+                    prefix: "ctrl-]".into(),
+                })
+            )
+        );
+        assert_eq!(
+            parse_mode(
+                &[
+                    "wrap",
+                    "c.sock",
+                    "web",
+                    "ctrl-]",
+                    "--",
+                    "terminal-browser",
+                    "open"
+                ]
+                .map(String::from)
+            ),
+            Mode::Wrap(
+                herdr_toolbar::relay::DockTo {
+                    control: "c.sock".into(),
+                    tool: "web".into(),
+                    prefix: "ctrl-]".into(),
+                },
+                vec!["terminal-browser".into(), "open".into()]
+            )
+        );
+        assert!(
+            matches!(
+                parse_mode(&["wrap", "c.sock", "web", "ctrl-]", "--"].map(String::from)),
+                Mode::Usage(_)
+            ),
+            "a wrap with nothing to run"
+        );
         assert!(matches!(parse_mode(&["bogus".into()]), Mode::Usage(_)));
     }
 }

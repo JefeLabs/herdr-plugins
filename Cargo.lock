@@ -598,6 +598,8 @@ name = "herdr-doc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nix 0.31.3",
+ "portable-pty",
  "tempfile",
 ]
 

@@ -5,5 +5,6 @@
 pub mod kind;
 pub mod nvim;
 pub mod paths;
+pub mod popout;
 pub mod render;
 pub mod vim;

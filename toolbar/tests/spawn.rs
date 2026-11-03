@@ -20,6 +20,7 @@ fn cfg(cmd: &[&str]) -> ToolConfig {
         panes: vec![],
         group: None,
         on_switch: None,
+        popout: None,
     }
 }
 

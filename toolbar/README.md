@@ -52,6 +52,9 @@ Everything goes to the hosted tool except a two-key prefix, default `Ctrl-]`:
 | `Ctrl-]` `j` / `k` | next / previous tool |
 | `Ctrl-]` `r` | reload `tools.toml` |
 | `Ctrl-]` `x` | kill and restart the selected tool |
+| `Ctrl-]` `p` | pop the selected tool out into a pane of its own, or dock it back |
+| `Ctrl-]` `d` | inside a pop-out's pane: dock it, and the toolbar shows the tool and takes focus (`p` does too) |
+| `Ctrl-]` `c` | inside a pop-out's pane: close the pane; the tool is back in its slot, and the toolbar stays as it was |
 | `Ctrl-]` `q` | quit the toolbar |
 | `Ctrl-]` `Ctrl-]` | send a literal `Ctrl-]` to the tool |
 | `Enter` on an exited tool | restart it |
@@ -119,6 +122,12 @@ panes = [
   ["dua", "i", "/path/to/your/repos"],
 ]
 ```
+
+**Pop-out.** `Ctrl-]` `p` moves the selected slot tool into a Herdr pane of its own beside the work pane, at full size: the same running tool, shown there through the toolbar (the pane runs `herdr-toolbar attach`), while its slot says where it went. Nothing is added to the bar; the tool's own button stands for it. To dock it from the toolbar, press `Ctrl-]` `p` again on that tool. Inside the pop-out's pane, `Ctrl-]` `d` docks it (the pane closes, and the toolbar shows the tool and takes focus; `Ctrl-]` `p` does the same), and `Ctrl-]` `c` only closes the pane (the tool is back in its slot, but the toolbar keeps the tool it shows and Herdr decides where focus goes). Closing the pane in Herdr is the same as `Ctrl-]` `c`. Inside the pane, `Ctrl-]` `Ctrl-]` types a literal `Ctrl-]`, and `Ctrl-]` before any other key is dropped.
+
+A slot tool may name `popout`, a command the pane runs instead: a program of its own, such as a browser drawn natively in the pane. The pane runs it through `herdr-toolbar wrap`, which gives it a terminal of its own at the pane's size (in pixels too, so images fit) and passes everything it prints straight through, so it is as fast as in a pane of its own. The same keys work inside it: `Ctrl-]` `d`, `c` and `p`, and `Ctrl-]` `Ctrl-]` for a literal `Ctrl-]`. If the toolbar is gone when you press one, the command ends and the pane is a shell again.
+
+The leave keys are recognised however the tool has the keyboard set up, including the kitty keyboard protocol's fuller reports: a key let go, Ctrl or Shift on its own, or Caps Lock and Num Lock, never cancels the prefix; only the next key pressed decides.
 
 `graphics = true` (experimental) lets a slot tool draw Kitty images. The slot's screen model drops them, so the toolbar cuts each image command out of the tool's output, keeps the cursor where it was printed, and after each frame writes it to Herdr placed at that cell of the slot, with replies turned off (`q=2`) so nothing comes back into the toolbar's input. It also answers what a graphics tool asks before drawing: whether images work, the device attributes (`CSI c`), and, when the toolbar's terminal reports its pixel size, the cell and text-area size (`CSI 16 t`, `CSI 14 t`, and the pty's pixel size). Switching to another tool clears the images; switching back makes the tool redraw. Every frame passes through the toolbar, so a busy page is slower than in its own pane, and the slot is only as big as the toolbar: `open = "pane"` is the faster choice for real browsing. A tool that is not installed shows a one-line "cannot start" message in its slot and the other tools keep working.
 

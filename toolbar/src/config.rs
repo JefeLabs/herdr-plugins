@@ -44,6 +44,10 @@ pub struct ToolConfig {
     /// An agent tool's answer to another agent becoming active.
     #[serde(default)]
     pub on_switch: Option<OnSwitch>,
+    /// A slot tool's pop-out (`Ctrl-] p`): what a Herdr pane beside the
+    /// work pane runs to show the tool there, e.g. `["herdr-doc", "popout"]`.
+    #[serde(default)]
+    pub popout: Option<Vec<String>>,
 }
 
 /// The bar's groups, top to bottom: what a tool's context is.
@@ -174,6 +178,15 @@ pub fn parse(text: &str) -> anyhow::Result<RawConfig> {
         }
         if t.id.is_empty() {
             bail!("a tool has an empty id");
+        }
+        if t.popout.as_ref().is_some_and(Vec::is_empty) {
+            bail!("tool `{}` has an empty popout command", t.id);
+        }
+        if t.popout.is_some() && t.open == Open::Pane {
+            bail!(
+                "tool `{}`: popout is for tools in the toolbar's slot, and this one opens a pane",
+                t.id
+            );
         }
         match &t.on_switch {
             None => {}
@@ -780,6 +793,32 @@ command = ["lazysql", "postgres://localhost:5433/x"]
             .unwrap_err()
             .to_string();
         assert!(empty.contains("db"), "{empty}");
+    }
+
+    #[test]
+    fn a_slot_tool_may_name_its_popout_and_a_pane_tool_may_not() {
+        let editor = parse(&grouped_tool(
+            "editor",
+            "agent",
+            "popout = [\"herdr-doc\", \"popout\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            editor.tool[0].popout,
+            Some(vec!["herdr-doc".to_string(), "popout".to_string()])
+        );
+        let pane = parse(&grouped_tool(
+            "web",
+            "space",
+            "open = \"pane\"\npopout = [\"x\"]\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(pane.contains("web") && pane.contains("popout"), "{pane}");
+        let empty = parse(&grouped_tool("editor", "agent", "popout = []\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("editor"), "{empty}");
     }
 
     #[test]

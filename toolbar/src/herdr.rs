@@ -325,6 +325,25 @@ pub fn select(ctx: &HerdrContext, tool: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tell the toolbar listening on `control` to put `tool`'s pop-out back in
+/// its slot and show it: what `Ctrl-] d` in a pop-out's pane does.
+pub fn dock(control: &Path, tool: &str) -> anyhow::Result<()> {
+    tell(control, &format!("dock {tool}\n"))
+}
+
+/// Tell the toolbar listening on `control` to close `tool`'s pop-out pane,
+/// leaving what it shows and where focus is: what `Ctrl-] c` there does.
+pub fn close_popout(control: &Path, tool: &str) -> anyhow::Result<()> {
+    tell(control, &format!("close {tool}\n"))
+}
+
+fn tell(control: &Path, line: &str) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(control)
+        .with_context(|| format!("no toolbar listening at {}", control.display()))?;
+    stream.write_all(line.as_bytes())?;
+    Ok(())
+}
+
 /// The toolbar's end of the control socket. Non-blocking; `poll` each loop.
 pub struct Control {
     listener: UnixListener,
@@ -356,6 +375,10 @@ impl Control {
             for line in text.lines() {
                 if let Some(tool) = line.strip_prefix("select ") {
                     cmds.push(ControlCmd::Select(tool.trim().to_string()));
+                } else if let Some(tool) = line.strip_prefix("dock ") {
+                    cmds.push(ControlCmd::Dock(tool.trim().to_string()));
+                } else if let Some(tool) = line.strip_prefix("close ") {
+                    cmds.push(ControlCmd::Close(tool.trim().to_string()));
                 }
             }
         }
@@ -371,6 +394,16 @@ impl Drop for Control {
 
 /// `<state_dir>/<workspace>.<tool>.pane`: the pane a pane tool was opened in.
 pub fn launched_pane_file(ctx: &HerdrContext, tool_id: &str) -> PathBuf {
+    tool_file(ctx, tool_id, "pane")
+}
+
+/// `<state_dir>/<workspace>.<tool>.relay`: where a pop-out's pane reaches
+/// the tool it shows (`herdr-toolbar attach`).
+pub fn relay_socket(ctx: &HerdrContext, tool_id: &str) -> PathBuf {
+    tool_file(ctx, tool_id, "relay")
+}
+
+fn tool_file(ctx: &HerdrContext, tool_id: &str, what: &str) -> PathBuf {
     let safe: String = tool_id
         .chars()
         .map(|c| {
@@ -381,7 +414,55 @@ pub fn launched_pane_file(ctx: &HerdrContext, tool_id: &str) -> PathBuf {
             }
         })
         .collect();
-    ctx.state_dir.join(format!("{}.{safe}.pane", ctx.ws()))
+    ctx.state_dir.join(format!("{}.{safe}.{what}", ctx.ws()))
+}
+
+/// Close the panes `tool` opened, those still there and still carrying its
+/// name, and forget them. Returns the ones closed; none were open: empty.
+pub fn close_panes(
+    ctx: &HerdrContext,
+    tool: &crate::config::ToolConfig,
+) -> anyhow::Result<Vec<String>> {
+    let file = launched_pane_file(ctx, &tool.id);
+    let recorded = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut ours = Vec::new();
+    for id in recorded.lines().map(str::trim).filter(|id| !id.is_empty()) {
+        let out = ctx.herdr(&["pane", "get", id])?;
+        if out.status.success()
+            && json_str(&out.stdout, "/result/pane/label").as_deref() == Some(tool.name.as_str())
+        {
+            ours.push(id.to_string());
+        }
+    }
+    for id in &ours {
+        let close = ctx.herdr(&["pane", "close", id])?;
+        if !close.status.success() {
+            bail!(
+                "herdr pane close failed: {}",
+                String::from_utf8_lossy(&close.stderr).trim()
+            );
+        }
+    }
+    if !ours.is_empty() {
+        let _ = std::fs::remove_file(&file);
+    }
+    Ok(ours)
+}
+
+/// Focus the toolbar's own pane.
+pub fn focus_toolbar(ctx: &HerdrContext) -> anyhow::Result<()> {
+    let pane = ctx
+        .pane_id
+        .as_deref()
+        .context("the toolbar's pane is not known (HERDR_PANE_ID is unset)")?;
+    let out = ctx.herdr(&["plugin", "pane", "focus", pane])?;
+    if !out.status.success() {
+        bail!(
+            "herdr plugin pane focus failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// What a press on a pane tool did.
@@ -411,30 +492,11 @@ pub fn toggle_pane(
     if commands.iter().any(Vec::is_empty) {
         bail!("{} has no command", tool.name);
     }
+    let closed = close_panes(ctx, tool)?;
+    if !closed.is_empty() {
+        return Ok(PaneToggle::Closed(closed));
+    }
     let file = launched_pane_file(ctx, &tool.id);
-    let recorded = std::fs::read_to_string(&file).unwrap_or_default();
-    let mut ours = Vec::new();
-    for id in recorded.lines().map(str::trim).filter(|id| !id.is_empty()) {
-        let out = ctx.herdr(&["pane", "get", id])?;
-        if out.status.success()
-            && json_str(&out.stdout, "/result/pane/label").as_deref() == Some(tool.name.as_str())
-        {
-            ours.push(id.to_string());
-        }
-    }
-    if !ours.is_empty() {
-        for id in &ours {
-            let close = ctx.herdr(&["pane", "close", id])?;
-            if !close.status.success() {
-                bail!(
-                    "herdr pane close failed: {}",
-                    String::from_utf8_lossy(&close.stderr).trim()
-                );
-            }
-        }
-        let _ = std::fs::remove_file(&file);
-        return Ok(PaneToggle::Closed(ours));
-    }
     let beside = ctx
         .pane_id
         .as_deref()
@@ -507,6 +569,14 @@ pub fn toggle_pane(
         }
     }
     Ok(PaneToggle::Opened(opened))
+}
+
+/// Whether pane `id` is there and still labelled `label` (Herdr reuses ids).
+pub fn pane_is(ctx: &HerdrContext, id: &str, label: &str) -> bool {
+    ctx.herdr(&["pane", "get", id]).is_ok_and(|out| {
+        out.status.success()
+            && json_str(&out.stdout, "/result/pane/label").as_deref() == Some(label)
+    })
 }
 
 /// The pane on `pane`'s left, if there is one.

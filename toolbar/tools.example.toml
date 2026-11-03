@@ -63,6 +63,8 @@ name    = "Editor"
 icon    = "◫"
 group   = "agent"
 command = ["/absolute/path/to/herdr-plugins/target/release/herdr-doc"]   # Neovim with documents (see tools/doc)
+# Ctrl-] p: the same Neovim, unsaved edits and all, in a pane of its own
+popout  = ["/absolute/path/to/herdr-plugins/target/release/herdr-doc", "popout"]
 # another agent becomes active: Neovim stays open and changes its folder. The
 # folder goes in as an argument ("$1"), never inside the script, and reaches
 # Neovim as a quoted string (chdir), never as a command line.

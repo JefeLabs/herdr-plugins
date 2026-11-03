@@ -78,6 +78,7 @@ fn browser() -> ToolConfig {
         panes: vec![],
         group: None,
         on_switch: None,
+        popout: None,
     }
 }
 
@@ -99,6 +100,7 @@ fn usage() -> ToolConfig {
         ],
         group: None,
         on_switch: None,
+        popout: None,
     }
 }
 

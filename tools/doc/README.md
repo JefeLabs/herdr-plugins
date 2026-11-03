@@ -60,9 +60,20 @@ on_switch = ["sh", "-c", "p=$(printf %s \"$1\" | sed \"s/'/''/g\"); exec nvim --
 
 `herdr-doc open` asks the toolbar for the tool named `editor`. Set `HERDR_DOC_TOOL` if yours has another id. Neovim listens on `${XDG_CACHE_HOME:-~/.cache}/nvim-editor-<workspace>.sock`, the Editor's usual socket, so `nvim --server … --remote <file>` and the `on_switch` above keep working. The installer links `herdr-doc` into `~/.local/bin` when the Editor is on your bar, so agents can run it.
 
+## Pop-out
+
+`Ctrl-]` `p` on the Editor shows it in a Herdr pane of its own, beside the work pane, with a marked button for it on the toolbar. Give the Editor's entry
+
+```toml
+popout = ["/absolute/path/to/herdr-plugins/target/release/herdr-doc", "popout"]
+```
+
+Neovim runs in the background (`nvim --headless`, on the Editor's socket) and the slot and the pop-out are both windows onto it (`nvim --remote-ui`), so the pop-out has every buffer, unsaved edits included. Neovim is drawn at the size of its smallest window, so while the pop-out is open the slot lets go of it and says so; when the pane closes, however it closes, the slot shows Neovim again. An agent's `herdr-doc open` shows the file in the pop-out then, without switching the toolbar. Neovim still stops with the slot, as before: when the toolbar closes or the Editor restarts.
+
 ## Modes
 
-- `herdr-doc [files…]`: the pane, which is Neovim with the document view.
+- `herdr-doc [files…]`: the slot, which starts Neovim with the document view in the background and shows it.
+- `herdr-doc popout`: the pop-out pane, a window onto the same Neovim.
 - `herdr-doc open <file>`: show a file, as an agent does.
 - `herdr-doc view <file>`: the formatted view (`less -R` over `render`).
 - `herdr-doc render <file>`: print the formatted view. It's what `less` runs (`LESSOPEN`). The width comes from `HERDR_DOC_COLUMNS`, else the terminal, else `COLUMNS`, else 100.

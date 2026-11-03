@@ -336,6 +336,7 @@ mod tests {
             panes: Vec::new(),
             group: None,
             on_switch: None,
+            popout: None,
         }
     }
 
