@@ -263,7 +263,9 @@ if [ -n "$config" ]; then
      s/^\(name[[:space:]]*=[[:space:]]*\)"Capabilities"/\1"Intents"/
      /^order/s/"capabilities"/"intents"/'
 fi
-rename_in "${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}" 'jefelabs\.capabilities\.add' \
+# Herdr's own config file: where its key bindings go
+herdr_config="${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}"
+rename_in "$herdr_config" 'jefelabs\.capabilities\.add' \
   's/jefelabs\.capabilities\.add/jefelabs.intents.add/g'
 
 # Third-party tools for --tools: name, platform, download, the SHA-256 it
@@ -757,9 +759,13 @@ if [ -n "$config" ] && { [ -n "$setup" ] || [ ! -f "$config/tools.toml" ]; }; th
   fi
 fi
 
+say ""
+if [ -f "$herdr_config" ]; then
+  say "Add these to your Herdr config, $herdr_config, then run: herdr server reload-config"
+else
+  say "Add these to your Herdr config, $herdr_config (a new file), then run: herdr server reload-config"
+fi
 cat <<'KEYS'
-
-Add these to your Herdr config.toml, then run: herdr server reload-config
 
 [[keys.command]]
 key = "prefix+t"

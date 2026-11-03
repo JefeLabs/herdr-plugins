@@ -1029,6 +1029,32 @@ case "$out" in
   *) flunk "a failed link shows Herdr's error" "exit $status: $out" ;;
 esac
 
+# --- the key bindings name the Herdr config file to add them to
+h="$work/hk-new"; mkdir -p "$h"
+run "$h" - "$work/good"
+case "$out" in
+  *"Add these to your Herdr config, $h/.config/herdr/config.toml (a new file), then run: herdr server reload-config"*)
+    pass "the key bindings name Herdr's config file, new" ;;
+  *) flunk "the key bindings name Herdr's config file, new" "$out" ;;
+esac
+
+h="$work/hk-have"; mkdir -p "$h/.config/herdr" && : > "$h/.config/herdr/config.toml"
+run "$h" - "$work/good"
+case "$out" in
+  *"Add these to your Herdr config, $h/.config/herdr/config.toml, then run: herdr server reload-config"*)
+    pass "the key bindings name Herdr's config file, existing" ;;
+  *) flunk "the key bindings name Herdr's config file, existing" "$out" ;;
+esac
+
+h="$work/hk-env"; mkdir -p "$h"
+out=$(env -i HOME="$h" PATH="$base_path" HERDR_PLUGINS_TTY=none HERDR_CONFIG_PATH="$work/elsewhere/herdr.toml" \
+  sh "$rel/install.sh" --from "$rel" 2>&1)
+case "$out" in
+  *"Add these to your Herdr config, $work/elsewhere/herdr.toml (a new file), then run"*)
+    pass "the key bindings name HERDR_CONFIG_PATH when it is set" ;;
+  *) flunk "the key bindings name HERDR_CONFIG_PATH when it is set" "$out" ;;
+esac
+
 # --- review fixes
 # 37. no terminal at all (CI, Docker, ssh host 'curl … | sh'): no questions, and
 # the install carries on, under sh and under dash (Linux's sh)

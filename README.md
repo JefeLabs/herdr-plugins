@@ -10,7 +10,7 @@ On macOS or Linux (arm64 or x86_64), with Herdr already installed:
 curl -fsSL https://github.com/JefeLabs/herdr-plugins/releases/latest/download/install.sh | sh
 ```
 
-It downloads the build for your machine from the latest release, checks it against the release's `SHA256SUMS`, puts both plugins in `~/.local/share/herdr-plugins`, links them with `herdr plugin link`, walks you through the toolbar's tools (below) if you have no toolbar `tools.toml` yet, and prints the Herdr key bindings to add. No sudo, Rust or compiler is needed: the Linux builds are static. Run it again to update; `HERDR_PLUGINS_VERSION=v0.1.0` installs a given release.
+It downloads the build for your machine from the latest release, checks it against the release's `SHA256SUMS`, puts both plugins in `~/.local/share/herdr-plugins`, links them with `herdr plugin link`, walks you through the toolbar's tools (below) if you have no toolbar `tools.toml` yet, and prints the Herdr key bindings to add, naming the file they go in (`~/.config/herdr/config.toml`, or `$HERDR_CONFIG_PATH` when set). No sudo, Rust or compiler is needed: the Linux builds are static. Run it again to update; `HERDR_PLUGINS_VERSION=v0.1.0` installs a given release.
 
 A plugin already linked to another folder (a development checkout, say) is left as it is, because Herdr would replace that link without a word. On a terminal you are asked first (the answer defaults to no); with no terminal it says so and moves on. Add `--relink` to switch such links without asking.
 
