@@ -9,6 +9,7 @@ pub mod herdr;
 pub mod keys;
 pub mod pty;
 pub mod relay;
+pub mod setup;
 pub mod ui;
 pub mod unzip;
 pub mod wrap;

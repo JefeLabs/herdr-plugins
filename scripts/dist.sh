@@ -53,9 +53,13 @@ build() { # <rust target> <asset name>
   cp tools/doc/README.md "$root/tools/doc/"
   cp "target/$target/release/herdr-toolbar" "target/$target/release/herdr-intents" \
     "target/$target/release/herdr-doc" "$root/target/release/"
+  # what `herdr-toolbar setup` runs, on a release mise (or anyone) unpacked
+  cp install.sh "$root/"
   pack "dist/herdr-plugins-$name.tar.gz" "$stage" herdr-plugins
   rm -rf "$stage"
   check_clean "dist/herdr-plugins-$name.tar.gz"
+  tar -tzf "dist/herdr-plugins-$name.tar.gz" | grep -qx 'herdr-plugins/install.sh' ||
+    { echo "dist: $name has no install.sh" >&2; exit 1; }
   echo "built dist/herdr-plugins-$name.tar.gz"
 }
 
