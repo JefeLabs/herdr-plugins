@@ -595,7 +595,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "herdr-doc"
-version = "0.1.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "nix 0.31.3",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "herdr-intents"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "herdr-toolbar"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "crossterm",
