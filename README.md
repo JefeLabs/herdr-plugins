@@ -20,6 +20,27 @@ curl -fsSL https://github.com/JefeLabs/herdr-plugins/releases/latest/download/in
 
 That installs procs, oxker, dua, yazi, lazysql and Neovim into `~/.local/bin` (`HERDR_PLUGINS_BIN` changes it) from their own GitHub releases, at versions pinned in `install.sh`. Each download must match the SHA-256 written there, or that tool is not installed and the run fails. Tools already on your `PATH` are left alone. procs and yazi ship only as `.zip`: the installer unpacks them with `unzip` or `python3` when present, else with the toolbar's own `herdr-toolbar unzip`, so a minimal system (debian:stable-slim, say) needs neither. With those programs in place, the walk-through offers the Usage tool: one press opens three panes stacked beside the work pane (processes, Docker containers, disk use), the next press closes them. Its disk pane opens `HERDR_PLUGINS_REPOS`, or your home folder. Neovim's release is a folder (the program and its runtime files): it is unpacked into `~/.local/share/herdr-plugins/vendor/nvim` and `nvim` is linked into `~/.local/bin`. Its Linux build needs glibc, so on Alpine or another musl system it is skipped with a hint to use the package manager. The Editor tool is Neovim in a pane beside the work pane, listening on `~/.cache/nvim-editor-<workspace id>.sock`, so `nvim --server <that socket> --remote <file>` opens a file in it from anywhere. `--tools` only installs programs: which tools go on the bar is the walk-through's choice. Your own Neovim configuration is not copied. For gh dash, jira and terminal-browser it prints how to install them. Offline, put the tools' archives in the `--from` folder as well. `sh scripts/test-install.sh` tests the installer offline.
 
+### With mise
+
+[mise](https://mise.jdx.dev) can install Herdr and the plugins, each on its own. In `~/.config/mise/config.toml`:
+
+```toml
+[tools]
+"github:herdrdev/herdr" = "latest"
+"github:JefeLabs/herdr-plugins" = { version = "0.11.0", strip_components = 1, bin_path = "target/release" }
+```
+
+The two options are needed because the archive keeps the programs in `target/release/`, where each plugin's manifest looks for them. Pin the version to the latest release (`herdr-toolbar setup` needs 0.11.0 or later): mise's list of releases can lag a new release by hours, so `latest` may still give you the one before.
+
+Then:
+
+```sh
+mise install
+herdr-toolbar setup
+```
+
+`herdr-toolbar setup` runs the release's own `install.sh` on mise's copy (`install.sh --tree <that folder>`). It copies the plugins into `~/.local/share/herdr-plugins` and links them there, never in mise's folder, so `mise upgrade` and `mise prune` can't break Herdr's links. It then walks you through the toolbar's tools and prints the key bindings, just as the curl installer does, and `--tools` and `--setup` work the same. To update, change the version, run `mise install`, then `herdr-toolbar setup` again. With mise, `herdr-intents` and `herdr-doc` are on your `PATH` as well.
+
 ### Choosing the toolbar's tools
 
 On a terminal, the installer lists the toolbar's tools (the catalog in `toolbar/setup/`): Intents, GitHub issues, Database, Files, Jira, Browser (in the toolbar), Editor, Browser, Usage and Terminal. All are ticked but Jira and the in-toolbar browser, so pressing Enter takes the default bar. Type numbers to switch tools on or off; a tool's `needs:` lists the programs it is missing.
@@ -43,7 +64,7 @@ Link one for development with `herdr plugin link <this checkout>/<plugin>` after
 
 ## Release
 
-`scripts/dist.sh` builds both plugins for linux-arm64, linux-x86_64, macos-arm64 and macos-x86_64 and packages them, with `SHA256SUMS` and `install.sh`, into `dist/`. Linux builds are linked with Rust's own `rust-lld` against musl, so no cross compiler is needed. Upload `dist/*` as the assets of a GitHub release.
+`scripts/dist.sh` builds both plugins for linux-arm64, linux-x86_64, macos-arm64 and macos-x86_64 and packages them, with `SHA256SUMS` and `install.sh`, into `dist/`. Linux builds are linked with Rust's own `rust-lld` against musl, so no cross compiler is needed. Each archive also carries `install.sh`, which `herdr-toolbar setup` runs. Upload `dist/*` as the assets of a GitHub release.
 
 ## Plugins
 

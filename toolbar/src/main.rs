@@ -25,11 +25,13 @@ enum Mode {
     /// `wrap <control> <tool> <prefix> -- <command…>`: the pane of a
     /// pop-out with a `popout` command of its own.
     Wrap(herdr_toolbar::relay::DockTo, Vec<String>),
+    /// `setup [--tools] [--setup]`: the release's own install.sh, run on
+    /// the folder this program came from (mise's copy, say).
+    Setup(Vec<String>),
     Usage(String),
 }
 
-const USAGE: &str =
-    "usage: herdr-toolbar [toggle | focus | select <tool-id|index> | trust | --version]";
+const USAGE: &str = "usage: herdr-toolbar [toggle | focus | select <tool-id|index> | trust | setup [--tools] [--setup] | --version]";
 
 fn parse_mode(args: &[String]) -> Mode {
     match args {
@@ -38,6 +40,7 @@ fn parse_mode(args: &[String]) -> Mode {
         [a] if a == "trust" => Mode::Trust,
         [a] if a == "focus" => Mode::Focus,
         [a, tool] if a == "select" => Mode::Select(tool.clone()),
+        [a, rest @ ..] if a == "setup" => Mode::Setup(rest.to_vec()),
         // a pop-out's pane; not in the usage line
         [a, socket] if a == "attach" => Mode::Attach(socket.clone(), None),
         // ...that leaves with `Ctrl-] c` or `Ctrl-] d` (the toolbar's prefix, then c or d)
@@ -83,6 +86,10 @@ fn main() -> ExitCode {
             herdr_toolbar::relay::attach(std::path::Path::new(&socket), dock)
         }
         Mode::Wrap(dock, command) => match herdr_toolbar::wrap::wrap(&dock, &command) {
+            Ok(code) => return ExitCode::from(code),
+            Err(e) => Err(e),
+        },
+        Mode::Setup(args) => match herdr_toolbar::setup::run(&args) {
             Ok(code) => return ExitCode::from(code),
             Err(e) => Err(e),
         },
@@ -190,6 +197,11 @@ mod tests {
             Mode::Unzip("a.zip".into(), "dir/x".into(), "out".into())
         );
         assert_eq!(parse_mode(&["focus".into()]), Mode::Focus);
+        assert_eq!(parse_mode(&["setup".into()]), Mode::Setup(vec![]));
+        assert_eq!(
+            parse_mode(&["setup".into(), "--tools".into(), "--setup".into()]),
+            Mode::Setup(vec!["--tools".into(), "--setup".into()])
+        );
         assert_eq!(
             parse_mode(&["attach".into(), "r.sock".into()]),
             Mode::Attach("r.sock".into(), None)
