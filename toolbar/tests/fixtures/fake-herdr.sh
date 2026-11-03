@@ -3,8 +3,10 @@
 printf '%s\n' "$*" >> "$FAKE_HERDR_LOG"
 case "$1 $2" in
   "pane get")
-    # FAKE_GONE: space-separated ids closed since they were recorded
-    case " ${FAKE_GONE:-} " in *" $3 "*) exit 1 ;; esac
+    # FAKE_GONE (or the file FAKE_GONE_FILE, read on each call): space-
+    # separated ids closed since they were recorded
+    gone="${FAKE_GONE:-} $(cat "${FAKE_GONE_FILE:-/dev/null}" 2>/dev/null)"
+    case " $gone " in *" $3 "*) exit 1 ;; esac
     if [ "${FAKE_PANE_EXISTS:-0}" = 1 ]; then
       # A real non-plugin pane has no plugin_id field; only the label tells it apart.
       printf '{"id":"cli:pane","result":{"pane":{"pane_id":"%s","label":"%s"}}}\n' "$3" "${FAKE_PANE_LABEL:-Toolbar}"

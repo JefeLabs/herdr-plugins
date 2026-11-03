@@ -8,5 +8,7 @@ pub mod graphics;
 pub mod herdr;
 pub mod keys;
 pub mod pty;
+pub mod relay;
 pub mod ui;
 pub mod unzip;
+pub mod wrap;

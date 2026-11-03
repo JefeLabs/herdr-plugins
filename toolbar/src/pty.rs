@@ -77,10 +77,20 @@ fn env_is_denied(name: &str) -> bool {
     DENIED_ENV.contains(&name) || DENIED_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+type Master = Arc<Mutex<Box<dyn MasterPty + Send>>>;
+
+/// Whether another terminal shows the tool (a pop-out), and the size the
+/// slot wants it back at.
+struct Relay {
+    to: Option<std::os::unix::net::UnixStream>,
+    slot_size: Size,
+}
+
 pub struct ToolProcess {
     parser: Arc<RwLock<vt100::Parser>>,
-    master: Box<dyn MasterPty + Send>,
+    master: Master,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    relay: Arc<Mutex<Relay>>,
     graphics: GraphicsQueue,
     cell: Option<(u16, u16)>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
@@ -158,22 +168,38 @@ impl ToolProcess {
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| fail(&e))?));
         let graphics: GraphicsQueue = Arc::new(Mutex::new(Vec::new()));
+        let relay = Arc::new(Mutex::new(Relay {
+            to: None,
+            slot_size: size,
+        }));
 
         {
             let parser = Arc::clone(&parser);
             let writer = Arc::clone(&writer);
             let graphics = Arc::clone(&graphics);
+            let relay = Arc::clone(&relay);
             let (with_graphics, cell) = (cfg.graphics, env.cell);
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
                 let mut splitter = crate::graphics::Splitter::default();
                 loop {
                     match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) | Err(_) => {
+                            // the tool is gone: so is its pop-out
+                            if let Some(to) = relay.lock().unwrap().to.take() {
+                                let _ = to.shutdown(std::net::Shutdown::Both);
+                            }
+                            break;
+                        }
                         Ok(n) if !with_graphics => {
-                            parser.write().unwrap().process(&buf[..n]);
+                            // under the screen's lock, so a pop-out attaching
+                            // gets each byte once: in its screen or after it
+                            let mut screen = parser.write().unwrap();
+                            screen.process(&buf[..n]);
+                            relay_out(&relay, &buf[..n]);
                         }
                         Ok(n) => {
+                            relay_out(&relay, &buf[..n]);
                             for piece in splitter.split(&buf[..n]) {
                                 take_piece(piece, &parser, &writer, &graphics, cell);
                             }
@@ -212,8 +238,9 @@ impl ToolProcess {
 
         Ok(Self {
             parser,
-            master: pair.master,
+            master: Arc::new(Mutex::new(pair.master)),
             writer,
+            relay,
             graphics,
             cell: env.cell,
             child,
@@ -239,13 +266,33 @@ impl ToolProcess {
         Ok(())
     }
 
+    /// The slot's size for the tool. While a pop-out shows it, the tool
+    /// keeps the pop-out's size and takes this one when it comes back.
     pub fn resize(&self, size: Size) {
-        self.parser
-            .write()
-            .unwrap()
-            .screen_mut()
-            .set_size(size.rows, size.cols);
-        let _ = self.master.resize(size.pty(self.cell));
+        {
+            let mut relay = self.relay.lock().unwrap();
+            relay.slot_size = size;
+            if relay.to.is_some() {
+                return;
+            }
+        }
+        set_size(&self.parser, &self.master, self.cell, size);
+    }
+
+    /// A handle for showing this tool on another terminal (a pop-out).
+    pub fn handle(&self) -> PtyHandle {
+        PtyHandle {
+            parser: Arc::clone(&self.parser),
+            master: Arc::clone(&self.master),
+            writer: Arc::clone(&self.writer),
+            relay: Arc::clone(&self.relay),
+            cell: self.cell,
+        }
+    }
+
+    /// Whether another terminal shows this tool now.
+    pub fn attached(&self) -> bool {
+        self.relay.lock().unwrap().to.is_some()
     }
 
     pub fn state(&self) -> ToolState {
@@ -341,5 +388,95 @@ impl std::ops::Deref for ScreenGuard<'_> {
     type Target = vt100::Screen;
     fn deref(&self) -> &vt100::Screen {
         self.0.screen()
+    }
+}
+
+/// The screen model and the pty at `size`; the tool hears SIGWINCH.
+fn set_size(parser: &RwLock<vt100::Parser>, master: &Master, cell: Option<(u16, u16)>, size: Size) {
+    parser
+        .write()
+        .unwrap()
+        .screen_mut()
+        .set_size(size.rows, size.cols);
+    let _ = master.lock().unwrap().resize(size.pty(cell));
+}
+
+/// The tool's output, as printed, to the terminal showing it elsewhere; a
+/// terminal that stopped reading is let go (its relay then gives the tool
+/// back).
+fn relay_out(relay: &Mutex<Relay>, bytes: &[u8]) {
+    let mut relay = relay.lock().unwrap();
+    if let Some(to) = relay.to.as_mut()
+        && to.write_all(bytes).is_err()
+    {
+        relay.to = None;
+    }
+}
+
+/// A tool's pty, for showing it on another terminal: there it is drawn
+/// and typed into, at that terminal's size, until it is given back.
+#[derive(Clone)]
+pub struct PtyHandle {
+    parser: Arc<RwLock<vt100::Parser>>,
+    master: Master,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    relay: Arc<Mutex<Relay>>,
+    cell: Option<(u16, u16)>,
+}
+
+impl PtyHandle {
+    /// Shows the tool on `to` at `size`: the pty takes that size, `to` gets
+    /// the screen as it is, then everything the tool prints.
+    pub fn attach(
+        &self,
+        mut to: std::os::unix::net::UnixStream,
+        size: Size,
+    ) -> std::io::Result<()> {
+        // a terminal that stops reading must not stall the tool for long
+        to.set_write_timeout(Some(Duration::from_secs(2)))?;
+        {
+            let mut parser = self.parser.write().unwrap();
+            parser.screen_mut().set_size(size.rows, size.cols);
+            let screen = parser.screen();
+            let mut now = Vec::new();
+            if screen.alternate_screen() {
+                now.extend_from_slice(b"\x1b[?1049h");
+            }
+            now.extend_from_slice(&screen.state_formatted());
+            to.write_all(&now)?;
+            self.relay.lock().unwrap().to = Some(to);
+        }
+        let _ = self.master.lock().unwrap().resize(size.pty(self.cell));
+        Ok(())
+    }
+
+    /// Bytes typed on the other terminal.
+    pub fn input(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(bytes)?;
+        w.flush()
+    }
+
+    /// The other terminal's new size.
+    pub fn resize(&self, size: Size) {
+        if self.attached() {
+            set_size(&self.parser, &self.master, self.cell, size);
+        }
+    }
+
+    pub fn attached(&self) -> bool {
+        self.relay.lock().unwrap().to.is_some()
+    }
+
+    /// Gives the tool back, at the slot's size; the other terminal is let go.
+    pub fn detach(&self) {
+        let size = {
+            let mut relay = self.relay.lock().unwrap();
+            if let Some(to) = relay.to.take() {
+                let _ = to.shutdown(std::net::Shutdown::Both);
+            }
+            relay.slot_size
+        };
+        set_size(&self.parser, &self.master, self.cell, size);
     }
 }

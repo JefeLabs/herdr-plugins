@@ -4,7 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use herdr_toolbar::app::ControlCmd;
-use herdr_toolbar::herdr::{Control, HerdrContext, focus, pane_file, select, socket_path, toggle};
+use herdr_toolbar::herdr::{
+    Control, HerdrContext, close_popout, dock, focus, pane_file, select, socket_path, toggle,
+};
 
 fn fake_herdr() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-herdr.sh")
@@ -113,6 +115,42 @@ fn select_reaches_a_listening_control_socket() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(got, vec![ControlCmd::Select("db".into())]);
+    drop(fx.tmp);
+}
+
+#[test]
+fn a_popouts_dock_key_reaches_a_listening_control_socket() {
+    let fx = fx();
+    let path = socket_path(&fx.ctx);
+    let control = Control::bind(&path).unwrap();
+    dock(&path, "files").unwrap();
+    let mut got = Vec::new();
+    for _ in 0..50 {
+        got.extend(control.poll());
+        if !got.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(got, vec![ControlCmd::Dock("files".into())]);
+    drop(fx.tmp);
+}
+
+#[test]
+fn a_popouts_close_key_reaches_a_listening_control_socket() {
+    let fx = fx();
+    let path = socket_path(&fx.ctx);
+    let control = Control::bind(&path).unwrap();
+    close_popout(&path, "files").unwrap();
+    let mut got = Vec::new();
+    for _ in 0..50 {
+        got.extend(control.poll());
+        if !got.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(got, vec![ControlCmd::Close("files".into())]);
     drop(fx.tmp);
 }
 

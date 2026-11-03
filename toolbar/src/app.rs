@@ -6,6 +6,7 @@
 //! messages and control-socket commands.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
@@ -40,6 +41,12 @@ pub struct Slot {
     stale: Option<String>,
 }
 
+/// A tool out in a pane of its own (`Ctrl-] p`): the panes it opened.
+struct Popout {
+    tool: String,
+    panes: Vec<String>,
+}
+
 impl Slot {
     fn state(&self) -> ToolState {
         match (&self.proc, &self.last_error) {
@@ -66,10 +73,74 @@ pub enum Flow {
     Quit,
 }
 
+/// What opening or closing a pane in the background reports back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneNews {
+    Opened {
+        tool: String,
+        panes: Vec<String>,
+    },
+    Closed {
+        tool: String,
+    },
+    /// A pop-out's panes are all gone: closed in Herdr.
+    Gone {
+        tool: String,
+        panes: Vec<String>,
+    },
+}
+
+/// The id of `tool`'s pop-out pane: what its pane is recorded under.
+fn popout_id(tool: &str) -> String {
+    format!("{tool}~popout")
+}
+
+/// What the slot says while a pop-out shows its tool; `prefix` as
+/// `tools.toml` writes it.
+fn shown_in_popout(prefix: &str) -> String {
+    format!(
+        "Shown in the pop-out \u{2197}\n\n\
+         In that pane, {prefix} d brings it back here and {prefix} c closes the pane.\n\
+         Here, {prefix} p brings it back."
+    )
+}
+
+/// A tool shown in a pop-out through the toolbar: its relay's socket and
+/// the flag that stops it.
+struct RelayRun {
+    tool: String,
+    socket: PathBuf,
+    stop: Arc<AtomicBool>,
+}
+
+/// The pop-out of `src`: a pane tool running `command`, named after it
+/// with `↗`, in its group.
+fn popout_config(src: &ToolConfig, command: Vec<String>) -> ToolConfig {
+    ToolConfig {
+        id: popout_id(&src.id),
+        name: format!("{} \u{2197}", src.name),
+        icon: src.icon.clone(),
+        command,
+        cwd: src.cwd.clone(),
+        env: src.env.clone(),
+        open: Open::Pane,
+        graphics: false,
+        panes: Vec::new(),
+        group: src.group,
+        on_switch: None,
+        popout: None,
+    }
+}
+
 /// Commands that reach a running toolbar from outside (the `select` mode).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCmd {
     Select(String),
+    /// From a pop-out's pane (`Ctrl-] d` there): put this tool back here,
+    /// shown, with focus.
+    Dock(String),
+    /// From a pop-out's pane (`Ctrl-] c` there): close that pane only.
+    Close(String),
 }
 
 pub struct App {
@@ -89,6 +160,14 @@ pub struct App {
     /// What background launches have to say (a failure), for the footer.
     notes_tx: Sender<String>,
     notes_rx: Receiver<String>,
+    /// What pane openings and closings report: pop-out buttons follow it.
+    news_tx: Sender<PaneNews>,
+    news_rx: Receiver<PaneNews>,
+    /// Tools shown in a pop-out through the toolbar.
+    relays: Vec<RelayRun>,
+    /// Tools out in panes of their own. Not in the rail: a tool's own
+    /// button stands for its pop-out.
+    popouts: Vec<Popout>,
     /// Bytes for the terminal after the next frame (clearing a hidden
     /// graphics tool's images).
     pending_out: Vec<u8>,
@@ -114,12 +193,17 @@ impl App {
     pub fn new(paths: ConfigPaths, env: SpawnEnv, size: Size) -> anyhow::Result<Self> {
         let (wake_tx, wake_rx) = channel();
         let (notes_tx, notes_rx) = channel();
+        let (news_tx, news_rx) = channel();
         let mut app = Self {
             slots: Vec::new(),
             selected: 0,
             herdr: None,
             notes_tx,
             notes_rx,
+            news_tx,
+            news_rx,
+            relays: Vec::new(),
+            popouts: Vec::new(),
             pending_out: Vec::new(),
             bar: Default::default(),
             hover: None,
@@ -348,7 +432,13 @@ impl App {
     /// Open a pane tool, or close the pane it opened, off the UI thread;
     /// Herdr answers in tens of milliseconds but the toolbar must never wait.
     fn toggle_pane(&mut self, idx: usize) {
-        let cfg = match crate::context::expand(&self.slots[idx].cfg, &self.vars) {
+        self.toggle_pane_of(self.slots[idx].cfg.clone());
+    }
+
+    /// `toggle_pane` for a tool's config, which may have no slot yet (a
+    /// pop-out about to open). What happened comes back as `PaneNews`.
+    fn toggle_pane_of(&mut self, cfg: ToolConfig) {
+        let cfg = match crate::context::expand(&cfg, &self.vars) {
             Ok(cfg) => cfg,
             Err(why) => {
                 self.message = Some(why);
@@ -363,10 +453,256 @@ impl App {
             return;
         };
         self.message = None;
-        let (tx, wake) = (self.notes_tx.clone(), self.wake_tx.clone());
+        let (tx, news, wake) = (
+            self.notes_tx.clone(),
+            self.news_tx.clone(),
+            self.wake_tx.clone(),
+        );
         std::thread::spawn(move || {
-            if let Err(e) = crate::herdr::toggle_pane(&ctx, &cfg) {
-                let _ = tx.send(format!("{}: {e:#}", cfg.name));
+            let tool = cfg.id.clone();
+            match crate::herdr::toggle_pane(&ctx, &cfg) {
+                Ok(crate::herdr::PaneToggle::Opened(panes)) => {
+                    let _ = news.send(PaneNews::Opened { tool, panes });
+                }
+                Ok(crate::herdr::PaneToggle::Closed(_)) => {
+                    let _ = news.send(PaneNews::Closed { tool });
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("{}: {e:#}", cfg.name));
+                }
+            }
+            let _ = wake.send(());
+        });
+    }
+
+    /// `Ctrl-] p`: the selected tool in a pane of its own, beside the work
+    /// pane (its `popout` command), or that pane closed when it is open.
+    /// A tool with a `popout` command runs that in the pane (the Editor's
+    /// own Neovim window); any other is shown there through the toolbar,
+    /// which hands the pane the tool's pty (`relay`).
+    fn toggle_popout(&mut self) {
+        let Some(src) = self.slots.get(self.selected) else {
+            return;
+        };
+        if self.popout_panes(&src.cfg.id).is_some() {
+            let tool = src.cfg.id.clone();
+            return self.close_popout(&tool, false);
+        }
+        if src.cfg.popout.is_some() {
+            let command = self.popout_command(&src.cfg);
+            return self.toggle_pane_of(popout_config(&src.cfg, command));
+        }
+        let Some(tool) = src
+            .proc
+            .as_ref()
+            .filter(|p| p.state() == ToolState::Running)
+            .map(ToolProcess::handle)
+        else {
+            self.message = Some(format!(
+                "{} is not running, so it cannot pop out",
+                src.cfg.name
+            ));
+            return;
+        };
+        let Some(ctx) = self.herdr.clone() else {
+            self.message = Some(format!(
+                "{} pops out into a Herdr pane: run the toolbar inside Herdr",
+                src.cfg.name
+            ));
+            return;
+        };
+        let cfg = src.cfg.clone();
+        self.stop_relay(&cfg.id);
+        let socket = crate::herdr::relay_socket(&ctx, &cfg.id);
+        let listening = std::fs::create_dir_all(&ctx.state_dir).and_then(|()| {
+            let _ = std::fs::remove_file(&socket);
+            std::os::unix::net::UnixListener::bind(&socket)
+        });
+        let listener = match listening {
+            Ok(l) => l,
+            Err(e) => {
+                self.message = Some(format!("{}: cannot pop out: {e}", cfg.name));
+                return;
+            }
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s, wake) = (stop.clone(), self.wake_tx.clone());
+        std::thread::spawn(move || crate::relay::serve(listener, tool, s, wake));
+        self.relays.push(RelayRun {
+            tool: cfg.id.clone(),
+            socket: socket.clone(),
+            stop,
+        });
+        let command = self.popout_command(&cfg);
+        self.toggle_pane_of(popout_config(&cfg, command));
+    }
+
+    /// The panes `tool`'s pop-out opened, while it is out.
+    fn popout_panes(&self, tool: &str) -> Option<&[String]> {
+        self.popouts
+            .iter()
+            .find(|p| p.tool == tool)
+            .map(|p| p.panes.as_slice())
+    }
+
+    /// Close `tool`'s pop-out pane, off the UI thread, then (`focus`) move
+    /// focus to the toolbar. Only closes: a pane already gone opens nothing.
+    fn close_popout(&mut self, tool: &str, focus: bool) {
+        let Some(src) = self.slots.iter().find(|s| s.cfg.id == tool) else {
+            return;
+        };
+        let cfg = popout_config(&src.cfg, Vec::new());
+        let Some(ctx) = self.herdr.clone() else {
+            return;
+        };
+        let (tx, news, wake) = (
+            self.notes_tx.clone(),
+            self.news_tx.clone(),
+            self.wake_tx.clone(),
+        );
+        std::thread::spawn(move || {
+            match crate::herdr::close_panes(&ctx, &cfg) {
+                Ok(_) => {
+                    let _ = news.send(PaneNews::Closed { tool: cfg.id });
+                    if focus && let Err(e) = crate::herdr::focus_toolbar(&ctx) {
+                        let _ = tx.send(format!("{e:#}"));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("{}: {e:#}", cfg.name));
+                }
+            }
+            let _ = wake.send(());
+        });
+    }
+
+    /// `Ctrl-] d` in a pop-out's pane: its pane closes, and the toolbar
+    /// shows the tool and takes focus.
+    fn dock(&mut self, tool: &str) {
+        if self.popout_panes(tool).is_none() {
+            return;
+        }
+        self.close_popout(tool, true);
+        self.select_by(tool);
+    }
+
+    /// `Ctrl-] c` in a pop-out's pane: its pane closes and the tool is
+    /// back in its slot, but the toolbar keeps the tool it shows and
+    /// leaves focus to Herdr.
+    fn close_from_pane(&mut self, tool: &str) {
+        if self.popout_panes(tool).is_none() {
+            return;
+        }
+        self.close_popout(tool, false);
+    }
+
+    /// What `tool`'s pop-out pane runs: `herdr-toolbar attach` on its relay,
+    /// or, for a tool with a `popout` command of its own, `herdr-toolbar
+    /// wrap` around that command. Either way the pane's leave keys reach
+    /// the toolbar through its control socket, with the toolbar's prefix.
+    fn popout_command(&self, tool: &ToolConfig) -> Vec<String> {
+        let me = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "herdr-toolbar".into());
+        let Some(ctx) = self.herdr.as_ref() else {
+            return match &tool.popout {
+                Some(command) => command.clone(),
+                None => vec![me, "attach".into(), String::new()],
+            };
+        };
+        let control = crate::herdr::socket_path(ctx).display().to_string();
+        let prefix = self.prefix.label().to_string();
+        match &tool.popout {
+            Some(command) => [
+                me,
+                "wrap".into(),
+                control,
+                tool.id.clone(),
+                prefix,
+                "--".into(),
+            ]
+            .into_iter()
+            .chain(command.iter().cloned())
+            .collect(),
+            None => vec![
+                me,
+                "attach".into(),
+                crate::herdr::relay_socket(ctx, &tool.id)
+                    .display()
+                    .to_string(),
+                control,
+                tool.id.clone(),
+                prefix,
+            ],
+        }
+    }
+
+    /// Stops `tool`'s relay, if it has one: its socket goes, and the tool
+    /// comes back to the slot.
+    fn stop_relay(&mut self, tool: &str) {
+        self.relays.retain(|r| {
+            if r.tool != tool {
+                return true;
+            }
+            r.stop.store(true, Ordering::Relaxed);
+            let _ = std::fs::remove_file(&r.socket);
+            false
+        });
+        if let Some(p) = self
+            .slots
+            .iter()
+            .find(|s| s.cfg.id == tool)
+            .and_then(|s| s.proc.as_ref())
+            .filter(|p| p.attached())
+        {
+            p.handle().detach();
+        }
+    }
+
+    /// Pop-out pane `id` (`<tool>~popout`) opened `panes`, unless its tool
+    /// is gone. Watches the panes: closed in Herdr, the pop-out is let go.
+    fn add_popout(&mut self, id: &str, panes: Vec<String>) {
+        let Some(src) = self.slots.iter().find(|s| popout_id(&s.cfg.id) == id) else {
+            return;
+        };
+        let (tool, cfg) = (src.cfg.id.clone(), popout_config(&src.cfg, Vec::new()));
+        self.watch_popout(&cfg, &panes);
+        match self.popouts.iter_mut().find(|p| p.tool == tool) {
+            Some(p) => p.panes = panes,
+            None => self.popouts.push(Popout { tool, panes }),
+        }
+    }
+
+    /// Lets go of pop-out pane `id` (when it shows `panes`, if given): its
+    /// relay stops and the tool is back in its slot.
+    fn remove_popout(&mut self, id: &str, panes: Option<&[String]>) {
+        let Some(tool) = id.strip_suffix("~popout") else {
+            return;
+        };
+        let before = self.popouts.len();
+        self.popouts
+            .retain(|p| !(p.tool == tool && panes.is_none_or(|ps| p.panes == ps)));
+        if self.popouts.len() < before {
+            self.stop_relay(tool);
+        }
+    }
+
+    /// Every second, whether pop-out `cfg`'s panes are still there; when
+    /// none is, it is let go.
+    fn watch_popout(&self, cfg: &ToolConfig, panes: &[String]) {
+        let Some(ctx) = self.herdr.clone() else {
+            return;
+        };
+        let (news, wake) = (self.news_tx.clone(), self.wake_tx.clone());
+        let (tool, label, panes) = (cfg.id.clone(), cfg.name.clone(), panes.to_vec());
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if !panes.iter().any(|p| crate::herdr::pane_is(&ctx, p, &label)) {
+                    break;
+                }
+            }
+            if news.send(PaneNews::Gone { tool, panes }).is_ok() {
                 let _ = wake.send(());
             }
         });
@@ -397,6 +733,13 @@ impl App {
 
     /// Show what background launches reported.
     pub fn drain_notes(&mut self) {
+        while let Ok(news) = self.news_rx.try_recv() {
+            match news {
+                PaneNews::Opened { tool, panes } => self.add_popout(&tool, panes),
+                PaneNews::Closed { tool } => self.remove_popout(&tool, None),
+                PaneNews::Gone { tool, panes } => self.remove_popout(&tool, Some(&panes)),
+            }
+        }
         while let Ok(note) = self.notes_rx.try_recv() {
             self.message = Some(note);
         }
@@ -580,7 +923,7 @@ impl App {
                 };
                 match slot.state() {
                     ToolState::Running => {
-                        if let Some(p) = slot.proc.as_ref() {
+                        if let Some(p) = slot.proc.as_ref().filter(|p| !p.attached()) {
                             let app_cursor = p.screen().application_cursor();
                             if let Some(bytes) = crate::keys::key_to_bytes(&key, app_cursor) {
                                 let _ = p.write(&bytes);
@@ -604,6 +947,7 @@ impl App {
             Action::Reload => self.reload(),
             Action::Restart => self.restart_selected(),
             Action::Quit => return Flow::Quit,
+            Action::PopOut => self.toggle_popout(),
             Action::Ignore => {}
         }
         Flow::Continue
@@ -636,7 +980,12 @@ impl App {
         if ev.column < content.x || ev.row < content.y || ev.row - content.y >= tool_rows {
             return;
         }
-        let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else {
+        let Some(p) = self
+            .slots
+            .get(self.selected)
+            .and_then(|s| s.proc.as_ref())
+            .filter(|p| !p.attached())
+        else {
             return;
         };
         if p.state() != ToolState::Running {
@@ -662,7 +1011,12 @@ impl App {
 
     /// Forward pasted text to the selected running tool, sanitised (see `keys::paste_bytes`).
     pub fn paste(&mut self, text: &str) {
-        let Some(p) = self.slots.get(self.selected).and_then(|s| s.proc.as_ref()) else {
+        let Some(p) = self
+            .slots
+            .get(self.selected)
+            .and_then(|s| s.proc.as_ref())
+            .filter(|p| !p.attached())
+        else {
             return;
         };
         if p.state() != ToolState::Running {
@@ -679,6 +1033,8 @@ impl App {
                     self.message = Some(format!("no tool `{tool}`"));
                 }
             }
+            ControlCmd::Dock(tool) => self.dock(&tool),
+            ControlCmd::Close(tool) => self.close_from_pane(&tool),
         }
     }
 
@@ -705,13 +1061,26 @@ impl App {
         }
     }
 
-    fn message_text(&self) -> Option<&str> {
+    /// Whether the selected tool is shown in a pop-out (through the
+    /// toolbar), so the slot only says so.
+    fn shown_elsewhere(&self) -> bool {
+        self.slots
+            .get(self.selected)
+            .and_then(|s| s.proc.as_ref())
+            .is_some_and(ToolProcess::attached)
+    }
+
+    fn message_text(&self) -> Option<std::borrow::Cow<'_, str>> {
         if let Some(m) = &self.message {
-            return Some(m.as_str());
+            return Some(m.as_str().into());
+        }
+        if self.shown_elsewhere() {
+            return Some(shown_in_popout(self.prefix.label()).into());
         }
         self.slots
             .get(self.selected)
             .and_then(|s| s.last_error.as_deref())
+            .map(Into::into)
     }
 
     /// A plain-data summary for tests and status: what `draw` would show.
@@ -720,8 +1089,8 @@ impl App {
         View {
             states: self.slots.iter().map(Slot::state).collect(),
             selected: self.selected,
-            has_screen: selected.and_then(|s| s.proc.as_ref()).is_some(),
-            message: self.message_text().map(str::to_string),
+            has_screen: selected.and_then(|s| s.proc.as_ref()).is_some() && !self.shown_elsewhere(),
+            message: self.message_text().map(|m| m.into_owned()),
             footer: self.footer(),
             prefix_armed: self.prefix.armed(),
         }
@@ -744,15 +1113,17 @@ impl App {
             })
             .collect();
         let footer = self.footer();
+        let message = self.message_text();
         let guard = self
             .slots
             .get(self.selected)
             .and_then(|s| s.proc.as_ref())
+            .filter(|p| !p.attached())
             .map(|p| p.screen());
         let frame = ui::Frame {
             items,
             screen: guard.as_deref(),
-            message: self.message_text(),
+            message: message.as_deref(),
             footer: footer.as_deref(),
             prefix_armed: self.prefix.armed(),
             bar: self.bar,
@@ -763,6 +1134,10 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        for r in self.relays.drain(..) {
+            r.stop.store(true, Ordering::Relaxed);
+            let _ = std::fs::remove_file(&r.socket);
+        }
         for slot in &mut self.slots {
             if let Some(p) = slot.proc.as_mut() {
                 p.kill();
@@ -1379,6 +1754,315 @@ mod tests {
                 .unwrap_or_default()
                 .contains("pane run w1:p12 'terminal-browser' 'open'")
         });
+    }
+
+    /// Jira (space), the Editor that pops out and Files (agent), Usage
+    /// (system, a pane tool): a rule after each group.
+    fn popout_tools() -> String {
+        tool("jira", "echo J; sleep 30")
+            + "group = \"space\"\n"
+            + &tool("editor", "echo E; sleep 30")
+            + "group = \"agent\"\npopout = [\"herdr-doc\", \"popout\"]\n"
+            + &tool("files", "echo F; sleep 30")
+            + "group = \"agent\"\n"
+            + &tool("usage", "echo U; sleep 30")
+            + "group = \"system\"\nopen = \"pane\"\n"
+    }
+
+    /// Inside (fake) Herdr, where the pop-out's pane exists, labelled
+    /// `label`, until its id is written to the returned file.
+    fn popout_app_labelled(fx: &Fixture, label: &str) -> (App, PathBuf, PathBuf) {
+        let mut app = App::new(fx.paths.clone(), fx.env.clone(), SIZE).unwrap();
+        let (mut ctx, log) = herdr_ctx(fx._tmp.path());
+        let gone = fx._tmp.path().join("gone");
+        ctx.extra_env.extend([
+            ("FAKE_PANE_EXISTS".to_string(), "1".to_string()),
+            ("FAKE_PANE_LABEL".to_string(), label.to_string()),
+            ("FAKE_GONE_FILE".to_string(), gone.display().to_string()),
+        ]);
+        app.set_herdr(ctx);
+        (app, log, gone)
+    }
+
+    /// `popout_app_labelled` for the Editor's pop-out.
+    fn popout_app(fx: &Fixture) -> (App, PathBuf, PathBuf) {
+        popout_app_labelled(fx, "editor \u{2197}")
+    }
+
+    fn ids(app: &App) -> Vec<&str> {
+        app.slots.iter().map(|s| s.cfg.id.as_str()).collect()
+    }
+
+    fn pop_out(app: &mut App) {
+        // crossterm reports Ctrl-] as Char('5') + CONTROL
+        app.apply_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
+        app.apply_key(key(KeyCode::Char('p')));
+    }
+
+    /// Lets background work report back (as the main loop does) until `ok`.
+    fn settle(app: &mut App, what: &str, ok: impl Fn(&App) -> bool) {
+        let start = Instant::now();
+        loop {
+            app.drain_notes();
+            if ok(app) {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "timed out: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn log_of(log: &Path) -> String {
+        fs::read_to_string(log).unwrap_or_default()
+    }
+
+    #[test]
+    fn popping_out_opens_a_pane_and_leaves_the_rail_as_it_was() {
+        let fx = fixture(&popout_tools());
+        let (mut app, log, _) = popout_app(&fx);
+        app.select(1);
+        pop_out(&mut app);
+        settle(&mut app, "popped out", |a| {
+            a.popout_panes("editor") == Some(&["w1:p12".to_string()][..])
+        });
+        let control = fx._tmp.path().join("state/w1.sock");
+        let run = log_of(&log)
+            .lines()
+            .find(|l| l.contains("pane run w1:p12 "))
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            run.ends_with(&format!(
+                "'wrap' '{}' 'editor' 'ctrl-]' '--' 'herdr-doc' 'popout'",
+                control.display()
+            )),
+            "the pane runs the tool's popout command behind the toolbar's leave keys:\n{}",
+            log_of(&log)
+        );
+        assert_eq!(ids(&app), ["jira", "editor", "files", "usage"]);
+        assert_eq!(app.rules(), [1, 3]);
+        assert_eq!(app.selected, 1, "the Editor stays selected");
+        app.shutdown();
+    }
+
+    #[test]
+    fn p_again_closes_the_popouts_pane() {
+        let fx = fixture(&popout_tools());
+        let (mut app, log, _) = popout_app(&fx);
+        app.select(1);
+        pop_out(&mut app);
+        settle(&mut app, "popped out", |a| {
+            a.popout_panes("editor").is_some()
+        });
+        pop_out(&mut app);
+        settle(&mut app, "let go", |a| a.popout_panes("editor").is_none());
+        assert!(
+            log_of(&log).contains("pane close w1:p12"),
+            "closes the pane"
+        );
+        assert_eq!(
+            log_of(&log).matches("pane split").count(),
+            1,
+            "and opens no other"
+        );
+        assert_eq!(ids(&app), ["jira", "editor", "files", "usage"]);
+        assert_eq!(app.selected, 1);
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_popout_closed_in_herdr_is_let_go() {
+        let fx = fixture(&popout_tools());
+        let (mut app, _, gone) = popout_app(&fx);
+        app.select(2);
+        app.select(1);
+        pop_out(&mut app);
+        settle(&mut app, "popped out", |a| {
+            a.popout_panes("editor").is_some()
+        });
+        app.select(2);
+        fs::write(&gone, "w1:p12").unwrap();
+        settle(&mut app, "let go", |a| a.popout_panes("editor").is_none());
+        assert_eq!(ids(&app), ["jira", "editor", "files", "usage"]);
+        assert_eq!(app.selected, 2, "Files stays selected");
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_popout_outlives_a_reload_and_p_still_closes_it() {
+        let fx = fixture(&popout_tools());
+        let (mut app, log, _) = popout_app(&fx);
+        app.select(1);
+        pop_out(&mut app);
+        settle(&mut app, "popped out", |a| {
+            a.popout_panes("editor").is_some()
+        });
+        app.reload();
+        assert_eq!(ids(&app), ["jira", "editor", "files", "usage"]);
+        assert_eq!(app.selected, 1);
+        pop_out(&mut app);
+        settle(&mut app, "let go", |a| a.popout_panes("editor").is_none());
+        assert!(log_of(&log).contains("pane close w1:p12"));
+        app.shutdown();
+    }
+
+    #[test]
+    fn docking_closes_the_popouts_pane_and_shows_its_tool_here() {
+        let fx = fixture(&popout_tools());
+        let (mut app, log, _) = popout_app(&fx);
+        app.select(1);
+        pop_out(&mut app);
+        settle(&mut app, "popped out", |a| {
+            a.popout_panes("editor").is_some()
+        });
+        app.select(0); // Jira, while the Editor is out
+
+        app.apply_control(ControlCmd::Dock("editor".into()));
+        settle(&mut app, "let go", |a| a.popout_panes("editor").is_none());
+        assert_eq!(app.selected, 1, "the Editor is shown in the toolbar");
+        wait_until("the toolbar takes focus", || {
+            log_of(&log).contains("plugin pane focus w1:p9")
+        });
+        let l = log_of(&log);
+        let (closed, focused) = (
+            l.find("pane close w1:p12").expect("the pane closes"),
+            l.find("plugin pane focus w1:p9").unwrap(),
+        );
+        assert!(closed < focused, "focus moves once the pane is gone:\n{l}");
+        assert_eq!(ids(&app), ["jira", "editor", "files", "usage"]);
+        app.shutdown();
+    }
+
+    #[test]
+    fn closing_from_the_pane_closes_it_and_leaves_the_toolbar_as_it_was() {
+        let fx = fixture(&popout_tools());
+        let (mut app, log, _) = popout_app(&fx);
+        app.select(1);
+        pop_out(&mut app);
+        settle(&mut app, "popped out", |a| {
+            a.popout_panes("editor").is_some()
+        });
+        app.select(0); // Jira, while the Editor is out
+
+        app.apply_control(ControlCmd::Close("editor".into()));
+        settle(&mut app, "let go", |a| a.popout_panes("editor").is_none());
+        assert!(
+            log_of(&log).contains("pane close w1:p12"),
+            "the pane closes"
+        );
+        assert_eq!(app.selected, 0, "the toolbar still shows Jira");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !log_of(&log).contains("plugin pane focus"),
+            "focus is left to Herdr:\n{}",
+            log_of(&log)
+        );
+        app.shutdown();
+    }
+
+    #[test]
+    fn docking_a_tool_that_is_not_out_opens_nothing() {
+        let fx = fixture(&popout_tools());
+        let (mut app, log, _) = popout_app(&fx);
+        app.select(0);
+        app.apply_control(ControlCmd::Dock("editor".into()));
+        std::thread::sleep(Duration::from_millis(200));
+        app.drain_notes();
+        assert!(!log_of(&log).contains("pane split"), "{}", log_of(&log));
+        assert!(app.popout_panes("editor").is_none());
+        app.shutdown();
+    }
+
+    #[test]
+    fn any_tool_pops_out_through_the_toolbar_and_its_slot_says_where() {
+        let fx = fixture(&popout_tools());
+        let (mut app, log, _) = popout_app_labelled(&fx, "files \u{2197}");
+        app.select(2); // Files: no popout command of its own
+        wait_until("files runs", || shows(&app, 2, "F"));
+        pop_out(&mut app);
+        settle(&mut app, "popped out", |a| {
+            a.popout_panes("files").is_some()
+        });
+        assert_eq!(ids(&app), ["jira", "editor", "files", "usage"]);
+        let socket = fx._tmp.path().join("state/w1.files.relay");
+        let control = fx._tmp.path().join("state/w1.sock");
+        assert!(
+            log_of(&log).contains(&format!(
+                "'attach' '{}' '{}' 'files' 'ctrl-]'",
+                socket.display(),
+                control.display()
+            )),
+            "the pane attaches to the toolbar's relay, and docks through its control socket:\n{}",
+            log_of(&log)
+        );
+
+        // the pane's `attach` connects and says its size
+        let mut pane = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        crate::relay::write_frame(
+            &mut pane,
+            &crate::relay::Frame::Size(Size {
+                rows: 30,
+                cols: 120,
+            }),
+        )
+        .unwrap();
+        settle(&mut app, "shown in the pane", |a| {
+            a.slots[2].proc.as_ref().is_some_and(|p| p.attached())
+        });
+        let v = app.view();
+        assert!(!v.has_screen, "the slot does not draw it");
+        let says = v.message.as_deref().unwrap_or("");
+        assert!(says.contains("pop-out"), "{says:?}");
+        assert!(
+            says.contains("ctrl-] d") && says.contains("ctrl-] c") && says.contains("ctrl-] p"),
+            "names the keys that dock it and close its pane: {says:?}"
+        );
+        assert_eq!(
+            app.slots[2].proc.as_ref().unwrap().screen().size(),
+            (30, 120),
+            "the pane's size"
+        );
+
+        // the pane closes: the slot shows it again
+        drop(pane);
+        settle(&mut app, "back in the slot", |a| {
+            a.slots[2].proc.as_ref().is_some_and(|p| !p.attached())
+        });
+        assert!(app.view().has_screen);
+        // p again closes the pane, and the relay goes with it
+        pop_out(&mut app);
+        settle(&mut app, "let go", |a| a.popout_panes("files").is_none());
+        assert!(!socket.exists(), "the relay's socket is gone");
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_tool_that_is_not_running_does_not_pop_out() {
+        let cfg = popout_tools().replace(
+            "[\"sh\", \"-c\", \"echo F; sleep 30\"]",
+            "[\"/no/such/tool\"]",
+        );
+        let fx = fixture(&cfg);
+        let (mut app, log, _) = popout_app(&fx);
+        app.select(2);
+        pop_out(&mut app);
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("files"),
+            "{:?}",
+            app.message
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        app.drain_notes();
+        assert_eq!(app.slots.len(), 4);
+        assert!(
+            !fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("pane split")
+        );
+        app.shutdown();
     }
 
     fn vars(pairs: &[(&str, &str)]) -> crate::context::Vars {
