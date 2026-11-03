@@ -29,7 +29,7 @@ That installs procs, oxker, dua, yazi, lazysql and Neovim into `~/.local/bin` (`
 ```toml
 [tools]
 "github:herdrdev/herdr" = "latest"
-"github:JefeLabs/herdr-plugins" = { version = "0.11.1", strip_components = 1, bin_path = "target/release" }
+"github:JefeLabs/herdr-plugins" = { version = "0.11.2", strip_components = 1, bin_path = "target/release" }
 ```
 
 The two options are needed because the archive keeps the programs in `target/release/`, where each plugin's manifest looks for them. Pin the version to the latest release (`herdr-toolbar setup` needs 0.11.0 or later): mise's list of releases can lag a new release by hours, so `latest` may still give you the one before.
