@@ -24,6 +24,12 @@
 # have is left alone; add --setup to be walked through again (the old file is
 # kept as tools.toml.bak-<date>).
 #
+# --tree <folder> installs from a release that is already unpacked (as mise
+# installs it) instead of downloading one: its files are copied into the
+# plugins folder below and linked there, never in <folder>, so upgrading or
+# pruning <folder> leaves Herdr's links alone. `herdr-toolbar setup` runs
+# this, with the release it came from as <folder>.
+#
 # No sudo, Rust or compiler needed. Settings (environment variables):
 #   HERDR_PLUGINS_VERSION   a release tag such as v0.1.0 (default: the latest)
 #   HERDR_PLUGINS_DIR       where the plugins go (default: ~/.local/share/herdr-plugins)
@@ -40,11 +46,17 @@ set -eu
 from="${HERDR_PLUGINS_FROM:-}"
 tools="${HERDR_PLUGINS_TOOLS:-}"
 setup=""
+tree=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)
       [ -n "${2:-}" ] || { echo "herdr-plugins: --from needs a folder" >&2; exit 1; }
       from=$2
+      shift 2
+      ;;
+    --tree)
+      [ -n "${2:-}" ] || { echo "herdr-plugins: --tree needs a folder" >&2; exit 1; }
+      tree=$2
       shift 2
       ;;
     --tools)
@@ -61,6 +73,10 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+if [ -n "$tree" ] && [ -n "$from" ]; then
+  echo "herdr-plugins: --tree and --from cannot be used together" >&2
+  exit 1
+fi
 
 repo="JefeLabs/herdr-plugins"
 version="${HERDR_PLUGINS_VERSION:-latest}"
@@ -120,24 +136,42 @@ sha256() {
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-if [ -n "$from" ]; then
-  [ -d "$from" ] || fail "no folder $from"
-  say "Installing $asset from $from"
+if [ -n "$tree" ]; then
+  # an unpacked release (mise's copy, say): whoever unpacked it checked it
+  [ -x "$tree/target/release/herdr-toolbar" ] ||
+    fail "$tree is not an unpacked herdr-plugins release (no target/release/herdr-toolbar)"
+  mkdir -p "$dir"
+  if [ "$(cd "$tree" && pwd -P)" = "$(cd "$dir" && pwd -P)" ]; then
+    # run from the installed copy itself: removing its files would remove the source
+    say "$dir is already in place"
+  else
+    # replace the files but keep the folder: Herdr links to it
+    rm -rf "$dir/toolbar" "$dir/tools" "$dir/target"
+    for part in toolbar tools target install.sh; do
+      if [ -e "$tree/$part" ]; then cp -R "$tree/$part" "$dir/"; fi
+    done
+    say "Copied $tree into $dir"
+  fi
 else
-  say "Downloading $asset ($version)"
-fi
-fetch "$base/$asset" "$tmp/$asset" || fail "could not get $asset${from:+ from $from}"
-fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || fail "could not get SHA256SUMS${from:+ from $from}"
-want=$(grep " $asset\$" "$tmp/SHA256SUMS" | cut -d ' ' -f 1)
-[ -n "$want" ] || fail "SHA256SUMS has no line for $asset"
-[ "$(sha256 "$tmp/$asset")" = "$want" ] || fail "checksum mismatch for $asset: not installing"
+  if [ -n "$from" ]; then
+    [ -d "$from" ] || fail "no folder $from"
+    say "Installing $asset from $from"
+  else
+    say "Downloading $asset ($version)"
+  fi
+  fetch "$base/$asset" "$tmp/$asset" || fail "could not get $asset${from:+ from $from}"
+  fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || fail "could not get SHA256SUMS${from:+ from $from}"
+  want=$(grep " $asset\$" "$tmp/SHA256SUMS" | cut -d ' ' -f 1)
+  [ -n "$want" ] || fail "SHA256SUMS has no line for $asset"
+  [ "$(sha256 "$tmp/$asset")" = "$want" ] || fail "checksum mismatch for $asset: not installing"
 
-tar -xzf "$tmp/$asset" -C "$tmp"
-mkdir -p "$dir"
-# replace the files but keep the folder: Herdr links to it
-rm -rf "$dir/toolbar" "$dir/tools" "$dir/target"
-cp -R "$tmp/herdr-plugins/." "$dir/"
-say "Installed into $dir"
+  tar -xzf "$tmp/$asset" -C "$tmp"
+  mkdir -p "$dir"
+  # replace the files but keep the folder: Herdr links to it
+  rm -rf "$dir/toolbar" "$dir/tools" "$dir/target"
+  cp -R "$tmp/herdr-plugins/." "$dir/"
+  say "Installed into $dir"
+fi
 
 for plugin in toolbar tools/intents; do
   if herdr plugin list 2>/dev/null | grep -q "local:$dir/$plugin\]"; then
