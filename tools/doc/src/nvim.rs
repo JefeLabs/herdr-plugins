@@ -80,8 +80,14 @@ if vim.fn.maparg('<leader>v', 'n') == '' then
 end
 "#;
 
+/// Whether a Neovim listens on `socket`.
+pub fn answers(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
 /// What the pane starts Neovim with: listening on `socket`, with the
-/// document view loaded after the user's own config.
+/// document view loaded after the user's own config. The pane adds
+/// `--headless`: Neovim runs in the background and UIs attach to it.
 pub fn args(socket: &Path) -> Vec<String> {
     vec![
         "--listen".into(),
