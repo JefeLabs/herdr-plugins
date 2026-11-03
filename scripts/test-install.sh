@@ -17,14 +17,26 @@ pass() { printf 'ok    %s\n' "$1"; }
 flunk() { printf 'FAIL  %s\n      %s\n' "$1" "$2"; failures=$((failures + 1)); }
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1; else shasum -a 256 "$1" | cut -d ' ' -f 1; fi; }
 
-# --- a fake herdr: remembers links, answers config-dir under $HOME
+# --- a fake herdr: remembers links, answers config-dir under $HOME. Like Herdr
+# 0.9.5, `plugin link` REPLACES the link of a plugin id that is already linked,
+# and `plugin list` prints `- <id> (<name>) enabled [local:<path>]`. A home with
+# a .fake-herdr-link-fails file gets a failing link, with Herdr's error on stderr.
 mkdir -p "$work/fakebin"
 cat > "$work/fakebin/herdr" <<'EOF'
 #!/bin/sh
 echo "$*" >> "$HOME/.fake-herdr-calls"
 case "$1 $2" in
   "plugin list") cat "$HOME/.fake-herdr-links" 2>/dev/null ;;
-  "plugin link") echo "[local:$3]" >> "$HOME/.fake-herdr-links" ;;
+  "plugin link")
+    if [ -f "$HOME/.fake-herdr-link-fails" ]; then
+      echo "error: the plugin manifest is not valid" >&2
+      exit 1
+    fi
+    id=$(sed -n 's/^id *= *"\(.*\)"/\1/p' "$3/herdr-plugin.toml" | head -n 1)
+    grep -v "^- $id " "$HOME/.fake-herdr-links" > "$HOME/.fake-herdr-links.tmp" 2>/dev/null
+    echo "- $id (Plugin) enabled [local:$3]" >> "$HOME/.fake-herdr-links.tmp"
+    mv "$HOME/.fake-herdr-links.tmp" "$HOME/.fake-herdr-links"
+    echo '{"result":{"type":"plugin_linked"}}' ;;
   "plugin unlink")
     grep -v "^- $3 " "$HOME/.fake-herdr-links" > "$HOME/.fake-herdr-links.tmp" 2>/dev/null
     mv "$HOME/.fake-herdr-links.tmp" "$HOME/.fake-herdr-links" ;;
@@ -954,6 +966,67 @@ case "$status:$out" in
       flunk "--tree on a partial release is refused and leaves the install alone" "the install lost its plugins"
     fi ;;
   *) flunk "--tree on a partial release is refused and leaves the install alone" "exit $status: $out" ;;
+esac
+
+# --- a plugin already linked to another folder (a development checkout, say).
+# Herdr would replace that link, so the installer asks first.
+dev="$work/dev checkout/herdr-plugins"
+seed_dev_link() { # <home>: jefelabs.toolbar linked to $dev/toolbar
+  mkdir -p "$1" && echo "- jefelabs.toolbar (Toolbar) enabled [local:$dev/toolbar]" > "$1/.fake-herdr-links"
+}
+
+h="$work/hr-quiet"; seed_dev_link "$h"; d="$h/.local/share/herdr-plugins"
+run "$h" - "$work/good"
+if [ $status -eq 0 ] && grep -qF "[local:$dev/toolbar]" "$h/.fake-herdr-links" &&
+  grep -qF "[local:$d/tools/intents]" "$h/.fake-herdr-links"; then
+  case "$out" in
+    *"toolbar: left linked to $dev/toolbar (run again with --relink to switch)"*)
+      pass "a plugin linked elsewhere is left alone without a terminal" ;;
+    *) flunk "a plugin linked elsewhere is left alone without a terminal" "$out" ;;
+  esac
+else
+  flunk "a plugin linked elsewhere is left alone without a terminal" "exit $status, links: $(cat "$h/.fake-herdr-links" 2>&1)"
+fi
+
+h="$work/hr-relink"; seed_dev_link "$h"; d="$h/.local/share/herdr-plugins"
+run "$h" - "$work/good" --relink
+if [ $status -eq 0 ] && grep -qF "[local:$d/toolbar]" "$h/.fake-herdr-links" &&
+  ! grep -qF "[local:$dev/toolbar]" "$h/.fake-herdr-links"; then
+  case "$out" in
+    *"toolbar: linked (was $dev/toolbar)"*) pass "--relink switches a plugin linked elsewhere" ;;
+    *) flunk "--relink switches a plugin linked elsewhere" "$out" ;;
+  esac
+else
+  flunk "--relink switches a plugin linked elsewhere" "exit $status, links: $(cat "$h/.fake-herdr-links" 2>&1)"
+fi
+
+h="$work/hr-yes"; seed_dev_link "$h"; d="$h/.local/share/herdr-plugins"
+answers "$work/hr-yes-answers" y
+TTY="$work/hr-yes-answers" run "$h" - "$work/good"
+case "$status:$out" in
+  0:*"jefelabs.toolbar is linked to $dev/toolbar. Link it to $d/toolbar instead? [y/N]"*"toolbar: linked (was $dev/toolbar)"*)
+    if grep -qF "[local:$d/toolbar]" "$h/.fake-herdr-links"; then pass "on a terminal, y switches a plugin linked elsewhere"
+    else flunk "on a terminal, y switches a plugin linked elsewhere" "links: $(cat "$h/.fake-herdr-links")"; fi ;;
+  *) flunk "on a terminal, y switches a plugin linked elsewhere" "exit $status: $out" ;;
+esac
+
+h="$work/hr-enter"; seed_dev_link "$h"
+answers "$work/hr-enter-answers" ""
+TTY="$work/hr-enter-answers" run "$h" - "$work/good"
+case "$status:$out" in
+  0:*"[y/N]"*"toolbar: left linked to $dev/toolbar"*)
+    if grep -qF "[local:$dev/toolbar]" "$h/.fake-herdr-links"; then pass "on a terminal, Enter leaves a plugin linked elsewhere"
+    else flunk "on a terminal, Enter leaves a plugin linked elsewhere" "links: $(cat "$h/.fake-herdr-links")"; fi ;;
+  *) flunk "on a terminal, Enter leaves a plugin linked elsewhere" "exit $status: $out" ;;
+esac
+unset TTY
+
+h="$work/hr-fails"; mkdir -p "$h"; touch "$h/.fake-herdr-link-fails"
+run "$h" - "$work/good"
+case "$out" in
+  *"another copy may be linked"*) flunk "a failed link shows Herdr's error" "$out" ;;
+  *"toolbar: could not link: error: the plugin manifest is not valid"*) pass "a failed link shows Herdr's error" ;;
+  *) flunk "a failed link shows Herdr's error" "exit $status: $out" ;;
 esac
 
 # --- review fixes

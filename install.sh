@@ -30,6 +30,10 @@
 # pruning <folder> leaves Herdr's links alone. `herdr-toolbar setup` runs
 # this, with the release it came from as <folder>.
 #
+# A plugin already linked to another folder (a development checkout, say) is
+# left as it is: Herdr would replace that link without a word. On a terminal
+# you are asked first; --relink switches it without asking.
+#
 # No sudo, Rust or compiler needed. Settings (environment variables):
 #   HERDR_PLUGINS_VERSION   a release tag such as v0.1.0 (default: the latest)
 #   HERDR_PLUGINS_DIR       where the plugins go (default: ~/.local/share/herdr-plugins)
@@ -47,6 +51,7 @@ from="${HERDR_PLUGINS_FROM:-}"
 tools="${HERDR_PLUGINS_TOOLS:-}"
 setup=""
 tree=""
+relink=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)
@@ -65,6 +70,10 @@ while [ $# -gt 0 ]; do
       ;;
     --setup)
       setup=1
+      shift
+      ;;
+    --relink)
+      relink=1
       shift
       ;;
     *)
@@ -182,13 +191,48 @@ else
   say "Installed into $dir"
 fi
 
+ask() { # <variable>: the next answer (empty once the answers run out)
+  if [ -z "${asking:-}" ]; then
+    exec 3<"$answers_from"
+    asking=1
+  fi
+  IFS= read -r "$1" <&3 || eval "$1="
+  # a typed answer ends its own line; one read from a file does not
+  [ "$answers_from" = /dev/tty ] || printf '\n'
+}
+linked_to() { # <plugin id>: its link as `herdr plugin list` shows it (local:<path>), or nothing
+  herdr plugin list 2>/dev/null | awk -v id="$1" '$1 == "-" && $2 == id {
+    s = $0; sub(/^[^[]*\[/, "", s); sub(/\][^]]*$/, "", s); print s; exit }'
+}
+
+# Herdr replaces the link of a plugin that is already linked (to a development
+# checkout, say) without a word, so a link to another folder is only switched
+# with --relink or a yes on the terminal.
 for plugin in toolbar tools/intents; do
-  if herdr plugin list 2>/dev/null | grep -q "local:$dir/$plugin\]"; then
+  id=$(sed -n 's/^id *= *"\(.*\)"/\1/p' "$dir/$plugin/herdr-plugin.toml" | head -n 1)
+  now=$(linked_to "$id")
+  if [ "$now" = "local:$dir/$plugin" ]; then
     say "  $plugin: already linked, updated in place"
-  elif herdr plugin link "$dir/$plugin" >/dev/null 2>&1; then
-    say "  $plugin: linked"
+    continue
+  fi
+  if [ -n "$now" ] && [ -z "$relink" ]; then
+    reply=""
+    if [ -n "$answers_from" ]; then
+      printf '  %s is linked to %s. Link it to %s instead? [y/N] ' "$id" "${now#local:}" "$dir/$plugin"
+      ask reply
+    fi
+    case "$reply" in
+      [Yy]*) ;;
+      *)
+        say "  $plugin: left linked to ${now#local:} (run again with --relink to switch)"
+        continue
+        ;;
+    esac
+  fi
+  if err=$(herdr plugin link "$dir/$plugin" 2>&1 >/dev/null); then
+    say "  $plugin: linked${now:+ (was ${now#local:})}"
   else
-    say "  $plugin: could not link (another copy may be linked; see 'herdr plugin list')"
+    say "  $plugin: could not link: $err"
   fi
 done
 
@@ -533,15 +577,6 @@ write_toolbar() { # <file> <nerd|text> <tool id>...
       ln -sf "$dir/target/release/herdr-doc" "$bin/herdr-doc"
     fi ;;
   esac
-}
-ask() { # <variable>: the next answer (empty once the answers run out)
-  if [ -z "${asking:-}" ]; then
-    exec 3<"$answers_from"
-    asking=1
-  fi
-  IFS= read -r "$1" <&3 || eval "$1="
-  # a typed answer ends its own line; one read from a file does not
-  [ "$answers_from" = /dev/tty ] || printf '\n'
 }
 missing_of() { awk -F'|' -v i="$1" '$1 == i { print $2 }' "$tmp/setup-missing"; }
 choose_tools() { # the list: numbers switch tools on and off until an empty answer
