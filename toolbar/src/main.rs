@@ -25,13 +25,13 @@ enum Mode {
     /// `wrap <control> <tool> <prefix> -- <command…>`: the pane of a
     /// pop-out with a `popout` command of its own.
     Wrap(herdr_toolbar::relay::DockTo, Vec<String>),
-    /// `setup [--tools] [--setup]`: the release's own install.sh, run on
+    /// `setup [--tools] [--setup] [--relink]`: the release's own install.sh, run on
     /// the folder this program came from (mise's copy, say).
     Setup(Vec<String>),
     Usage(String),
 }
 
-const USAGE: &str = "usage: herdr-toolbar [toggle | focus | select <tool-id|index> | trust | setup [--tools] [--setup] | --version]";
+const USAGE: &str = "usage: herdr-toolbar [toggle | focus | select <tool-id|index> | trust | setup [--tools] [--setup] [--relink] | --version]";
 
 fn parse_mode(args: &[String]) -> Mode {
     match args {

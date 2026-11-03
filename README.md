@@ -12,6 +12,8 @@ curl -fsSL https://github.com/JefeLabs/herdr-plugins/releases/latest/download/in
 
 It downloads the build for your machine from the latest release, checks it against the release's `SHA256SUMS`, puts both plugins in `~/.local/share/herdr-plugins`, links them with `herdr plugin link`, walks you through the toolbar's tools (below) if you have no toolbar `tools.toml` yet, and prints the Herdr key bindings to add. No sudo, Rust or compiler is needed: the Linux builds are static. Run it again to update; `HERDR_PLUGINS_VERSION=v0.1.0` installs a given release.
 
+A plugin already linked to another folder (a development checkout, say) is left as it is, because Herdr would replace that link without a word. On a terminal you are asked first (the answer defaults to no); with no terminal it says so and moves on. Add `--relink` to switch such links without asking.
+
 To also install the command-line tools the toolbar uses, add `--tools`:
 
 ```sh
@@ -39,7 +41,7 @@ mise install
 herdr-toolbar setup
 ```
 
-`herdr-toolbar setup` runs the release's own `install.sh` on mise's copy (`install.sh --tree <that folder>`). It copies the plugins into `~/.local/share/herdr-plugins` and links them there, never in mise's folder, so `mise upgrade` and `mise prune` can't break Herdr's links. It then walks you through the toolbar's tools and prints the key bindings, just as the curl installer does, and `--tools` and `--setup` work the same. To update, change the version, run `mise install`, then `herdr-toolbar setup` again. With mise, `herdr-intents` and `herdr-doc` are on your `PATH` as well.
+`herdr-toolbar setup` runs the release's own `install.sh` on mise's copy (`install.sh --tree <that folder>`). It copies the plugins into `~/.local/share/herdr-plugins` and links them there, never in mise's folder, so `mise upgrade` and `mise prune` can't break Herdr's links. It then walks you through the toolbar's tools and prints the key bindings, just as the curl installer does, and `--tools`, `--setup` and `--relink` work the same. To update, change the version, run `mise install`, then `herdr-toolbar setup` again. With mise, `herdr-intents` and `herdr-doc` are on your `PATH` as well.
 
 ### Choosing the toolbar's tools
 
