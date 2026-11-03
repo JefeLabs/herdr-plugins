@@ -137,16 +137,24 @@ sha256() {
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 if [ -n "$tree" ]; then
-  # an unpacked release (mise's copy, say): whoever unpacked it checked it
+  # an unpacked release (mise's copy, say): whoever unpacked it checked it.
+  # Absolute, so a `cd` below never searches CDPATH for it.
+  case "$tree" in /*) ;; *) tree="$PWD/$tree" ;; esac
+  # everything the steps below use, checked before anything is removed
+  for need in target/release/herdr-toolbar toolbar/herdr-plugin.toml tools/intents/herdr-plugin.toml; do
+    [ -f "$tree/$need" ] || fail "$tree is not an unpacked herdr-plugins release (no $need)"
+  done
   [ -x "$tree/target/release/herdr-toolbar" ] ||
-    fail "$tree is not an unpacked herdr-plugins release (no target/release/herdr-toolbar)"
+    fail "$tree is not an unpacked herdr-plugins release (target/release/herdr-toolbar cannot run)"
   mkdir -p "$dir"
-  if [ "$(cd "$tree" && pwd -P)" = "$(cd "$dir" && pwd -P)" ]; then
+  if [ "$(cd -P -- "$tree" >/dev/null && pwd -P)" = "$(cd -P -- "$dir" >/dev/null && pwd -P)" ]; then
     # run from the installed copy itself: removing its files would remove the source
     say "$dir is already in place"
   else
-    # replace the files but keep the folder: Herdr links to it
-    rm -rf "$dir/toolbar" "$dir/tools" "$dir/target"
+    # replace the files but keep the folder: Herdr links to it. install.sh is
+    # removed, not overwritten: when it is the script running now, the shell
+    # keeps reading the old file instead of the new one at the old offset.
+    rm -rf "$dir/toolbar" "$dir/tools" "$dir/target" "$dir/install.sh"
     for part in toolbar tools target install.sh; do
       if [ -e "$tree/$part" ]; then cp -R "$tree/$part" "$dir/"; fi
     done
@@ -167,8 +175,9 @@ else
 
   tar -xzf "$tmp/$asset" -C "$tmp"
   mkdir -p "$dir"
-  # replace the files but keep the folder: Herdr links to it
-  rm -rf "$dir/toolbar" "$dir/tools" "$dir/target"
+  # replace the files but keep the folder: Herdr links to it (install.sh: removed,
+  # not overwritten, in case it is the script running now; see --tree above)
+  rm -rf "$dir/toolbar" "$dir/tools" "$dir/target" "$dir/install.sh"
   cp -R "$tmp/herdr-plugins/." "$dir/"
   say "Installed into $dir"
 fi

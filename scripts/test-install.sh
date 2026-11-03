@@ -891,6 +891,71 @@ else
   flunk "--tree leaves its source alone" "$(find "$tree" 2>&1 | head -20)"
 fi
 
+# each of these installs into its own home first, so one failure cannot spoil the next
+longer() { # <install.sh> <lines>: the same script with a longer header, as a newer release might have
+  head -n 1 "$1"
+  i=0
+  while [ $i -lt "$2" ]; do echo "# a longer header in a newer release"; i=$((i + 1)); done
+  tail -n +2 "$1"
+}
+
+# an exported CDPATH makes `cd <relative>` print the folder: the same-folder check must not see it
+h="$work/ht-cdpath"; mkdir -p "$h"; d="$h/.local/share/herdr-plugins"
+run_tree "$h" --tree "$tree"
+out=$(cd "$h/.local/share" && env -i HOME="$h" PATH="$base_path" CDPATH="$h/.local/share" HERDR_PLUGINS_TTY=none \
+  HERDR_PLUGINS_BASE_URL="file://$work/no-such-release" sh "$d/install.sh" --tree herdr-plugins 2>&1)
+status=$?
+case "$status:$out" in
+  0:*"$d is already in place"*)
+    if [ -x "$d/target/release/herdr-toolbar" ]; then pass "--tree on the install folder by a relative name, with CDPATH set"
+    else flunk "--tree on the install folder by a relative name, with CDPATH set" "the install folder lost its files"; fi ;;
+  *) flunk "--tree on the install folder by a relative name, with CDPATH set" "exit $status: $out" ;;
+esac
+
+# the installed copy of install.sh, run again, must not read a newer one copied over it mid-run
+h="$work/ht-self"; mkdir -p "$h"; d="$h/.local/share/herdr-plugins"
+run_tree "$h" --tree "$tree"
+newer="$work/newer/herdr-plugins"
+mkdir -p "$newer" && cp -R "$tree/." "$newer/" && longer "$tree/install.sh" 40 > "$newer/install.sh"
+out=$(env -i HOME="$h" PATH="$base_path" HERDR_PLUGINS_TTY=none \
+  HERDR_PLUGINS_BASE_URL="file://$work/no-such-release" sh "$d/install.sh" --tree "$newer" 2>&1)
+status=$?
+case "$status:$out" in
+  0:*"Run this installer again to update."*) pass "the installed install.sh survives a newer one copied over it (--tree)" ;;
+  *) flunk "the installed install.sh survives a newer one copied over it (--tree)" "exit $status: $out" ;;
+esac
+
+# ...and the same for a download
+h="$work/ht-self-dl"; mkdir -p "$h"; d="$h/.local/share/herdr-plugins"
+run_tree "$h" --tree "$tree"
+rel2="$work/release-newer"
+mkdir -p "$rel2" "$work/stage-newer" && cp -R "$work/stage/herdr-plugins" "$work/stage-newer/" &&
+  longer "$tree/install.sh" 80 > "$work/stage-newer/herdr-plugins/install.sh" &&
+  tar -czf "$rel2/$asset" -C "$work/stage-newer" herdr-plugins &&
+  echo "$(sha "$rel2/$asset")  $asset" > "$rel2/SHA256SUMS"
+out=$(env -i HOME="$h" PATH="$base_path" HERDR_PLUGINS_TTY=none sh "$d/install.sh" --from "$rel2" 2>&1)
+status=$?
+case "$status:$out" in
+  0:*"Run this installer again to update."*) pass "the installed install.sh survives a newer one copied over it (download)" ;;
+  *) flunk "the installed install.sh survives a newer one copied over it (download)" "exit $status: $out" ;;
+esac
+
+# a folder with the program but not the plugins is refused before anything is removed
+h="$work/ht-partial"; mkdir -p "$h"; d="$h/.local/share/herdr-plugins"
+run_tree "$h" --tree "$tree"
+partial="$work/partial/herdr-plugins"
+mkdir -p "$partial/target/release" && cp "$tree/target/release/herdr-toolbar" "$partial/target/release/"
+run_tree "$h" --tree "$partial"
+case "$status:$out" in
+  1:*"is not an unpacked herdr-plugins release"*)
+    if [ -f "$d/toolbar/herdr-plugin.toml" ] && [ -f "$d/tools/intents/herdr-plugin.toml" ]; then
+      pass "--tree on a partial release is refused and leaves the install alone"
+    else
+      flunk "--tree on a partial release is refused and leaves the install alone" "the install lost its plugins"
+    fi ;;
+  *) flunk "--tree on a partial release is refused and leaves the install alone" "exit $status: $out" ;;
+esac
+
 # --- review fixes
 # 37. no terminal at all (CI, Docker, ssh host 'curl … | sh'): no questions, and
 # the install carries on, under sh and under dash (Linux's sh)
