@@ -13,8 +13,8 @@ use crate::config::Dirs;
 
 pub use herdr_space::pointers::Storage;
 pub use herdr_space::{
-    INTENTS_DIR, Space, SpaceRepo, database_on, git_slug, intents_space, is_meta, missing,
-    origin_slug, plain, read_space, repo_name, space_name, target_slug,
+    INTENTS_DIR, Space, SpaceRepo, database_on, database_setting, git_slug, intents_space, is_meta,
+    missing, origin_slug, plain, read_space, repo_name, space_name, target_slug,
 };
 
 /// Where this person's pointers are kept.

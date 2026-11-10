@@ -423,3 +423,51 @@ fn the_context_names_the_space_files_to_watch() {
         );
     }
 }
+
+/// A run guide whose front matter is not YAML.
+const BROKEN_GUIDE: &str = "---\nurl: [\n---\nBody.\n";
+
+#[test]
+fn a_run_guide_that_cannot_be_read_keeps_the_database_tool() {
+    let s = space(Some(SLOT_DB));
+    put(&s.meta.join(".helmsmith/capture.md"), BROKEN_GUIDE);
+    let got = context_of(&s);
+    assert_eq!(got["database"], "on");
+    assert!(got.contains_key("database_error"), "{got:?}");
+}
+
+#[test]
+fn a_meta_repo_that_is_gone_keeps_the_database_tool() {
+    let s = space(Some(SLOT_DB));
+    fs::remove_dir_all(&s.meta).unwrap();
+    let got = gather(
+        &s.dirs,
+        Some("skoolscout-com"),
+        Some(&s.wt),
+        None,
+        Duration::from_secs(5),
+    );
+    assert_eq!(got["database"], "on");
+    assert!(
+        got["database_error"]
+            .as_str()
+            .unwrap()
+            .contains("not there"),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn no_run_guide_and_no_key_is_off() {
+    let s = space(None);
+    fs::remove_file(s.meta.join(".helmsmith/capture.md")).unwrap();
+    assert_eq!(context_of(&s)["database"], "off");
+}
+
+#[test]
+fn the_space_file_wins_over_a_broken_run_guide() {
+    let s = space(Some(SLOT_DB));
+    put(&s.meta.join(".helmsmith/capture.md"), BROKEN_GUIDE);
+    put(&s.meta.join(".helmsmith/space.toml"), "database = false\n");
+    assert_eq!(context_of(&s)["database"], "off");
+}

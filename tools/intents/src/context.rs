@@ -154,10 +154,23 @@ pub fn gather(
             }),
     };
     // whether the space uses a database: its space file says, else its run
-    // guide's `db:` does; a broken space file keeps the Database tool
-    let database = meta.as_ref().ok().map(|m| {
-        let has_db = matches!(&guide, Some(Ok(g)) if g.db.is_some());
-        crate::space::database_on(m, has_db)
+    // guide's `db:` does, and with no run guide it doesn't. What can't be
+    // told (a broken space file or run guide, a meta repo that is gone)
+    // keeps the Database tool and says why.
+    let database = meta.as_ref().ok().map(|m| -> Result<bool, String> {
+        if !m.is_dir() {
+            return Err(format!("the meta repo {} is not there", m.display()));
+        }
+        if let Some(on) = crate::space::database_setting(m)? {
+            return Ok(on);
+        }
+        let h = m.join(".helmsmith");
+        let guide_there = ["run.md", "capture.md"].iter().any(|n| h.join(n).is_file());
+        match &guide {
+            Some(Ok(g)) => Ok(g.db.is_some()),
+            Some(Err(e)) if guide_there => Err(e.clone()),
+            _ => Ok(false),
+        }
     });
     let db = match (&meta, &agent) {
         (Err(_), _) => Err("no meta repo, so no run guide".to_string()),

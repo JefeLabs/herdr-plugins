@@ -152,11 +152,18 @@ pub fn read_space(meta: &Path) -> anyhow::Result<Space> {
 /// keeps today's Database tool. No space file also follows the guide. `Err`
 /// says why a space file that is there can't be read.
 pub fn database_on(meta: &Path, guide_has_db: bool) -> Result<bool, String> {
+    Ok(database_setting(meta)?.unwrap_or(guide_has_db))
+}
+
+/// What the space file of meta repo `meta` says about a database: `None`
+/// when there is no space file or it has no `database`. `Err` says why a
+/// space file that is there can't be read.
+pub fn database_setting(meta: &Path) -> Result<Option<bool>, String> {
     if !meta.join(".helmsmith").join("space.toml").is_file() {
-        return Ok(guide_has_db);
+        return Ok(None);
     }
     let space = read_space(meta).map_err(|e| format!("{e:#}"))?;
-    Ok(space.database.unwrap_or(guide_has_db))
+    Ok(space.database)
 }
 
 /// The listed repos that are not there.
