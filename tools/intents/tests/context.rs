@@ -173,7 +173,10 @@ fn a_space_with_an_active_agent_gives_its_meta_repo_and_the_agents_database() {
             "agent": s.wt.display().to_string(),
             "db": "postgres://u@localhost:5434/db",
             "database": "on",
-            "browse_error":"the run guide has no browse: page for the space (its url needs a slot's port)",
+            "watch": (["space.toml", "run.md", "capture.md"]
+                .map(|n| s.meta.join(".helmsmith").join(n).display().to_string())
+                .join("\n")),
+            "browse_error": "the run guide has no browse: page for the space (its url needs a slot's port)",
         })
         .to_string()
     );
@@ -405,4 +408,18 @@ fn no_meta_repo_no_database() {
     let s = space(None);
     let home = gather(&s.dirs, None, None, None, Duration::from_secs(5));
     assert!(!home.contains_key("database"), "{home:?}");
+}
+
+#[test]
+fn the_context_names_the_space_files_to_watch() {
+    let s = space(None);
+    let got = context_of(&s);
+    let watch: Vec<&str> = got["watch"].as_str().unwrap().lines().collect();
+    let h = s.meta.join(".helmsmith");
+    for name in ["space.toml", "run.md", "capture.md"] {
+        assert!(
+            watch.contains(&h.join(name).display().to_string().as_str()),
+            "{name}: {watch:?}"
+        );
+    }
 }

@@ -178,6 +178,16 @@ pub fn gather(
             },
         },
     };
+    // the files this context was read from: the toolbar asks again when one
+    // changes (a space's database switch, an edited run guide)
+    if let Ok(m) = &meta {
+        let h = m.join(".helmsmith");
+        let watch: Vec<String> = ["space.toml", "run.md", "capture.md"]
+            .iter()
+            .map(|n| h.join(n).display().to_string())
+            .collect();
+        put("watch", watch.join("\n"));
+    }
     match meta {
         Ok(m) => put("meta", m.display().to_string()),
         Err(e) => put("meta_error", e),

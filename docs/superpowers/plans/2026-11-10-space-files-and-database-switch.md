@@ -218,5 +218,5 @@
 Run the full gate once more on the branch: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && sh scripts/test-install.sh && shellcheck install.sh scripts/test-install.sh`. Then stop. The owner decides about the push, the PR and the release.
 
 What the owner can try by hand once it's built:
-- Add `database = false` to a meta repo's `.helmsmith/space.toml`. The Database icon leaves that space's bar within the toolbar's next context refresh.
+- Add `database = false` to a meta repo's `.helmsmith/space.toml`. The Database icon leaves that space's bar within about a second: the context names the space files in `watch`, and the toolbar asks again when one changes (added in the final review's fix pass).
 - Delete the line, and it comes back, because the run guide has `db:`.
