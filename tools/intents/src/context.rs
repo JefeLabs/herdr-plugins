@@ -102,7 +102,8 @@ pub fn agent_db(cmd: &str, agent: &Path, meta: &Path, timeout: Duration) -> Resu
 /// The context of a workspace in space `space` whose folder is `here`, with
 /// active agent `agent`: `space`, `meta`, `agent` (the top of its worktree)
 /// and `db`, each present only when known; `meta_error` and `db_error` say
-/// why one is not.
+/// why one is not. With a meta repo, `database` is `on` or `off`: whether the
+/// space uses a database (`database_error` when its space file is broken).
 pub fn gather(
     dirs: &Dirs,
     space: Option<&str>,
@@ -152,6 +153,12 @@ pub fn gather(
                     .to_string()
             }),
     };
+    // whether the space uses a database: its space file says, else its run
+    // guide's `db:` does; a broken space file keeps the Database tool
+    let database = meta.as_ref().ok().map(|m| {
+        let has_db = matches!(&guide, Some(Ok(g)) if g.db.is_some());
+        crate::space::database_on(m, has_db)
+    });
     let db = match (&meta, &agent) {
         (Err(_), _) => Err("no meta repo, so no run guide".to_string()),
         (Ok(_), None) => Err("no active agent".to_string()),
@@ -178,6 +185,14 @@ pub fn gather(
     match db {
         Ok(d) => put("db", d),
         Err(e) => put("db_error", e),
+    }
+    match database {
+        Some(Ok(on)) => put("database", if on { "on" } else { "off" }.to_string()),
+        Some(Err(e)) => {
+            put("database", "on".to_string());
+            put("database_error", e);
+        }
+        None => {}
     }
     match browse {
         Ok(b) => put("browse", b),

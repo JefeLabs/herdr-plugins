@@ -172,7 +172,8 @@ fn a_space_with_an_active_agent_gives_its_meta_repo_and_the_agents_database() {
             "meta": s.meta.display().to_string(),
             "agent": s.wt.display().to_string(),
             "db": "postgres://u@localhost:5434/db",
-            "browse_error": "the run guide has no browse: page for the space (its url needs a slot's port)",
+            "database": "on",
+            "browse_error":"the run guide has no browse: page for the space (its url needs a slot's port)",
         })
         .to_string()
     );
@@ -350,4 +351,58 @@ fn the_space_has_a_default_page_for_the_browser() {
         got["browse_error"].as_str().unwrap().contains("browse:"),
         "{got:?}"
     );
+}
+
+/// The context of the space's meta repo, with no active agent.
+fn context_of(s: &Space) -> serde_json::Map<String, serde_json::Value> {
+    gather(
+        &s.dirs,
+        Some("skoolscout-com"),
+        Some(&s.meta),
+        None,
+        Duration::from_secs(5),
+    )
+}
+
+#[test]
+fn database_off_in_the_space_file() {
+    let s = space(Some(SLOT_DB));
+    put(&s.meta.join(".helmsmith/space.toml"), "database = false\n");
+    assert_eq!(context_of(&s)["database"], "off");
+}
+
+#[test]
+fn no_key_and_a_db_line_is_on() {
+    let s = space(Some(SLOT_DB));
+    put(&s.meta.join(".helmsmith/space.toml"), "repos = []\n");
+    assert_eq!(context_of(&s)["database"], "on");
+}
+
+#[test]
+fn no_key_and_no_db_line_is_off() {
+    let s = space(None);
+    put(&s.meta.join(".helmsmith/space.toml"), "repos = []\n");
+    assert_eq!(context_of(&s)["database"], "off");
+}
+
+#[test]
+fn broken_space_file_keeps_the_database_tool_and_says_why() {
+    let s = space(None);
+    put(&s.meta.join(".helmsmith/space.toml"), "database = \"no\"\n");
+    let got = context_of(&s);
+    assert_eq!(got["database"], "on");
+    assert!(
+        got["database_error"]
+            .as_str()
+            .unwrap()
+            .contains("space.toml"),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn no_meta_repo_no_database() {
+    let s = space(None);
+    let home = gather(&s.dirs, None, None, None, Duration::from_secs(5));
+    assert!(!home.contains_key("database"), "{home:?}");
 }
