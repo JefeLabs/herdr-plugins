@@ -31,6 +31,7 @@ fn cat() -> ToolProcess {
         group: None,
         on_switch: None,
         popout: None,
+        when: None,
     };
     let env = SpawnEnv {
         cwd: std::env::temp_dir(),

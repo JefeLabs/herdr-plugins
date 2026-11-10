@@ -64,6 +64,14 @@ fn texts(tool: &ToolConfig) -> impl Iterator<Item = &String> {
         .chain(tool.cwd.iter())
 }
 
+/// Whether `tool` is on the bar under the context `vars`: unless its `when`
+/// names a value the context says is `off`.
+pub fn shown(tool: &ToolConfig, vars: &Vars) -> bool {
+    tool.when
+        .as_ref()
+        .is_none_or(|name| vars.get(name).map(String::as_str) != Some("off"))
+}
+
 /// The `{name}`s a tool uses (`{name?}` counts as `name`).
 pub fn placeholders(tool: &ToolConfig) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -337,7 +345,33 @@ mod tests {
             group: None,
             on_switch: None,
             popout: None,
+            when: None,
         }
+    }
+
+    fn with_when(when: Option<&str>) -> ToolConfig {
+        let mut t = tool(&["lazysql", "{db?}"], None);
+        t.when = when.map(str::to_string);
+        t
+    }
+
+    #[test]
+    fn a_tool_with_when_is_hidden_only_by_off() {
+        let t = with_when(Some("database"));
+        assert!(!shown(&t, &vars(&[("database", "off")])));
+        assert!(shown(&t, &vars(&[("database", "on")])));
+        assert!(shown(&t, &Vars::new()));
+    }
+
+    #[test]
+    fn a_tool_whose_value_is_missing_is_shown() {
+        let t = with_when(Some("database"));
+        assert!(shown(&t, &vars(&[("db_error", "no slot database")])));
+    }
+
+    #[test]
+    fn a_tool_without_when_is_always_shown() {
+        assert!(shown(&with_when(None), &vars(&[("database", "off")])));
     }
 
     fn vars(pairs: &[(&str, &str)]) -> Vars {

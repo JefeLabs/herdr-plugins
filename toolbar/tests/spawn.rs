@@ -21,6 +21,7 @@ fn cfg(cmd: &[&str]) -> ToolConfig {
         group: None,
         on_switch: None,
         popout: None,
+        when: None,
     }
 }
 
