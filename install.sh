@@ -275,12 +275,21 @@ free_bak() { # <file>
   done
   printf '%s\n' "$keep"
 }
+# What the installer has already done to the toolbar's tools.toml, one name
+# a line in <config>/.installer-updates, so each change is made once and
+# taking it out by hand sticks.
+update_done() { [ -f "$config/.installer-updates" ] && grep -qx "$1" "$config/.installer-updates"; }
+record_update() { # <name>
+  update_done "$1" || { mkdir -p "$config" && printf '%s\n' "$1" >> "$config/.installer-updates"; }
+}
 # Database shows only in spaces that use a database: its entry carries
 # `when = "database"`. An existing tools.toml gets that one line, right after
 # the Database entry's id, once, with a backup; nothing else in it changes.
+# It is written through, so a tools.toml that is a link stays one.
 # The first pass finds Database entries without a `when`, the second adds it.
 add_when_database() { # <tools.toml>
   [ -f "$1" ] || return 0
+  update_done when-database && return 0
   if awk '
     function header() {
       if (FNR == NR && intool && isdb && !haswhen) need[n] = 1
@@ -307,11 +316,12 @@ add_when_database() { # <tools.toml>
   ' "$1" "$1" > "$1.tmp"; then
     keep=$(free_bak "$1")
     cp "$1" "$keep"
-    mv "$1.tmp" "$1"
+    cat "$1.tmp" > "$1" && rm -f "$1.tmp"
     say "  Updated $1: the Database tool now shows only in spaces that use a database (old copy: $keep)"
   else
     rm -f "$1.tmp"
   fi
+  record_update when-database
 }
 # --setup writes a new tools.toml from the catalog, which has the line already
 if [ -n "$config" ] && [ -z "$setup" ]; then
@@ -802,6 +812,8 @@ if [ -n "$config" ] && { [ -n "$setup" ] || [ ! -f "$config/tools.toml" ]; }; th
     say ""
     say "Toolbar:"
     setup_toolbar
+    # a tools.toml from the catalog has every update already
+    [ ! -f "$config/tools.toml" ] || record_update when-database
   else
     say "No toolbar catalog in $dir: tools.toml not written"
   fi

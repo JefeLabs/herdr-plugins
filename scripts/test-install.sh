@@ -1220,5 +1220,40 @@ else
   flunk "a Database entry that already has when is left alone" "exit $status, backups $(baks_in "$tb"): $out"
 fi
 
+# 47-48. the line is added once: taking it out by hand sticks, after a patch
+# and after a new tools.toml alike
+tb="$work/h43/.config/herdr/plugins/config/jefelabs.toolbar"
+grep -v '^when    = "database"$' "$tb/tools.toml" > "$work/t47" && cat "$work/t47" > "$tb/tools.toml"
+run "$work/h43" - "$work/good"
+if [ $status -eq 0 ] && cmp -s "$work/t47" "$tb/tools.toml" && [ "$(baks_in "$tb")" = 1 ]; then
+  pass "a when line taken out by hand stays out"
+else
+  flunk "a when line taken out by hand stays out" "exit $status, backups $(baks_in "$tb"): $out
+$(cat "$tb/tools.toml" 2>&1)"
+fi
+t48=$(toml "$work/h42")
+grep -v '^when    = "database"$' "$t48" > "$work/t48" && cat "$work/t48" > "$t48"
+run "$work/h42" "$work/f42" "$work/good"
+if [ $status -eq 0 ] && cmp -s "$work/t48" "$t48" && [ "$(baks_in "$(dirname "$t48")")" = 0 ]; then
+  pass "a when line taken out of a new tools.toml stays out"
+else
+  flunk "a when line taken out of a new tools.toml stays out" "exit $status: $out
+$(cat "$t48" 2>&1)"
+fi
+
+# 49. a tools.toml that is a link (to a dotfiles repo, say) stays a link
+h="$work/h49"
+tb="$h/.config/herdr/plugins/config/jefelabs.toolbar"
+mkdir -p "$tb" "$work/dot49"
+db_tools "$work/dot49/tools.toml" -
+ln -s "$work/dot49/tools.toml" "$tb/tools.toml"
+run "$h" - "$work/good"
+if [ $status -eq 0 ] && [ -L "$tb/tools.toml" ] &&
+  [ "$(line_after_db_id "$work/dot49/tools.toml")" = 'when    = "database"' ] && [ "$(baks_in "$tb")" = 1 ]; then
+  pass "a linked tools.toml is patched through the link"
+else
+  flunk "a linked tools.toml is patched through the link" "exit $status, link $([ -L "$tb/tools.toml" ] && echo yes || echo no): $out"
+fi
+
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"
 [ $failures -eq 0 ]
