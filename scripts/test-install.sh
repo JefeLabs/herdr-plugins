@@ -1142,5 +1142,83 @@ else
   flunk "list in the mock-up's order, bar in the owner's" "$(grep '^order' "$(toml "$h")" 2>&1): $out"
 fi
 
+# 42-46. Database shows only in spaces that use a database: a new tools.toml
+# carries `when = "database"` on its entry, and an existing one gets the line
+# once, with a backup, touching nothing else.
+baks_in() { # <toolbar config folder>: how many tools.toml backups it holds
+  set -- "$1"/tools.toml.bak-*
+  if [ -e "$1" ]; then echo $#; else echo 0; fi
+}
+line_after_db_id() { awk 'prev ~ /^id *= *"db"/ { print; exit } { prev = $0 }' "$1"; }
+db_has_when() { awk '/^\[\[tool\]\]/ { db = 0 } /^id *= *"db"/ { db = 1 } db && /^when *= *"database"$/ { f = 1 } END { exit !f }' "$1"; }
+db_tools() { # <tools.toml> <when line or ->: a Database and a Files entry
+  {
+    printf '%s\n' "# mine" 'order  = ["db", "files"]' "" "[[tool]]" 'id      = "db"'
+    [ "$2" = - ] || printf '%s\n' "$2"
+    printf '%s\n' 'name    = "Database"' 'icon    = "▤"' 'group   = "agent"' 'command = ["lazysql", "{db?}"]' \
+      "" "[[tool]]" 'id      = "files"' 'name    = "Files"' 'icon    = "▭"' 'command = ["yazi"]'
+  } > "$1"
+}
+
+h="$work/h42"
+fake_bin "$work/f42/lazysql" lazysql
+run "$h" "$work/f42" "$work/good"
+if [ $status -eq 0 ] && db_has_when "$(toml "$h")"; then
+  pass "a new tools.toml's Database entry shows only in spaces with a database"
+else
+  flunk "a new tools.toml's Database entry shows only in spaces with a database" "exit $status: $out
+$(cat "$(toml "$h")" 2>&1)"
+fi
+
+h="$work/h43"
+tb="$h/.config/herdr/plugins/config/jefelabs.toolbar"
+mkdir -p "$tb"
+db_tools "$tb/tools.toml" -
+cp "$tb/tools.toml" "$work/t43-before"
+run "$h" - "$work/good"
+t43="$tb/tools.toml"
+changes=$(diff "$work/t43-before" "$t43" | grep -c '^[<>]')
+case "$out" in *"Updated $t43: the Database tool now shows only in spaces that use a database (old copy: $tb/tools.toml.bak-"*) said=1 ;; *) said= ;; esac
+if [ $status -eq 0 ] && [ "$(baks_in "$tb")" = 1 ] && cmp -s "$work/t43-before" "$tb"/tools.toml.bak-* &&
+  [ "$changes" = 1 ] && [ "$(line_after_db_id "$t43")" = 'when    = "database"' ] && [ -n "$said" ]; then
+  pass "an existing tools.toml gets when = database on Database, with a backup"
+else
+  flunk "an existing tools.toml gets when = database on Database, with a backup" "exit $status, backups $(baks_in "$tb"), changed lines $changes: $out
+$(cat "$t43" 2>&1)"
+fi
+
+cp "$t43" "$work/t44-before"
+run "$h" - "$work/good"
+if [ $status -eq 0 ] && cmp -s "$work/t44-before" "$t43" && [ "$(baks_in "$tb")" = 1 ]; then
+  pass "installing again leaves the patched tools.toml alone"
+else
+  flunk "installing again leaves the patched tools.toml alone" "exit $status, backups $(baks_in "$tb"): $out
+$(diff "$work/t44-before" "$t43" 2>&1)"
+fi
+
+h="$work/h45"
+tb="$h/.config/herdr/plugins/config/jefelabs.toolbar"
+mkdir -p "$tb"
+printf '%s\n' 'order  = ["files"]' "" "[[tool]]" 'id      = "files"' 'name    = "Files"' 'icon    = "▭"' 'command = ["yazi"]' > "$tb/tools.toml"
+cp "$tb/tools.toml" "$work/t45-before"
+run "$h" - "$work/good"
+if [ $status -eq 0 ] && cmp -s "$work/t45-before" "$tb/tools.toml" && [ "$(baks_in "$tb")" = 0 ]; then
+  pass "a tools.toml without Database is left alone"
+else
+  flunk "a tools.toml without Database is left alone" "exit $status, backups $(baks_in "$tb"): $out"
+fi
+
+h="$work/h46"
+tb="$h/.config/herdr/plugins/config/jefelabs.toolbar"
+mkdir -p "$tb"
+db_tools "$tb/tools.toml" 'when    = "database"'
+cp "$tb/tools.toml" "$work/t46-before"
+run "$h" - "$work/good"
+if [ $status -eq 0 ] && cmp -s "$work/t46-before" "$tb/tools.toml" && [ "$(baks_in "$tb")" = 0 ]; then
+  pass "a Database entry that already has when is left alone"
+else
+  flunk "a Database entry that already has when is left alone" "exit $status, backups $(baks_in "$tb"): $out"
+fi
+
 [ $failures -eq 0 ] && echo "all install tests passed" || echo "$failures install test(s) failed"
 [ $failures -eq 0 ]

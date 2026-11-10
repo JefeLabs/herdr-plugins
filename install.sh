@@ -263,6 +263,60 @@ if [ -n "$config" ]; then
      s/^\(name[[:space:]]*=[[:space:]]*\)"Capabilities"/\1"Intents"/
      /^order/s/"capabilities"/"intents"/'
 fi
+# A backup name not taken yet: <file>.bak-<date>, then -2, -3, ... (a second
+# run in the same second).
+free_bak() { # <file>
+  bak="$1.bak-$(date +%Y%m%d-%H%M%S)"
+  keep=$bak
+  n=2
+  while [ -e "$keep" ]; do
+    keep="$bak-$n"
+    n=$((n + 1))
+  done
+  printf '%s\n' "$keep"
+}
+# Database shows only in spaces that use a database: its entry carries
+# `when = "database"`. An existing tools.toml gets that one line, right after
+# the Database entry's id, once, with a backup; nothing else in it changes.
+# The first pass finds Database entries without a `when`, the second adds it.
+add_when_database() { # <tools.toml>
+  [ -f "$1" ] || return 0
+  if awk '
+    function header() {
+      if (FNR == NR && intool && isdb && !haswhen) need[n] = 1
+      isdb = 0; haswhen = 0
+      intool = ($0 ~ /^[[:space:]]*\[\[tool\]\][[:space:]]*(#.*)?$/)
+      if (intool) n++
+    }
+    FNR == 1 && NR != 1 { if (intool && isdb && !haswhen) need[n] = 1; n = 0; intool = 0 }
+    FNR == NR {
+      if ($0 ~ /^[[:space:]]*\[/) { header(); next }
+      if (intool && $0 ~ /^[[:space:]]*id[[:space:]]*=[[:space:]]*"db"[[:space:]]*(#.*)?$/) isdb = 1
+      if (intool && $0 ~ /^[[:space:]]*when[[:space:]]*=/) haswhen = 1
+      next
+    }
+    {
+      print
+      if ($0 ~ /^[[:space:]]*\[/) { header(); next }
+      if (intool && need[n] && $0 ~ /^[[:space:]]*id[[:space:]]*=[[:space:]]*"db"[[:space:]]*(#.*)?$/) {
+        print "when    = \"database\""
+        changed = 1
+      }
+    }
+    END { exit changed ? 0 : 1 }
+  ' "$1" "$1" > "$1.tmp"; then
+    keep=$(free_bak "$1")
+    cp "$1" "$keep"
+    mv "$1.tmp" "$1"
+    say "  Updated $1: the Database tool now shows only in spaces that use a database (old copy: $keep)"
+  else
+    rm -f "$1.tmp"
+  fi
+}
+# --setup writes a new tools.toml from the catalog, which has the line already
+if [ -n "$config" ] && [ -z "$setup" ]; then
+  add_when_database "$config/tools.toml"
+fi
 # Herdr's own config file: where its key bindings go
 herdr_config="${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}"
 rename_in "$herdr_config" 'jefelabs\.capabilities\.add' \
@@ -740,14 +794,8 @@ if [ -n "$config" ] && { [ -n "$setup" ] || [ ! -f "$config/tools.toml" ]; }; th
   if [ -d "$catalog" ]; then
     mkdir -p "$config"
     if [ -f "$config/tools.toml" ]; then
-      # --setup: keep the old file; a second run in the same second gets -2, -3, ...
-      bak="$config/tools.toml.bak-$(date +%Y%m%d-%H%M%S)"
-      keep=$bak
-      n=2
-      while [ -e "$keep" ]; do
-        keep="$bak-$n"
-        n=$((n + 1))
-      done
+      # --setup: keep the old file
+      keep=$(free_bak "$config/tools.toml")
       cp "$config/tools.toml" "$keep"
       say "Kept your old tools.toml as $keep"
     fi
