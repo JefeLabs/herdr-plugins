@@ -12,6 +12,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 anyhow = "1"
 shellexpand = "3"
+toml_edit = "0.25"
 
 [dev-dependencies]
 tempfile = "3"

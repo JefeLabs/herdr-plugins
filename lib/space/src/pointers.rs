@@ -6,26 +6,23 @@ use std::path::{Path, PathBuf};
 use crate::plain;
 
 /// Each person's pointers, `<config dir>/spaces.toml`:
-/// `[spaces.<name>] meta = "<path>"`, `storage = "profile"`, `url = "…"`.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+/// `[spaces.<name>] meta = "<path>"`, `storage = "profile"`, `url = "…"` (kept in the file, not used yet).
+#[derive(Default, serde::Deserialize)]
 struct Pointers {
     #[serde(default)]
     spaces: std::collections::BTreeMap<String, Pointer>,
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 struct Pointer {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     meta: Option<String>,
     /// `profile` (the default), or the placeholders `meta` and `remote`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     storage: Option<String>,
-    /// A remote storage's address: kept, not used yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
     /// Names the space had before it took its meta repo's name, which still
     /// find it (a Herdr workspace, `INTENTS_SCOPE`, an agent's old path).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     old_names: Vec<String>,
 }
 
@@ -95,16 +92,66 @@ pub fn meta_for(config: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Records `meta` as the meta repo of the space named `name`, keeping the
-/// entry's other settings. A file that does not parse is left as it is.
+/// entry's other settings. A file that does not parse is left as it is. The
+/// file is edited in place, so comments and keys this code does not know
+/// stay as they were.
 pub fn remember_meta(config: &Path, name: &str, meta: &Path) -> anyhow::Result<()> {
-    let mut pointers = read_pointers(config).map_err(|e| anyhow::anyhow!(e))?;
+    let pointers = read_pointers(config).map_err(|e| anyhow::anyhow!(e))?;
     let key = entry(&pointers, name)
         .map(|(k, _)| k.clone())
         .unwrap_or_else(|| name.to_string());
-    pointers.spaces.entry(key).or_default().meta = Some(meta.display().to_string());
+    let mut doc = read_doc(config)?;
+    let spaces = spaces_table(config, &mut doc)?;
+    let entry = spaces
+        .entry(&key)
+        .or_insert(toml_edit::table())
+        .as_table_like_mut()
+        .ok_or_else(|| not_a_table(config, &key))?;
+    entry.insert("meta", toml_edit::value(meta.display().to_string()));
     std::fs::create_dir_all(config)?;
-    std::fs::write(pointers_path(config), toml::to_string(&pointers)?)?;
+    std::fs::write(pointers_path(config), doc.to_string())?;
     Ok(())
+}
+
+/// The pointers file as an editable document; none yet reads as empty.
+fn read_doc(config: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    let path = pointers_path(config);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
+    }
+}
+
+/// The document's `[spaces]` table, made when missing. Written inline
+/// (`spaces = { … }`), it becomes `[spaces.<name>]` tables, the only
+/// layout this code adds to.
+fn spaces_table<'a>(
+    config: &Path,
+    doc: &'a mut toml_edit::DocumentMut,
+) -> anyhow::Result<&'a mut toml_edit::Table> {
+    let item = doc.entry("spaces").or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        toml_edit::Item::Table(t)
+    });
+    if let Some(inline) = item.as_inline_table() {
+        let mut t = inline.clone().into_table();
+        t.set_implicit(true);
+        *item = toml_edit::Item::Table(t);
+    }
+    item.as_table_mut().ok_or_else(|| {
+        anyhow::anyhow!("{}: spaces is not a table", pointers_path(config).display())
+    })
+}
+
+fn not_a_table(config: &Path, key: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: spaces.{key} is not a table",
+        pointers_path(config).display()
+    )
 }
 
 /// Where a space keeps its intents.
@@ -152,28 +199,61 @@ pub fn pointer_metas(config: &Path) -> Vec<(String, PathBuf)> {
 
 /// Renames the pointer `from` to `to`, which keeps `from` as an old name.
 /// An entry already called `to` keeps its own settings and takes only
-/// what it lacks from `from`'s.
+/// what it lacks from `from`'s. The file is edited in place: comments and
+/// unknown keys stay, and `from`'s entry moves with its comments when there
+/// is no `to` yet.
 pub fn rename_pointer(config: &Path, from: &str, to: &str) -> anyhow::Result<()> {
-    let mut pointers = read_pointers(config).map_err(|e| anyhow::anyhow!(e))?;
-    let Some(old) = pointers.spaces.remove(from) else {
+    read_pointers(config).map_err(|e| anyhow::anyhow!(e))?;
+    let mut doc = read_doc(config)?;
+    let spaces = spaces_table(config, &mut doc)?;
+    let Some(old) = spaces.remove(from) else {
         anyhow::bail!("{}: no space {from}", pointers_path(config).display());
     };
-    let key = pointers
-        .spaces
-        .keys()
+    let key = spaces
+        .iter()
+        .map(|(k, _)| k.to_string())
         .find(|k| k.eq_ignore_ascii_case(to))
-        .cloned()
         .unwrap_or_else(|| to.to_string());
-    let new = pointers.spaces.entry(key).or_default();
-    new.meta = new.meta.take().or(old.meta);
-    new.storage = new.storage.take().or(old.storage);
-    new.url = new.url.take().or(old.url);
-    for name in old.old_names.into_iter().chain([from.to_string()]) {
-        if !new.old_names.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
-            new.old_names.push(name);
+    let old_names = |item: &toml_edit::Item| -> Vec<String> {
+        item.get("old_names")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut names = old_names(&old);
+    if !spaces.contains_key(&key) {
+        spaces.insert(&key, old);
+    } else {
+        let new = spaces[&key]
+            .as_table_like_mut()
+            .ok_or_else(|| not_a_table(config, &key))?;
+        if let Some(from_settings) = old.as_table_like() {
+            for (k, v) in from_settings.iter() {
+                if k != "old_names" && !new.contains_key(k) {
+                    new.insert(k, v.clone());
+                }
+            }
         }
     }
-    std::fs::write(pointers_path(config), toml::to_string(&pointers)?)?;
+    let mut all = old_names(&spaces[&key]);
+    names.push(from.to_string());
+    for name in names {
+        if !all.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
+            all.push(name);
+        }
+    }
+    let entry = spaces[&key]
+        .as_table_like_mut()
+        .ok_or_else(|| not_a_table(config, &key))?;
+    entry.insert(
+        "old_names",
+        toml_edit::value(toml_edit::Array::from_iter(all)),
+    );
+    std::fs::write(pointers_path(config), doc.to_string())?;
     Ok(())
 }
 
@@ -212,5 +292,40 @@ mod tests {
         remember_meta(cfg, "shop", Path::new("/x/shop-meta")).unwrap();
         assert_eq!(meta_for(cfg, "SHOP"), Some(PathBuf::from("/x/shop-meta")));
         assert_eq!(pointers_path(cfg), cfg.join("spaces.toml"));
+    }
+
+    const MINE: &str = "# mine\n[spaces.shop]\nmeta = \"~/a\"\nmine = 1\n";
+
+    #[test]
+    fn remember_meta_keeps_comments_and_unknown_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        std::fs::write(pointers_path(cfg), MINE).unwrap();
+        remember_meta(cfg, "shop", Path::new("/b")).unwrap();
+        let text = std::fs::read_to_string(pointers_path(cfg)).unwrap();
+        assert!(text.contains("# mine"), "{text}");
+        assert!(text.contains("mine = 1"), "{text}");
+        assert!(text.contains("meta = \"/b\""), "{text}");
+    }
+
+    #[test]
+    fn rename_pointer_keeps_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        std::fs::write(pointers_path(cfg), MINE).unwrap();
+        rename_pointer(cfg, "shop", "shop-meta").unwrap();
+        let text = std::fs::read_to_string(pointers_path(cfg)).unwrap();
+        assert!(text.contains("# mine"), "{text}");
+        assert!(text.contains("[spaces.shop-meta]"), "{text}");
+        let table: toml::Table = text.parse().unwrap();
+        let entry = &table["spaces"]["shop-meta"];
+        assert_eq!(entry["meta"].as_str(), Some("~/a"), "{text}");
+        let old: Vec<&str> = entry["old_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(old.contains(&"shop"), "{text}");
     }
 }
