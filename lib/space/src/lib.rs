@@ -13,6 +13,9 @@ pub mod pointers;
 pub struct Space {
     pub meta: PathBuf,
     pub repos: Vec<SpaceRepo>,
+    /// `database = true/false`: whether the space's app uses a database.
+    /// `None` when the file doesn't say (see [`database_on`]).
+    pub database: Option<bool>,
 }
 
 /// One of a space's repos.
@@ -35,7 +38,10 @@ impl SpaceRepo {
 
 #[derive(serde::Deserialize)]
 struct SpaceFile {
+    #[serde(default)]
     repos: Vec<RepoEntry>,
+    #[serde(default)]
+    database: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -136,7 +142,21 @@ pub fn read_space(meta: &Path) -> anyhow::Result<Space> {
     Ok(Space {
         meta: meta.to_path_buf(),
         repos,
+        database: parsed.database,
     })
+}
+
+/// Whether the space of meta repo `meta` uses a database: its space file's
+/// `database`, else whether its run guide has a `db:` line (`guide_has_db`,
+/// worked out by the caller, who reads the guide), so a space with no say
+/// keeps today's Database tool. No space file also follows the guide. `Err`
+/// says why a space file that is there can't be read.
+pub fn database_on(meta: &Path, guide_has_db: bool) -> Result<bool, String> {
+    if !meta.join(".helmsmith").join("space.toml").is_file() {
+        return Ok(guide_has_db);
+    }
+    let space = read_space(meta).map_err(|e| format!("{e:#}"))?;
+    Ok(space.database.unwrap_or(guide_has_db))
 }
 
 /// The listed repos that are not there.
@@ -245,5 +265,54 @@ mod tests {
         let space = read_space(&meta).unwrap();
         assert_eq!(space.repos[0].path, tmp.path().join("api"));
         assert_eq!(space.repos[0].rel, "../api");
+    }
+
+    /// A meta repo `<tmp>/m` with `.helmsmith/intents/`, and the given space file.
+    fn meta_with(tmp: &Path, space_toml: Option<&str>) -> PathBuf {
+        let meta = tmp.join("m");
+        std::fs::create_dir_all(meta.join(".helmsmith/intents")).unwrap();
+        if let Some(text) = space_toml {
+            std::fs::write(meta.join(".helmsmith/space.toml"), text).unwrap();
+        }
+        meta
+    }
+
+    #[test]
+    fn database_only_file_reads_with_no_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = meta_with(tmp.path(), Some("database = false\n"));
+        let space = read_space(&meta).unwrap();
+        assert!(space.repos.is_empty());
+        assert_eq!(space.database, Some(false));
+    }
+
+    #[test]
+    fn database_key_wins_over_the_guide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = meta_with(tmp.path(), Some("database = false\n"));
+        assert_eq!(database_on(&meta, true), Ok(false));
+    }
+
+    #[test]
+    fn no_key_follows_the_guide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = meta_with(tmp.path(), Some("repos = []\n"));
+        assert_eq!(database_on(&meta, true), Ok(true));
+        assert_eq!(database_on(&meta, false), Ok(false));
+    }
+
+    #[test]
+    fn no_space_file_follows_the_guide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = meta_with(tmp.path(), None);
+        assert_eq!(database_on(&meta, true), Ok(true));
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = meta_with(tmp.path(), Some("database = \"no\"\n"));
+        let err = database_on(&meta, true).unwrap_err();
+        assert!(err.contains("space.toml"), "{err}");
     }
 }
