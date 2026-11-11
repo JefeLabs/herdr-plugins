@@ -48,6 +48,11 @@ pub struct ToolConfig {
     /// work pane runs to show the tool there, e.g. `["herdr-doc", "popout"]`.
     #[serde(default)]
     pub popout: Option<Vec<String>>,
+    /// Shown on the bar unless the workspace's context says `off` for this
+    /// value: `when = "database"` hides Database in a space that uses no
+    /// database. A context without the value (an older one) shows the tool.
+    #[serde(default)]
+    pub when: Option<String>,
 }
 
 /// The bar's groups, top to bottom: what a tool's context is.
@@ -770,6 +775,14 @@ command = ["lazysql", "postgres://localhost:5433/x"]
                 ":cd {agent}<CR>".into()
             ])
         );
+    }
+
+    #[test]
+    fn when_parses() {
+        let cfg = parse(&grouped_tool("db", "agent", "when = \"database\"\n")).unwrap();
+        assert_eq!(cfg.tool[0].when.as_deref(), Some("database"));
+        let plain = parse(&grouped_tool("db", "agent", "")).unwrap();
+        assert_eq!(plain.tool[0].when, None);
     }
 
     #[test]

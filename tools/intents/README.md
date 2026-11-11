@@ -198,7 +198,10 @@ repos = [
   { path = "../api", git = "git@github.com:acme/shop-api.git" },
   { path = "../web", git = "git@github.com:acme/shop-web.git" },
 ]
+database = false   # optional: this app uses no database, so the toolbar hides Database
 ```
+
+`database` says whether the space's app uses a database. Without it, a space uses one when its run guide has a `db:` line, as before. With `database = false` the toolbar's Database tool is hidden in that space (its entry carries `when = "database"`); `true` keeps it even without `db:`, and LazySql then opens its own connection list.
 
 `.helmsmith/run.md` says how to run the app (the older name `capture.md` is still read): front matter for the tool, then instructions for the agent.
 
@@ -247,7 +250,7 @@ It is filled in for you the first time the tool starts in a workspace whose fold
 
 **Skoolscout's way.** A guide with `default_area` in place of `start` keeps skoolscout's own steps: a `work` slot, e2e seed stories and logs in the slot's worktree, as the next sections describe.
 
-**The toolbar's context.** `herdr-intents context` prints, as one JSON object, what the toolbar's tools may know about the workspace it runs in: the space (`space`), its meta repo (`meta`), the space's default page for the browser (`browse`), the active agent's worktree (`agent`, from `TOOLBAR_AGENT_CWD`) and that agent's database (`db`). A value that cannot be known is left out, and `meta_error` or `db_error` says why. The toolbar runs it as its `context` command (see the toolbar README): Terminal opens at the meta repo, and LazySql on the active agent's database. The run guide says how to find that database, so neither tool learns how the project runs:
+**The toolbar's context.** `herdr-intents context` prints, as one JSON object, what the toolbar's tools may know about the workspace it runs in: the space (`space`), its meta repo (`meta`), the space's default page for the browser (`browse`), the active agent's worktree (`agent`, from `TOOLBAR_AGENT_CWD`), that agent's database (`db`) and whether the space uses a database at all (`database`: `on` or `off`, from `space.toml`'s `database`, else the run guide's `db:`). A value that cannot be known is left out, and `meta_error` or `db_error` says why; what can't be told (a `space.toml` or run guide that can't be read, a meta repo folder that is gone) gives `database` `on`, keeping the tool, and `database_error` says why. `watch` lists the space files the context reads (`space.toml`, `run.md`, `capture.md`, one path a line), so the toolbar asks again when one changes. The toolbar runs it as its `context` command (see the toolbar README): Terminal opens at the meta repo, and LazySql on the active agent's database. The run guide says how to find that database, so neither tool learns how the project runs:
 
 ```yaml
 db: '. ./.env.slot 2>/dev/null; echo "postgres://app:secret@localhost:${PG_PORT:-5432}/app?sslmode=disable"'

@@ -64,6 +64,14 @@ fn texts(tool: &ToolConfig) -> impl Iterator<Item = &String> {
         .chain(tool.cwd.iter())
 }
 
+/// Whether `tool` is on the bar under the context `vars`: unless its `when`
+/// names a value the context says is `off`.
+pub fn shown(tool: &ToolConfig, vars: &Vars) -> bool {
+    tool.when
+        .as_ref()
+        .is_none_or(|name| vars.get(name).map(String::as_str) != Some("off"))
+}
+
 /// The `{name}`s a tool uses (`{name?}` counts as `name`).
 pub fn placeholders(tool: &ToolConfig) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -284,11 +292,33 @@ pub fn fetch(cmd: &[String], cwd: &Path, agent: Option<&Agent>, env: &[(String, 
     vars
 }
 
+/// The files a context says it was read from (`watch`, one path a line),
+/// each with when it last changed (none: not there). The toolbar knows
+/// nothing about them; it asks again when one changes.
+pub fn watched(vars: &Vars) -> Vec<(std::path::PathBuf, Option<std::time::SystemTime>)> {
+    vars.get("watch").map_or_else(Vec::new, |w| {
+        w.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let path = std::path::PathBuf::from(l);
+                let at = modified(&path);
+                (path, at)
+            })
+            .collect()
+    })
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// Follows the active agent of the toolbar's workspace (`herdr`) every
 /// `every`, and sends the workspace's context (`cmd` run in `cwd`) whenever
-/// it changes: once at the start, then for each other agent made active.
-/// Outside Herdr there is no agent, and the context is sent once. Ends when
-/// `stop` is set or nobody listens.
+/// it changes: once at the start, then for each other agent made active,
+/// and again whenever a file the context named in `watch` changes (the
+/// space's settings, say). Outside Herdr there is no agent, and the context
+/// is sent once. Ends when `stop` is set or nobody listens.
 pub fn follow(
     herdr: Option<crate::herdr::HerdrContext>,
     cmd: Vec<String>,
@@ -299,15 +329,19 @@ pub fn follow(
 ) {
     use std::sync::atomic::Ordering;
     let mut sent: Option<Option<Agent>> = None;
+    let mut seen: Vec<(std::path::PathBuf, Option<std::time::SystemTime>)> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         let agent = herdr.as_ref().and_then(|h| {
             let list = h.agent_list()?;
             let before = sent.clone().flatten();
             active_agent(&list, h.workspace_id.as_deref()?, before.as_ref()).or(before)
         });
-        if sent.as_ref() != Some(&agent) {
+        let files_changed = seen.iter().any(|(path, at)| modified(path) != *at);
+        if sent.as_ref() != Some(&agent) || files_changed {
             let env: &[(String, String)] = herdr.as_ref().map_or(&[], |h| &h.inherit);
-            if tx.send(fetch(&cmd, &cwd, agent.as_ref(), env)).is_err() {
+            let vars = fetch(&cmd, &cwd, agent.as_ref(), env);
+            seen = watched(&vars);
+            if tx.send(vars).is_err() {
                 return;
             }
             sent = Some(agent);
@@ -337,7 +371,33 @@ mod tests {
             group: None,
             on_switch: None,
             popout: None,
+            when: None,
         }
+    }
+
+    fn with_when(when: Option<&str>) -> ToolConfig {
+        let mut t = tool(&["lazysql", "{db?}"], None);
+        t.when = when.map(str::to_string);
+        t
+    }
+
+    #[test]
+    fn a_tool_with_when_is_hidden_only_by_off() {
+        let t = with_when(Some("database"));
+        assert!(!shown(&t, &vars(&[("database", "off")])));
+        assert!(shown(&t, &vars(&[("database", "on")])));
+        assert!(shown(&t, &Vars::new()));
+    }
+
+    #[test]
+    fn a_tool_whose_value_is_missing_is_shown() {
+        let t = with_when(Some("database"));
+        assert!(shown(&t, &vars(&[("db_error", "no slot database")])));
+    }
+
+    #[test]
+    fn a_tool_without_when_is_always_shown() {
+        assert!(shown(&with_when(None), &vars(&[("database", "off")])));
     }
 
     fn vars(pairs: &[(&str, &str)]) -> Vars {
@@ -566,6 +626,55 @@ mod tests {
                 ("FAKE_AGENTS".into(), agents.display().to_string()),
             ],
         }
+    }
+
+    #[test]
+    fn the_context_is_asked_again_when_a_file_it_watches_changes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, SystemTime};
+        let tmp = tempfile::tempdir().unwrap();
+        let agents = tmp.path().join("agents.json");
+        std::fs::write(&agents, list(&[("w1:p3", "w1", true, "/wt/a")]).to_string()).unwrap();
+        let space = tmp.path().join("space.toml");
+        std::fs::write(&space, "on").unwrap();
+        let set_time = |secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(&space)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        set_time(1_000_000);
+        // the context names the file it read, as Intents' `watch` does
+        let cmd: Vec<String> = [
+            "sh",
+            "-c",
+            r#"printf '{"database":"%s","watch":"%s"}' "$(cat "$1")" "$1""#,
+            "sh",
+            &space.display().to_string(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let herdr = fake_herdr(tmp.path(), &agents);
+        let (s, dir) = (stop.clone(), tmp.path().to_path_buf());
+        let follower = std::thread::spawn(move || {
+            follow(Some(herdr), cmd, dir, Duration::from_millis(30), s, tx)
+        });
+        let next = || rx.recv_timeout(Duration::from_secs(5)).expect("a context");
+        assert_eq!(next().get("database").map(String::as_str), Some("on"));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "nothing changed: no new context"
+        );
+        std::fs::write(&space, "off").unwrap();
+        set_time(2_000_000);
+        assert_eq!(next().get("database").map(String::as_str), Some("off"));
+        stop.store(true, Ordering::Relaxed);
+        follower.join().unwrap();
     }
 
     #[test]

@@ -79,6 +79,7 @@ fn browser() -> ToolConfig {
         group: None,
         on_switch: None,
         popout: None,
+        when: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn usage() -> ToolConfig {
         group: None,
         on_switch: None,
         popout: None,
+        when: None,
     }
 }
 

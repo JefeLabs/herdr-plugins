@@ -54,18 +54,8 @@ pub fn current_workspace(get: impl Fn(&str) -> Option<String>) -> Option<String>
     (!id.trim().is_empty()).then_some(id)
 }
 
-/// A workspace name usable as one folder name: trimmed, not empty, no path
-/// separator, not `.`-led, not `~`-led (Herdr names a workspace started in
-/// the home folder `~`). Anything else is no scope rather than a path.
-pub fn group_name(name: &str) -> Option<String> {
-    let name = name.trim();
-    let one_folder = !name.is_empty()
-        && !name.starts_with('.')
-        && !name.starts_with('~')
-        && !name.contains('/')
-        && !name.contains('\\');
-    one_folder.then(|| name.to_string())
-}
+/// A workspace name usable as one folder name (see `herdr_space::group_name`).
+pub use herdr_space::group_name;
 
 /// `herdr workspace get <id>`: the workspace's current name.
 pub fn herdr_label(bin: &Path, id: &str) -> Option<String> {

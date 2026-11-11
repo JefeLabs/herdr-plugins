@@ -102,7 +102,8 @@ pub fn agent_db(cmd: &str, agent: &Path, meta: &Path, timeout: Duration) -> Resu
 /// The context of a workspace in space `space` whose folder is `here`, with
 /// active agent `agent`: `space`, `meta`, `agent` (the top of its worktree)
 /// and `db`, each present only when known; `meta_error` and `db_error` say
-/// why one is not.
+/// why one is not. With a meta repo, `database` is `on` or `off`: whether the
+/// space uses a database (`database_error` when its space file is broken).
 pub fn gather(
     dirs: &Dirs,
     space: Option<&str>,
@@ -152,6 +153,25 @@ pub fn gather(
                     .to_string()
             }),
     };
+    // whether the space uses a database: its space file says, else its run
+    // guide's `db:` does, and with no run guide it doesn't. What can't be
+    // told (a broken space file or run guide, a meta repo that is gone)
+    // keeps the Database tool and says why.
+    let database = meta.as_ref().ok().map(|m| -> Result<bool, String> {
+        if !m.is_dir() {
+            return Err(format!("the meta repo {} is not there", m.display()));
+        }
+        if let Some(on) = crate::space::database_setting(m)? {
+            return Ok(on);
+        }
+        let h = m.join(".helmsmith");
+        let guide_there = ["run.md", "capture.md"].iter().any(|n| h.join(n).is_file());
+        match &guide {
+            Some(Ok(g)) => Ok(g.db.is_some()),
+            Some(Err(e)) if guide_there => Err(e.clone()),
+            _ => Ok(false),
+        }
+    });
     let db = match (&meta, &agent) {
         (Err(_), _) => Err("no meta repo, so no run guide".to_string()),
         (Ok(_), None) => Err("no active agent".to_string()),
@@ -171,6 +191,16 @@ pub fn gather(
             },
         },
     };
+    // the files this context was read from: the toolbar asks again when one
+    // changes (a space's database switch, an edited run guide)
+    if let Ok(m) = &meta {
+        let h = m.join(".helmsmith");
+        let watch: Vec<String> = ["space.toml", "run.md", "capture.md"]
+            .iter()
+            .map(|n| h.join(n).display().to_string())
+            .collect();
+        put("watch", watch.join("\n"));
+    }
     match meta {
         Ok(m) => put("meta", m.display().to_string()),
         Err(e) => put("meta_error", e),
@@ -178,6 +208,14 @@ pub fn gather(
     match db {
         Ok(d) => put("db", d),
         Err(e) => put("db_error", e),
+    }
+    match database {
+        Some(Ok(on)) => put("database", if on { "on" } else { "off" }.to_string()),
+        Some(Err(e)) => {
+            put("database", "on".to_string());
+            put("database_error", e);
+        }
+        None => {}
     }
     match browse {
         Ok(b) => put("browse", b),

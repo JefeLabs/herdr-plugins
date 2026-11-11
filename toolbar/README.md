@@ -143,6 +143,7 @@ id      = "db"
 name    = "Database"
 icon    = "▤"
 command = ["lazysql", "{db?}"]   # the active agent's database, else LazySql's own list
+when    = "database"             # only in spaces that use a database
 
 [[tool]]
 id      = "terminal"
@@ -153,6 +154,8 @@ cwd     = "{meta?}"              # the space's meta repo, else the workspace's f
 ```
 
 The command runs in the workspace's folder, with `TOOLBAR_AGENT_CWD` set to the active agent's folder, and prints a JSON object. Its text values are the names a tool can use, and a `<name>_error` value says why `<name>` is missing. `herdr-intents context` prints the space, its meta repo (`meta`), the space's default page (`browse`, which the Browser opens), the active agent's worktree (`agent`) and its database (`db`), found by the space's run guide (see the Intents README). The toolbar adds `{agent}` itself, so it works without a context command too. `${…}` is the shell's, never a name.
+
+**Tools only some spaces need.** `when = "<name>"` keeps a tool off the bar while the context's `<name>` is `off`. Intents says `database = "off"` for a space whose `space.toml` has `database = false`, so Database leaves that space's bar. A context without the value (an older Intents, say) shows the tool. A hidden tool keeps running, and when the value changes it goes back in its place: Intents names the files it read in `watch`, and the toolbar asks again within a second of one changing, so editing `database` in `space.toml` shows or hides Database right away. If it was the tool on screen, the first tool shown in the toolbar takes over.
 
 **Groups.** A tool can say what it follows with `group`, and the bar draws the groups top to bottom with a rule between each: `space` (the project; it starts at the meta repo, `{meta?}`), `agent` (the active agent; it starts in its worktree, `{agent?}`), and `system` (the machine; it starts as written). A `cwd` of a tool's own wins. `order` sorts the tools within a group, pane tools come last in theirs, and tools without a group come after the groups. Once any tool has a group, the groups draw the rules and `"---"` in `order` is ignored. A worktree's entry that replaces a grouped tool keeps its group unless it names one.
 
@@ -177,7 +180,7 @@ on_switch = "keep"
 
 When the active agent first becomes known (just after the toolbar opens), a `"keep"` tool started a moment before moves into the agent's worktree too, and a command runs. Space and system tools keep running through a switch, since their values don't change. `on_switch` is only for agent tools, and only for tools that run in the toolbar: a pane tool takes its values when it opens.
 
-**The active agent** is the agent whose chat is in the main pane: the focused agent of this workspace, or, while you are in the toolbar, the one that was active before. The toolbar checks it every second (`herdr agent list`), and only when a tool names a value. When it changes, the context is asked again, and every tool you have opened whose values changed restarts right away on the new ones: LazySql moves to the new agent's database. Tools you have not opened wait for their first opening, and a pane tool takes the values it has when it opens.
+**The active agent** is the agent whose chat is in the main pane: the focused agent of this workspace, or, while you are in the toolbar, the one that was active before. The toolbar checks it every second (`herdr agent list`), and only when a tool names a value. When it changes, or a file the context names in `watch` changes, the context is asked again, and every tool you have opened whose values changed restarts right away on the new ones: LazySql moves to the new agent's database. Tools you have not opened wait for their first opening, and a pane tool takes the values it has when it opens.
 
 **A missing value.** `{name}` is required: a tool missing one does not start, and its slot says why (`Database needs {db}: no slot database here`). `{name?}` is optional: an argument that is only `{name?}` is left out, a `cwd` that is only `{name?}` is the workspace's folder, and inside a longer text it is empty.
 

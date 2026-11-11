@@ -129,6 +129,7 @@ fn popout_config(src: &ToolConfig, command: Vec<String>) -> ToolConfig {
         group: src.group,
         on_switch: None,
         popout: None,
+        when: None,
     }
 }
 
@@ -144,8 +145,14 @@ pub enum ControlCmd {
 }
 
 pub struct App {
+    /// The tools on the bar, in bar order.
     pub slots: Vec<Slot>,
     pub selected: usize,
+    /// Tools the context keeps off the bar (`when`), still running if they
+    /// were; they go back in their place when the value changes.
+    hidden: Vec<Slot>,
+    /// Every tool's id in the config's order: where a hidden tool goes back.
+    tool_order: Vec<String>,
     pub prefix: Prefix,
     /// Replaces the screen when set (config errors, untrusted file, spawn failures).
     pub message: Option<String>,
@@ -197,6 +204,8 @@ impl App {
         let mut app = Self {
             slots: Vec::new(),
             selected: 0,
+            hidden: Vec::new(),
+            tool_order: Vec::new(),
             herdr: None,
             notes_tx,
             notes_rx,
@@ -242,6 +251,8 @@ impl App {
         self.hover = None;
         let mut old: Vec<Slot> = std::mem::take(&mut self.slots);
         let selected_id = old.get(self.selected).map(|s| s.cfg.id.clone());
+        old.append(&mut self.hidden);
+        self.tool_order = config.tools.iter().map(|t| t.id.clone()).collect();
         for cfg in config.tools {
             let slot = match old.iter().position(|s| s.cfg.id == cfg.id) {
                 Some(i) => {
@@ -278,6 +289,65 @@ impl App {
             )
         });
         let _ = config.prefix; // prefix changes apply on next start; see reload()
+        self.apply_shown();
+    }
+
+    /// Puts each tool on the bar or in `hidden`, as the context's values say
+    /// (`when`), in the config's order. The selected tool stays selected
+    /// while it shows; once hidden, the first tool shown in the slot takes
+    /// its place. A hidden tool keeps running. Says whether the bar changed.
+    fn apply_shown(&mut self) -> bool {
+        let selected_id = self.slots.get(self.selected).map(|s| s.cfg.id.clone());
+        let before: Vec<String> = self.slots.iter().map(|s| s.cfg.id.clone()).collect();
+        let mut all: Vec<Slot> = std::mem::take(&mut self.slots);
+        all.append(&mut self.hidden);
+        let order = &self.tool_order;
+        all.sort_by_key(|s| {
+            order
+                .iter()
+                .position(|id| *id == s.cfg.id)
+                .unwrap_or(usize::MAX)
+        });
+        let vars = &self.vars;
+        let (shown, hidden): (Vec<Slot>, Vec<Slot>) = all
+            .into_iter()
+            .partition(|s| crate::context::shown(&s.cfg, vars));
+        self.slots = shown;
+        self.hidden = hidden;
+        let after: Vec<String> = self.slots.iter().map(|s| s.cfg.id.clone()).collect();
+        match selected_id.and_then(|id| self.slots.iter().position(|s| s.cfg.id == id)) {
+            Some(i) => self.selected = i,
+            None => {
+                let gone = self
+                    .hidden
+                    .iter()
+                    .find(|s| Some(&s.cfg.id) == before.get(self.selected));
+                // a hidden graphics tool's images would stay on screen
+                if gone.is_some_and(|s| s.cfg.graphics) {
+                    self.pending_out
+                        .extend_from_slice(crate::graphics::DELETE_ALL);
+                }
+                let idx = self
+                    .slots
+                    .iter()
+                    .position(|s| s.cfg.open != Open::Pane)
+                    .unwrap_or(0);
+                self.selected = idx;
+                if gone.is_some()
+                    && let Some(slot) = self.slots.get(idx)
+                    && slot.cfg.open != Open::Pane
+                    && slot.proc.is_none()
+                    && slot.last_error.is_none()
+                {
+                    self.spawn(idx);
+                }
+            }
+        }
+        let changed = before != after;
+        if changed {
+            self.hover = None;
+        }
+        changed
     }
 
     /// Where the bar's rules go (before each of these tools): after each
@@ -761,9 +831,11 @@ impl App {
 
     /// Whether any tool names a `{name}` from the workspace's context.
     pub fn uses_context(&self) -> bool {
+        // a tool with `when` follows the context too, or it could never come back
         self.slots
             .iter()
-            .any(|s| !crate::context::placeholders(&s.cfg).is_empty())
+            .chain(&self.hidden)
+            .any(|s| !crate::context::placeholders(&s.cfg).is_empty() || s.cfg.when.is_some())
     }
 
     /// The command that prints the workspace's context; empty: none.
@@ -779,7 +851,8 @@ impl App {
         let before = self.vars.get("agent").cloned();
         let switched = before.as_ref() != vars.get("agent");
         self.vars = vars;
-        let mut restale = false;
+        // a tool coming back is on the bar before the values below reach it
+        let mut restale = self.apply_shown();
         for idx in 0..self.slots.len() {
             let slot = &mut self.slots[idx];
             let uses = !crate::context::placeholders(&slot.cfg).is_empty();
@@ -1043,7 +1116,7 @@ impl App {
         self.size = size;
         self.keep_icons_visible();
         let content = self.content_size();
-        for slot in &self.slots {
+        for slot in self.slots.iter().chain(&self.hidden) {
             if let Some(p) = slot.proc.as_ref() {
                 p.resize(content);
             }
@@ -1138,7 +1211,7 @@ impl App {
             r.stop.store(true, Ordering::Relaxed);
             let _ = std::fs::remove_file(&r.socket);
         }
-        for slot in &mut self.slots {
+        for slot in self.slots.iter_mut().chain(&mut self.hidden) {
             if let Some(p) = slot.proc.as_mut() {
                 p.kill();
             }
@@ -2195,6 +2268,85 @@ mod tests {
         let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
         assert!(!app.uses_context());
         app.shutdown();
+    }
+
+    /// Intents, Database (shown only while the space uses a database), Files.
+    fn with_db() -> String {
+        tool("intents", "echo I; sleep 30")
+            + &tool("db", "echo D; sleep 30")
+                .replace("[[tool]]\n", "[[tool]]\nwhen = \"database\"\n")
+            + &tool("files", "echo F; sleep 30")
+    }
+
+    #[test]
+    fn database_off_takes_the_tool_off_the_bar() {
+        let f = fixture(&with_db());
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        assert_eq!(ids(&app), ["intents", "db", "files"]);
+        app.apply_context(vars(&[("database", "off")]));
+        assert_eq!(app.view().states.len(), 2);
+        assert_eq!(ids(&app), ["intents", "files"]);
+        app.shutdown();
+    }
+
+    #[test]
+    fn hiding_the_selected_tool_moves_the_selection_and_keeps_it_running() {
+        let f = fixture(&with_db());
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        app.select(1);
+        let p = pid(&app, 1);
+        app.apply_context(vars(&[("database", "off")]));
+        assert_eq!(app.view().selected, 0);
+        assert!(alive(p), "a hidden tool keeps running");
+        app.apply_context(vars(&[("database", "on")]));
+        assert_eq!(ids(&app), ["intents", "db", "files"]);
+        assert_eq!(pid(&app, 1), p, "the same process comes back");
+        app.shutdown();
+    }
+
+    #[test]
+    fn shutdown_ends_hidden_tools_too() {
+        let f = fixture(&with_db());
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        app.select(1);
+        let p = pid(&app, 1);
+        app.apply_context(vars(&[("database", "off")]));
+        app.shutdown();
+        wait_until("the hidden tool ended", || !alive(p));
+    }
+
+    #[test]
+    fn select_by_a_hidden_tool_is_false() {
+        let f = fixture(&with_db());
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        app.apply_context(vars(&[("database", "off")]));
+        assert!(!app.select_by("db"));
+        assert!(app.select_by("files"));
+        app.shutdown();
+    }
+
+    #[test]
+    fn clicking_after_a_hidden_tool_selects_the_tool_under_the_mouse() {
+        let f = fixture(&with_db());
+        let mut app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        app.apply_context(vars(&[("database", "off")]));
+        // the second button, one row down, is Files now
+        app.apply_mouse(click(SIZE.cols - 2, 1));
+        assert_eq!(app.slots[app.selected].cfg.id, "files");
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_tool_with_when_uses_the_context() {
+        let f = fixture(
+            &(tool("a", "sleep 30")
+                + &tool("b", "sleep 30").replace("[[tool]]\n", "[[tool]]\nwhen = \"database\"\n")),
+        );
+        let app = App::new(f.paths.clone(), f.env.clone(), SIZE).unwrap();
+        assert!(
+            app.uses_context(),
+            "without the context a hidden tool could never come back"
+        );
     }
 
     #[test]
